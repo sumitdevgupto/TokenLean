@@ -1,0 +1,1892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Token Optimization Playbook for Agentic AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080c14;
+    --bg2: #0d1422;
+    --bg3: #111b2e;
+    --border: #1e2d47;
+    --border2: #243352;
+    --teal: #00d4aa;
+    --teal-dim: #00a07e;
+    --teal-glow: rgba(0,212,170,0.12);
+    --amber: #f59e0b;
+    --amber-dim: #d97706;
+    --blue: #3b82f6;
+    --blue-dim: #2563eb;
+    --pink: #f472b6;
+    --text: #e2e8f0;
+    --text-muted: #7a8fa8;
+    --text-dim: #4a6280;
+    --code-bg: #0a1628;
+    --card: #0e1829;
+    --radius: 10px;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  /* ── GRID NOISE TEXTURE ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0; z-index: 0;
+    background-image:
+      radial-gradient(ellipse 800px 600px at 10% 20%, rgba(0,212,170,0.05) 0%, transparent 60%),
+      radial-gradient(ellipse 600px 800px at 90% 80%, rgba(59,130,246,0.05) 0%, transparent 60%),
+      url("data:image/svg+xml,%3Csvg width='40' height='40' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 0h40v40H0z' fill='none'/%3E%3Cpath d='M40 0L0 0 0 40' fill='none' stroke='%231e2d47' stroke-width='0.3'/%3E%3C/svg%3E");
+    pointer-events: none;
+  }
+
+  .page-wrap { position: relative; z-index: 1; }
+
+  /* ── NAV ── */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(8,12,20,0.9);
+    backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 32px;
+    display: flex; align-items: center; gap: 0;
+    height: 52px;
+  }
+  .nav-logo {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; font-weight: 600;
+    color: var(--teal);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    margin-right: auto;
+  }
+  .nav-links {
+    display: flex; gap: 4px; list-style: none;
+    overflow-x: auto;
+  }
+  .nav-links a {
+    display: block; padding: 6px 12px;
+    font-size: 12px; font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    border-radius: 6px;
+    transition: color 0.15s, background 0.15s;
+    white-space: nowrap;
+  }
+  .nav-links a:hover { color: var(--teal); background: var(--teal-glow); }
+
+  /* ── HERO ── */
+  .hero {
+    padding: 80px 32px 60px;
+    max-width: 1100px; margin: 0 auto;
+    text-align: center;
+  }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 14px;
+    border: 1px solid rgba(0,212,170,0.3);
+    border-radius: 100px;
+    background: rgba(0,212,170,0.06);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; font-weight: 500;
+    color: var(--teal);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 28px;
+  }
+  .hero-badge::before { content: '●'; font-size: 7px; }
+  h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: clamp(32px, 5vw, 58px);
+    font-weight: 800;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    color: #fff;
+    margin-bottom: 28px;
+  }
+  h1 span { color: var(--teal); }
+  .hero-principle {
+    max-width: 680px; margin: 0 auto 48px;
+    background: linear-gradient(135deg, rgba(0,212,170,0.08), rgba(59,130,246,0.06));
+    border: 1px solid rgba(0,212,170,0.2);
+    border-radius: var(--radius);
+    padding: 24px 32px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 14px; font-weight: 500;
+    color: var(--text);
+    font-style: italic;
+  }
+  .hero-principle strong { color: var(--teal); font-weight: 700; font-style: normal; }
+
+  /* ── TOKEN ROLE CARDS ── */
+  .token-roles {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px; max-width: 1100px; margin: 0 auto 24px; padding: 0 32px;
+  }
+  .role-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 22px;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .role-card:hover { border-color: var(--teal-dim); transform: translateY(-2px); }
+  .role-card .label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; font-weight: 600;
+    color: var(--teal);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .role-card p { font-size: 13.5px; color: var(--text-muted); }
+
+  .mandate {
+    max-width: 1100px; margin: 0 auto 56px; padding: 0 32px;
+    background: rgba(245,158,11,0.07);
+    border: 1px solid rgba(245,158,11,0.2);
+    border-radius: var(--radius);
+    padding: 16px 24px;
+    font-size: 13.5px; font-weight: 500; color: var(--amber);
+    text-align: center;
+  }
+
+  /* ── LEGEND ── */
+  .legend-bar {
+    max-width: 1100px; margin: 0 auto 56px; padding: 0 32px;
+    display: flex; gap: 24px; flex-wrap: wrap; align-items: center;
+    font-size: 13px; color: var(--text-muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; }
+  .legend-chip {
+    display: inline-block; padding: 2px 10px;
+    border-radius: 100px; font-size: 12px; font-weight: 600;
+    border: 1px solid;
+  }
+  .chip-green { border-color: rgba(0,212,170,0.4); color: var(--teal); background: var(--teal-glow); }
+  .chip-amber { border-color: rgba(245,158,11,0.4); color: var(--amber); background: rgba(245,158,11,0.08); }
+
+  /* ── SECTION HEADERS ── */
+  .section { max-width: 1100px; margin: 0 auto; padding: 0 32px 72px; }
+  h2 {
+    font-family: 'Syne', sans-serif;
+    font-size: 28px; font-weight: 700;
+    color: #fff;
+    margin-bottom: 32px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+  }
+  h2 .section-num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px; font-weight: 500;
+    color: var(--teal); letter-spacing: 0.1em;
+  }
+
+  /* ── LIFECYCLE FLOW DIAGRAM ── */
+  .flow-wrap {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 40px 32px;
+    position: relative;
+    overflow: hidden;
+  }
+  .flow-wrap::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--teal), var(--blue), var(--pink));
+  }
+  .flow-user {
+    text-align: center;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px; font-weight: 600;
+    color: var(--teal);
+    padding: 12px 24px;
+    border: 2px solid var(--teal);
+    border-radius: 8px;
+    display: inline-block;
+    background: var(--teal-glow);
+    margin: 0 auto 0; display: table;
+  }
+  .flow-arrow {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 20px;
+    line-height: 1;
+    margin: 8px 0;
+  }
+  .flow-stages { display: flex; flex-direction: column; gap: 0; }
+  .flow-stage {
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    padding: 18px 24px;
+    position: relative;
+    transition: border-color 0.2s;
+  }
+  .flow-stage:hover { border-color: var(--teal-dim); }
+  .flow-stage-header {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 10px;
+  }
+  .stage-pill {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 0.1em;
+    padding: 3px 10px;
+    border-radius: 100px;
+    text-transform: uppercase;
+  }
+  .s1 { background: rgba(0,212,170,0.15); color: var(--teal); border: 1px solid rgba(0,212,170,0.3); }
+  .s2 { background: rgba(59,130,246,0.15); color: #93c5fd; border: 1px solid rgba(59,130,246,0.3); }
+  .s3 { background: rgba(168,85,247,0.15); color: #d8b4fe; border: 1px solid rgba(168,85,247,0.3); }
+  .s4 { background: rgba(245,158,11,0.15); color: var(--amber); border: 1px solid rgba(245,158,11,0.3); }
+  .s5 { background: rgba(244,114,182,0.15); color: var(--pink); border: 1px solid rgba(244,114,182,0.3); }
+  .s6 { background: rgba(52,211,153,0.15); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.3); }
+  .stage-name {
+    font-family: 'Syne', sans-serif;
+    font-size: 14px; font-weight: 700; color: #fff;
+  }
+  .stage-desc { font-size: 13px; color: var(--text-muted); margin: 0; }
+  .stage-groups {
+    display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px;
+  }
+  .stage-group-tag {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 6px;
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .stage-group-tag:hover { border-color: var(--teal-dim); color: var(--teal); }
+
+  /* ── OVERVIEW TABLE ── */
+  .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; }
+  thead tr {
+    background: var(--bg3);
+    border-bottom: 2px solid var(--border2);
+  }
+  th {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 14px 16px; text-align: left;
+    white-space: nowrap;
+  }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,0.02); }
+  td { padding: 13px 16px; font-size: 13px; color: var(--text); vertical-align: top; }
+  td:first-child {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px; font-weight: 600;
+    color: var(--teal); white-space: nowrap;
+  }
+  td a { color: var(--blue); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  .saving-badge {
+    font-size: 12px; font-weight: 600;
+    color: #fff;
+    background: rgba(0,212,170,0.15);
+    border: 1px solid rgba(0,212,170,0.25);
+    border-radius: 6px;
+    padding: 2px 8px;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .stage-badge {
+    font-size: 11px; font-weight: 500;
+    padding: 2px 8px; border-radius: 6px;
+    white-space: nowrap; display: inline-block;
+  }
+
+  /* ── GROUP DETAIL CARDS ── */
+  .groups-grid { display: flex; flex-direction: column; gap: 20px; }
+  .group-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+  .group-card:hover { border-color: var(--border2); }
+  .group-card-header {
+    display: flex; align-items: flex-start; gap: 16px;
+    padding: 24px 28px 20px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .group-id {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 20px; font-weight: 700;
+    color: var(--teal);
+    white-space: nowrap;
+    min-width: 44px;
+    padding-top: 2px;
+  }
+  .group-title-wrap { flex: 1; }
+  .group-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 18px; font-weight: 700;
+    color: #fff; margin-bottom: 6px;
+  }
+  .group-meta {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    align-items: center;
+  }
+  .meta-tag {
+    font-size: 11.5px;
+    padding: 2px 10px; border-radius: 6px;
+    font-weight: 500;
+  }
+  .meta-stage { background: var(--bg3); border: 1px solid var(--border2); color: var(--text-muted); }
+  .meta-saving { background: rgba(0,212,170,0.1); border: 1px solid rgba(0,212,170,0.25); color: var(--teal); font-weight: 600; }
+  .meta-agnostic { background: rgba(0,212,170,0.07); border: 1px solid rgba(0,212,170,0.15); color: var(--teal-dim); }
+  .meta-warning { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); color: var(--amber); }
+  .group-chevron {
+    font-size: 18px; color: var(--text-dim);
+    transition: transform 0.25s;
+    padding-top: 4px;
+  }
+  .group-card.open .group-chevron { transform: rotate(180deg); }
+  .group-body {
+    display: none;
+    padding: 24px 28px;
+  }
+  .group-card.open .group-body { display: block; }
+
+  /* ── CONTENT WITHIN GROUPS ── */
+  .group-body p { color: var(--text-muted); margin-bottom: 14px; line-height: 1.75; }
+  .group-body p strong { color: var(--text); }
+  .group-body h4 {
+    font-family: 'Syne', sans-serif;
+    font-size: 14px; font-weight: 700; color: #fff;
+    margin: 18px 0 8px;
+  }
+  .group-body ul {
+    padding-left: 20px; margin-bottom: 16px; color: var(--text-muted);
+  }
+  .group-body ul li { margin-bottom: 5px; font-size: 13.5px; }
+  .group-body ul li strong { color: var(--text); }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border2);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: #a8c4e0;
+  }
+  code {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12.5px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    color: #a8c4e0;
+  }
+  pre code { background: none; border: none; padding: 0; }
+
+  .tools-line {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 14px 16px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 16px;
+  }
+  .tools-line .tl-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10.5px; font-weight: 600;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-right: 4px;
+  }
+  .tool-link {
+    font-size: 12px; font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border2);
+    background: var(--card);
+    color: var(--blue);
+    text-decoration: none;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .tool-link:hover { border-color: var(--blue-dim); background: rgba(59,130,246,0.1); }
+  .tool-separator { color: var(--text-dim); font-size: 12px; margin: 0 2px; }
+
+  .inline-table-wrap { overflow-x: auto; margin: 14px 0; border-radius: 8px; border: 1px solid var(--border); }
+  .inline-table-wrap table { margin: 0; }
+  .inline-table-wrap thead tr { background: var(--bg3); border-bottom: 1px solid var(--border2); }
+  .inline-table-wrap th { font-size: 11px; padding: 10px 14px; }
+  .inline-table-wrap td { padding: 10px 14px; font-size: 13px; }
+  .inline-table-wrap td:first-child { color: var(--text); font-family: inherit; font-size: 13px; }
+
+  blockquote {
+    border-left: 3px solid var(--teal-dim);
+    padding: 12px 18px;
+    background: var(--teal-glow);
+    border-radius: 0 8px 8px 0;
+    color: var(--text-muted);
+    font-size: 13.5px;
+    margin: 14px 0;
+  }
+
+  .ref-line {
+    font-size: 12px; color: var(--text-dim);
+    margin-top: 16px; padding-top: 14px;
+    border-top: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  }
+  .ref-line span { color: var(--text-dim); font-weight: 600; font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.1em; }
+  .ref-line a { color: var(--text-dim); text-decoration: underline; font-size: 12px; }
+  .ref-line a:hover { color: var(--text-muted); }
+
+  /* ── BLUEPRINT TABLE ── */
+  .blueprint-table td:nth-child(2) { color: var(--text-muted); }
+  .blueprint-table td:nth-child(3) { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--teal); }
+
+  /* ── FORMULA BOX ── */
+  .formula-box {
+    background: var(--code-bg);
+    border: 1px solid rgba(0,212,170,0.2);
+    border-radius: 10px;
+    padding: 20px 24px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 14px;
+    color: var(--teal);
+    text-align: center;
+    margin: 16px 0;
+    letter-spacing: 0.04em;
+  }
+  .formula-box .formula-label { font-size: 11px; color: var(--text-dim); margin-top: 8px; letter-spacing: 0.08em; }
+
+  /* ── ARCHITECTURE SECTION ── */
+  .arch-section { padding-bottom: 80px; }
+
+  /* ── FOOTER ── */
+  footer {
+    text-align: center;
+    padding: 40px 32px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 13px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 700px) {
+    nav { padding: 0 16px; }
+    .hero { padding: 48px 16px 40px; }
+    .section { padding: 0 16px 48px; }
+    .token-roles { padding: 0 16px; }
+    .mandate { margin: 0 16px 40px; }
+    .legend-bar { padding: 0 16px; }
+    h1 { font-size: 28px; }
+    .group-card-header { padding: 18px 18px 14px; }
+    .group-body { padding: 18px; }
+    .flow-wrap { padding: 24px 16px; }
+  }
+
+  /* ── SCROLLBAR ── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg2); }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+  /* ── OPEN ALL BUTTON ── */
+  .controls {
+    display: flex; gap: 10px; align-items: center;
+    margin-bottom: 24px;
+  }
+  .btn {
+    font-size: 12px; font-weight: 600;
+    font-family: 'IBM Plex Mono', monospace;
+    padding: 7px 16px;
+    border-radius: 7px;
+    cursor: pointer;
+    border: 1px solid var(--border2);
+    background: var(--bg3);
+    color: var(--text-muted);
+    transition: border-color 0.15s, color 0.15s;
+    letter-spacing: 0.04em;
+  }
+  .btn:hover { border-color: var(--teal-dim); color: var(--teal); }
+
+  /* ── STAGE COLOR DOTS ── */
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .dot-1 { background: var(--teal); }
+  .dot-2 { background: #93c5fd; }
+  .dot-3 { background: #d8b4fe; }
+  .dot-4 { background: var(--amber); }
+  .dot-5 { background: var(--pink); }
+  .dot-6 { background: #6ee7b7; }
+
+  .author-date {
+      text-align: center;
+      color: #1abc9c;
+      margin: 0 0 20px;
+      font-style: italic;
+    }
+
+        /* Unvisited link */
+a:link {
+  color: #00ffcc; /* Put your desired color hex or name here */
+  text-decoration: none; /* Optional: removes the underline */
+}
+
+/* Visited link */
+a:visited {
+  color: #00b38f;
+}
+
+/* Mouse over link */
+a:hover {
+  color: #ffffff;
+  text-decoration: underline;
+}
+
+/* Selected/Clicked link */
+a:active {
+  color: #ff0000;
+}
+</style>
+</head>
+<body>
+
+  <div class="container hero-content">
+
+        <div class="author-date">
+          Content curated by Sumit, Formatted by AI | 
+            <a href="https://www.linkedin.com/in/sumitdevgupta" target="_blank">Sumit's Profile</a> | 
+            May 24, 2026 
+        </div>
+
+    </div>
+<div class="page-wrap">
+
+<!-- ── NAV ── -->
+<nav>
+  <div class="nav-logo">Token Optimization Playbook · Agentic AI</div>
+  <ul class="nav-links">
+    <li><a href="#principle">Principle</a></li>
+    <li><a href="#lifecycle">Lifecycle</a></li>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#groups">G1–G18</a></li>
+    <li><a href="#blueprint">Blueprint</a></li>
+  </ul>
+</nav>
+
+<!-- ── HERO ── -->
+<section class="hero" id="principle">
+  <h1>Token Optimization<br><span>Playbook</span></h1>
+  <div class="hero-principle">
+    "The objective of an agent architect is to maximise <strong>signal per token</strong>,<br>not to maximise the token window."
+  </div>
+</section>
+
+<!-- ── TOKEN ROLES ── -->
+<div class="token-roles">
+  <div class="role-card">
+    <div class="label">Working Memory</div>
+    <p>Every token in context is memory the model reasons over</p>
+  </div>
+  <div class="role-card">
+    <div class="label">Reasoning Bandwidth</div>
+    <p>More tokens = more compute = more latency</p>
+  </div>
+  <div class="role-card">
+    <div class="label">Execution Fuel</div>
+    <p>Agentic loops multiply token spend non-linearly</p>
+  </div>
+  <div class="role-card">
+    <div class="label">Cost</div>
+    <p>Output tokens cost 2–5× more than input tokens</p>
+  </div>
+</div>
+
+<div class="mandate">
+  Tokens must be <strong>budgeted, monitored, and optimised</strong> as a first-class architectural concern.
+</div>
+
+<div class="legend-bar">
+  <div class="legend-item">
+    <span class="legend-chip chip-green">✅</span>
+    Works with any LLM, any provider, any language
+  </div>
+  <div class="legend-item">
+    <span class="legend-chip chip-amber">⚠️</span>
+    Universal technique but specific tools/APIs are vendor/language locked
+  </div>
+</div>
+
+<!-- ── LIFECYCLE ── -->
+<div class="section" id="lifecycle">
+  <h2><span class="section-num">01</span> Request Lifecycle Flow</h2>
+  <div class="flow-wrap">
+    <div class="flow-user">USER SENDS PROMPT</div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-stages">
+
+      <div class="flow-stage">
+        <div class="flow-stage-header">
+          <span class="stage-pill s1">Stage 1</span>
+          <span class="stage-name">Before the Request &mdash; Design time + Governance</span>
+        </div>
+        <p class="stage-desc">Design and governance work before any request arrives</p>
+        <div class="stage-groups">
+          <a href="#g1" class="stage-group-tag">G1 · Prompt &amp; System Prompt Design</a>
+          <a href="#g2" class="stage-group-tag">G2 · Prompt Template Registry</a>
+          <a href="#g3" class="stage-group-tag">G3 · Knowledge Strategy</a>
+        </div>
+      </div>
+
+      <div class="flow-arrow">↓</div>
+
+      <div class="flow-stage">
+        <div class="flow-stage-header">
+          <span class="stage-pill s2">Stage 2</span>
+          <span class="stage-name">At the Gate &mdash; Request arrives, before LLM</span>
+        </div>
+        <p class="stage-desc">Intercept and route before spending any LLM tokens</p>
+        <div class="stage-groups">
+          <a href="#g4" class="stage-group-tag">G4 · Rules-Based Bypass</a>
+          <a href="#g5" class="stage-group-tag">G5 · Response &amp; Step Caching</a>
+          <a href="#g6" class="stage-group-tag">G6 · Model Routing &amp; Cascading</a>
+        </div>
+      </div>
+
+      <div class="flow-arrow">↓</div>
+
+      <div class="flow-stage">
+        <div class="flow-stage-header">
+          <span class="stage-pill s3">Stage 3</span>
+          <span class="stage-name">Into the LLM &mdash; Context assembly</span>
+        </div>
+        <p class="stage-desc">Assemble only the context the model actually needs</p>
+        <div class="stage-groups">
+          <a href="#g7" class="stage-group-tag">G7 · Retrieval Optimisation</a>
+          <a href="#g8" class="stage-group-tag">G8 · Tool Definition Loading</a>
+          <a href="#g9" class="stage-group-tag">G9 · Context Schema &amp; Handoffs</a>
+          <a href="#g10" class="stage-group-tag">G10 · Conversation &amp; Memory</a>
+        </div>
+      </div>
+
+      <div class="flow-arrow">↓</div>
+
+      <div class="flow-stage">
+        <div class="flow-stage-header">
+          <span class="stage-pill s4">Stage 4</span>
+          <span class="stage-name">Inside the LLM &mdash; Inference</span>
+        </div>
+        <p class="stage-desc">Control what the model generates and how much</p>
+        <div class="stage-groups">
+          <a href="#g11" class="stage-group-tag">G11 · Output Length &amp; Format</a>
+          <a href="#g12" class="stage-group-tag">G12 · Reasoning Budget Control</a>
+          <a href="#g13" class="stage-group-tag">G13 · Batch &amp; Compact Notation</a>
+        </div>
+      </div>
+
+      <div class="flow-arrow">↓</div>
+
+      <div class="flow-stage">
+        <div class="flow-stage-header">
+          <span class="stage-pill s5">Stage 5</span>
+          <span class="stage-name">After the Response &mdash; Tool execution + Results</span>
+        </div>
+        <p class="stage-desc">Minimise cost of tool calls and their results</p>
+        <div class="stage-groups">
+          <a href="#g14" class="stage-group-tag">G14 · Tool Call &amp; Output Minimisation</a>
+          <a href="#g15" class="stage-group-tag">G15 · Server-Side Computation &amp; MCP</a>
+        </div>
+      </div>
+
+      <div class="flow-arrow">↓</div>
+
+      <div class="flow-stage">
+        <div class="flow-stage-header">
+          <span class="stage-pill s6">Stage 6</span>
+          <span class="stage-name">Across the Loop &mdash; Orchestration + Governance</span>
+        </div>
+        <p class="stage-desc">Govern the full agentic loop across all iterations</p>
+        <div class="stage-groups">
+          <a href="#g16" class="stage-group-tag">G16 · Agent Architecture</a>
+          <a href="#g17" class="stage-group-tag">G17 · Loop Control &amp; Budget Propagation</a>
+          <a href="#g18" class="stage-group-tag">G18 · Observability &amp; Token FinOps</a>
+        </div>
+      </div>
+
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-user">RESPONSE RETURNED TO USER</div>
+  </div>
+</div>
+
+<!-- ── OVERVIEW TABLE ── -->
+<div class="section" id="overview">
+  <h2><span class="section-num">02</span> Master Overview — All 18 Groups</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Group</th>
+          <th>Stage</th>
+          <th>What it does</th>
+          <th>Est. Saving</th>
+          <th>Agnostic</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><a href="#g1">G1</a> Prompt Design</td>
+          <td><span class="dot dot-1"></span>Before Request</td>
+          <td>Compress prompts; one-role-one-agent; lazy-load edge-case instructions</td>
+          <td><span class="saving-badge">15–40% input</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g2">G2</a> Template Registry</td>
+          <td><span class="dot dot-1"></span>Before Request</td>
+          <td>Git-backed registry with per-template token budgets enforced in CI/CD</td>
+          <td><span class="saving-badge">Prevents bloat</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g3">G3</a> Knowledge Strategy</td>
+          <td><span class="dot dot-1"></span>Before Request</td>
+          <td>Preprocess documents at ingestion; decide RAG vs. fine-tune per domain</td>
+          <td><span class="saving-badge">Up to 100% retrieval</span></td>
+          <td><span class="legend-chip chip-amber">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g4">G4</a> Rules-Based Bypass</td>
+          <td><span class="dot dot-2"></span>At the Gate</td>
+          <td>Skip LLM entirely for deterministic requests</td>
+          <td><span class="saving-badge">30–90% LLM calls</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g5">G5</a> Response Caching</td>
+          <td><span class="dot dot-2"></span>At the Gate</td>
+          <td>L1 exact + L2 semantic cache; idempotent step cache for retries</td>
+          <td><span class="saving-badge">40–70% API calls</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g6">G6</a> Model Routing</td>
+          <td><span class="dot dot-2"></span>At the Gate</td>
+          <td>Route to cheapest capable model; escalate on low confidence only</td>
+          <td><span class="saving-badge">60–80% per-query cost</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g7">G7</a> Retrieval Optimisation</td>
+          <td><span class="dot dot-3"></span>Into the LLM</td>
+          <td>Small chunks + reranker + hybrid dense/sparse → inject only top-1 or top-2</td>
+          <td><span class="saving-badge">50–80% context</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g8">G8</a> Tool Loading</td>
+          <td><span class="dot dot-3"></span>Into the LLM</td>
+          <td>Inject only tools relevant to the current step; prune unused tools weekly</td>
+          <td><span class="saving-badge">20–70% sys prompt</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g9">G9</a> Context Schema</td>
+          <td><span class="dot dot-3"></span>Into the LLM</td>
+          <td>Compact typed fields for inter-step state; suppress reasoning from handoffs</td>
+          <td><span class="saving-badge">20–70% handoff tokens</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g10">G10</a> Memory Management</td>
+          <td><span class="dot dot-3"></span>Into the LLM</td>
+          <td>Sliding window + rolling summary; externalise state; retrieve skills on-demand</td>
+          <td><span class="saving-badge">30–70% multi-turn</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g11">G11</a> Output Control</td>
+          <td><span class="dot dot-4"></span>Inside the LLM</td>
+          <td>Always set max_tokens; use JSON schema instead of prose for machine outputs</td>
+          <td><span class="saving-badge">30–60% output</span></td>
+          <td><span class="legend-chip chip-amber">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g12">G12</a> Reasoning Budget</td>
+          <td><span class="dot dot-4"></span>Inside the LLM</td>
+          <td>Constrain chain-of-thought via prompt instructions or provider budget parameters</td>
+          <td><span class="saving-badge">50–90% reasoning</span></td>
+          <td><span class="legend-chip chip-amber">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g13">G13</a> Batch &amp; TOON</td>
+          <td><span class="dot dot-4"></span>Inside the LLM</td>
+          <td>Batch similar items into one call; use TOON compact schema for repetitive data</td>
+          <td><span class="saving-badge">20–98% bulk calls</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g14">G14</a> Tool Minimisation</td>
+          <td><span class="dot dot-5"></span>After Response</td>
+          <td>Combine tool calls, parallelise in handler; project to only the fields needed</td>
+          <td><span class="saving-badge">30–90% tool spend</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g15">G15</a> Server-Side Compute</td>
+          <td><span class="dot dot-5"></span>After Response</td>
+          <td>Filter, sort, aggregate in your tool/MCP handler — never in the LLM context</td>
+          <td><span class="saving-badge">40–80% data-heavy</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g16">G16</a> Agent Architecture</td>
+          <td><span class="dot dot-6"></span>Across the Loop</td>
+          <td>Decompose monoliths into specialised sub-agents; async for I/O-heavy workflows</td>
+          <td><span class="saving-badge">20–60% per-agent</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g17">G17</a> Loop Control</td>
+          <td><span class="dot dot-6"></span>Across the Loop</td>
+          <td>Hard iteration limits + stop conditions; pass remaining_budget to downstream agents</td>
+          <td><span class="saving-badge">10–30% iterative</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+        <tr>
+          <td><a href="#g18">G18</a> Observability</td>
+          <td><span class="dot dot-6"></span>Across the Loop</td>
+          <td>Instrument every LLM call; track ET metric + turn efficiency; alert on overruns</td>
+          <td><span class="saving-badge">15–40% indirect</span></td>
+          <td><span class="legend-chip chip-green">✅</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── GROUP DETAILS ── -->
+<div class="section" id="groups">
+  <h2><span class="section-num">03</span> Technique Detail — Groups G1 to G18</h2>
+
+  <div class="controls">
+    <button class="btn" onclick="toggleAll(true)">Expand All</button>
+    <button class="btn" onclick="toggleAll(false)">Collapse All</button>
+  </div>
+
+  <div class="groups-grid">
+
+    <!-- G1 -->
+    <div class="group-card" id="g1">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G1</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Prompt &amp; System Prompt Design</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-1"></span> Before the Request</span>
+            <span class="meta-tag meta-saving">15–40% input tokens</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Every token in every system prompt is billed on every call. Three compounding levers:</p>
+
+        <h4>Compression and trimming</h4>
+        <p>Remove filler phrases ("As an AI…", "Please note…"), collapse whitespace, eliminate boilerplate. For automated compression: <strong>LLMLingua-2</strong> (Microsoft Research, MIT) runs as a Docker HTTP sidecar — call via HTTP from Java or Go before any LLM request. Reduces prompts 50–80% preserving semantic accuracy. Deploy in your AI Gateway, not individual service logic. Compress static prompts at build time; dynamic prompts at runtime. Do not compress user inputs.</p>
+
+        <h4>Few-shot → Zero-shot</h4>
+        <p>Each example adds 50–200 tokens per call. Audit all prompts with 3+ examples; replace with precise task description + JSON output schema. A/B test on 200 representative samples. If accuracy drops, add back one example only. ⚠️ Cheaper model tiers may still need 1–2 examples — test each tier separately.</p>
+
+        <h4>System Prompt Architecture (role isolation + lazy instructions)</h4>
+        <p>Three failure modes inflate system prompts fleet-wide:</p>
+        <ul>
+          <li><strong>Role stacking:</strong> one agent carrying multiple roles → one-role-one-agent (see G16)</li>
+          <li><strong>Instruction duplication:</strong> every agent repeating shared safety/format rules → extract to a shared base layer; agent-specific content layered on top</li>
+          <li><strong>Always-on edge instructions:</strong> escalation paths, refusal language relevant to ~5% of calls but loaded 100% of the time → tag with intents; inject conditionally</li>
+        </ul>
+        <p>Establish a layered composition model: <strong>base → role → task → dynamic context</strong>. Each layer independently versioned and token-budgeted (G2).</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/microsoft/LLMLingua" class="tool-link">LLMLingua-2</a>
+          <a href="https://github.com/liyucheng09/selective_context" class="tool-link">Selective Context</a>
+          <a href="https://github.com/stanfordnlp/dspy" class="tool-link">DSPy</a>
+          <a href="https://github.com/promptfoo/promptfoo" class="tool-link">Promptfoo</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://promptlayer.com" class="tool-link">PromptLayer</a>
+          <a href="https://humanloop.com" class="tool-link">Humanloop</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://arxiv.org/abs/2403.12968">LLMLingua-2 arXiv</a> ·
+          <a href="https://www.tokenoptimize.dev/guides/token-efficient-prompting-patterns">TokenOptimize.dev</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G2 -->
+    <div class="group-card" id="g2">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G2</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Prompt Template Registry</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-1"></span> Before the Request</span>
+            <span class="meta-tag meta-saving">Prevents fleet-wide bloat</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>All other groups fix token waste reactively. This group prevents it by making token budgets a <strong>first-class property of every prompt template</strong>, enforced in CI/CD.</p>
+        <p>Each template stored in Git (YAML/JSON) with mandatory fields:</p>
+<pre>template_id: customer-support-classifier
+version: 3.2.1
+owner: platform-team
+token_budget:
+  system_prompt_max: 400
+  total_input_max: 800
+  output_max: 150
+current_token_counts:
+  system_prompt: 387    # measured at build time</pre>
+        <p><strong>CI/CD enforcement:</strong> pre-commit hook renders each template with representative inputs, counts tokens, <strong>fails the pipeline</strong> if budget exceeded. Token count history tracked per version — regressions visible in PR diff. Increasing a budget requires documented justification. Templates not accessed in 30 days flagged for deprecation.</p>
+        <p>Count tokens using your provider's tokenizer endpoint. For Go: <code>tiktoken-go</code> gives reasonable BPE approximations for GPT-family models only. ⚠️ <code>tiktoken</code> and <code>tiktoken-go</code> are OpenAI-specific — they will produce incorrect counts for Gemini and other non-BPE models. For a provider-agnostic fallback, use a character-based estimate (~4 chars ≈ 1 token) as a ceiling check before calling the provider endpoint.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/promptfoo/promptfoo" class="tool-link">Promptfoo</a>
+          <a href="https://github.com/stanfordnlp/dspy" class="tool-link">DSPy</a>
+          <a href="https://github.com/langfuse/langfuse" class="tool-link">Langfuse OSS</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://promptlayer.com" class="tool-link">PromptLayer</a>
+          <a href="https://humanloop.com" class="tool-link">Humanloop</a>
+          <a href="https://langfuse.com" class="tool-link">Langfuse Cloud</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://www.pluralsight.com/resources/blog/ai-and-data/how-cut-llm-costs-with-metering">Pluralsight — Meter before you manage</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G3 -->
+    <div class="group-card" id="g3">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G3</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Knowledge Strategy (RAG vs. Fine-Tune + Document Prep)</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-1"></span> Before the Request</span>
+            <span class="meta-tag meta-saving">Up to 100% retrieval elimination</span>
+            <span class="meta-tag meta-warning">⚠️ Partially vendor-locked</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <h4>Document Preprocessing</h4>
+        <p>Strip content that tokenises expensively but carries no value: HTML tags, headers/footers, legal boilerplate, base64 data. Process at ingestion — cost paid once, not on every retrieval.</p>
+<pre>Raw doc → Extract text → Strip boilerplate → Collapse whitespace
+        → Tables to CSV → If &gt;4,000t → summarise with cheap model
+        → Store clean text in vector DB</pre>
+        <p>Apache Tika: ⚠️ Java Maven dependency. Unstructured OSS, Docling, MarkItDown: Python-based, available as Docker HTTP sidecars for Java/Go.</p>
+
+        <h4>RAG vs. Fine-Tune Decision</h4>
+        <p>Every RAG call injects 400–3,000 retrieval tokens per query. For stable, high-frequency domain knowledge (product taxonomy, internal policies, support playbooks), fine-tuning bakes knowledge into weights — zero retrieval tokens per call permanently.</p>
+
+        <div class="inline-table-wrap">
+          <table>
+            <thead><tr><th>Knowledge</th><th>Approach</th><th>Token impact</th></tr></thead>
+            <tbody>
+              <tr><td>Changes frequently</td><td>RAG</td><td>Retrieval cost per call</td></tr>
+              <tr><td>Stable, large (&gt;1M tokens)</td><td>RAG + hybrid search (G7)</td><td>Optimise precision</td></tr>
+              <tr><td>Stable, moderate size, high frequency</td><td><strong>Fine-tune</strong></td><td>Eliminate retrieval entirely</td></tr>
+              <tr><td>Stable, small, critical accuracy</td><td>Fine-tune + RAG fallback</td><td>Minimal retrieval</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>Break-even:</strong> for a domain receiving 1M queries/month with 1,000 retrieval tokens per cache-miss query, even a 50% cache hit rate from G5 still yields 500M retrieval tokens/month saved via fine-tuning. ⚠️ Re-train when knowledge changes. ⚠️ Keep RAG fallback for out-of-distribution queries.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/Unstructured-IO/unstructured" class="tool-link">Unstructured OSS</a>
+          <a href="https://github.com/DS4SD/docling" class="tool-link">Docling</a>
+          <a href="https://github.com/microsoft/markitdown" class="tool-link">MarkItDown</a>
+          <a href="https://tika.apache.org" class="tool-link">Apache Tika ⚠️</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://unstructured.io" class="tool-link">Unstructured API</a>
+          <a href="https://platform.openai.com/docs/guides/fine-tuning" class="tool-link">OpenAI Fine-tuning ⚠️</a>
+          <a href="https://cloud.google.com/vertex-ai/docs/generative-ai/models/tune-models" class="tool-link">Vertex AI ⚠️</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://oplexa.com/ai-inference-cost-crisis-2026/">Oplexa — RAG inflates context 3–5×</a> ·
+          <a href="https://platform.openai.com/docs/guides/fine-tuning">OpenAI Fine-tuning guide</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G4 -->
+    <div class="group-card" id="g4">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G4</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Rules-Based Bypass</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-2"></span> At the Gate</span>
+            <span class="meta-tag meta-saving">30–90% fewer LLM calls</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Not every request needs an LLM. Route deterministic requests — order lookups, eligibility checks, CRUD, FAQ matches, structured data queries — directly to backend services <strong>before</strong> the LLM call. Zero tokens spent.</p>
+        <h4>Patterns</h4>
+        <ul>
+          <li>Lightweight rules engine or regex classifier identifies deterministic intents → backend API</li>
+          <li>Invoke LLM only when rules engine cannot handle with sufficient confidence</li>
+          <li>Database-first resolution before reaching for the LLM</li>
+        </ul>
+        <p>Audit LLM call logs first — categorise by type, identify what is deterministic. Do not over-specify rules — incorrectly bypassing the LLM costs more in quality than it saves in tokens.</p>
+        <p>For Java: <strong>Apache Camel</strong> ⚠️ for routing logic. For Go: HTTP middleware layer.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/apache/camel" class="tool-link">Apache Camel ⚠️</a>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/open-telemetry/opentelemetry-java" class="tool-link">OpenTelemetry</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+          <a href="https://smith.langchain.com" class="tool-link">LangSmith</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G5 -->
+    <div class="group-card" id="g5">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G5</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Response &amp; Step Caching</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-2"></span> At the Gate</span>
+            <span class="meta-tag meta-saving">40–70% API calls eliminated</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>31% of enterprise LLM queries are semantically similar to previous ones.</p>
+        <h4>Response Caching (L1 + L2)</h4>
+        <ul>
+          <li><strong>L1 Exact-match:</strong> hash(normalised prompt) → Redis lookup. Sub-millisecond.</li>
+          <li><strong>L2 Semantic:</strong> embed query → vector similarity search against past queries. Threshold: 0.88–0.92.</li>
+        </ul>
+        <p>Tiered strategy: L1 → L2 → L3 (LLM call + store result). Normalise before hashing. TTL: FAQ answers → days; real-time data → no cache.</p>
+
+        <h4>Step-Level Idempotent Cache</h4>
+        <p>Individual workflow steps treated as pure functions — results memoised by <code>hash(step_name + step_inputs + template_version)</code>. On retry/re-run, unchanged steps skipped — no LLM call. High value for: workflows that fail partway, evaluation pipelines, batch pipelines sharing upstream steps.</p>
+        <p>In <strong>Temporal</strong>, Activity replay is idempotent by design — built in at no extra cost. Workflow replay is deterministic; Activity idempotency is developer responsibility.</p>
+        <p>For Java: Jedis/Lettuce for Redis. For Go: <code>go-redis</code>.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/zilliztech/GPTCache" class="tool-link">GPTCache</a>
+          <a href="https://github.com/redis/redis" class="tool-link">Redis OSS</a>
+          <a href="https://github.com/facebookresearch/faiss" class="tool-link">FAISS</a>
+          <a href="https://github.com/chroma-core/chroma" class="tool-link">Chroma</a>
+          <a href="https://github.com/temporalio/temporal" class="tool-link">Temporal OSS</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://momentohq.com" class="tool-link">Momento</a>
+          <a href="https://upstash.com" class="tool-link">Upstash</a>
+          <a href="https://redis.com" class="tool-link">Redis Enterprise</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+          <a href="https://temporal.io" class="tool-link">Temporal</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://www.pluralsight.com/resources/blog/ai-and-data/how-cut-llm-costs-with-metering">Pluralsight — Semantic caching 40–70%</a> ·
+          <a href="https://docs.temporal.io/activities#idempotency">Temporal — Activity idempotency</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G6 -->
+    <div class="group-card" id="g6">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G6</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Model Routing &amp; Cascading</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-2"></span> At the Gate</span>
+            <span class="meta-tag meta-saving">60–80% avg per-query cost</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Two complementary strategies — use both:</p>
+        <h4>Static Routing (pre-classify then route)</h4>
+        <p>Classifier categorises each request before any model call → cheapest capable model.</p>
+
+        <div class="inline-table-wrap">
+          <table>
+            <thead><tr><th>Tier</th><th>Example models</th><th>Relative cost</th><th>Typical traffic</th></tr></thead>
+            <tbody>
+              <tr><td>Simple</td><td>Gemini Flash Lite · GPT-4o mini · Claude Haiku</td><td>~1×</td><td>~70%</td></tr>
+              <tr><td>Medium</td><td>Gemini Flash · GPT-4o · Claude Sonnet</td><td>~5–15×</td><td>~20%</td></tr>
+              <tr><td>Complex</td><td>Gemini Pro · GPT-4.5 · Claude Opus</td><td>~50–150×</td><td>~10%</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><strong>RouteLLM</strong> (ICLR 2025): achieves 95% of GPT-4 quality routing only 14–26% of traffic to frontier models.</p>
+
+        <h4>Cascading (live quality decision)</h4>
+        <p>Send every request to cheap model first. If it returns <code>&#123;answer, confidence ≥ 0.88&#125;</code> → return immediately. Escalate only on low confidence. In practice 70–80% of queries never need escalation.</p>
+        <p>⚠️ 0.88 is a starting point only — model-generated confidence is not statistically calibrated. Validate against ground truth on your own workload before deploying; the right threshold varies significantly by task type.</p>
+        <p>Start with word-count + keyword heuristic classifier (zero latency). LiteLLM acts as provider-agnostic proxy — routing logic lives in the proxy, your code calls one endpoint.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/lm-sys/RouteLLM" class="tool-link">RouteLLM</a>
+          <a href="https://github.com/BerriAI/litellm" class="tool-link">LiteLLM</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://withmartian.com" class="tool-link">Martian</a>
+          <a href="https://www.notdiamond.ai" class="tool-link">Not Diamond</a>
+          <a href="https://unify.ai" class="tool-link">Unify.ai</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+          <a href="https://helicone.ai" class="tool-link">Helicone</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://arxiv.org/abs/2406.18665">RouteLLM — ICLR 2025</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G7 -->
+    <div class="group-card" id="g7">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G7</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Retrieval Optimisation</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-3"></span> Into the LLM</span>
+            <span class="meta-tag meta-saving">50–80% context tokens</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Naive RAG retrieves top-5 large chunks (~10,000 context tokens/call). Optimised RAG delivers top-1 or top-2 (~400–800 tokens). Two compounding levers:</p>
+        <h4>Chunk size, top-k, reranking</h4>
+        <ul>
+          <li>Chunk size: 256–512 tokens, not 1,000–2,000</li>
+          <li>Retrieve top-3 → rerank → inject top-1 or top-2</li>
+          <li>Similarity threshold &gt; 0.85 — pass "no relevant context found" if nothing qualifies</li>
+          <li>Cross-encoder reranker is far cheaper than sending all chunks to the LLM</li>
+          <li>Just-in-Time retrieval: fetch exactly when needed, not upfront in bulk</li>
+        </ul>
+        <h4>Hybrid Dense + Sparse Retrieval (RRF fusion)</h4>
+        <div class="inline-table-wrap">
+          <table>
+            <thead><tr><th>Strategy</th><th>Weakness</th></tr></thead>
+            <tbody>
+              <tr><td>Dense only (ANN/embedding)</td><td>Misses exact keywords → false positives in context</td></tr>
+              <tr><td>Sparse only (BM25/TF-IDF)</td><td>Misses paraphrases → over-fetches</td></tr>
+              <tr><td><strong>Hybrid RRF</strong></td><td>Higher precision → fewer chunks pass threshold</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>RRF score: <code>1/(k + rank_dense) + 1/(k + rank_sparse)</code> where k=60. Start with <code>alpha=0.5</code>, tune on your dataset.</p>
+        <ul>
+          <li><strong>Vespa / Qdrant:</strong> native hybrid (HNSW + BM25) via REST API</li>
+          <li><strong>pgvector:</strong> combine <code>&lt;=&gt;</code> with <code>tsvector</code> in SQL — no new infra if Postgres is running</li>
+          <li><strong>Weaviate:</strong> native hybrid with tunable <code>alpha</code></li>
+        </ul>
+        <p>Pre-compute all embeddings and sparse indexes at ingestion — never at query time. For Java: LangChain4j ⚠️ for orchestration.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langchain" class="tool-link">LangChain</a>
+          <a href="https://github.com/run-llama/llama_index" class="tool-link">LlamaIndex</a>
+          <a href="https://github.com/deepset-ai/haystack" class="tool-link">Haystack</a>
+          <a href="https://github.com/pgvector/pgvector" class="tool-link">pgvector</a>
+          <a href="https://github.com/vespa-engine/vespa" class="tool-link">Vespa</a>
+          <a href="https://github.com/qdrant/qdrant" class="tool-link">Qdrant</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://pinecone.io" class="tool-link">Pinecone</a>
+          <a href="https://weaviate.io" class="tool-link">Weaviate Cloud</a>
+          <a href="https://cohere.com/rerank" class="tool-link">Cohere Rerank</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://oplexa.com/ai-inference-cost-crisis-2026/">Oplexa — RAG inflates context 3–5×</a> ·
+          <a href="https://www.pinecone.io/learn/hybrid-search-intro/">Pinecone — Hybrid Search</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G8 -->
+    <div class="group-card" id="g8">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G8</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Tool Definition Loading</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-3"></span> Into the LLM</span>
+            <span class="meta-tag meta-saving">20–70% system prompt tokens</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>All tool definitions injected into every system prompt by default. A large tool registry adds 2,000–5,000 tokens to <strong>every single LLM call</strong>. Inject only tools relevant to the current step.</p>
+        <h4>Patterns</h4>
+        <ul>
+          <li><strong>Intent-based tool selection</strong> — classify task → inject relevant subset</li>
+          <li><strong>Step-aware injection</strong> — LangGraph per-node tool scoping</li>
+          <li><strong>MCP lazy loading</strong> — on-demand tool manifest exposure</li>
+          <li><strong>Automated pruning</strong> — cross-reference manifest against call logs weekly; flag any tool not called in 30 days</li>
+        </ul>
+        <p>⚠️ Requires tools tagged with intent/category metadata in advance.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/modelcontextprotocol/python-sdk" class="tool-link">MCP SDK</a>
+          <a href="https://github.com/langchain-ai/langchain" class="tool-link">LangChain</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://crewai.com" class="tool-link">CrewAI Enterprise</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G9 -->
+    <div class="group-card" id="g9">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G9</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Context Schema &amp; Inter-Agent Handoffs</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-3"></span> Into the LLM</span>
+            <span class="meta-tag meta-saving">20–70% handoff tokens</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>The architect's choice of <em>how information flows between steps and agents</em> is made once but affects every token for the system's lifetime. Prose accumulates 3–5× larger than structured context.</p>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;">
+          <div>
+            <p style="font-size:12px;color:var(--text-dim);margin-bottom:6px;">PROSE (~40–60 tokens)</p>
+<pre style="margin:0;">"Customer John Smith called about
+order 1234 placed March 15th,
+shipped 7 days ago without
+confirmation. Requested escalation."</pre>
+          </div>
+          <div>
+            <p style="font-size:12px;color:var(--teal);margin-bottom:6px;">STRUCTURED (~14–18 tokens)</p>
+<pre style="margin:0;border-color:rgba(0,212,170,0.3);">cust=C99|order=1234
+|placed=2026-03-15
+|status=shipped|days=7
+|action=escalate</pre>
+          </div>
+        </div>
+
+        <h4>Inter-Agent Message Rules</h4>
+        <ul>
+          <li><strong>Typed fields only</strong> in state schema — no free-form text blobs</li>
+          <li><strong>Explicit field scoping</strong> — if one node needs it, pass as node-local variable, not shared state</li>
+          <li><strong>Reasoning suppression</strong> — consuming agent needs outcome only, not producing agent's reasoning</li>
+          <li><strong>Hint fields</strong> — include <code>next_action</code> upstream to reduce downstream re-derivation (saves an extra LLM call)</li>
+        </ul>
+        <p>Design LangGraph TypedDict collaboratively before implementation — state field proliferation is hard to prune retroactively. Use <strong>Instructor</strong> to enforce typed LLM output at message boundaries.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/jxnl/instructor" class="tool-link">Instructor</a>
+          <a href="https://github.com/microsoft/autogen" class="tool-link">AutoGen</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://smith.langchain.com" class="tool-link">LangSmith</a>
+          <a href="https://crewai.com" class="tool-link">CrewAI Enterprise</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G10 -->
+    <div class="group-card" id="g10">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G10</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Conversation &amp; Memory Management</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-3"></span> Into the LLM</span>
+            <span class="meta-tag meta-saving">30–70% multi-turn input</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Three compounding patterns preventing context from growing unbounded:</p>
+        <h4>Sliding Window + Rolling Summary</h4>
+        <p>A 20-turn conversation accumulates 15,000+ tokens/call. Fix: keep last 4–8 turns verbatim; summarise older turns with cheap model once; prepend as a single context message. One summarisation call recovers in 2–3 subsequent calls of avoided history tokens.</p>
+
+        <h4>State Externalisation</h4>
+        <p>Naive agents embed full state in system prompt every call. By step 7 of a 10-step workflow: 5,000+ tokens/call. Fix: store state externally; inject only <code>instruction + minimal_context</code> for the current step.</p>
+<pre>[Orchestrator] &lt;--&gt; [State Store (Redis / any KV)]
+      │
+  [LLM API]  — sees only current-step context (200–500 tokens)</pre>
+
+        <h4>Agent Knowledge Base (SKILLS.md pattern)</h4>
+        <p>Knowledge-heavy agents embed all procedures in the system prompt permanently (1,000–3,000+ tokens/call). Fix: index skills as RAG chunks with metadata tags; retrieve only relevant skills using hybrid retrieval (G7).</p>
+<pre>Before: [Role: 500t] + [All skills: 2,000t] + [Tools: 800t] = 3,300 tokens/call
+After:  [Role: 500t] + [Retrieved skills: ~300t] + [Tools: 800t] = ~1,600 tokens/call</pre>
+        <p>Skills: atomic chunks (one skill = one chunk), tagged with category and conditions. Version in Git. Store history/state in Redis — never in-process memory.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langchain" class="tool-link">LangChain</a>
+          <a href="https://github.com/langchain4j/langchain4j" class="tool-link">LangChain4j ⚠️</a>
+          <a href="https://github.com/mem0ai/mem0" class="tool-link">Mem0</a>
+          <a href="https://github.com/getzep/zep" class="tool-link">Zep OSS</a>
+          <a href="https://github.com/langchain-ai/langmem" class="tool-link">LangMem</a>
+          <a href="https://github.com/run-llama/llama_index" class="tool-link">LlamaIndex</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://mem0.ai" class="tool-link">Mem0 Cloud</a>
+          <a href="https://www.getzep.com" class="tool-link">Zep Cloud</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://redis.io/blog/llm-token-optimization-speed-up-apps/">Redis — Session context management</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G11 -->
+    <div class="group-card" id="g11">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G11</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Output Length &amp; Format Control</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-4"></span> Inside the LLM</span>
+            <span class="meta-tag meta-saving">30–60% output tokens</span>
+            <span class="meta-tag meta-warning">⚠️ Partially vendor-locked</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Output tokens cost 2–5× more than input. Two always-on levers:</p>
+        <ul>
+          <li><strong>Always set <code>max_tokens</code></strong> — mandatory on every call. Without it, models return 3–10× more than needed. Start at 2× expected output, tune down.</li>
+          <li><strong>JSON schema instead of prose</strong> for any response parsed by code — eliminates preambles, disclaimers, padding.</li>
+        </ul>
+
+        <div class="inline-table-wrap">
+          <table>
+            <thead><tr><th>Provider</th><th>Structured output feature</th></tr></thead>
+            <tbody>
+              <tr><td>Gemini / Vertex AI</td><td><code>response_mime_type: application/json</code> + <code>response_schema</code></td></tr>
+              <tr><td>OpenAI</td><td><code>response_format: json_schema</code> (GPT-4o+)</td></tr>
+              <tr><td>Anthropic Claude</td><td>Tool use pattern + Instructor</td></tr>
+              <tr><td>All providers</td><td><code>max_tokens</code> / <code>max_output_tokens</code> — always set</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/jxnl/instructor" class="tool-link">Instructor</a>
+          <a href="https://github.com/instructor-ai/instructor-java" class="tool-link">Instructor Java ⚠️</a>
+          <a href="https://github.com/guardrails-ai/guardrails" class="tool-link">Guardrails AI</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://boundaryml.com" class="tool-link">BoundaryML</a>
+          <a href="https://humanloop.com" class="tool-link">Humanloop</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G12 -->
+    <div class="group-card" id="g12">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G12</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Reasoning Budget Control</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-4"></span> Inside the LLM</span>
+            <span class="meta-tag meta-saving">50–90% reasoning tokens</span>
+            <span class="meta-tag meta-warning">⚠️ Partially vendor-locked</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Extended reasoning models generate large reasoning volumes billed at output token rates — often dwarfing the actual response.</p>
+        <h4>Prompt-Level (fully agnostic)</h4>
+        <ul>
+          <li>"Answer in 2 sentences or fewer."</li>
+          <li>"Respond only with JSON. Do not include any explanation."</li>
+          <li>"Give your final answer only. Do not show your work."</li>
+        </ul>
+        <h4>Provider-Specific Budget Parameters (⚠️ not portable)</h4>
+        <div class="inline-table-wrap">
+          <table>
+            <thead><tr><th>Provider</th><th>Parameter</th></tr></thead>
+            <tbody>
+              <tr><td>OpenAI o1/o3</td><td><code>reasoning_effort: low/medium/high</code> + <code>max_completion_tokens</code></td></tr>
+              <tr><td>Gemini 2.5 Flash Thinking</td><td><code>thinking_config</code> or <code>thinking_budget</code> in Vertex AI</td></tr>
+              <tr><td>Anthropic Claude</td><td><code>thinking: &#123;budget_tokens: N&#125;</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Apply only where reasoning is not needed in the output. ⚠️ Over-constraining hurts accuracy on complex tasks — validate quality trade-offs on your workload. Measure reasoning vs. output split separately in observability (G18).</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/stanfordnlp/dspy" class="tool-link">DSPy</a>
+          <a href="https://github.com/promptfoo/promptfoo" class="tool-link">Promptfoo</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://promptlayer.com" class="tool-link">PromptLayer</a>
+          <a href="https://humanloop.com" class="tool-link">Humanloop</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G13 -->
+    <div class="group-card" id="g13">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G13</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Batch Processing &amp; Compact Notation (TOON)</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-4"></span> Inside the LLM</span>
+            <span class="meta-tag meta-saving">20–98% on bulk calls</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <h4>Batch Processing</h4>
+        <p>Shared prompt overhead paid once per batch instead of once per item. Instead of 50 calls each paying for the same system prompt, send one: <em>"Classify each of the following 50 tickets. Return a JSON array indexed by position."</em></p>
+        <p>Use message queue (Kafka) to accumulate items; flush on size or time threshold. Cap batch size by token budget: <code>items × avg_size + shared_prefix</code>. For Java: <code>CompletableFuture</code>. For Go: goroutines with semaphore.</p>
+
+        <h4>TOON — Token-Optimized Object Notation</h4>
+        <p>For repetitive structured data with uniform schema, verbose JSON is extremely expensive — every key name, brace, and quote is tokenised.</p>
+<pre style="border-color:rgba(245,158,11,0.2);">// Standard JSON (~85 tokens for 2 rows)
+[{"order_id": 1001, "status": "shipped", "region": "APAC"},
+ {"order_id": 1002, "status": "pending", "region": "EMEA"}]
+
+// TOON (~12 tokens for 2 data rows)
+orders: id|status|region
+1001|shipped|APAC
+1002|pending|EMEA
+
+// TOON with code substitution (~8 tokens per data row)
+orders(id,s,r): 1001,S,A|1002,P,E
+# s: S=shipped P=pending  r: A=APAC E=EMEA</pre>
+        <blockquote>Schema definition is a one-time cost in the system prompt, amortised across thousands of data rows. For a batch of 500 rows, the ~20-token schema overhead adds ~0.04 tokens per row. Apply TOON only to the LLM-facing portion when the downstream system needs standard JSON.</blockquote>
+        <p>⚠️ Requires uniform structure across items.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/BerriAI/litellm" class="tool-link">LiteLLM</a>
+          <a href="https://github.com/apache/kafka" class="tool-link">Apache Kafka</a>
+          <a href="https://github.com/ray-project/ray" class="tool-link">Ray</a>
+          <a href="https://github.com/temporalio/temporal" class="tool-link">Temporal OSS</a>
+          <a href="https://github.com/jxnl/instructor" class="tool-link">Instructor</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://temporal.io" class="tool-link">Temporal</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+          <a href="https://boundaryml.com" class="tool-link">BoundaryML</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G14 -->
+    <div class="group-card" id="g14">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G14</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Tool Call &amp; Output Minimisation</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-5"></span> After the Response</span>
+            <span class="meta-tag meta-saving">30–90% tool token spend</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>Two distinct compounding levers — reduce <strong>number</strong> of calls and <strong>size</strong> of each result:</p>
+        <h4>Minimise Call Count</h4>
+        <p>Each tool call = full LLM round-trip (output tokens + result input tokens + follow-up). Three lookups = 3× the tokens.</p>
+        <ul>
+          <li>Combine related lookups into a single coarse-grained tool</li>
+          <li>Avoid confirmation round-trips — if result is deterministic, don't ask LLM to confirm</li>
+          <li>Parallelise inside the tool handler (not the agent loop) — one LLM call, tool fans out concurrently</li>
+        </ul>
+        <p>For Java: <code>CompletableFuture.allOf()</code> inside tool implementations. For Go: <code>sync.WaitGroup</code>.</p>
+        <h4>Project Tool Outputs</h4>
+        <p>If a tool returns 50 fields but agent uses 3, the other 47 are waste on every subsequent turn.</p>
+        <ul>
+          <li><strong>Field projection in the tool handler</strong> — LLM never receives extra fields</li>
+          <li><strong>Truncate large text fields</strong> to a token budget before returning</li>
+          <li><strong>Summarise before return</strong> for large result sets</li>
+          <li><strong>Structured compaction</strong> — <code>[1001, 1002, 1003]</code> vs <code>[&#123;"id": 1001, ...&#125;]</code></li>
+        </ul>
+        <p>For Java: <code>ToolResponseProjector</code> class with field whitelist. For Go: middleware wrapper stripping unexposed keys. Use G18 observability to measure average tool result token size — high-average tools are top targets.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langchain" class="tool-link">LangChain</a>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/run-llama/llama_index" class="tool-link">LlamaIndex</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://smith.langchain.com" class="tool-link">LangSmith</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G15 -->
+    <div class="group-card" id="g15">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G15</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Server-Side Computation &amp; MCP Offloading</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-5"></span> After the Response</span>
+            <span class="meta-tag meta-saving">40–80% data-heavy context</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <p>A common expensive pattern: loading raw data into the LLM context for filtering, sorting, or aggregation. Code execution costs nothing in tokens; in-context data processing is extremely expensive.</p>
+
+        <div class="inline-table-wrap">
+          <table>
+            <thead><tr><th>❌ Do NOT do (in-context)</th><th>✅ Do instead (server-side)</th></tr></thead>
+            <tbody>
+              <tr><td>Pass 500 log lines → find errors</td><td>Regex in your service; return matching lines only</td></tr>
+              <tr><td>Pass full customer list → filter by region</td><td><code>WHERE region = 'X'</code> in DB; pass only results</td></tr>
+              <tr><td>Pass raw API response → sort by date</td><td>Sort in tool handler before returning</td></tr>
+              <tr><td>Pass 200 results → pick top 5</td><td>Cross-encoder rerank; return top 5</td></tr>
+              <tr><td>Pass 40-field JSON → extract 3 fields</td><td>Extract in code; pass only those 3</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><strong>MCP servers</strong> are the ideal location: filter, sort, project data in the tool handler so the LLM never receives raw unprocessed data. Audit current tool handlers for raw dataset dumps. Compounds with G14.</p>
+        <p>For Java/Go: filtering/sorting in tool handler methods or DB queries — never delegate to the LLM.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/modelcontextprotocol/python-sdk" class="tool-link">MCP SDK</a>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/apache/camel" class="tool-link">Apache Camel ⚠️</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+          <a href="https://smith.langchain.com" class="tool-link">LangSmith</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G16 -->
+    <div class="group-card" id="g16">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G16</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Agent Architecture</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-6"></span> Across the Loop</span>
+            <span class="meta-tag meta-saving">20–60% per-agent context</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <h4>Agent Decomposition</h4>
+        <p>A monolithic agent carries all tools, instructions, and domain knowledge — the system prompt is maximally large. Decompose into specialised sub-agents: each carries only context relevant to its function. Additional benefits: each sub-agent uses the cheapest model tier for its complexity (G6); failures isolated; agents independently testable. ⚠️ Start with 2–3 sub-agents for highest-token tasks before decomposing everything.</p>
+
+        <h4>Async / Event-Driven Execution</h4>
+        <p>In a synchronous ReAct agent, the full accumulated context is held open and re-sent while waiting for tool I/O.</p>
+<pre>Synchronous:   Agent holds [full context] → calls tool → waits → injects result → LLM call
+Async:         Agent emits event → suspends (context discarded, zero cost during I/O)
+               Tool executes → fires result → Agent resumes with [minimal state + result only]</pre>
+        <p>On async resume, the agent loads only current-step context from the external state store (G10) — 200–500 tokens vs. 5,000+ in the synchronous version.</p>
+        <p><strong>Temporal</strong> is the most mature tool for durable async workflows: each Activity receives only its specific inputs on resume, not the full workflow history. ⚠️ Async adds operational complexity (distributed state, event ordering, idempotency) — apply to high-token, high-latency workflows first.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/microsoft/autogen" class="tool-link">AutoGen</a>
+          <a href="https://github.com/crewAIInc/crewAI" class="tool-link">CrewAI OSS</a>
+          <a href="https://github.com/temporalio/temporal" class="tool-link">Temporal OSS</a>
+          <a href="https://github.com/apache/kafka" class="tool-link">Apache Kafka</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://crewai.com" class="tool-link">CrewAI Enterprise</a>
+          <a href="https://temporal.io" class="tool-link">Temporal</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://arxiv.org/abs/2604.12301">arXiv — Multi-agent efficiency 2026</a> ·
+          <a href="https://docs.temporal.io/workflows">Temporal — Workflow concepts</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G17 -->
+    <div class="group-card" id="g17">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G17</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Loop Control &amp; Token Budget Propagation</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-6"></span> Across the Loop</span>
+            <span class="meta-tag meta-saving">10–30% iterative tokens</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <h4>Loop Limits and Stop Conditions</h4>
+        <p>Without explicit bounds, agents accumulate tokens at each iteration until context window exhaustion.</p>
+        <ul>
+          <li><strong>Hard iteration limit</strong> — never allow &gt; N steps; return partial result or escalate</li>
+          <li><strong>Confidence-based stop</strong> — below threshold, request clarification</li>
+          <li><strong>Turn Efficiency alert</strong> — turn count &gt; 2× baseline = loop pathology, halt</li>
+          <li><strong>Timeout-based stop</strong> — cap total execution time</li>
+        </ul>
+        <p>LangGraph: <code>recursion_limit</code> in graph config. AutoGen: <code>max_turns</code>. LangChain AgentExecutor: <code>max_iterations</code>.</p>
+
+        <h4>Token Budget Propagation</h4>
+        <p>In multi-agent pipelines, downstream agents default to unconstrained verbosity without a budget. Pass <code>remaining_budget</code> as an explicit field in every inter-agent message (as part of the G9 state schema):</p>
+<pre>{"task": "...", "token_budget_remaining": 800, "output_format": "compact"}</pre>
+        <p>Budget-aware output instruction in each agent's system prompt: <em>"If <code>token_budget_remaining</code> &lt; 500, respond only with required JSON fields — no explanation."</em></p>
+        <p>In LangGraph: add <code>remaining_budget</code> to TypedDict state; decrement at each node using <code>completion_tokens</code> from API response. Implement in the orchestration layer, not individual agent code.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langchain-ai/langgraph" class="tool-link">LangGraph</a>
+          <a href="https://github.com/microsoft/autogen" class="tool-link">AutoGen</a>
+          <a href="https://github.com/langchain-ai/langchain" class="tool-link">LangChain</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://crewai.com" class="tool-link">CrewAI Enterprise</a>
+          <a href="https://smith.langchain.com" class="tool-link">LangSmith</a>
+          <a href="https://portkey.ai" class="tool-link">Portkey</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://oplexa.com/ai-inference-cost-crisis-2026/">Oplexa — Agentic loop overhead</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- G18 -->
+    <div class="group-card" id="g18">
+      <div class="group-card-header" onclick="toggle(this)">
+        <div class="group-id">G18</div>
+        <div class="group-title-wrap">
+          <div class="group-title">Observability &amp; Token FinOps</div>
+          <div class="group-meta">
+            <span class="meta-tag meta-stage"><span class="dot dot-6"></span> Across the Loop</span>
+            <span class="meta-tag meta-saving">15–40% indirect</span>
+            <span class="meta-tag meta-agnostic">✅ Agnostic</span>
+          </div>
+        </div>
+        <div class="group-chevron">▾</div>
+      </div>
+      <div class="group-body">
+        <blockquote>"Optimization without measurement is guesswork."</blockquote>
+
+        <h4>Measure per LLM call</h4>
+        <ul>
+          <li><code>prompt_tokens</code> + <code>completion_tokens</code> split</li>
+          <li>Model tier used</li>
+          <li>Feature + team labels (for chargeback)</li>
+          <li>Cache hit/miss</li>
+          <li>Tool call count per task</li>
+          <li>Retry count (retries double spend)</li>
+        </ul>
+
+        <h4>Effective Token (ET) Metric</h4>
+        <p>Normalised cost across tiers:</p>
+        <div class="formula-box">
+          ET = m × (1.0 × Input + 0.1 × Cache-read + 4.0 × Output)
+          <div class="formula-label">Where m = model cost multiplier vs. cheapest baseline. Use ET instead of raw counts to compare cost across tiers fairly.</div>
+        </div>
+
+        <h4>Key KPIs and Governance</h4>
+        <ul>
+          <li><strong>Turn Efficiency KPI:</strong> alert when workflow turn count &gt; 2× baseline — indicates loop pathology (broken tool, unexpected fallback, retry storm)</li>
+          <li><strong>Automated tool governance:</strong> cross-reference tool manifest against call logs; flag any tool not called in 30 days for pruning</li>
+        </ul>
+
+        <h4>Implementation</h4>
+        <p><strong>OpenLLMetry</strong> — lowest effort, wraps existing LLM SDK via OpenTelemetry auto-instrumentation. <strong>Langfuse</strong> — adds prompt versioning, eval scoring, team dashboards. Emit <code>token-usage.jsonl</code> per workflow run for post-hoc analysis. Set per-feature and per-team daily budgets in Prometheus; alert on overrun.</p>
+
+        <div class="tools-line">
+          <span class="tl-label">OSS</span>
+          <a href="https://github.com/langfuse/langfuse" class="tool-link">Langfuse OSS</a>
+          <a href="https://github.com/traceloop/openllmetry" class="tool-link">OpenLLMetry</a>
+          <a href="https://github.com/Helicone/helicone" class="tool-link">Helicone OSS</a>
+          <a href="https://github.com/open-telemetry/opentelemetry-java" class="tool-link">OpenTelemetry Java</a>
+          <a href="https://github.com/grafana/grafana" class="tool-link">Grafana</a>
+          <span class="tool-separator">|</span>
+          <span class="tl-label">Commercial</span>
+          <a href="https://langfuse.com" class="tool-link">Langfuse Cloud</a>
+          <a href="https://helicone.ai" class="tool-link">Helicone</a>
+          <a href="https://smith.langchain.com" class="tool-link">LangSmith</a>
+          <a href="https://phoenix.arize.com" class="tool-link">Arize Phoenix</a>
+          <a href="https://wandb.ai/site/weave" class="tool-link">W&amp;B Weave</a>
+          <a href="https://www.datadoghq.com/product/llm-observability/" class="tool-link">Datadog LLM Obs.</a>
+        </div>
+        <div class="ref-line"><span>REF</span>
+          <a href="https://www.pluralsight.com/resources/blog/ai-and-data/how-cut-llm-costs-with-metering">Pluralsight — Meter before you manage</a> ·
+          <a href="https://www.getmaxim.ai/articles/llm-token-optimization-with-top-enterprise-ai-gateways">Getmaxim.ai — LLM token optimization</a> ·
+          <a href="https://artificialanalysis.ai/models/caching">Provider comparison</a>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- end groups-grid -->
+</div>
+
+<!-- ── ARCHITECTURE BLUEPRINT ── -->
+<div class="section arch-section" id="blueprint">
+  <h2><span class="section-num">04</span> Architecture Blueprint</h2>
+  <div class="table-wrap">
+    <table class="blueprint-table">
+      <thead>
+        <tr>
+          <th>Layer</th>
+          <th>Recommended Approach</th>
+          <th>Group</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Prompt registry</td><td>Git + YAML with token budgets + Promptfoo in CI</td><td>G2</td></tr>
+        <tr><td>Document ingestion</td><td>Unstructured OSS / Apache Tika Docker sidecar at ingestion</td><td>G3</td></tr>
+        <tr><td>AI Gateway / proxy</td><td>LiteLLM as provider-agnostic proxy</td><td>G6</td></tr>
+        <tr><td>Rules bypass</td><td>Apache Camel / LangGraph conditional routing</td><td>G4</td></tr>
+        <tr><td>Response cache L1</td><td>Redis OSS — hash-based exact match</td><td>G5</td></tr>
+        <tr><td>Response cache L2</td><td>GPTCache + pgvector — semantic similarity</td><td>G5</td></tr>
+        <tr><td>Step cache</td><td>Redis with <code>hash(step_name + inputs + version)</code></td><td>G5</td></tr>
+        <tr><td>Model routing</td><td>RouteLLM + LiteLLM rules</td><td>G6</td></tr>
+        <tr><td>Vector / RAG store</td><td>pgvector or Qdrant — hybrid dense+sparse</td><td>G7</td></tr>
+        <tr><td>Reranker</td><td>Cohere Rerank or cross-encoder in Haystack</td><td>G7</td></tr>
+        <tr><td>Tool registry</td><td>Intent-tagged manifest; inject per step</td><td>G8</td></tr>
+        <tr><td>Agent state store</td><td>Redis / any KV — externalised per step</td><td>G10</td></tr>
+        <tr><td>Agent memory</td><td>Mem0 + Redis — skills retrieved on-demand</td><td>G10</td></tr>
+        <tr><td>Agent orchestration</td><td>LangGraph — typed state schema; per-node tool scoping</td><td>G9 · G8</td></tr>
+        <tr><td>Async execution</td><td>Temporal OSS for long-running / I/O-heavy workflows</td><td>G16</td></tr>
+        <tr><td>MCP tool handlers</td><td>Server-side filtering/sorting/projection</td><td>G15</td></tr>
+        <tr><td>Observability</td><td>Langfuse OSS + OpenLLMetry — ET metric + turn efficiency</td><td>G18</td></tr>
+        <tr><td>Token governance</td><td>Prometheus + Grafana — per-feature and per-team budget alerts</td><td>G18</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<footer>
+  Token Optimization Playbook for Agentic AI &nbsp;·&nbsp; v7 &nbsp;·&nbsp;
+  <span style="font-family:'IBM Plex Mono',monospace;color:var(--teal);">✅</span> = agnostic &nbsp;
+  <span style="font-family:'IBM Plex Mono',monospace;color:var(--amber);">⚠️</span> = vendor/language constraints apply
+
+  <div class="container hero-content">
+
+        <div class="author-date">
+          Content curated by Sumit, Formatted by AI | 
+            <a href="https://www.linkedin.com/in/sumitdevgupta" target="_blank">Sumit's Profile</a> | 
+            May 24, 2026 
+        </div>
+
+    </div>
+</footer>
+
+</div><!-- page-wrap -->
+
+<script>
+function toggle(header) {
+  const card = header.closest('.group-card');
+  card.classList.toggle('open');
+}
+function toggleAll(open) {
+  document.querySelectorAll('.group-card').forEach(c => {
+    if (open) c.classList.add('open');
+    else c.classList.remove('open');
+  });
+}
+// Open the card if anchor is in the URL
+function openFromHash() {
+  const h = window.location.hash.slice(1);
+  if (h) {
+    const el = document.getElementById(h);
+    if (el && el.classList.contains('group-card')) el.classList.add('open');
+  }
+}
+window.addEventListener('DOMContentLoaded', openFromHash);
+window.addEventListener('hashchange', openFromHash);
+</script>
+
+</body>
+</html>
