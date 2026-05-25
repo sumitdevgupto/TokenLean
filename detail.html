@@ -1782,7 +1782,12 @@ Async:         Agent emits event → suspends (context discarded, zero cost duri
         </ul>
 
         <h4>Implementation</h4>
-        <p><strong>OpenLLMetry</strong> — lowest effort, wraps existing LLM SDK via OpenTelemetry auto-instrumentation. <strong>Langfuse</strong> — adds prompt versioning, eval scoring, team dashboards. Emit <code>token-usage.jsonl</code> per workflow run for post-hoc analysis. Set per-feature and per-team daily budgets in Prometheus; alert on overrun.</p>
+        <p><strong>OpenLLMetry</strong> — lowest effort, wraps existing LLM SDK via OpenTelemetry auto-instrumentation. <strong>Langfuse</strong> — adds prompt versioning, eval scoring, team dashboards. Emit <code>token-usage.jsonl</code> per workflow run for post-hoc analysis. Set per-feature and per-team daily budgets in Prometheus; alert on overrun.
+           </p>
+
+            <p>
+        When a loop pathology is detected, the framework must act — not just alert. Implement a configurable circuit breaker per workflow: on trigger (turn count > 2× baseline, or repeated identical call fingerprint detected via `hash(step_name + input)` appearing ≥ 3 times in a sliding window of 5 calls), execute one of: `partial_return` (halt and return accumulated result with a `forced_stop` flag), `human_interrupt` (halt and emit to a webhook/queue for human decision), or `hard_kill` (halt and discard). Configure the action per workflow type in your orchestration layer — interactive agents default to `partial_return`; high-stakes workflows to `human_interrupt`; batch pipelines to `hard_kill`.
+        </p>
 
         <div class="tools-line">
           <span class="tl-label">OSS</span>
