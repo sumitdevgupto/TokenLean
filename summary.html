@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Token Optimization · Agentic AI · v7</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html{background:#111}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html{background:#111}
+
+body{
+  font-family:'DM Sans',sans-serif;
+  font-size: 16px; /* Significantly larger base */
+  background:#0E0F1C;
+  color:#fff;
+  width:960px; /* Expanded board width to give big fonts room to breathe */
+  margin:0 auto;
+  padding:36px 36px 32px;
+  position:relative;
+}
+
+/* ── BLOBS ── */
+.blobs{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;pointer-events:none;z-index:0}
+.blob{position:absolute;border-radius:50%;filter:blur(90px)}
+.b1{width:450px;height:450px;background:#FF5C3E;opacity:.09;top:-100px;left:-80px}
+.b2{width:400px;height:400px;background:#00CEB0;opacity:.07;top:350px;right:-80px}
+.b3{width:380px;height:380px;background:#7B5CF0;opacity:.07;top:900px;left:-60px}
+.b4{width:360px;height:360px;background:#FFC300;opacity:.06;top:1600px;right:80px}
+
+.wrap{position:relative;z-index:1;display:flex;flex-direction:column;gap:16px}
+
+/* ── HEADER ── */
+.hdr{display:grid;grid-template-columns:1fr auto;align-items:start;gap:16px;
+  border-bottom:1px solid rgba(255,255,255,.1);padding-bottom:18px}
+.eye{font-size:12px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:#00CEB0;margin-bottom:8px}
+h1{font-family:'Syne',sans-serif;font-size:32px;font-weight:800;line-height:1.2;color:#fff}
+h1 em{font-style:normal;color:#FF5C3E}
+.hsub{font-size:14px;color:rgba(255,255,255,.5);margin-top:8px;line-height:1.5}
+.kpis{display:flex;flex-direction:column;gap:10px;text-align:right;flex-shrink:0}
+.kpi{display:flex;flex-direction:column;align-items:flex-end}
+.kn{font-family:'Syne',sans-serif;font-size:34px;font-weight:800;line-height:1}
+.kl{font-size:12px;color:rgba(255,255,255,.4);line-height:1.3;max-width:180px;text-align:right}
+
+/* ── PRINCIPLE BAR ── */
+.principle{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+  border-left:4px solid #00CEB0;border-radius:8px;padding:12px 16px;
+  font-size:14px;color:rgba(255,255,255,.75);line-height:1.5}
+.principle strong{color:#00CEB0}
+
+/* ── STAGE BLOCK ── */
+.stage{display:flex;flex-direction:column;gap:12px}
+.stage-hdr{display:flex;align-items:center;gap:12px}
+.stage-pill{font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  padding:6px 14px;border-radius:99px;white-space:nowrap;flex-shrink:0}
+.stage-line{flex:1;height:1px;opacity:.2}
+.stage-desc{font-size:12px;color:rgba(255,255,255,.45);white-space:nowrap}
+
+.cards{display:grid;gap:10px}
+.c3{grid-template-columns:repeat(3,1fr)}
+.c4{grid-template-columns:repeat(4,1fr)}
+.c2{grid-template-columns:repeat(2,1fr)}
+
+/* ── GROUP CARD ── */
+.gc{border-radius:8px;padding:14px 14px;border:1px solid;
+  display:flex;flex-direction:column;gap:8px;position:relative;overflow:hidden}
+.gc::before{content:'';position:absolute;top:0;left:0;right:0;height:4px}
+.gnum{font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.4)}
+.gtitle{font-size:15px;font-weight:700;color:#fff;line-height:1.3}
+.gsave{font-family:'Syne',sans-serif;font-size:19px;font-weight:800;line-height:1.1;margin:2px 0}
+.gwhat{font-size:12.5px;color:rgba(255,255,255,.65);line-height:1.45}
+.gtools{font-size:11.5px;color:rgba(255,255,255,.5);line-height:1.4;margin-top:6px;
+  border-top:1px solid rgba(255,255,255,.07);padding-top:6px}
+.gtools span{color:rgba(255,255,255,.75);font-weight:500}
+.badge{display:inline-block;font-size:10px;font-weight:600;padding:3px 8px;
+  border-radius:99px;letter-spacing:.04em;text-transform:uppercase;width:fit-content;margin-top:4px}
+.bok{background:rgba(0,206,176,.15);color:#00CEB0}
+.bwn{background:rgba(255,195,0,.15);color:#FFC300}
+
+/* Stage Colors inherited perfectly */
+.s1 .stage-pill{background:rgba(255,92,62,.15);color:#FF5C3E;border:1px solid rgba(255,92,62,.3)}
+.s1 .stage-line{background:#FF5C3E} .s1 .gc{background:rgba(255,92,62,.06);border-color:rgba(255,92,62,.2)}
+.s1 .gc::before{background:#FF5C3E} .s1 .gsave{color:#FF7A5C}
+.s2 .stage-pill{background:rgba(0,206,176,.15);color:#00CEB0;border:1px solid rgba(0,206,176,.3)}
+.s2 .stage-line{background:#00CEB0} .s2 .gc{background:rgba(0,206,176,.06);border-color:rgba(0,206,176,.2)}
+.s2 .gc::before{background:#00CEB0} .s2 .gsave{color:#00CEB0}
+.s3 .stage-pill{background:rgba(74,144,226,.15);color:#64BAFF;border:1px solid rgba(74,144,226,.3)}
+.s3 .stage-line{background:#4A90E2} .s3 .gc{background:rgba(74,144,226,.06);border-color:rgba(74,144,226,.2)}
+.s3 .gc::before{background:#4A90E2} .s3 .gsave{color:#64BAFF}
+.s4 .stage-pill{background:rgba(123,92,240,.15);color:#A78BFA;border:1px solid rgba(123,92,240,.3)}
+.s4 .stage-line{background:#7B5CF0} .s4 .gc{background:rgba(123,92,240,.06);border-color:rgba(123,92,240,.22)}
+.s4 .gc::before{background:#7B5CF0} .s4 .gsave{color:#A78BFA}
+.s5 .stage-pill{background:rgba(255,195,0,.15);color:#FFC300;border:1px solid rgba(255,195,0,.3)}
+.s5 .stage-line{background:#FFC300} .s5 .gc{background:rgba(255,195,0,.06);border-color:rgba(255,195,0,.2)}
+.s5 .gc::before{background:#FFC300} .s5 .gsave{color:#FFC300}
+.s6 .stage-pill{background:rgba(163,217,119,.15);color:#A3D977;border:1px solid rgba(163,217,119,.3)}
+.s6 .stage-line{background:#A3D977} .s6 .gc{background:rgba(163,217,119,.06);border-color:rgba(163,217,119,.2)}
+.s6 .gc::before{background:#A3D977} .s6 .gsave{color:#A3D977}
+
+/* ── CONNECTOR ── */
+.arrow{text-align:center;font-size:18px;color:rgba(255,255,255,.18);line-height:1;margin:0}
+
+/* ── BOTTOM ROW ── */
+.bottom{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.bcard{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:14px 16px}
+.bcard h3{font-family:'Syne',sans-serif;font-size:13px;font-weight:700;color:rgba(255,255,255,.6);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px}
+.et-box{background:rgba(0,206,176,.06);border:1px solid rgba(0,206,176,.2);border-radius:6px;
+  padding:12px 14px;font-family:monospace;font-size:13.5px;color:#00CEB0;line-height:1.8;margin-bottom:10px}
+.et-note{font-size:12px;color:rgba(255,255,255,.5);line-height:1.6}
+.et-note strong{color:rgba(255,255,255,.7)}
+
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{text-align:center;background:rgba(255,255,255,.04);border-radius:6px;padding:10px 8px}
+.sn{font-family:'Syne',sans-serif;font-size:20px;font-weight:800;line-height:1;margin-bottom:4px}
+.sl{font-size:11.5px;color:rgba(255,255,255,.45);line-height:1.35}
+
+/* ── FOOTER ── */
+.footer{border-top:1px solid rgba(255,255,255,.07);padding-top:14px;display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.fl{font-size:11px;color:rgba(255,255,255,.35);line-height:1.6;max-width:640px}
+.fr{font-size:11px;color:rgba(255,255,255,.25);text-align:right;line-height:1.6}
+
+.author-date {
+      text-align: center;
+      color: #1abc9c;
+      margin: 0 0 20px;
+      font-style: italic;
+    }
+
+        /* Unvisited link */
+a:link {
+  color: #00ffcc; /* Put your desired color hex or name here */
+  text-decoration: none; /* Optional: removes the underline */
+}
+
+/* Visited link */
+a:visited {
+  color: #00b38f;
+}
+
+/* Mouse over link */
+a:hover {
+  color: #ffffff;
+  text-decoration: underline;
+}
+
+/* Selected/Clicked link */
+a:active {
+  color: #ff0000;
+}
+
+</style>
+</head>
+<body>
+
+  <div class="author-date">
+          Content curated by Sumit, Formatted by AI | 
+            <a href="https://www.linkedin.com/in/sumitdevgupta">Sumit's Profile</a> | 
+            May 24, 2026 
+        </div>
+
+<div class="blobs">
+  <div class="blob b1"></div>
+  <div class="blob b2"></div>
+  <div class="blob b3"></div>
+  <div class="blob b4"></div>
+</div>
+
+<div class="wrap">
+
+
+  <div class="hdr">
+    <div>
+      <div class="eye">Agentic AI · Token Optimization Playbook · May 2026</div>
+      <h1>Stop Burning Money on <em>Invisible Tokens</em></h1>
+      <p class="hsub">18 technique groups across 6 lifecycle stages — all within your implementation control · any LLM · any provider</p>
+    </div>
+    <div class="kpis">
+      <div class="kpi">
+        <div class="kn" style="color:#FF5C3E">$8:$1</div>
+        <div class="kl">Compute vs. revenue per Anthropic user</div>
+      </div>
+      <div class="kpi">
+        <div class="kn" style="color:#FFC300">40–60%</div>
+        <div class="kl">Of prod token budgets are pure waste</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="principle">
+    🎯 <strong>Signal per Token</strong> — Maximise signal per token, not the token window. Tokens are simultaneously: working memory · reasoning bandwidth · execution fuel · cost (output tokens cost 2–5× more than input). Budget them like CPU.
+  </div>
+
+  <div class="stage s1">
+    <div class="stage-hdr">
+      <div class="stage-pill">Stage 1 · Before the Request</div>
+      <div class="stage-line"></div>
+      <div class="stage-desc">Design time + governance</div>
+    </div>
+    <div class="cards c3">
+
+      <div class="gc">
+        <div class="gnum">G1 · Prompt &amp; System Prompt Design</div>
+        <div class="gtitle">Compress &amp; Structure Prompts</div>
+        <div class="gsave">15–40% input</div>
+        <div class="gwhat">Strip filler phrases; one-role-one-agent rule; lazy-load edge-case instructions only when needed</div>
+        <div class="gtools"><span>OSS:</span> LLMLingua-2 · Selective Context · DSPy · Promptfoo</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G2 · Prompt Template Registry</div>
+        <div class="gtitle">Git-Backed Token Governance</div>
+        <div class="gsave">Fleet-wide</div>
+        <div class="gwhat">Centralised registry with per-template token budgets enforced in CI/CD pipelines</div>
+        <div class="gtools"><span>OSS:</span> Promptfoo · DSPy · Langfuse OSS</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G3 · Knowledge Strategy</div>
+        <div class="gtitle">RAG vs Fine-Tune + Doc Prep</div>
+        <div class="gsave">Up to 100%</div>
+        <div class="gwhat">Preprocess docs at ingestion (strip HTML/boilerplate); decide RAG vs fine-tune per domain</div>
+        <div class="gtools"><span>OSS:</span> Unstructured · Docling · MarkItDown · Apache Tika</div>
+        <span class="badge bwn">⚠️ Fine-tune tooling is provider-specific</span>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="stage s2">
+    <div class="stage-hdr">
+      <div class="stage-pill">Stage 2 · At the Gate</div>
+      <div class="stage-line"></div>
+      <div class="stage-desc">Request arrives — intercept before LLM call</div>
+    </div>
+    <div class="cards c3">
+
+      <div class="gc">
+        <div class="gnum">G4 · Rules-Based Bypass</div>
+        <div class="gtitle">Skip the LLM Entirely</div>
+        <div class="gsave">30–90%</div>
+        <div class="gwhat">Route deterministic requests (CRUD, lookups, eligibility checks) directly to backend APIs — zero tokens consumed</div>
+        <div class="gtools"><span>OSS:</span> LangGraph · Apache Camel · OpenTelemetry</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G5 · Response &amp; Step Caching</div>
+        <div class="gtitle">L1 Exact + L2 Semantic Cache</div>
+        <div class="gsave">40–70%</div>
+        <div class="gwhat">L1 hash-based exact match; L2 vector similarity (≥0.88). Idempotent step cache for agent retry loops</div>
+        <div class="gtools"><span>OSS:</span> GPTCache · Redis OSS · FAISS · Chroma · Temporal OSS</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G6 · Model Routing &amp; Cascading</div>
+        <div class="gtitle">Cheapest Capable Model Wins</div>
+        <div class="gsave">60–80%</div>
+        <div class="gwhat">Route 70% to cheap tier; escalate only when confidence &lt;0.88. Static routing pre-call; cascading post-cheap-model</div>
+        <div class="gtools"><span>OSS:</span> RouteLLM · LiteLLM</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="stage s3">
+    <div class="stage-hdr">
+      <div class="stage-pill">Stage 3 · Into the LLM</div>
+      <div class="stage-line"></div>
+      <div class="stage-desc">Context assembly — controlling what enters the prompt</div>
+    </div>
+    <div class="cards c4">
+
+      <div class="gc">
+        <div class="gnum">G7 · Retrieval Optimisation</div>
+        <div class="gtitle">Inject Top-1, Not Top-5</div>
+        <div class="gsave">50–80%</div>
+        <div class="gwhat">256–512 token chunks; reranker → inject top-1/2. Naïve RAG: 10K tokens. Optimised: ~400</div>
+        <div class="gtools"><span>OSS:</span> LangChain · LlamaIndex · Haystack · pgvector · Qdrant</div>
+        <span class="badge bok">✅ Agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G8 · Tool Definition Loading</div>
+        <div class="gtitle">Lazy Load + Prune Weekly</div>
+        <div class="gsave">20–70%</div>
+        <div class="gwhat">Inject only tools relevant to current step. Audit: prune tools unused for 30+ days from agent context</div>
+        <div class="gtools"><span>OSS:</span> LangGraph · MCP SDK · LangChain</div>
+        <span class="badge bok">✅ Agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G9 · Context Schema &amp; Handoffs</div>
+        <div class="gtitle">Compact Typed State Fields</div>
+        <div class="gsave">20–70%</div>
+        <div class="gwhat">Use compact typed fields for inter-step state. Suppress reasoning traces from agent handoffs — pass answers only</div>
+        <div class="gtools"><span>OSS:</span> LangGraph · Instructor · AutoGen</div>
+        <span class="badge bok">✅ Agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G10 · Conversation &amp; Memory</div>
+        <div class="gtitle">Sliding Window + Externalise</div>
+        <div class="gsave">30–70%</div>
+        <div class="gwhat">Keep last 4–8 turns; summarise older turns with cheap model. Externalise agent state to Redis — never embed in prompt</div>
+        <div class="gtools"><span>OSS:</span> Mem0 · Zep OSS · LangMem · LangChain4j</div>
+        <span class="badge bok">✅ Agnostic</span>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="stage s4">
+    <div class="stage-hdr">
+      <div class="stage-pill">Stage 4 · Inside the LLM</div>
+      <div class="stage-line"></div>
+      <div class="stage-desc">Inference — controlling what the model generates</div>
+    </div>
+    <div class="cards c3">
+
+      <div class="gc">
+        <div class="gnum">G11 · Output Length &amp; Format</div>
+        <div class="gtitle">max_tokens + JSON Schema</div>
+        <div class="gsave">30–60%</div>
+        <div class="gwhat">Always set max_tokens — treat it as mandatory. Return JSON not prose for machine-consumed outputs. Output costs 2–5× more</div>
+        <div class="gtools"><span>OSS:</span> Instructor · Instructor Java · Guardrails AI</div>
+        <span class="badge bwn">⚠️ Schema enforcement varies by provider</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G12 · Reasoning Budget Control</div>
+        <div class="gtitle">Bound Chain-of-Thought</div>
+        <div class="gsave">50–90%</div>
+        <div class="gwhat">Prompt-level: "answer only, no reasoning shown." Provider params where available (budget_tokens, reasoning_effort)</div>
+        <div class="gtools"><span>OSS:</span> DSPy · Promptfoo</div>
+        <span class="badge bwn">⚠️ Budget params are provider-specific</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G13 · Batch &amp; Compact Notation</div>
+        <div class="gtitle">TOON + Batch Bundling</div>
+        <div class="gsave">20–98%</div>
+        <div class="gwhat">Bundle similar items into one call. TOON compact schema for repetitive data — up to 98% reduction vs verbose JSON</div>
+        <div class="gtools"><span>OSS:</span> LiteLLM · Kafka · Ray · Temporal OSS · Instructor</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="stage s5">
+    <div class="stage-hdr">
+      <div class="stage-pill">Stage 5 · After the Response</div>
+      <div class="stage-line"></div>
+      <div class="stage-desc">Tool execution + result handling</div>
+    </div>
+    <div class="cards c2">
+
+      <div class="gc">
+        <div class="gnum">G14 · Tool Call &amp; Output Minimisation</div>
+        <div class="gtitle">Fewer Calls, Smaller Results</div>
+        <div class="gsave">30–90% tool tokens</div>
+        <div class="gwhat">Combine related lookups into one coarse-grained tool. Parallelise inside the handler (not the loop). Project to only the 3–5 fields the agent uses — never return full 50-key objects</div>
+        <div class="gtools"><span>OSS:</span> LangChain · LangGraph · LlamaIndex &nbsp;|&nbsp; <span>Commercial:</span> LangSmith · Portkey</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G15 · Server-Side Computation &amp; MCP Offloading</div>
+        <div class="gtitle">Process in Code, Not in Context</div>
+        <div class="gsave">40–80% data-heavy</div>
+        <div class="gwhat">Filter, sort, aggregate in your tool/MCP handler before results reach the LLM. Code execution costs zero tokens — processing raw data in-context is expensive and unnecessary</div>
+        <div class="gtools"><span>OSS:</span> MCP SDK · LangGraph · Apache Camel &nbsp;|&nbsp; <span>Commercial:</span> Portkey · LangSmith</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="stage s6">
+    <div class="stage-hdr">
+      <div class="stage-pill">Stage 6 · Across the Loop</div>
+      <div class="stage-line"></div>
+      <div class="stage-desc">Orchestration + governance — runs continuously</div>
+    </div>
+    <div class="cards c3">
+
+      <div class="gc">
+        <div class="gnum">G16 · Agent Architecture</div>
+        <div class="gtitle">Decompose + Async</div>
+        <div class="gsave">20–60%</div>
+        <div class="gwhat">Break monolithic agents into specialised sub-agents (each carries only its own context). Async execution for I/O-heavy workflows</div>
+        <div class="gtools"><span>OSS:</span> LangGraph · AutoGen · CrewAI OSS · Temporal OSS · Kafka</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G17 · Loop Control &amp; Budget Propagation</div>
+        <div class="gtitle">Hard Limits + remaining_budget</div>
+        <div class="gsave">10–30%</div>
+        <div class="gwhat">Set hard iteration caps. Stop when confidence drops. Pass remaining_budget token downstream so sub-agents self-constrain</div>
+        <div class="gtools"><span>OSS:</span> LangGraph · AutoGen · LangChain</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+      <div class="gc">
+        <div class="gnum">G18 · Observability &amp; Token FinOps</div>
+        <div class="gtitle">Measure Everything First</div>
+        <div class="gsave">15–40% indirect</div>
+        <div class="gwhat">Tag every call (feature + team). Track ET metric + turn efficiency. Alert on budget overruns before the invoice arrives. Without this you optimise blind</div>
+        <div class="gtools"><span>OSS:</span> Langfuse · OpenLLMetry · Helicone OSS · OpenTelemetry · Grafana</div>
+        <span class="badge bok">✅ Fully agnostic</span>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="bottom">
+
+    <div class="bcard">
+      <h3>Effective Token (ET) Formula — use instead of raw counts</h3>
+      <div class="et-box">ET = m × (1.0 × Input + 0.1 × Cache-read + 4.0 × Output)</div>
+      <div class="et-note">
+        <strong>m</strong> = model cost multiplier vs. baseline &nbsp;·&nbsp;
+        <strong>Cache-read × 0.1</strong> = cheap to re-read &nbsp;·&nbsp;
+        <strong>Output × 4.0</strong> = most expensive component<br>
+        ET normalises across model tiers so you can compare savings fairly.
+        Also track <strong>turn efficiency</strong> (LLM turns per run) — a jump from 5 → 15 turns signals a loop pathology.
+      </div>
+    </div>
+
+    <div class="bcard">
+      <h3>Numbers Every CXO Should Know</h3>
+      <div class="stat-grid">
+        <div class="stat">
+          <div class="sn" style="color:#FF5C3E">$8:$1</div>
+          <div class="sl">Compute vs. subscription per Anthropic user</div>
+        </div>
+        <div class="stat">
+          <div class="sn" style="color:#FFC300">90 min</div>
+          <div class="sl">To exhaust a 5-hr agentic rate-limit quota</div>
+        </div>
+        <div class="stat">
+          <div class="sn" style="color:#00CEB0">40–60%</div>
+          <div class="sl">Of prod tokens are waste — invisible without G18</div>
+        </div>
+        <div class="stat">
+          <div class="sn" style="color:#A78BFA">10–20×</div>
+          <div class="sl">More tokens burned per agentic vs. chat session</div>
+        </div>
+        <div class="stat">
+          <div class="sn" style="color:#64BAFF">30 days</div>
+          <div class="sl">Prune tools unused for 30+ days from context (G8)</div>
+        </div>
+        <div class="stat">
+          <div class="sn" style="color:#A3D977">98%</div>
+          <div class="sl">Max saving via TOON compact notation (G13)</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    <div class="fl">
+      ✅ = fully agnostic (any LLM, any provider) &nbsp;·&nbsp; ⚠️ = technique is agnostic but specific tools or APIs are provider/language-locked &nbsp;·&nbsp; All 18 groups are within direct implementation control — provider-side infrastructure features excluded by design<br>
+    </div>
+    <div class="fr">
+      May 2026<br>
+      #AgenticAI #LLMCost<br>
+      #TokenOptimization<br>
+      #GenAI #CTO
+    </div>
+  </div>
+
+</div></body>
+</html>
