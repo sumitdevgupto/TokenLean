@@ -1024,7 +1024,7 @@ current_token_counts:
         <p>Apache Tika: ⚠️ Java Maven dependency. Unstructured OSS, Docling, MarkItDown: Python-based, available as Docker HTTP sidecars for Java/Go.</p>
 
         <h4>RAG vs. Fine-Tune Decision</h4>
-        <p>Every RAG call injects 400–3,000 retrieval tokens per query. For stable, high-frequency domain knowledge (product taxonomy, internal policies, support playbooks), fine-tuning bakes knowledge into weights — zero retrieval tokens per call permanently.</p>
+        <p>Every RAG call injects 400–3,000 retrieval tokens per query. For stable, high-frequency domain knowledge (product taxonomy, internal policies, support playbooks), fine-tuning bakes knowledge into weights — reduced retrieval tokens per call permanently, though Fine-tuning is not a reliable replacement for knowledge retrieval and can lead to stale knowledge.</p>
 
         <div class="inline-table-wrap">
           <table>
@@ -1121,7 +1121,7 @@ current_token_counts:
 
         <h4>Step-Level Idempotent Cache</h4>
         <p>Individual workflow steps treated as pure functions — results memoised by <code>hash(step_name + step_inputs + template_version)</code>. On retry/re-run, unchanged steps skipped — no LLM call. High value for: workflows that fail partway, evaluation pipelines, batch pipelines sharing upstream steps.</p>
-        <p>In <strong>Temporal</strong>, Activity replay is idempotent by design — built in at no extra cost. Workflow replay is deterministic; Activity idempotency is developer responsibility.</p>
+        <p><strong>Temporal</strong> provides deterministic workflow replay: completed Activity results are stored in workflow history and reused during replay, avoiding re-execution of already completed Activities. Activities themselves use at-least-once execution semantics and should be designed to be idempotent when side effects are involved.</p>
         <p>For Java: Jedis/Lettuce for Redis. For Go: <code>go-redis</code>.</p>
 
         <div class="tools-line">
@@ -1176,7 +1176,7 @@ current_token_counts:
           </table>
         </div>
 
-        <p><strong>RouteLLM</strong> (ICLR 2025): achieves 95% of GPT-4 quality routing only 14–26% of traffic to frontier models.</p>
+        <p><strong>RouteLLM</strong> (ICLR 2025): achieves 95% of GPT-4 quality routing only 14–26% of traffic to frontier models, though these results are benchmark-dependent and workload-specific</p>
 
         <h4>Cascading (live quality decision)</h4>
         <p>Send every request to cheap model first. If it returns <code>&#123;answer, confidence ≥ 0.88&#125;</code> → return immediately. Escalate only on low confidence. In practice 70–80% of queries never need escalation.</p>
@@ -1224,6 +1224,7 @@ current_token_counts:
           <li>Similarity threshold &gt; 0.85 — pass "no relevant context found" if nothing qualifies</li>
           <li>Cross-encoder reranker is far cheaper than sending all chunks to the LLM</li>
           <li>Just-in-Time retrieval: fetch exactly when needed, not upfront in bulk</li>
+          <li>NOTE : Optimal chunk size, top-k, and re-ranking thresholds are corpus-specific and require evaluation</li>
         </ul>
         <h4>Hybrid Dense + Sparse Retrieval (RRF fusion)</h4>
         <div class="inline-table-wrap">
@@ -1425,7 +1426,7 @@ After:  [Role: 500t] + [Retrieved skills: ~300t] + [Tools: 800t] = ~1,600 tokens
         <div class="group-chevron">▾</div>
       </div>
       <div class="group-body">
-        <p>Output tokens cost 2–5× more than input. Two always-on levers:</p>
+        <p>Output tokens cost 2–5× more than input (model/provider dependent). Two always-on levers:</p>
         <ul>
           <li><strong>Always set <code>max_tokens</code></strong> — mandatory on every call. Without it, models return 3–10× more than needed. Start at 2× expected output, tune down.</li>
           <li><strong>JSON schema instead of prose</strong> for any response parsed by code — eliminates preambles, disclaimers, padding.</li>
@@ -1663,7 +1664,8 @@ orders(id,s,r): 1001,S,A|1002,P,E
       </div>
       <div class="group-body">
         <h4>Agent Decomposition</h4>
-        <p>A monolithic agent carries all tools, instructions, and domain knowledge — the system prompt is maximally large. Decompose into specialised sub-agents: each carries only context relevant to its function. Additional benefits: each sub-agent uses the cheapest model tier for its complexity (G6); failures isolated; agents independently testable. ⚠️ Start with 2–3 sub-agents for highest-token tasks before decomposing everything.</p>
+        <p>A monolithic agent carries all tools, instructions, and domain knowledge — the system prompt is maximally large. Decompose into specialised sub-agents: each carries only context relevant to its function. Additional benefits: each sub-agent uses the cheapest model tier for its complexity (G6); failures isolated; agents independently testable. ⚠️ Start with 2–3 sub-agents for highest-token tasks before decomposing everything.
+        NOTE: Multi-agent systems can reduce context per agent, but they can also increase total token usage due to handoffs, orchestration overhead, and duplicated context. The benefit is workload-dependent.</p>
 
         <h4>Async / Event-Driven Execution</h4>
         <p>In a synchronous ReAct agent, the full accumulated context is held open and re-sent while waiting for tool I/O.</p>
@@ -1772,7 +1774,7 @@ Async:         Agent emits event → suspends (context discarded, zero cost duri
         <p>Normalised cost across tiers:</p>
         <div class="formula-box">
           ET = m × (1.0 × Input + 0.1 × Cache-read + 4.0 × Output)
-          <div class="formula-label">Where m = model cost multiplier vs. cheapest baseline. Use ET instead of raw counts to compare cost across tiers fairly.</div>
+          <div class="formula-label">Where m = model cost multiplier vs. cheapest baseline. Use ET instead of raw counts to compare cost across tiers fairly. NOTE: Change the weights based on your model and workload</div>
         </div>
 
         <h4>Key KPIs and Governance</h4>
