@@ -430,51 +430,6 @@ a:active {
     </div>
   </div>
 
-  <div class="bottom">
-
-    <div class="bcard">
-      <h3>Effective Token (ET) Formula — use instead of raw counts</h3>
-      <div class="et-box">ET = m × (1.0 × Input + 0.1 × Cache-read + 4.0 × Output)</div>
-      <div class="et-note">
-        <strong>m</strong> = model cost multiplier vs. baseline &nbsp;·&nbsp;
-        <strong>Cache-read × 0.1</strong> = cheap to re-read &nbsp;·&nbsp;
-        <strong>Output × 4.0</strong> = most expensive component<br>
-        ET normalises across model tiers so you can compare savings fairly.
-        Also track <strong>turn efficiency</strong> (LLM turns per run) — a jump from 5 → 15 turns signals a loop pathology.
-      </div>
-    </div>
-
-    <div class="bcard">
-      <h3>Numbers Every CXO Should Know</h3>
-      <div class="stat-grid">
-        <div class="stat">
-          <div class="sn" style="color:#FF5C3E">$8:$1</div>
-          <div class="sl">Compute vs. subscription per Anthropic user</div>
-        </div>
-        <div class="stat">
-          <div class="sn" style="color:#FFC300">90 min</div>
-          <div class="sl">To exhaust a 5-hr agentic rate-limit quota</div>
-        </div>
-        <div class="stat">
-          <div class="sn" style="color:#00CEB0">40–60%</div>
-          <div class="sl">Of prod tokens are waste — invisible without G18</div>
-        </div>
-        <div class="stat">
-          <div class="sn" style="color:#A78BFA">10–20×</div>
-          <div class="sl">More tokens burned per agentic vs. chat session</div>
-        </div>
-        <div class="stat">
-          <div class="sn" style="color:#64BAFF">30 days</div>
-          <div class="sl">Prune tools unused for 30+ days from context (G8)</div>
-        </div>
-        <div class="stat">
-          <div class="sn" style="color:#A3D977">98%</div>
-          <div class="sl">Max saving via TOON compact notation (G13)</div>
-        </div>
-      </div>
-    </div>
-
-  </div>
 
   <div class="footer">
     <div class="fl">
