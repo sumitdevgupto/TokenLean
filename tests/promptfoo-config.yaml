@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# =============================================================================
+# Promptfoo quality eval for the Token Optimisation proxy.
+#
+# Exercises the `customer-support-classifier` prompt (mirrors
+# config/templates/customer-support-classifier.yaml) THROUGH the proxy, so all
+# optimisations are applied, then asserts the output is still well-formed JSON
+# with the expected category/priority enums.
+#
+# Target proxy + auth come from the ENVIRONMENT (set by ci/promptfoo-eval.sh and
+# the build scripts) — deliberately NOT hardcoded here, so the same config works
+# for the local stack and a deployed Cloud Run URL:
+#     OPENAI_BASE_URL = <proxy>/v1    (e.g. http://localhost:4000/v1)
+#     OPENAI_API_KEY  = <proxy key>   (a tok-... key the proxy accepts)
+#
+# Run manually:
+#   OPENAI_BASE_URL=http://localhost:4000/v1 OPENAI_API_KEY=tok-... \
+#     npx promptfoo@latest eval -c tests/promptfoo-config.yaml
+# =============================================================================
+description: Token Optimisation proxy — customer-support-classifier quality eval
+
+providers:
+  # Base URL + API key are read from OPENAI_BASE_URL / OPENAI_API_KEY so this
+  # is portable across local + GCP. Do not add config.apiBaseUrl here — an
+  # explicit value would override the env var and break the GCP target.
+  - openai:gpt-4o-mini
+
+# Paths are resolved relative to THIS file's directory (tests/), not the repo root.
+prompts:
+  - data/prompts/customer-support.txt
+
+tests: data/promptfoo-tests.yaml
+
+# Applied to EVERY test: the response must be a JSON object with the expected
+# shape + enum values. Deterministic (no LLM-graded checks) so this is a stable
+# regression gate, not a flaky one.
+defaultTest:
+  assert:
+    - type: is-json
+      value:
+        type: object
+        required: [category, priority, reason]
+        additionalProperties: true
+        properties:
+          category:
+            type: string
+            enum: [BILLING, TECHNICAL, ACCOUNT, SHIPPING, REFUND, GENERAL]
+          priority:
+            type: string
+            enum: [LOW, MEDIUM, HIGH, URGENT]
+          reason:
+            type: string

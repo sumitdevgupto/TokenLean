@@ -1,0 +1,4 @@
+g20_prompt_optimizer:
+  enabled: false                  # set true to activate runtime prompt swap
+  redis_tpl_prefix: "tok_opt:g20:tpl:"   # key prefix for pre-computed templates
+  sha_prefix_len: 16             # hex chars used for fingerprint match

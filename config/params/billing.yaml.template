@@ -1,0 +1,9 @@
+billing:
+  enabled: false                        # set true to activate usage metering
+  openmeter_url: ""                     # e.g. http://openmeter:8888
+  openmeter_api_key: ""                 # injected from Secret Manager at runtime
+  default_tier: basic                   # tier applied when tenant has no explicit tier
+  # NOTE: the per-tier G-group feature map (`tiers:`) is a commercial-layer
+  # concern and lives in the gitignored config/params/tiers.yaml.template
+  # (item 40). config_loader.merge_params_dir() merges it back under `billing:`
+  # in private builds; in OSS it is simply absent (no tier gating).

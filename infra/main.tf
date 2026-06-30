@@ -1,0 +1,762 @@
+terraform {
+  required_version = ">= 1.8"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# ─── Enable required APIs ────────────────────────────────────────────────────
+resource "google_project_service" "apis" {
+  for_each = toset([
+    "run.googleapis.com",
+    "sqladmin.googleapis.com",
+    "storage.googleapis.com",
+    "secretmanager.googleapis.com",
+    "cloudtasks.googleapis.com",
+    "artifactregistry.googleapis.com",
+  ])
+  service            = each.value
+  disable_on_destroy = false
+}
+
+
+# ─── Artifact Registry ───────────────────────────────────────────────────────
+resource "google_artifact_registry_repository" "repo" {
+  location      = var.region
+  repository_id = var.artifact_registry_repo
+  format        = "DOCKER"
+  description   = "Token optimisation framework Docker images"
+  depends_on    = [google_project_service.apis]
+}
+
+# ─── GCS Bucket (config + Redis export) ──────────────────────────────────────
+resource "random_id" "bucket_suffix" {
+  byte_length = 4
+}
+
+locals {
+  bucket_name = var.config_bucket_name != "" ? var.config_bucket_name : "token-opt-config-${random_id.bucket_suffix.hex}"
+}
+
+resource "google_storage_bucket" "config" {
+  name                        = local.bucket_name
+  location                    = var.region
+  force_destroy               = false
+  uniform_bucket_level_access = true
+
+  versioning { enabled = true }
+
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition { age = 90 }
+  }
+}
+
+# ─── Cloud SQL (PostgreSQL 15 + pgvector) ────────────────────────────────────
+resource "random_password" "db_password" {
+  length  = 32
+  special = true
+}
+
+resource "google_sql_database_instance" "main" {
+  name             = "token-opt-pg"
+  database_version = "POSTGRES_15"
+  region           = var.region
+
+  settings {
+    tier              = var.db_tier
+    availability_type = "ZONAL"
+    disk_size         = 20
+    disk_autoresize   = true
+
+    ip_configuration {
+      ipv4_enabled = true
+    }
+
+    database_flags {
+      name  = "max_connections"
+      value = "100"
+    }
+  }
+
+  deletion_protection = true
+  depends_on          = [google_project_service.apis]
+}
+
+resource "google_sql_database" "langfuse" {
+  name     = "langfuse"
+  instance = google_sql_database_instance.main.name
+}
+
+resource "google_sql_database" "proxy" {
+  name     = "token_opt"
+  instance = google_sql_database_instance.main.name
+}
+
+resource "google_sql_user" "app_user" {
+  name     = "token_opt_app"
+  instance = google_sql_database_instance.main.name
+  password = random_password.db_password.result
+}
+
+
+# ─── Secret Manager ──────────────────────────────────────────────────────────
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "token-opt-db-password"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "db_password" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = random_password.db_password.result
+}
+
+resource "google_secret_manager_secret" "proxy_api_keys" {
+  secret_id = "token-proxy-api-keys"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "proxy_api_keys_init" {
+  secret      = google_secret_manager_secret.proxy_api_keys.id
+  secret_data = "{}"
+}
+
+# LLM provider key secrets (populated by gcp-deploy.sh)
+resource "google_secret_manager_secret" "llm_key_openai" {
+  secret_id = "llm-key-openai"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "llm_key_anthropic" {
+  secret_id = "llm-key-anthropic"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "llm_key_google" {
+  secret_id = "llm-key-google"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "llm_key_mistral" {
+  secret_id = "llm-key-mistral"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# Additional first-class provider key secrets (10-provider support; populated by
+# gcp-deploy.sh). The proxy SA reads these via the Secret Manager client at runtime — the
+# project-level secretmanager.secretAccessor binding (proxy_secret_accessor) already covers
+# them, so no per-secret IAM is required.
+resource "google_secret_manager_secret" "llm_key_extra" {
+  for_each  = toset(["gemini", "cohere", "deepseek", "xai", "groq", "azure", "openrouter", "opencode"])
+  secret_id = "llm-key-${each.key}"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# AWS Bedrock uses SigV4 credentials (no single bearer key). litellm reads them from the
+# environment, so the proxy deploy mounts these as env vars (see gcp-deploy.sh proxy
+# --set-secrets / --set-env-vars). Optional — only populate if you route to Bedrock.
+resource "google_secret_manager_secret" "aws_access_key_id" {
+  secret_id = "aws-access-key-id"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "aws_secret_access_key" {
+  secret_id = "aws-secret-access-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# RouteLLM OpenAI API key (required for embeddings by mf/sw_ranking routers)
+resource "google_secret_manager_secret" "routellm_openai_key" {
+  secret_id = "routellm-openai-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# Langfuse API keys (populated by gcp-deploy.sh after first deploy)
+resource "google_secret_manager_secret" "langfuse_public_key" {
+  secret_id = "langfuse-public-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "langfuse_secret_key" {
+  secret_id = "langfuse-secret-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# Grafana admin password
+resource "google_secret_manager_secret" "grafana_admin_password" {
+  secret_id = "grafana-admin-password"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# Langfuse NEXTAUTH_SECRET
+resource "google_secret_manager_secret" "langfuse_nextauth_secret" {
+  secret_id = "langfuse-nextauth-secret"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# NOTE: OpenMeter API key secret moved to infra/commercial.tf (open-core split,
+# item 11) — billing's OpenMeter push is a commercial-layer integration.
+
+# ─── Billing: usage_events Cloud SQL table migration ─────────────────────────
+# Applied once against the Cloud SQL Postgres instance via a null_resource
+# provisioner so no state is kept in Cloud SQL itself.
+resource "null_resource" "billing_schema_migration" {
+  triggers = {
+    schema_version = "1"
+  }
+
+  # PGPASSWORD is required so psql (invoked by gcloud sql connect) does not
+  # prompt interactively — without it terraform apply hangs indefinitely.
+  # We fetch the password from Secret Manager at apply time.
+  provisioner "local-exec" {
+    command = <<-SHELL
+      DB_PASS=$(gcloud secrets versions access latest \
+        --secret="${google_secret_manager_secret.db_password.secret_id}" \
+        --project="${var.project_id}" 2>/dev/null)
+      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
+        --user=token_opt_app \
+        --database=token_opt \
+        --quiet <<'EOSQL'
+CREATE TABLE IF NOT EXISTS usage_events (
+  id             BIGSERIAL PRIMARY KEY,
+  tenant_id      TEXT        NOT NULL,
+  request_id     TEXT        NOT NULL UNIQUE,
+  timestamp      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  baseline_tokens   INT     NOT NULL DEFAULT 0,
+  optimised_tokens  INT     NOT NULL DEFAULT 0,
+  tokens_saved      INT     NOT NULL DEFAULT 0,
+  cost_saved_usd    NUMERIC(12,8) NOT NULL DEFAULT 0,
+  groups_applied    TEXT[]  NOT NULL DEFAULT '{}',
+  pricing_tier      TEXT    NOT NULL DEFAULT 'basic'
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_id
+  ON usage_events (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp
+  ON usage_events (timestamp DESC);
+EOSQL
+    SHELL
+  }
+
+  depends_on = [
+    google_sql_database.proxy,
+    google_sql_user.app_user,
+    google_secret_manager_secret_version.db_password,
+  ]
+}
+
+# ─── E2: tenant_configs Cloud SQL table migration ────────────────────────────
+resource "null_resource" "tenant_configs_schema_migration" {
+  triggers = {
+    schema_version = "1"
+  }
+
+  provisioner "local-exec" {
+    command = <<-SHELL
+      DB_PASS=$(gcloud secrets versions access latest \
+        --secret="${google_secret_manager_secret.db_password.secret_id}" \
+        --project="${var.project_id}" 2>/dev/null)
+      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
+        --user=token_opt_app \
+        --database=token_opt \
+        --quiet <<'EOSQL'
+CREATE TABLE IF NOT EXISTS tenant_configs (
+  tenant_id        TEXT        PRIMARY KEY,
+  config_overrides JSONB       NOT NULL DEFAULT '{}',
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+EOSQL
+    SHELL
+  }
+
+  depends_on = [
+    google_sql_database.proxy,
+    google_sql_user.app_user,
+    google_secret_manager_secret_version.db_password,
+    null_resource.billing_schema_migration,
+  ]
+}
+
+# ─── F2: audit_events Cloud SQL table migration + INSERT-only role ───────────
+resource "null_resource" "audit_events_schema_migration" {
+  triggers = {
+    schema_version = "1"
+  }
+
+  provisioner "local-exec" {
+    command = <<-SHELL
+      DB_PASS=$(gcloud secrets versions access latest \
+        --secret="${google_secret_manager_secret.db_password.secret_id}" \
+        --project="${var.project_id}" 2>/dev/null)
+      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
+        --user=token_opt_app \
+        --database=token_opt \
+        --quiet <<'EOSQL'
+CREATE TABLE IF NOT EXISTS audit_events (
+  id             BIGSERIAL    PRIMARY KEY,
+  tenant_id      TEXT         NOT NULL,
+  request_id     TEXT         NOT NULL,
+  timestamp      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  action         TEXT         NOT NULL DEFAULT 'proxy_request',
+  user_id        TEXT,
+  groups_applied TEXT[]       NOT NULL DEFAULT '{}',
+  tokens_saved   INT          NOT NULL DEFAULT 0,
+  otel_trace_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_id
+  ON audit_events (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp
+  ON audit_events (timestamp DESC);
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT FROM pg_roles WHERE rolname = 'proxy_audit_role'
+  ) THEN
+    CREATE ROLE proxy_audit_role;
+  END IF;
+END $$;
+REVOKE ALL ON audit_events FROM proxy_audit_role;
+GRANT INSERT ON audit_events TO proxy_audit_role;
+EOSQL
+    SHELL
+  }
+
+  depends_on = [
+    google_sql_database.proxy,
+    google_sql_user.app_user,
+    google_secret_manager_secret_version.db_password,
+    null_resource.billing_schema_migration,
+  ]
+}
+
+# ─── I2: Row-Level Security policies on the tenant tables (defense-in-depth) ──
+resource "null_resource" "rls_policies_migration" {
+  triggers = {
+    schema_version = "1"
+    sql_sha        = filesha256("${path.module}/migrations/rls_policies.sql")
+  }
+
+  provisioner "local-exec" {
+    command = <<-SHELL
+      DB_PASS=$(gcloud secrets versions access latest \
+        --secret="${google_secret_manager_secret.db_password.secret_id}" \
+        --project="${var.project_id}" 2>/dev/null)
+      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
+        --user=token_opt_app \
+        --database=token_opt \
+        --quiet < "${path.module}/migrations/rls_policies.sql"
+    SHELL
+  }
+
+  depends_on = [
+    null_resource.audit_events_schema_migration,
+  ]
+}
+
+# NOTE: SLA alert rules (sla_alert_rules → alert_rules.yaml) moved to
+# infra/commercial.tf (open-core split, item 11/35) — SLA alerting is PAID.
+
+# ─── Service Accounts ────────────────────────────────────────────────────────
+resource "google_service_account" "proxy_sa" {
+  account_id   = "token-opt-proxy-sa"
+  display_name = "Token Optimisation Proxy"
+}
+
+resource "google_project_iam_member" "proxy_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+resource "google_project_iam_member" "proxy_storage_admin" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+resource "google_project_iam_member" "proxy_cloudsql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+
+resource "google_project_iam_member" "proxy_run_invoker" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# ─── Memorystore Redis (G5 cache, G10 state, G13 streams, G18 turn KPI) ──────
+resource "google_project_service" "redis_api" {
+  service            = "redis.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_redis_instance" "cache" {
+  name           = "token-opt-redis"
+  tier           = var.redis_tier
+  memory_size_gb = var.redis_memory_size_gb
+  region         = var.region
+
+  redis_version = "REDIS_7_0"
+
+  labels = {
+    environment = var.environment
+    component   = "token-opt"
+  }
+
+  depends_on = [google_project_service.redis_api]
+}
+
+# ─── Qdrant (G03 doc-pipeline ingestion, G07 hybrid search) ──────────────────
+resource "google_cloud_run_v2_service" "qdrant" {
+  name     = "token-opt-qdrant"
+  location = var.region
+  ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  template {
+    service_account = google_service_account.proxy_sa.email
+
+    containers {
+      image = var.qdrant_image
+
+      ports {
+        container_port = 6333
+      }
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# ─── RouteLLM Sidecar Service Account ───────────────────────────────────────
+resource "google_service_account" "routellm_sa" {
+  account_id   = "routellm-sidecar-sa"
+  display_name = "RouteLLM Sidecar"
+}
+
+resource "google_secret_manager_secret_iam_member" "routellm_secret_accessor" {
+  secret_id = google_secret_manager_secret.routellm_openai_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.routellm_sa.email}"
+}
+
+resource "google_project_iam_member" "routellm_run_invoker" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.routellm_sa.email}"
+}
+
+# Allow the proxy service account to act-as the routellm service account
+# Required for: gcloud run deploy --service-account=routellm-sidecar-sa
+resource "google_service_account_iam_member" "proxy_sa_acts_as_routellm_sa" {
+  service_account_id = google_service_account.routellm_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# ─── Prometheus OSS (Cloud Run v2) ─────────────────────────────────────────
+
+locals {
+  prom_proxy_host        = var.proxy_service_url != "" ? trimprefix(trimprefix(var.proxy_service_url, "https://"), "http://") : "localhost:9090"
+  prom_alertmanager_host = var.alertmanager_url != "" ? trimprefix(trimprefix(var.alertmanager_url, "https://"), "http://") : "localhost:9093"
+
+  prometheus_config = templatefile("${path.module}/prometheus.yml.tmpl", {
+    proxy_host          = local.prom_proxy_host
+    environment         = var.environment
+    alertmanager_host   = local.prom_alertmanager_host
+    metrics_scrape_token = var.metrics_scrape_token
+  })
+}
+
+resource "google_secret_manager_secret" "prometheus_config" {
+  secret_id = "token-opt-prometheus-config"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "prometheus_config" {
+  secret      = google_secret_manager_secret.prometheus_config.id
+  secret_data = local.prometheus_config
+}
+
+# H2: bearer token guarding the proxy's /metrics endpoint. The proxy reads it via
+# --set-secrets METRICS_SCRAPE_TOKEN; Prometheus presents it in its scrape config
+# (rendered from var.metrics_scrape_token above). A version is only created when a
+# token is configured — otherwise gcp-deploy.sh leaves /metrics open.
+resource "google_secret_manager_secret" "metrics_scrape_token" {
+  secret_id = "token-opt-metrics-scrape-token"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "metrics_scrape_token" {
+  count       = var.metrics_scrape_token != "" ? 1 : 0
+  secret      = google_secret_manager_secret.metrics_scrape_token.id
+  secret_data = var.metrics_scrape_token
+}
+
+resource "google_secret_manager_secret" "prometheus_alerts" {
+  secret_id = "token-opt-prometheus-alerts"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "prometheus_alerts" {
+  secret      = google_secret_manager_secret.prometheus_alerts.id
+  secret_data = file("${path.module}/prometheus-alerts.yml")
+}
+
+resource "google_cloud_run_v2_service" "prometheus" {
+  name     = "token-opt-prometheus"
+  location = var.region
+  ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  template {
+    service_account = google_service_account.proxy_sa.email
+
+    containers {
+      image = "prom/prometheus:v2.53.0"
+
+      ports {
+        container_port = 9090
+      }
+
+      args = [
+        "--config.file=/secrets/prometheus/prometheus.yml",
+        "--storage.tsdb.retention.time=${var.prometheus_retention}",
+        "--web.enable-lifecycle",
+        "--enable-feature=remote-write-receiver",
+        "--web.listen-address=0.0.0.0:9090",
+        "--storage.tsdb.path=/tmp/prometheus",
+      ]
+
+      startup_probe {
+        initial_delay_seconds = 5
+        timeout_seconds       = 5
+        period_seconds        = 10
+        failure_threshold     = 30
+        tcp_socket {
+          port = 9090
+        }
+      }
+
+      volume_mounts {
+        name       = "prometheus-config"
+        mount_path = "/secrets/prometheus"
+      }
+      volume_mounts {
+        name       = "prometheus-alerts"
+        mount_path = "/secrets/alerts"
+      }
+    }
+
+    volumes {
+      name = "prometheus-config"
+      secret {
+        secret = google_secret_manager_secret.prometheus_config.secret_id
+        items {
+          version = "latest"
+          path    = "prometheus.yml"
+        }
+      }
+    }
+    volumes {
+      name = "prometheus-alerts"
+      secret {
+        secret = google_secret_manager_secret.prometheus_alerts.secret_id
+        items {
+          version = "latest"
+          path    = "prometheus-alerts.yml"
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.apis,
+    google_secret_manager_secret_version.prometheus_config,
+    google_secret_manager_secret_version.prometheus_alerts,
+    google_project_iam_member.proxy_secret_accessor,
+    google_secret_manager_secret_iam_member.prometheus_config_accessor,
+    google_secret_manager_secret_iam_member.prometheus_alerts_accessor,
+  ]
+}
+
+# ─── Alertmanager OSS (Cloud Run v2) ────────────────────────────────────────
+
+resource "google_secret_manager_secret" "alertmanager_config" {
+  secret_id = "token-opt-alertmanager-config"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "alertmanager_config" {
+  secret      = google_secret_manager_secret.alertmanager_config.id
+  secret_data = <<EOF
+global:
+  resolve_timeout: ${var.alertmanager_resolve_timeout}
+
+route:
+  group_by: ['alertname', 'team', 'feature']
+  group_wait: ${var.alertmanager_group_wait}
+  group_interval: ${var.alertmanager_group_interval}
+  repeat_interval: ${var.alertmanager_repeat_interval}
+  receiver: 'default'
+
+receivers:
+  - name: 'default'
+    webhook_configs:
+      - url: '${var.alert_webhook_url != "" ? var.alert_webhook_url : (var.proxy_service_url != "" ? "${var.proxy_service_url}/admin/alert-webhook" : "http://localhost:8000/admin/alert-webhook")}'
+        send_resolved: true
+EOF
+}
+
+resource "google_cloud_run_v2_service" "alertmanager" {
+  name     = "token-opt-alertmanager"
+  location = var.region
+  ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  template {
+    service_account = google_service_account.proxy_sa.email
+
+    containers {
+      image = "prom/alertmanager:v0.27.0"
+
+      ports {
+        container_port = 9093
+      }
+
+      args = concat(
+        [
+          "--config.file=/secrets/alertmanager/alertmanager.yml",
+          "--storage.path=/tmp/alertmanager",
+          "--web.listen-address=0.0.0.0:9093",
+        ],
+        var.alertmanager_url != "" ? ["--web.external-url=${var.alertmanager_url}"] : []
+      )
+
+      volume_mounts {
+        name       = "alertmanager-config"
+        mount_path = "/secrets/alertmanager"
+      }
+    }
+
+    volumes {
+      name = "alertmanager-config"
+      secret {
+        secret = google_secret_manager_secret.alertmanager_config.secret_id
+        items {
+          version = "latest"
+          path    = "alertmanager.yml"
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.apis,
+    google_secret_manager_secret_version.alertmanager_config,
+    google_project_iam_member.proxy_secret_accessor,
+  ]
+}
+
+# Allow Grafana (if deployed in same project) to invoke Prometheus
+resource "google_cloud_run_v2_service_iam_member" "prometheus_grafana_invoker" {
+  location = var.region
+  name     = google_cloud_run_v2_service.prometheus.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Allow Prometheus to invoke Alertmanager
+resource "google_cloud_run_v2_service_iam_member" "alertmanager_prometheus_invoker" {
+  location = var.region
+  name     = google_cloud_run_v2_service.alertmanager.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Secret-level IAM bindings for Prometheus secret volume mounts
+resource "google_secret_manager_secret_iam_member" "prometheus_config_accessor" {
+  secret_id = google_secret_manager_secret.prometheus_config.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "prometheus_alerts_accessor" {
+  secret_id = google_secret_manager_secret.prometheus_alerts.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "alertmanager_config_accessor" {
+  secret_id = google_secret_manager_secret.alertmanager_config.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Note: Cloud Run v2 service deployment is done via gcp-deploy.sh script
+# This IAM binding allows the proxy to invoke the RouteLLM sidecar
+

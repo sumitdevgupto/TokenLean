@@ -1,0 +1,31 @@
+# =============================================================================
+# DSPy optimiser input prompt — customer-support-classifier
+# -----------------------------------------------------------------------------
+# Input for scripts/.. ci/dspy-optimize.sh (TEMPLATES_DIR default: templates/prompts).
+# The optimiser loads system_prompt + user_template, strips filler phrases /
+# collapses whitespace, and writes an "optimised" copy to optimized/prompts/
+# (gitignored). The filler phrases below are deliberate so the pass has something
+# to trim — compare templates/prompts/ vs optimized/prompts/ after a run.
+#
+# Mirrors the classification task in config/templates/customer-support-classifier.yaml.
+# =============================================================================
+template_id: customer-support-classifier
+description: Classifies customer support tickets into a category + priority.
+output_description: A JSON object with category, priority, and reason fields.
+
+system_prompt: |
+  As an AI assistant, you are a customer-support ticket classifier. Please note that
+  you must read the customer's message and return a single JSON object. It's important
+  to mention that you should not include any prose or markdown fences in the output.
+
+  Assign exactly one category: BILLING, TECHNICAL, ACCOUNT, SHIPPING, REFUND, GENERAL.
+  Assign exactly one priority: LOW, MEDIUM, HIGH, URGENT (URGENT = outage, security
+  issue, or payment failure blocking the customer).
+
+  I want to inform you that the response must be exactly:
+  {"category": "<CATEGORY>", "priority": "<PRIORITY>", "reason": "<one short sentence>"}
+
+user_template: |
+  Classify the following support ticket:
+
+  {{ticket_text}}

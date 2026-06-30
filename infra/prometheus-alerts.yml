@@ -1,0 +1,119 @@
+groups:
+  - name: token_opt_budgets
+    interval: 1m
+    rules:
+      # Recording rules: daily budget accumulation per team/feature
+      - record: token_opt:cost_usd_daily:team_feature
+        expr: |
+          sum by (team, feature) (
+            increase(token_opt_cost_usd_total[1d])
+          )
+
+      - record: token_opt:prompt_tokens_daily:team_feature
+        expr: |
+          sum by (team, feature) (
+            increase(token_opt_prompt_tokens_total[1d])
+          )
+
+      - record: token_opt:completion_tokens_daily:team_feature
+        expr: |
+          sum by (team, feature) (
+            increase(token_opt_completion_tokens_total[1d])
+          )
+
+      - record: token_opt:reasoning_tokens_daily:team_feature
+        expr: |
+          sum by (team, feature) (
+            increase(token_opt_reasoning_tokens_total[1d])
+          )
+
+      # Recording rules: per-user request and cost aggregations
+      - record: token_opt:requests_daily:user
+        expr: |
+          sum by (user_id) (
+            increase(token_opt_requests_total[1d])
+          )
+
+      - record: token_opt:cost_usd_daily:user
+        expr: |
+          sum by (user_id) (
+            increase(token_opt_cost_usd_total[1d])
+          )
+
+      - record: token_opt:requests_hourly:user
+        expr: |
+          sum by (user_id) (
+            increase(token_opt_requests_total[1h])
+          )
+
+      # Alert rules: budget breach (default threshold $100/day; override via config)
+      - alert: TokenOptDailyCostBudgetExceeded
+        expr: |
+          token_opt:cost_usd_daily:team_feature
+          > 100
+        for: 5m
+        labels:
+          severity: warning
+          category: budget
+        annotations:
+          summary: "Daily cost budget exceeded for team={{ $labels.team }} feature={{ $labels.feature }}"
+          description: "Daily cost ${{ $value }} exceeds $100 budget threshold (adjust via config) "
+
+      - alert: TokenOptDailyTokenBudgetExceeded
+        expr: |
+          (token_opt:prompt_tokens_daily:team_feature + token_opt:completion_tokens_daily:team_feature)
+          > 1000000
+        for: 5m
+        labels:
+          severity: warning
+          category: budget
+        annotations:
+          summary: "Daily token budget exceeded for team={{ $labels.team }} feature={{ $labels.feature }}"
+          description: "Daily tokens {{ $value }} exceeds 1M budget threshold"
+
+      # Reasoning token alert (G12)
+      - alert: TokenOptHighReasoningTokenRatio
+        expr: |
+          (
+            sum by (team, feature) (increase(token_opt_reasoning_tokens_total[1d]))
+            /
+            sum by (team, feature) (increase(token_opt_completion_tokens_total[1d]))
+          ) > 0.5
+          and
+          sum by (team, feature) (increase(token_opt_completion_tokens_total[1d])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          category: reasoning
+        annotations:
+          summary: "High reasoning token ratio for team={{ $labels.team }} feature={{ $labels.feature }}"
+          description: "Reasoning tokens are {{ $value | humanizePercentage }} of completion tokens — consider reducing reasoning_effort"
+
+      # Turn efficiency alert (leverages G18 turn efficiency baseline tracking)
+      - alert: TokenOptTurnEfficiencyBreach
+        expr: |
+          rate(token_opt_turn_efficiency_alerts_total[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: critical
+          category: loop_pathology
+        annotations:
+          summary: "Turn efficiency alerts exceeding baseline"
+          description: "Turn efficiency alert rate {{ $value }}/s indicates possible loop pathology"
+
+      # Cache hit rate degradation (G5 health)
+      # Denominator: total requests (token_opt_requests_total), same unit as cache hit events
+      - alert: TokenOptCacheHitRateLow
+        expr: |
+          (
+            sum(rate(token_opt_cache_hits_total[5m]))
+            /
+            sum(rate(token_opt_requests_total[5m]))
+          ) < 0.1
+        for: 15m
+        labels:
+          severity: info
+          category: cache_health
+        annotations:
+          summary: "Cache hit rate below 10%"
+          description: "Cache hit rate {{ $value | humanizePercentage }} — consider reviewing cache TTL or similarity thresholds"

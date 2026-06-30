@@ -1,0 +1,56 @@
+name: Bug Report
+description: Report a problem with the proxy or an optimisation group
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug! Please do **not** include API keys, secrets, or
+        raw customer data. For security vulnerabilities, see SECURITY.md instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: "When I send X through the proxy, Y happens; I expected Z."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps (request, config, command) to reproduce.
+      placeholder: |
+        1. Config: `groups.G05_cache.enabled: true`
+        2. Send request: ...
+        3. Observe: ...
+    validations:
+      required: true
+  - type: input
+    id: group
+    attributes:
+      label: Optimisation group(s) involved
+      description: If known, which G-group(s)? (e.g. G01, G05, G21)
+      placeholder: "G05"
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Deployment (local Docker / GCP Cloud Run), proxy version/commit, Python version.
+      placeholder: |
+        - Deployment: local Docker Compose
+        - Commit: abc1234
+        - Python: 3.12
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste logs or stack traces (redact any secrets). Will be formatted as code.
+      render: shell
+    validations:
+      required: false

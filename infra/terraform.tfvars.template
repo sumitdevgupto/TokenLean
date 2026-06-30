@@ -1,0 +1,26 @@
+# Rename this file to terraform.tfvars and fill in your values.
+# SAFE TO COMMIT (this template) — terraform.tfvars is gitignored.
+
+project_id             = "YOUR_GCP_PROJECT_ID"
+region                 = "asia-south1"
+db_tier                = "db-g1-small"       # upgrade to db-n1-standard-2 for production
+redis_tier             = "BASIC"             # upgrade to STANDARD_HA for production
+redis_memory_size_gb   = 1                  # upgrade to 2+ for production
+artifact_registry_repo = "token-opt"
+config_bucket_name     = ""                  # leave empty to auto-generate
+
+# ── Set automatically by gcp-deploy.sh post-deploy (patch_prometheus step) ───
+# Leave blank on first deploy — the script fills these in after Cloud Run URLs are known.
+proxy_service_url      = ""                  # e.g. https://token-proxy-xxxx-uc.a.run.app
+alertmanager_url       = ""                  # e.g. https://alertmanager-xxxx-uc.a.run.app
+
+# ── Alertmanager webhook override (optional) ───────────────────────────────────
+# When set, overrides the auto-derived proxy_service_url/admin/alert-webhook endpoint.
+alert_webhook_url      = ""
+
+# ── Observability tuning ───────────────────────────────────────────────────────
+prometheus_retention              = "15d"   # e.g. 30d for production
+alertmanager_resolve_timeout      = "5m"
+alertmanager_group_wait           = "10s"
+alertmanager_group_interval       = "10s"
+alertmanager_repeat_interval      = "12h"

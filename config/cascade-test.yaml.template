@@ -1,0 +1,41 @@
+# Cascade Validation Test Configuration — TEMPLATE
+# =============================================================================
+# Used by scripts/validate-cascade.py to tune the G6 cascade confidence
+# threshold against a ground-truth dataset.
+#
+# Setup:
+#   cp config/cascade-test.yaml.template config/cascade-test.yaml
+#   # then edit tiers / judge_model / pricing to match your proxy config
+#
+# The validation script reads G6_routing.tiers (simple = tier-1 cheap model,
+# complex = tier-3 expensive model) and judge_model. It sweeps the confidence
+# threshold itself, so the value below is only a placeholder for single tests.
+# =============================================================================
+
+G6_routing:
+  enabled: true
+  classifier: cascade
+  cascade_execution: true
+
+  tiers:
+    simple: ["gpt-4o-mini"]    # tier-1: cheap model tried first
+    medium: ["gpt-4o"]
+    complex: ["gpt-4-5"]       # tier-3: expensive model on escalation
+
+  # Judge model used to score tier-1 answers vs expected (medium-tier = good
+  # cost/quality balance). Make real LLM calls — keep validation sets small.
+  judge_model: "gpt-4o-mini"
+
+  # Placeholder threshold for single tests; validate-cascade.py overrides this
+  # with its own sweep: [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.95]
+  cascade_confidence_threshold: 0.85
+  max_escalation_cost_usd: 0.02
+
+  routellm:
+    enabled: false  # validation uses the cascade classifier, not RouteLLM
+
+# Pricing for cost calculations — must match your proxy config.yaml pricing.
+pricing:
+  gpt-4o-mini: { input: 0.00015, output: 0.0006 }
+  gpt-4o: { input: 0.005, output: 0.015 }
+  gpt-4-5: { input: 0.075, output: 0.15 }

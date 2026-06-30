@@ -1,0 +1,359 @@
+{
+  "title": "Token Optimisation - Pitch Comparison",
+  "uid": "token-opt-pitch",
+  "tags": [
+    "token-optimisation",
+    "pitch"
+  ],
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Simple - FAQ Bot % Reduction",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'model_requested' = 'gpt-4o-mini' OR metadata->>'model' = 'gpt-4o-mini')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "yellow",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 20
+              }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Medium - Doc Q&A % Reduction",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'x_rag_collection' IS NOT NULL OR metadata->>'rag_collection' IS NOT NULL)",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "yellow",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 25
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Complex - Code Agent % Reduction",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'model_requested' = 'gpt-4o' OR metadata->>'model' = 'gpt-4o') AND (metadata->>'x_rag_collection') IS NULL",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "yellow",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 30
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "type": "barchart",
+      "title": "Baseline vs Optimized - Tokens per Run",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 14,
+        "h": 9
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'user_id' AS run_type, ROUND(AVG((metadata->>'baseline_tokens')::float)) AS avg_baseline_tokens, ROUND(AVG((metadata->>'final_tokens_sent')::float)) AS avg_final_tokens FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "barWidth": 0.7,
+        "groupWidth": 0.7
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Total Cost Saved (All 3 Optimized Runs)",
+      "gridPos": {
+        "x": 14,
+        "y": 5,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,6) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized'",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Cache Hits (Optimized Runs)",
+      "gridPos": {
+        "x": 19,
+        "y": 5,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'cache_hit')::boolean = true",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "barchart",
+      "title": "G-Group Savings Contribution (Optimized Runs)",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 14,
+        "h": 9
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT key AS g_group, SUM((value->>'abs_saving')::int) AS tokens_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE metadata->>'user_id' = 'pitch-optimized' AND (value->>'abs_saving')::int > 0 GROUP BY 1 ORDER BY tokens_saved DESC",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "barWidth": 0.7
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Per-Step Breakdown - All Optimized Runs",
+      "gridPos": {
+        "x": 14,
+        "y": 9,
+        "w": 10,
+        "h": 14
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT id AS request_id, created_at::time(0) AS time, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline, (metadata->>'final_tokens_sent')::int AS final, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' ORDER BY created_at DESC LIMIT 10",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Waterfall - Step Savings per Optimized Call",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT t.id AS request_id, t.metadata->>'model_requested' AS model, s.key AS g_group, (s.value->>'abs_saving')::int AS tokens_saved, ROUND((s.value->>'pct_saving_vs_baseline')::numeric,1) AS pct_of_baseline, s.value->>'description' AS description FROM traces t, jsonb_each(t.metadata->'step_savings') s WHERE t.metadata->>'user_id' = 'pitch-optimized' AND (s.value->>'abs_saving')::int > 0 ORDER BY t.created_at DESC, s.key",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Side-by-Side - Last 6 Runs (Baseline + Optimized)",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'user_id' AS run_type, created_at, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline_tokens, (metadata->>'final_tokens_sent')::int AS final_tokens, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved_usd, (metadata->>'cache_hit')::boolean AS cache_hit, metadata->>'routed_model' AS routed_model FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') ORDER BY created_at DESC LIMIT 6",
+          "format": "table"
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Pitch Test Runs",
+        "datasource": {
+          "uid": "langfuse-postgres"
+        },
+        "rawQuery": "SELECT created_at AS time, (metadata->>'user_id') || ' - ' || metadata->>'model_requested' AS text FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') ORDER BY created_at",
+        "enable": true,
+        "iconColor": "blue"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  }
+}

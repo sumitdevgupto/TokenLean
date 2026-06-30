@@ -1,0 +1,257 @@
+{
+  "title": "Token Savings - Hourly",
+  "uid": "token-opt-hourly",
+  "tags": [
+    "token-optimisation"
+  ],
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Requests / min (live)",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_requests_total{tenant_id=~\"$tenant\"}[1m])) * 60",
+          "legendFormat": "all users"
+        },
+        {
+          "expr": "sum by (team) (rate(token_opt_requests_total{tenant_id=~\"$tenant\"}[1m])) * 60",
+          "legendFormat": "{{team}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Requests / sec (now)",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_requests_total{tenant_id=~\"$tenant\"}[1m]))",
+          "legendFormat": "req/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Cache Hit Rate (live)",
+      "gridPos": {
+        "x": 8,
+        "y": 3,
+        "w": 4,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_cache_hits_total[5m])) / sum(rate(token_opt_requests_total[5m])) * 100",
+          "legendFormat": "hit rate %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Call Volume per Hour",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('hour', created_at) AS time, COUNT(*) AS calls FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND created_at >= NOW() - INTERVAL '24 hours' AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Tokens Saved per Hour",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('hour', created_at) AS time, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND created_at >= NOW() - INTERVAL '24 hours' AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Cost Saved per Hour (USD)",
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('hour', created_at) AS time, SUM((metadata->>'cost_saving_usd')::float) AS cost_saved FROM traces WHERE created_at >= NOW() - INTERVAL '24 hours' AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 6
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Cache Hit Rate per Hour (%)",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('hour', created_at) AS time, ROUND(100.0 * SUM(CASE WHEN (metadata->>'cache_hit')::boolean THEN 1 ELSE 0 END) / COUNT(*), 1) AS cache_hit_pct FROM traces WHERE created_at >= NOW() - INTERVAL '24 hours' GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Top Savers by User (Last Hour)",
+      "gridPos": {
+        "x": 12,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'user_id' AS user_id, COUNT(*) AS calls, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved, ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS avg_pct_saving, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric, 4) AS cost_saved_usd FROM traces WHERE created_at >= NOW() - INTERVAL '1 hour' GROUP BY 1 ORDER BY tokens_saved DESC LIMIT 20",
+          "format": "table"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "user_id",
+        "type": "query",
+        "label": "User",
+        "datasource": {
+          "uid": "langfuse-postgres"
+        },
+        "query": "SELECT DISTINCT metadata->>'user_id' FROM traces WHERE created_at >= NOW() - INTERVAL '24 hours' ORDER BY 1",
+        "current": {
+          "value": "All",
+          "text": "All"
+        },
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false,
+        "refresh": 2
+      },
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  }
+}

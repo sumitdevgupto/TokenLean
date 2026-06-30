@@ -1,0 +1,22 @@
+# ── OpenTelemetry tracing configuration ───────────────────────────────────────
+# Copy to config/params/tracing.yaml and fill in values.
+# All keys are merged under ctx.config["tracing"] at proxy startup.
+#
+# OSS stack: opentelemetry-sdk (Apache-2) + Jaeger (Apache-2)
+
+tracing:
+  # Enable OpenTelemetry pipeline tracing.  When false, all span calls are no-ops.
+  enabled: true
+
+  # OTLP gRPC endpoint for the OTel collector / Jaeger.
+  # Override with OTEL_EXPORTER_OTLP_ENDPOINT env var.
+  otlp_endpoint: "http://jaeger:4317"
+
+  # Service name reported to Jaeger / Tempo.
+  service_name: "token-opt-proxy"
+
+  # Propagate trace ID as X-Trace-ID response header.
+  propagate_trace_id_header: true
+
+  # Sampling ratio (1.0 = 100%, 0.1 = 10%).  Use 1.0 in dev, lower in prod.
+  sample_rate: 1.0

@@ -1,0 +1,23 @@
+apiVersion: 1
+
+# Application database (token_opt) — holds usage_events written by the proxy's
+# UsageMeter. Separate from the langfuse DB; Postgres cannot cross-query
+# databases, so billing / tenant-overview / SLA savings panels need this.
+datasources:
+  - name: AppDB
+    type: postgres
+    uid: app-postgres
+    url: ${LANGFUSE_DB_HOST}:5432
+    database: token_opt
+    user: ${LANGFUSE_DB_USER}
+    secureJsonData:
+      password: ${LANGFUSE_DB_PASSWORD}
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+      postgresVersion: 1500
+      timescaledb: false
+    isDefault: false
+    editable: false

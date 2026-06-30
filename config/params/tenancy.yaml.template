@@ -1,0 +1,34 @@
+# ── Tenancy configuration ──────────────────────────────────────────────────────
+# Copy to config/params/tenancy.yaml and fill in values.
+# All keys in this file are merged under ctx.config["tenancy"] at proxy startup.
+
+tenancy:
+  # Enable multi-tenant isolation.  When false, all requests use the "default"
+  # tenant context with no Redis/Qdrant namespacing.
+  enabled: true
+
+  # Enable per-tenant config overrides loaded from Postgres `tenant_configs` table.
+  # When true, TenantConfigLoader merges per-tenant JSON overrides into ctx.config
+  # at request time (cached for config_cache_ttl_seconds).
+  per_tenant_config_enabled: true
+
+  # Where per-tenant config overrides are stored (postgres table name).
+  # Overrides are merged into ctx.config at request time (60 s cache).
+  tenant_configs_table: tenant_configs
+
+  # TTL for the in-process per-tenant config cache (seconds).
+  config_cache_ttl_seconds: 60
+
+  # Fallback tenant ID used when no X-Tenant-ID header and no API key match.
+  default_tenant_id: default
+
+  # Default pricing tier for tenants not explicitly registered.
+  # Allowed values: basic | pro | enterprise
+  default_tier: basic
+
+  # Redis key namespace template.  {tenant_id} is substituted at runtime.
+  # Default "t:{tenant_id}:" prefixes all cache keys.  Set to "" to disable.
+  redis_prefix_template: "t:{tenant_id}:"
+
+  # Qdrant collection name template.  {tenant_id} is substituted at runtime.
+  qdrant_collection_template: "rag_{tenant_id}"

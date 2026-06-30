@@ -1,0 +1,41 @@
+# Test cases for the customer-support-classifier prompt.
+# Each provides a ticket and asserts the classifier picks a sensible category.
+# The structural JSON-shape + enum check lives in defaultTest (promptfoo-config.yaml).
+# `output` is the model's raw text response (expected to be the JSON object).
+
+- description: Billing — duplicate subscription charge
+  vars:
+    ticket_text: >-
+      I was billed 49 USD twice for my Pro plan this month. I only have one
+      account and didn't upgrade anything. Please refund the duplicate charge.
+  assert:
+    # A duplicate-charge refund request is reasonably BILLING or REFUND.
+    - type: javascript
+      value: "['BILLING','REFUND'].includes(JSON.parse(output).category)"
+
+- description: Technical — API outage
+  vars:
+    ticket_text: >-
+      Since this morning every call to your API returns HTTP 500 and our
+      production integration is completely down. Nothing changed on our side.
+  assert:
+    - type: javascript
+      value: JSON.parse(output).category === 'TECHNICAL'
+
+- description: Account — cannot log in
+  vars:
+    ticket_text: >-
+      I can't log into my account. I requested a password reset three times but
+      the reset email never arrives, and yes I have checked my spam folder.
+  assert:
+    - type: javascript
+      value: JSON.parse(output).category === 'ACCOUNT'
+
+- description: Shipping — delayed delivery
+  vars:
+    ticket_text: >-
+      Where is my order? The tracking page hasn't updated in five days and the
+      package was supposed to arrive last Monday.
+  assert:
+    - type: javascript
+      value: JSON.parse(output).category === 'SHIPPING'

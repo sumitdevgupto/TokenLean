@@ -1,0 +1,327 @@
+{
+  "title": "Token Savings - Per Call",
+  "uid": "token-opt-per-call",
+  "tags": [
+    "token-optimisation"
+  ],
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 11,
+      "type": "text",
+      "title": "Cost disclosure (read me)",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Cost figures are config-priced estimates - directional, not invoice-grade.** Dollar values = token counts x a static pricing table; they exclude negotiated discounts, provider-side prompt caching, batch/reasoning surcharges, and currency effects. baseline_* is a counterfactual. **Token-count savings are measured; dollar figures are estimates.** Provider-reconciled billing is a separate (non-OSS) concern."
+      },
+      "transparent": true
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Tokens Saved",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT (metadata->>'total_abs_saving')::int FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND id = '${request_id}' LIMIT 1",
+          "format": "table"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 0
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Savings %",
+      "gridPos": {
+        "x": 4,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT (metadata->>'total_pct_saving')::float FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND id = '${request_id}' LIMIT 1",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cost Saving (USD)",
+      "gridPos": {
+        "x": 8,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT (metadata->>'cost_saving_usd')::float FROM traces WHERE id = '${request_id}' LIMIT 1",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 6
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Model Routed",
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'routed_model' FROM traces WHERE id = '${request_id}' LIMIT 1",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Cache Hit",
+      "gridPos": {
+        "x": 16,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'cache_level' FROM traces WHERE id = '${request_id}' LIMIT 1",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "barchart",
+      "title": "Savings by G-Group (tokens)",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT key AS group, (value->>'abs_saving')::int AS tokens_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE id = '${request_id}' ORDER BY tokens_saved DESC",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Step-by-Step Savings Detail",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT key AS \"G-Group\", value->>'description' AS \"Description\", (value->>'tokens_before')::int AS \"Tokens Before\", (value->>'tokens_after')::int AS \"Tokens After\", (value->>'abs_saving')::int AS \"Saved\", (value->>'pct_saving_vs_baseline')::float AS \"% vs Baseline\" FROM traces, jsonb_each(metadata->'step_savings') WHERE id = '${request_id}' ORDER BY key",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "text",
+      "title": "Langfuse Trace",
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 2
+      },
+      "options": {
+        "content": "<a href=\"${LANGFUSE_HOST}/project/${project_id}/traces/${request_id}\" target=\"_blank\">Open trace in Langfuse UI</a>",
+        "mode": "html"
+      }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Child Observations (Spans)",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT name, type, start_time, end_time, (input::text) as input_summary, (output::text) as output_summary FROM observations WHERE trace_id = '${request_id}' ORDER BY start_time",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Evaluation Scores",
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT name, value, comment FROM scores WHERE trace_id = '${request_id}' ORDER BY name",
+          "format": "table"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "request_id",
+        "type": "textbox",
+        "label": "Request ID",
+        "current": {
+          "value": ""
+        }
+      },
+      {
+        "name": "project_id",
+        "type": "textbox",
+        "label": "Langfuse Project ID",
+        "description": "Found in Langfuse UI -> Settings -> Project ID",
+        "current": {
+          "value": "default"
+        }
+      },
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "description": "Cost figures are config-priced estimates (directional, not invoice-grade) - token savings are measured, dollar values are estimated."
+}

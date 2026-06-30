@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: token-opt
+    env: ${environment}
+
+rule_files:
+  - /secrets/alerts/prometheus-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - ${alertmanager_host}
+
+scrape_configs:
+  - job_name: token-opt-proxy
+    metrics_path: /metrics
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true
+    # H2: /metrics is gated by METRICS_SCRAPE_TOKEN on the proxy — present it here.
+    authorization:
+      type: Bearer
+      credentials: ${metrics_scrape_token}
+    static_configs:
+      - targets:
+          - ${proxy_host}
+        labels:
+          service: token-opt-proxy

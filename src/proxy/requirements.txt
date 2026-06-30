@@ -1,0 +1,28 @@
+litellm>=1.90.1,<2.0.0                       # MIT — pinned: floor at tested 1.90.1, cap pre-2.0 to avoid breaking changes
+boto3>=1.34.0                                # Apache-2.0 — AWS Bedrock provider lane (litellm `bedrock/`); pulls in botocore
+fastapi>=0.111.0                             # MIT
+uvicorn[standard]>=0.30.0                    # BSD-3-Clause
+httpx>=0.27.0                                # BSD-3-Clause
+pyyaml>=6.0.0                               # MIT
+redis[asyncio]>=5.0.0                        # MIT
+asyncpg>=0.29.0                              # Apache-2.0
+pgvector>=0.2.5                              # MIT
+google-cloud-storage>=2.16.0                 # Apache-2.0
+google-cloud-secret-manager>=2.20.0          # Apache-2.0
+google-cloud-tasks>=2.16.0                   # Apache-2.0
+google-cloud-run>=0.10.0                     # Apache-2.0
+langfuse>=2.7.0,<3.0.0                       # MIT
+opentelemetry-sdk>=1.25.0                    # Apache-2.0
+opentelemetry-exporter-otlp>=1.25.0          # Apache-2.0
+tiktoken>=0.7.0                              # MIT
+qdrant-client>=1.12,<1.13                    # Apache-2.0 — pinned to match Qdrant server v1.12.x (query_points/RRF API; avoids 1.18 skew)
+fastembed>=0.3.0                             # Apache-2.0
+sentence-transformers>=2.2.0                 # Apache-2.0
+prometheus-client>=0.20.0                    # Apache-2.0
+instructor>=1.3.0                            # MIT
+temporalio>=1.5.0                            # MIT
+
+# Optional deps — imported via try/except; install only when the feature is enabled
+headroom-ai>=0.27                            # Apache-2.0 (SmartCrusher/headroom.image APIs)
+mem0ai>=2.0.7                                # Apache-2.0
+zep-python>=2.0.2                            # Apache-2.0

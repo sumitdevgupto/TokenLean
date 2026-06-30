@@ -1,0 +1,245 @@
+{
+  "title": "Token Savings - Quarterly",
+  "uid": "token-opt-quarterly",
+  "tags": [
+    "token-optimisation"
+  ],
+  "schemaVersion": 38,
+  "refresh": "1h",
+  "time": {
+    "from": "now-1y",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Cumulative Tokens Saved (All Time)",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM((metadata->>'total_abs_saving')::int) FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Cumulative Cost Saved (All Time, USD)",
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,2) FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 6
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Avg Saving % (All Time)",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) FROM traces WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Total LLM Calls (All Time)",
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) FROM traces WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Quarterly Cumulative Cost Saved",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('quarter', created_at) AS time, SUM(SUM((metadata->>'cost_saving_usd')::float)) OVER (ORDER BY date_trunc('quarter', created_at)) AS cumulative_cost_saved FROM traces WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 6
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "barchart",
+      "title": "G-Group ROI Ranking (All Time)",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT key AS g_group, SUM((value->>'abs_saving')::int) AS total_tokens_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY total_tokens_saved DESC",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "barchart",
+      "title": "Quarterly Cost by User (Stacked)",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT to_char(date_trunc('quarter', created_at), 'YYYY-\"Q\"Q') AS quarter, metadata->>'user_id' AS user_id, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,2) AS cost_saved_usd FROM traces WHERE created_at >= NOW() - INTERVAL '1 year' GROUP BY date_trunc('quarter', created_at), 1, 2 ORDER BY date_trunc('quarter', created_at), cost_saved_usd DESC",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 6
+        }
+      },
+      "options": {
+        "stacking": "normal"
+      }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Quarterly Summary",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT to_char(date_trunc('quarter', created_at), 'YYYY-\"Q\"Q') AS quarter, COUNT(*) AS total_calls, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved, ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS avg_pct_saving, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,2) AS cost_saved_usd, COUNT(DISTINCT metadata->>'user_id') AS unique_users FROM traces WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1 DESC",
+          "format": "table"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "user_id",
+        "type": "query",
+        "label": "User",
+        "datasource": {
+          "uid": "langfuse-postgres"
+        },
+        "query": "SELECT DISTINCT metadata->>'user_id' FROM traces ORDER BY 1",
+        "current": {
+          "value": "All",
+          "text": "All"
+        },
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false,
+        "refresh": 2
+      },
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  }
+}

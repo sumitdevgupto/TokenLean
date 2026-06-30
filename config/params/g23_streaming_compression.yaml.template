@@ -1,0 +1,11 @@
+# G23 — Streaming Output Compression
+# Collapses repeated n-gram patterns in LLM responses to reduce context bloat
+# in subsequent multi-turn requests.  The compressed version is stored as
+# x_compressed_content in the response; the original is returned to the client.
+#
+# Copy to config/params/g23_streaming_compression.yaml and tune for your workload.
+
+G23_streaming_compression:
+  enabled: false          # set true to activate post-response compression
+  min_repeat: 3           # minimum repetitions of an n-gram before collapsing
+  ngram_size: 5           # word-count of each n-gram window to analyse

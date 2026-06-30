@@ -1,0 +1,15 @@
+# ── Audit logging configuration ────────────────────────────────────────────────
+# Copy to config/params/audit.yaml and fill in values.
+# Keys are merged under ctx.config["audit"] at proxy startup.
+
+audit:
+  # Enable immutable audit logging to Postgres `audit_events` table.
+  # Requires the `proxy_audit_role` INSERT-only Postgres role.
+  enabled: true
+
+  # Number of days to retain audit events.  Automated nightly cleanup removes
+  # rows older than this threshold via Cloud Scheduler + Cloud Run Job.
+  retention_days: 365
+
+  # Postgres table name for audit events.
+  table_name: audit_events

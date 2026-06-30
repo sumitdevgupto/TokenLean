@@ -1,0 +1,27 @@
+Token Optimisation Framework
+Copyright 2026 Sumit Gupto
+
+This product is licensed under the Apache License, Version 2.0 (the "License").
+You may not use this product except in compliance with the License. A copy of
+the License is provided in the LICENSE file and at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied.
+
+------------------------------------------------------------------------------
+
+This product depends on, integrates with, and (in its self-hosted deployment)
+bundles third-party open-source software. Their copyright and license terms are
+documented in:
+
+  * THIRD_PARTY_LICENSES.md   — bundled OSS services, sidecars, and models run
+                                alongside the proxy (Docker images, etc.)
+  * docs/oss-licenses.md      — Python package dependencies (imported libraries)
+
+All imported (linked) dependencies are permissive (MIT / BSD / Apache-2.0).
+Copyleft components (e.g. Grafana, AGPL-3.0) are run only as separate, network-
+isolated services and are NOT linked into or distributed as part of this Work.
+See THIRD_PARTY_LICENSES.md for details.

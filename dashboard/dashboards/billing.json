@@ -1,0 +1,455 @@
+{
+  "title": "Token Optimisation - Billing",
+  "uid": "token-opt-billing",
+  "tags": [
+    "token-optimisation",
+    "billing"
+  ],
+  "schemaVersion": 38,
+  "refresh": "5m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 12,
+      "type": "text",
+      "title": "Cost disclosure (read me)",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Cost figures are config-priced estimates - directional, not invoice-grade.** Dollar values = token counts x a static pricing table; they exclude negotiated discounts, provider-side prompt caching, batch/reasoning surcharges, and currency effects. baseline_* is a counterfactual. **Token-count savings are measured; dollar figures are estimates.** Provider-reconciled billing is a separate (non-OSS) concern."
+      },
+      "transparent": true
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Tokens Saved",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(tokens_saved) FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Cost Saved (USD)",
+      "gridPos": {
+        "x": 5,
+        "y": 3,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(SUM(cost_saved_usd)::numeric, 4) FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Total Requests",
+      "gridPos": {
+        "x": 10,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Active Tenants",
+      "gridPos": {
+        "x": 14,
+        "y": 3,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "count(count by (tenant_id)(token_opt_requests_total{tenant_id=~\"$tenant\"}))",
+          "legendFormat": "tenants"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 5,
+      "type": "piechart",
+      "title": "Tier Distribution",
+      "gridPos": {
+        "x": 19,
+        "y": 3,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT pricing_tier, COUNT(*) AS requests FROM usage_events GROUP BY pricing_tier ORDER BY requests DESC",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": true,
+          "calc": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "pieType": "pie",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "desc"
+        },
+        "displayLabels": [
+          "name",
+          "percent"
+        ]
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Tokens Saved per Day",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('day', timestamp) AS time, SUM(tokens_saved) AS tokens_saved FROM usage_events WHERE timestamp >= NOW() - INTERVAL '30 days' AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Cost Saved per Day (USD)",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('day', timestamp) AS time, ROUND(SUM(cost_saved_usd)::numeric, 4) AS cost_saved FROM usage_events WHERE timestamp >= NOW() - INTERVAL '30 days' AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Top 10 Tenants by Tokens Saved",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT tenant_id, pricing_tier, COUNT(*) AS requests, SUM(tokens_saved) AS total_tokens_saved, ROUND(SUM(cost_saved_usd)::numeric, 4) AS total_cost_saved_usd, ROUND(AVG(CASE WHEN baseline_tokens > 0 THEN 100.0 * tokens_saved / baseline_tokens ELSE 0 END)::numeric, 1) AS avg_saving_pct FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1, 2 ORDER BY total_tokens_saved DESC LIMIT 10",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "barchart",
+      "title": "Requests by Pricing Tier (This Month)",
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT pricing_tier, COUNT(*) AS requests FROM usage_events WHERE timestamp >= date_trunc('month', NOW()) GROUP BY pricing_tier ORDER BY requests DESC",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Request Rate by Tenant (Prometheus)",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (tenant_id) (rate(token_opt_requests_total{tenant_id=~\"$tenant\"}[5m])) * 300",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "piechart",
+      "title": "$ Saved by Group",
+      "description": "USD saved per optimisation group (G0-G24) over the selected time range. Powered by token_opt_usd_saved_total Prometheus counter (T07).",
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (group) (increase(token_opt_usd_saved_total{tenant_id=~\"$tenant\"}[$__range]))",
+          "legendFormat": "{{group}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calc": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "pieType": "pie",
+        "legend": {
+          "displayMode": "list",
+          "placement": "right",
+          "values": [
+            "value"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "desc"
+        },
+        "displayLabels": [
+          "name"
+        ]
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "description": "Cost figures are config-priced estimates (directional, not invoice-grade) - token savings are measured, dollar values are estimated."
+}

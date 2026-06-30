@@ -1,0 +1,53 @@
+# G12 — Reasoning Budget Control
+# Injects provider-specific reasoning budget parameters to cap token spend on
+# extended thinking (o-series models, Claude thinking, Gemini thinking).
+#
+# Copy to config/params/g12_reasoning_budget.yaml and tune for your use case.
+
+G12_reasoning:
+  enabled: false
+  default_effort: medium        # low | medium | high
+
+  # ── Fast-path shortcuts ────────────────────────────────────────────────────
+  # These apply automatically when the requested model is an o-series or Claude
+  # thinking model, without needing a full provider_params entry.
+
+  # OpenAI o-series (o1, o1-mini, o3, o3-mini, o4, o4-mini):
+  # Sets reasoning_effort parameter. Accepted values: low | medium | high
+  o_model_effort: medium
+
+  # Anthropic Claude thinking models (claude-3-sonnet, claude-3-opus, etc.):
+  # Sets thinking.budget_tokens to limit extended-thinking token spend.
+  thinking_budget_tokens: 8000
+
+  # ── Full provider_params (optional — overrides fast-path for matched models) ─
+  # provider_params:
+  #   - model_fragment: "o1"
+  #     param_key: "reasoning_effort"
+  #     is_effort_key: true
+  #   - model_fragment: "claude"
+  #     param_key: "thinking"
+  #     budget_key: "budget_tokens"
+  #   - model_fragment: "gemini"
+  #     param_key: "thinking_config"
+  #     mode_key: "thinking_mode"
+  provider_params: []
+
+  effort_map:
+    low:
+      openai: low
+      anthropic_tokens: 1000
+      gemini_mode: disabled
+    medium:
+      openai: medium
+      anthropic_tokens: 5000
+      gemini_mode: auto
+    high:
+      openai: high
+      anthropic_tokens: 10000
+      gemini_mode: auto
+
+  # Reasoning suppression prompts (injected into the system message for low effort)
+  reasoning_suppression_prompts: {}
+  # reasoning_suppression_prompts:
+  #   low: "Answer directly. Do not reason step-by-step unless strictly necessary."

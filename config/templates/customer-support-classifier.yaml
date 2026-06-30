@@ -1,0 +1,63 @@
+# =============================================================================
+# G02 Prompt Template — customer-support-classifier
+# -----------------------------------------------------------------------------
+# Registered template whose token budget is declared in
+# config/config.yaml.template → groups.G2_template_registry.budgets.
+#
+# This file is the *content* the CI/build gate counts tokens against:
+#   scripts/ci/validate-templates.sh   — counts system_prompt and
+#                                         (system_prompt + example_input)
+#   scripts/ci/pr-diff-token-check.py  — counts system_prompt + user_template
+#
+# Budget (see config.yaml.template):
+#   system_prompt_max : 400 tokens
+#   total_input_max   : 800 tokens   (system_prompt + example_input)
+#   output_max        : 150 tokens
+#
+# Keep this file within budget — the gate fails the build if it grows past it.
+# =============================================================================
+template_id: customer-support-classifier
+version: '2.1'
+author: platform-team
+description: Classifies customer support tickets into a category + priority.
+
+# System prompt — the standing instruction sent on every classification call.
+system_prompt: |
+  You are a customer-support ticket classifier. Read the customer's message and
+  return a single JSON object — no prose, no markdown fences.
+
+  Assign exactly one category:
+    BILLING   — charges, invoices, payment methods, pricing
+    TECHNICAL — bugs, errors, outages, API/integration problems
+    ACCOUNT   — login, passwords, profile, permissions
+    SHIPPING  — delivery, tracking, address changes
+    REFUND    — refund or cancellation requests
+    GENERAL   — anything that does not fit the above
+
+  Assign exactly one priority:
+    URGENT — outage, security issue, or payment failure blocking the customer
+    HIGH   — customer is blocked or at clear risk of churn
+    MEDIUM — important but the customer can still work
+    LOW    — question, feedback, or minor request
+
+  Respond only with:
+  {"category": "<CATEGORY>", "priority": "<PRIORITY>", "reason": "<one short sentence>"}
+
+# User-message template — {{ticket_text}} is substituted with the ticket body.
+user_template: |
+  Classify the following support ticket:
+
+  {{ticket_text}}
+
+# Representative input used by the build gate to measure realistic total input
+# tokens (system_prompt + example_input must stay within total_input_max).
+example_input: |
+  Subject: Charged twice for my subscription this month
+
+  Hi — I was billed 49 USD twice for my Pro plan on the 3rd. I only have one
+  account and I didn't upgrade anything. Please refund the duplicate charge.
+  This is the second month in a row it has happened and it's getting frustrating.
+
+# Expected output shape — informational; output_max is enforced separately.
+output_format: |
+  {"category": "BILLING", "priority": "HIGH", "reason": "Duplicate subscription charge needs a refund."}

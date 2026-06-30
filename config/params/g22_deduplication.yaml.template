@@ -1,0 +1,5 @@
+g22_deduplication:
+  enabled: false                        # set true to activate semantic deduplication
+  dedup_threshold: 0.97                 # cosine similarity above which turns are collapsed
+  embedding_model: "BAAI/bge-small-en-v1.5"  # sentence-transformers model for embeddings
+  use_embeddings: true                  # false = fall back to character n-gram heuristic

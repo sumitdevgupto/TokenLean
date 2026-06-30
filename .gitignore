@@ -1,0 +1,222 @@
+scripts/gcp/gcp_manual_scripts.txt
+# ─── Secrets — NEVER commit ───────────────────────────────────────────────────
+.env
+*.env
+.env.*
+!.env.template
+!.env.gcp.template
+config/keys.yaml
+config/local-keys.json
+config/local-keys.txt
+*.key
+*.pem
+*secret*
+*credential*
+*password*
+secrets/
+service-account*.json
+application_default_credentials.json
+gcp-key*.json
+keyfile.json
+
+# ─── Redis backup path (local state) ──────────────────────────────────────────
+.redis-backup-path
+
+# ─── Terraform ────────────────────────────────────────────────────────────────
+infra/terraform.tfvars
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/tfplan
+infra/override.tf
+infra/override.tf.json
+infra/*_override.tf
+infra/*_override.tf.json
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.python-version
+
+# ─── Java / Maven ─────────────────────────────────────────────────────────────
+target/
+*.class
+*.jar
+*.war
+.classpath
+.project
+.settings/
+*.iml
+
+# ─── Go ───────────────────────────────────────────────────────────────────────
+bin/
+*.exe
+*.test
+vendor/
+
+# ─── Node / Dashboard tooling ─────────────────────────────────────────────────
+node_modules/
+.npm
+.yarn
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+.docker/
+
+# ─── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# ─── IDE / AI tool directories ────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.iws
+.cursor/
+.windsurf/
+.devin/
+.opencode/
+# NOTE: .github/ is intentionally NOT ignored — community-health files + public
+# CI workflows (items 47/48) must ship in the OSS repo.
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+token-usage.jsonl
+
+# ─── Config — live files (templates are the committable source of truth) ──────
+config/config.yaml
+config/config.roi-openai.yaml
+config/adaptive_bypass_rules.yaml
+config/bypass-rules.yaml
+config/cascade-test.yaml
+config/local-keys.json.backup.*
+
+# ─── Pitch test plan — INTERNAL (item 62) ─────────────────────────────────────
+# Full ablation + multi-tenant validation + GCP-ops harness, built for internal
+# benefit (multi-tenant = PAID-adjacent), not a customer artifact. OSS ships a
+# lean examples/benchmark/ reproducible proof instead. Excluded wholesale.
+pitch-test-plan/
+
+# ─── Publish assets ───────────────────────────────────────────────────────────
+publish/
+
+# ─── Local development files ────────────────────────────────────────────────
+.envrc
+.direnv/
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# ─── Local Prometheus config (generated from infra/prometheus.yml.tmpl) ───────
+infra/prometheus.local.yml
+
+# ─── One-off generated / captured files ───────────────────────────────────────
+validation_output.txt
+cost-optimisation.mhtml
+
+# ─── Generated CI/eval outputs (promptfoo results, pr-diff reports) ────────────
+reports/
+optimized/
+
+# ─── Benchmark run outputs (the source — dataset.jsonl, scripts, README — ships) ─
+examples/benchmark/last_run.json
+examples/benchmark/run_output*.txt
+examples/benchmark/*.out
+.gptcache/
+
+# ─── Scratch / debugging output ───────────────────────────────────────────────
+temp/
+analysis/
+
+# ─── Internal documentation (commercial strategy + internal roadmap — NOT public) ─
+# Curated OSS docs live in docs/ (published); everything internal stays here.
+internal-docs/
+# GTM / monetisation strategy working directory — internal, never published
+GTM/
+
+# NOTE: ci/ is intentionally NOT ignored — CI pipeline definitions ship in OSS
+# for build transparency (item 41; verified present by item 42).
+
+# ─── AI assistant instruction files ──────────────────────────────────────────
+AGENTS.md
+CLAUDE.md
+CONVENTIONS.md
+GEMINI.md
+# Copilot instructions mirror AGENTS.md + reference internal-only pitch-test-plan;
+# gitignore for consistency (item 2). A clean OSS contributor guide can be added
+# later if desired. (.github/ itself ships — for workflows + community files.)
+.github/copilot-instructions.md
+
+# ─── Skills / AI assistant files ─────────────────────────────────────────────
+skills/
+.claude/
+
+# ─── Commercial / release tooling (private — not published) ──────────────────
+# item 54 — open-core gate runner (private)
+scripts/verify-oss-gates.sh
+
+# ─── Commercial layer (private — open-core split) ────────────────────────────
+# Pure-commercial source (item 8). Engines STAY in core (billing/metering.py,
+# billing/models.py, audit/, tenancy/) — only tier-gating + portal + gdpr gated.
+src/proxy/api/portal.py
+src/proxy/api/gdpr.py
+src/proxy/billing/tiers.py
+# Request-count invoicing (E2) — the paid product's billing calculation. Engines
+# (metering/models/audit) stay in core; the invoice generator is commercial.
+src/proxy/billing/invoicing.py
+# Payment-push seam (H1) — the Stripe integration point. Commercial.
+src/proxy/billing/payments.py
+# SOC2 / audit-attestation tooling (I1) — paid product. The OSS audit ENGINE
+# (audit/log.py) stays core; only this attestation tooling is commercial.
+src/proxy/audit/attestation.py
+tests/test_attestation.py
+# Commercial app entrypoint — wires the gated GDPR/portal/billing routers (item 26).
+# Must stay out of core so verify-oss-gates Gate 7 (core barricade) stays clean.
+src/proxy/commercial_app.py
+tests/test_commercial_app.py
+tests/test_invoicing.py
+src/portal/
+# Commercial config templates (items 9, 40)
+config/params/portal.yaml.template
+config/params/tiers.yaml.template
+# Commercial infra (item 11) + orphaned SLA alert rules (item 35)
+infra/commercial.tf
+infra/alert_rules.yaml
+# Commercial docker services (item 12)
+docker-compose.commercial.yml
+# Commercial / gated-module tests (items 31, 58 + B13)
+tests/unit/billing/test_tiers.py
+tests/unit/test_pipeline_tiers.py
+tests/unit/test_alert_rules.py
+tests/unit/api/test_portal.py
+tests/test_gdpr_compliance.py
+tests/integration/test_portal.py
+tests/integration/test_openmeter.py
+# imports internal pitch-test-plan harness (gitignored) — would break OSS pytest
+tests/test_g21_ds8_anthropic.py
+# Paid scripts — folder-gitignored (setup-tenants.sh, export_tenant_costs.py +
+# future hosted-SaaS automation)
+scripts/commercial/
+scripts/schedule-skill-sync.ps1
+scripts/sync-skills.py

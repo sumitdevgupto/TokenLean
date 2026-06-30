@@ -1,0 +1,21 @@
+# G05 — Response & Step Caching
+# Controls L1 (Redis exact), L2 (pgvector semantic), L3 (GPTCache), step, and
+# temporal-activity caching layers.
+#
+# Copy to config/params/g05_cache.yaml and fill in values for your environment.
+
+G05_cache:
+  enabled: true
+  l1_ttl_seconds: 3600          # L1 exact-match cache TTL
+  l2_ttl_seconds: 86400         # L2 semantic cache TTL
+  l2_threshold: 0.95            # cosine similarity threshold for L2 hit
+  l2_embedding_model: "BAAI/bge-small-en-v1.5"   # local embedding model (MIT)
+  step_cache_ttl_seconds: 86400 # durable step-cache TTL (for Temporal workflows)
+
+  # Cache warming: list of canonical query strings to pre-embed into L2 at
+  # proxy startup.  Fills the semantic cache so the first real request is a hit.
+  # Leave empty ([]) if no warming is needed.
+  warm_patterns: []
+  # warm_patterns:
+  #   - "What is the status of incident INC-3301?"
+  #   - "List recent errors for the checkout service"

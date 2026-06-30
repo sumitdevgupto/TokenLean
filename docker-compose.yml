@@ -1,0 +1,322 @@
+# =============================================================================
+# Docker Compose — Token Optimisation Framework (Local Deployment)
+# =============================================================================
+# Usage:
+#   docker-compose up -d              # Start all services
+#   docker-compose up -d proxy        # Start only proxy + dependencies
+#   docker-compose --profile observability up -d  # Include Grafana
+#   docker-compose down               # Stop all (zero cost)
+#
+# All services support G1-G18 optimisations via local Docker networking.
+# =============================================================================
+version: '3.8'
+
+services:
+  # ─── Infrastructure Layer ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: token-opt-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --save 60 1
+    networks:
+      - token-opt-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: token-opt-postgres
+    environment:
+      POSTGRES_USER: token_opt
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: token_opt
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - token-opt-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U token_opt"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    container_name: token-opt-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - token-opt-net
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── Application Services ───────────────────────────────────────────────────
+  llmlingua:
+    build:
+      context: ./src/llmlingua-sidecar
+      dockerfile: Dockerfile
+    container_name: token-opt-llmlingua
+    ports:
+      - "8080:8080"
+    environment:
+      LOG_LEVEL: INFO
+    networks:
+      - token-opt-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${LLMLINGUA_MEM:-2g}
+    restart: unless-stopped
+
+  proxy:
+    build:
+      context: ./src/proxy
+      dockerfile: Dockerfile
+    container_name: token-opt-proxy
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: "4000"
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://token_opt:${DB_PASSWORD}@postgres:5432/token_opt
+      QDRANT_URL: http://qdrant:6333
+      LLMLINGUA_URL: http://llmlingua:8080
+      ROUTELLM_URL: http://routellm:8080
+      G06_JUDGE_MODEL: ${G06_JUDGE_MODEL:-}
+      TIKA_URL: http://tika:9998
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      CONFIG_GCS_BUCKET: ${CONFIG_GCS_BUCKET:-}
+      CONFIG_LOCAL_PATH: /app/config/config.yaml
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-}
+      LOCAL_PROXY_KEYS_FILE: /app/config/local-keys.json
+      # H2: gate /metrics with a bearer token. Unset by default for local dev
+      # (endpoint stays open with a startup warning); set it to require auth.
+      METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:-}
+      LLM_KEY_OPENAI: ${LLM_KEY_OPENAI:-}
+      LLM_KEY_ANTHROPIC: ${LLM_KEY_ANTHROPIC:-}
+      LLM_KEY_GOOGLE: ${LLM_KEY_GOOGLE:-}
+      LLM_KEY_GEMINI: ${LLM_KEY_GEMINI:-}
+      LLM_KEY_MISTRAL: ${LLM_KEY_MISTRAL:-}
+      LLM_KEY_COHERE: ${LLM_KEY_COHERE:-}
+      LLM_KEY_DEEPSEEK: ${LLM_KEY_DEEPSEEK:-}
+      LLM_KEY_XAI: ${LLM_KEY_XAI:-}
+      LLM_KEY_GROQ: ${LLM_KEY_GROQ:-}
+      LLM_KEY_OPENROUTER: ${LLM_KEY_OPENROUTER:-}
+      LLM_KEY_OPENCODE: ${LLM_KEY_OPENCODE:-}
+      LLM_KEY_AZURE: ${LLM_KEY_AZURE:-}
+      # AWS Bedrock uses SigV4 credentials (no single key)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION_NAME: ${AWS_REGION_NAME:-}
+      LOG_LEVEL: INFO
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - token-opt-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      llmlingua:
+        condition: service_started
+      routellm:
+        condition: service_started
+      tika:
+        condition: service_healthy
+      langfuse:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: ${PROXY_MEM:-4g}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ─── RouteLLM Sidecar (G06 Routing) ────────────────────────────────────────
+  routellm:
+    build:
+      context: ./src/routellm-sidecar
+      dockerfile: Dockerfile
+    container_name: token-opt-routellm
+    ports:
+      - "8081:8080"
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: INFO
+      ROUTELLM_STRONG_MODEL: ${ROUTELLM_STRONG_MODEL:-gpt-4o}
+      ROUTELLM_WEAK_MODEL: ${ROUTELLM_WEAK_MODEL:-gpt-4o-mini}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    networks:
+      - token-opt-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${ROUTELLM_MEM:-2g}
+    restart: unless-stopped
+
+  # ─── Tika Sidecar (G03 Document Extraction) ────────────────────────────────
+  tika:
+    build:
+      context: ./src/tika-sidecar
+      dockerfile: Dockerfile
+    container_name: token-opt-tika
+    ports:
+      - "9998:9998"
+    environment:
+      TIKA_MAX_FILE_SIZE: ${TIKA_MAX_FILE_SIZE:-100000000}
+      TIKA_TIMEOUT_MS: ${TIKA_TIMEOUT_MS:-30000}
+    networks:
+      - token-opt-net
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9998"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─── Langfuse (G18 Observability) ────────────────────────────────────────────
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: token-opt-langfuse
+    ports:
+      - "3100:3000"
+    environment:
+      DATABASE_URL: postgresql://token_opt:${DB_PASSWORD}@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3100
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SALT: ${SALT}
+      LANGFUSE_CSP_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: token-opt-local
+      LANGFUSE_INIT_ORG_NAME: Token Optimisation Local
+      LANGFUSE_INIT_PROJECT_ID: token-opt-local-proj
+      LANGFUSE_INIT_PROJECT_NAME: token-optimisation
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@local.dev}
+      LANGFUSE_INIT_USER_NAME: Local Admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-changeme123}
+      LANGFUSE_INIT_USER_ROLE: ADMIN
+    networks:
+      - token-opt-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Observability (Optional Profile) ────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:10.4.0
+    container_name: token-opt-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      PROMETHEUS_HOST: http://prometheus:9090
+      LANGFUSE_DB_HOST: postgres
+      LANGFUSE_DB_NAME: langfuse
+      LANGFUSE_DB_USER: token_opt
+      LANGFUSE_DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dashboard/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboard/dashboards:/etc/grafana/dashboards:ro
+    networks:
+      - token-opt-net
+    depends_on:
+      - prometheus
+    profiles:
+      - observability
+
+  # Prometheus — scrapes /metrics from the proxy every 15s
+  # UI available at http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: token-opt-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.local.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - token-opt-net
+    depends_on:
+      proxy:
+        condition: service_healthy
+    profiles:
+      - observability
+    restart: unless-stopped
+
+  # Jaeger all-in-one — OSS distributed tracing (Apache-2)
+  # Receives OTel spans from the proxy via OTLP gRPC on port 4317.
+  # UI available at http://localhost:16686
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: token-opt-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC receiver
+      - "4318:4318"     # OTLP HTTP receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - token-opt-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:16686/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  # NOTE: openmeter + portal services moved to docker-compose.commercial.yml
+  # (open-core split, item 12). Run them alongside the base stack with:
+  #   docker compose -f docker-compose.yml -f docker-compose.commercial.yml up -d
+
+volumes:
+  redis_data:
+  postgres_data:
+  qdrant_data:
+  grafana_data:
+  prometheus_data:
+
+networks:
+  token-opt-net:
+    driver: bridge

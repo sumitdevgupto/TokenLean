@@ -1,0 +1,82 @@
+# G08 — Tool Registry
+# Each tool is tagged with intents. The proxy injects only tools whose intents
+# match the current request (classified from the last user message).
+# Tools not called in 30 days should be flagged for pruning (G18 governance).
+
+tools:
+  - name: web_search
+    description: Search the web for current information
+    intents: [search, research, fetch_data]
+    last_used: "2026-05-01"
+
+  - name: get_order_status
+    description: Retrieve the status of a customer order by ID
+    intents: [fetch_data, order]
+    last_used: "2026-05-28"
+
+  - name: send_email
+    description: Send an email notification to a user
+    intents: [email, write, notify]
+    last_used: "2026-05-15"
+
+  - name: create_calendar_event
+    description: Schedule a meeting or appointment
+    intents: [calendar, schedule]
+    last_used: "2026-04-20"
+
+  - name: execute_sql
+    description: Run a read-only SQL query against the data warehouse
+    intents: [fetch_data, calculate, search]
+    last_used: "2026-05-29"
+
+  - name: generate_report
+    description: Generate a PDF or CSV report from structured data
+    intents: [write, fetch_data]
+    last_used: "2026-05-10"
+
+  - name: run_python_code
+    description: Execute Python code in a sandboxed environment
+    intents: [code, calculate]
+    last_used: "2026-05-25"
+
+  - name: get_weather
+    description: Get current weather for a location
+    intents: [fetch_data, search]
+    last_used: "2026-03-01"   # flagged: last used >30 days ago
+
+  # ROI demo tools — used by multi_turn_agent scenario (G8 prunes irrelevant ones)
+  - name: analyze_query_plan
+    description: Analyze SQL query execution plan and suggest optimizations
+    intents: [database, optimize, code]
+    last_used: "2026-06-10"
+
+  - name: get_table_statistics
+    description: Get table row count, size, and index statistics
+    intents: [database, fetch_data]
+    last_used: "2026-06-10"
+
+  - name: check_redis_config
+    description: Check Redis configuration and memory usage
+    intents: [database, fetch_data, optimize]
+    last_used: "2026-06-10"
+
+  - name: run_security_scan
+    description: Run security vulnerability scan on the codebase
+    intents: [security, code]
+    last_used: "2026-06-10"
+
+  - name: deploy_migration
+    description: Deploy a database migration to production
+    intents: [deploy, database]
+    last_used: "2026-06-10"
+
+  # NEW: code_agent scenario tools (Phase 1 — enables G08 pruning)
+  - name: validate_python_syntax
+    description: Check if Python code is syntactically valid
+    intents: [code, validate]
+    last_used: "2026-06-14"
+
+  - name: check_type_hints
+    description: Verify type hints in Python code
+    intents: [code, validate, analyze]
+    last_used: "2026-06-14"

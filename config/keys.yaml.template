@@ -1,0 +1,40 @@
+# LLM API Keys — Admin only. NEVER commit keys.yaml (it is gitignored).
+# Copy this file to config/keys.yaml, fill in real values, then run:
+#   ./scripts/gcp/gcp-deploy.sh
+# The script reads this file and stores all keys in Secret Manager.
+# Delete or keep config/keys.yaml locally — it will never be committed.
+
+llm_keys:
+  # ── MANDATORY: the key for your proxy.default_provider ────────────────────────
+  # By default that is OpenAI. To deploy with a different default (Anthropic/Gemini/…),
+  # set proxy.default_provider in config.yaml AND export DEFAULT_PROVIDER=<name> before
+  # running gcp-deploy.sh, then fill that provider's key below instead of openai.
+  openai:    "sk-proj-..."       # default-provider key (REQUIRED for the default setup)
+
+  # ── RECOMMENDED: only if G06 routing uses the mf/sw_ranking routers (OpenAI embeddings)
+  routellm:  "sk-proj-..."       # RouteLLM key (can reuse the OpenAI key; warn-only if absent)
+
+  # ── OPTIONAL (skip if you don't use these providers) ───────────────────────────
+  #anthropic: "sk-ant-..."       # Anthropic API key
+  #google:    "AI..."            # Google AI (Gemini) API key
+  #gemini:    "AI..."            # Google Gemini (alias of google for LLM_KEY_GEMINI)
+  #mistral:   "..."              # Mistral API key
+  #cohere:    "..."              # Cohere API key
+  #deepseek:  "sk-..."           # DeepSeek API key
+  #xai:       "xai-..."          # xAI (Grok) API key
+  #groq:      "gsk-..."          # Groq API key
+  #openrouter: "sk-or-..."       # OpenRouter API key (aggregator; openrouter/<vendor>/<model>)
+  #opencode:  "..."             # OpenCode Zen API key (gateway; opencode/<model>)
+  #azure:     "..."              # Azure OpenAI key (endpoint/version in config providers.azure)
+  # AWS Bedrock uses SigV4 creds (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / region), not a key here.
+
+# Langfuse OSS API Keys — generated AFTER first deploy.
+# Steps:
+#   1. Run ./scripts/gcp/gcp-deploy.sh (deploys Langfuse to Cloud Run)
+#   2. Open the Langfuse URL printed at the end of the deploy
+#   3. Log in → Settings → API Keys → Create new key
+#   4. Copy the public key and secret key here
+#   5. Run: ./scripts/gcp/gcp-deploy.sh --skip-infra  (re-deploys proxy with these keys)
+langfuse_keys:
+  public_key: "pk-lf-..."        # From Langfuse UI → Settings → API Keys (optional, post-deploy)
+  secret_key: "sk-lf-..."        # From Langfuse UI → Settings → API Keys (optional, post-deploy)

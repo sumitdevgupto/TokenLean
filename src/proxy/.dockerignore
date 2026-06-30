@@ -1,0 +1,20 @@
+# ─── Commercial layer — excluded from the OSS proxy image (item 19) ───────────
+# The proxy build context is ./src/proxy and the Dockerfile does `COPY . .`, so
+# these commercial-layer modules must be excluded from the free image. Mirrors
+# the commercial .gitignore. Engines STAY in the image: billing/metering.py,
+# billing/models.py, billing/api.py, audit/, tenancy/.
+api/portal.py
+api/gdpr.py
+commercial_app.py
+billing/tiers.py
+billing/invoicing.py
+billing/payments.py
+audit/attestation.py
+
+# ─── Build hygiene ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint imports, boot & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/proxy/requirements.txt -r tests/requirements-test.txt
+
+      - name: Clean-checkout boot gate (import main with no commercial files)
+        working-directory: src/proxy
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src/proxy
+        run: python -c "import main; print('boot OK:', main.app.title)"
+
+      - name: Collection gate (no test imports a missing/gated module)
+        run: pytest tests/ --collect-only -q
+
+      - name: G02 prompt-template token-budget gate
+        run: bash scripts/ci/validate-templates.sh
+
+      - name: Tenant isolation gate (cross-tenant invariants must hold)
+        run: pytest tests/unit/test_isolation_invariants.py tests/unit/tenancy tests/unit/middleware/test_multi_tenancy.py -q
+
+      - name: Unit tests
+        run: pytest tests/unit -q

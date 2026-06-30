@@ -1,0 +1,169 @@
+steps:
+  # Step 0: Run unit + integration test suite
+  - name: 'python:3.11-slim'
+    id: run-tests
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        pip install -r tests/requirements-test.txt --quiet
+        pip install -r src/proxy/requirements.txt --quiet
+        python -m pytest tests/ -v --tb=short \
+          --cov=src/proxy --cov-report=term-missing --cov-fail-under=80
+
+  # Step 1: Validate prompt template token budgets (G02)
+  - name: 'python:3.11-slim'
+    id: validate-templates
+    entrypoint: bash
+    waitFor: [run-tests]
+    args:
+      - '-c'
+      - |
+        pip install pyyaml tiktoken --quiet
+        bash scripts/ci/validate-templates.sh
+
+  # Step 2: PR-diff token count check (G02 enhancement)
+  - name: 'python:3.11-slim'
+    id: pr-diff-check
+    entrypoint: bash
+    waitFor: [validate-templates]
+    args:
+      - '-c'
+      - |
+        pip install pyyaml --quiet
+        python scripts/ci/pr-diff-token-check.py \
+          --base-ref main \
+          --head-ref $COMMIT_SHA \
+          --fail-on-budget-exceeded \
+          --output-json reports/pr-diff-report.json
+
+  # Step 3: Promptfoo prompt evaluation (optional)
+  - name: 'node:20-slim'
+    id: promptfoo-eval
+    entrypoint: bash
+    waitFor: [pr-diff-check]
+    args:
+      - '-c'
+      - |
+        if [ "${_RUN_PROMPTFOO}" = "true" ]; then
+          npm install -g promptfoo
+          bash ci/promptfoo-eval.sh
+        else
+          echo "Promptfoo eval skipped (set _RUN_PROMPTFOO=true to enable)"
+        fi
+
+  # Step 4: DSPy prompt optimization (optional)
+  - name: 'python:3.11-slim'
+    id: dspy-optimize
+    entrypoint: bash
+    waitFor: [pr-diff-check]
+    args:
+      - '-c'
+      - |
+        if [ "${_RUN_DSPY}" = "true" ]; then
+          pip install dspy-ai pyyaml --quiet
+          bash ci/dspy-optimize.sh \
+            --templates-dir templates/prompts \
+            --output-dir optimized/prompts
+        else
+          echo "DSPy optimization skipped (set _RUN_DSPY=true to enable)"
+        fi
+
+  # Step 5: Build proxy Docker image (wait for tests to pass first)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-proxy
+    args:
+      - build
+      - '--platform=linux/amd64'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/proxy:$COMMIT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/proxy:latest'
+      - 'src/proxy'
+    waitFor: [run-tests]
+
+  # Step 6: Build LLMLingua-2 sidecar image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-llmlingua
+    args:
+      - build
+      - '--platform=linux/amd64'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/llmlingua-sidecar:$COMMIT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/llmlingua-sidecar:latest'
+      - 'src/llmlingua-sidecar'
+    waitFor: [run-tests]
+
+  # Step 7: Build fine-tune-pipeline image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-finetune
+    args:
+      - build
+      - '--platform=linux/amd64'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/finetune-pipeline:$COMMIT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/finetune-pipeline:latest'
+      - 'src/finetune-pipeline'
+    waitFor: [run-tests]
+
+  # Step 8: Build doc-pipeline image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build-doc-pipeline
+    args:
+      - build
+      - '--platform=linux/amd64'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/doc-pipeline:$COMMIT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/doc-pipeline:latest'
+      - 'src/doc-pipeline'
+    waitFor: [run-tests]
+
+  # Step 9: Push all images
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-proxy
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/proxy']
+    waitFor: [build-proxy]
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-llmlingua
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/llmlingua-sidecar']
+    waitFor: [build-llmlingua]
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-finetune
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/finetune-pipeline']
+    waitFor: [build-finetune]
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-doc-pipeline
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/doc-pipeline']
+    waitFor: [build-doc-pipeline]
+
+  # Step 10: Deploy proxy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: deploy-proxy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - token-proxy
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/proxy:$COMMIT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--quiet'
+    waitFor: [push-proxy]
+
+substitutions:
+  _REGION: asia-south1
+  _REPO: token-opt
+  _RUN_PROMPTFOO: "false"  # Set to "true" to enable Promptfoo evals
+  _RUN_DSPY: "false"       # Set to "true" to enable DSPy optimization
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: '1800s'
