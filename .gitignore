@@ -154,6 +154,9 @@ analysis/
 internal-docs/
 # GTM / monetisation strategy working directory — internal, never published
 GTM/
+# Billing docs — PAID/hosted-tier billing & invoicing methodology (commercial,
+# open-core split). Whole folder gitignored; never published in OSS docs.
+docs/billing/
 
 # NOTE: ci/ is intentionally NOT ignored — CI pipeline definitions ship in OSS
 # for build transparency (item 41; verified present by item 42).
