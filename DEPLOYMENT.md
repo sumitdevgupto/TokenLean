@@ -1,6 +1,6 @@
 # Deployment Guide
 
-Complete step-by-step guide for deploying, managing, and tearing down the Token Optimisation Framework.
+Complete step-by-step guide for deploying, managing, and tearing down the TokenLean — Token Optimisation Framework.
 
 This project supports **two deployment modes** with identical G1-G18 functionality:
 

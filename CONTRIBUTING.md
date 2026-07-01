@@ -1,4 +1,4 @@
-# Contributing to the Token Optimisation Framework
+# Contributing to TokenLean
 
 Thanks for your interest in contributing! This project is an open-core LLM
 optimisation proxy that transparently applies a suite of token-reduction
@@ -24,8 +24,8 @@ Qdrant, sidecars) runs via Docker Compose.
 
 ```bash
 # 1. Clone and copy config templates
-git clone https://github.com/your-org/token-optimisation-framework
-cd token-optimisation-framework
+git clone https://github.com/sumitdevgupto/TokenLean
+cd TokenLean
 cp config/config.yaml.template config/config.yaml
 
 # 2. Start the local stack

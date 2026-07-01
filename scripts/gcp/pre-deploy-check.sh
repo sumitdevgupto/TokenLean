@@ -56,7 +56,8 @@ done
 
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Token Optimisation Framework — Pre-Deployment      ║"
+echo "║   TokenLean — Token Optimisation Framework           ║"
+echo "║   Pre-Deployment                                     ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 

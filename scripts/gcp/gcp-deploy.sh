@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# gcp-deploy.sh — Token Optimisation Framework: one-stop GCP deployment
+# gcp-deploy.sh — TokenLean — Token Optimisation Framework: one-stop GCP deployment
 # =============================================================================
 # Usage:
 #   ./scripts/gcp/gcp-deploy.sh [OPTIONS]
@@ -677,7 +677,7 @@ PYEOF
   echo -e "${GREEN}║${NC}     --update-env-vars=DOMAIN=<domain>,PROVIDER=<openai|vertex_ai>"
   echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
   echo ""
-  info "Docs: https://github.com/your-org/token-optimisation-framework/blob/main/docs/developer-onboarding.md"
+  info "Docs: https://github.com/sumitdevgupto/TokenLean/blob/main/docs/developer-onboarding.md"
 }
 
 # ─── Step 5b: Deploy G3 Cloud Run Jobs (doc-pipeline, finetune-pipeline) ─────
@@ -877,7 +877,8 @@ load_infra_outputs() {
 main() {
   echo -e "${BLUE}"
   echo "╔══════════════════════════════════════════════════════╗"
-  echo "║   Token Optimisation Framework — GCP Deploy          ║"
+  echo "║   TokenLean — Token Optimisation Framework           ║"
+  echo "║   GCP Deploy                                         ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 

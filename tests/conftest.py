@@ -1,5 +1,5 @@
 """
-Shared pytest fixtures for the Token Optimisation Framework test suite.
+Shared pytest fixtures for the TokenLean — Token Optimisation Framework test suite.
 Adds src/proxy to sys.path so all proxy modules are importable without installation.
 """
 import copy

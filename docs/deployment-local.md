@@ -1,6 +1,6 @@
 # Local Deployment Guide
 
-Complete guide for running the Token Optimisation Framework locally via Docker Compose. Zero GCP cost.
+Complete guide for running the TokenLean — Token Optimisation Framework locally via Docker Compose. Zero GCP cost.
 
 ---
 

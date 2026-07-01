@@ -1,6 +1,6 @@
 # GCP Deployment Guide
 
-Complete guide for deploying the Token Optimisation Framework on Google Cloud Platform (GCP).
+Complete guide for deploying the TokenLean — Token Optimisation Framework on Google Cloud Platform (GCP).
 
 ---
 

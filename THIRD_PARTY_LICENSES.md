@@ -1,6 +1,6 @@
 # Third-Party Licenses
 
-The Token Optimisation Framework is licensed under **Apache-2.0** (see [LICENSE](LICENSE)).
+The TokenLean — Token Optimisation Framework is licensed under **Apache-2.0** (see [LICENSE](LICENSE)).
 It depends on, integrates with, and — in its self-hosted Docker deployment — runs
 alongside third-party open-source software.
 

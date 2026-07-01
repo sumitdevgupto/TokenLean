@@ -85,7 +85,8 @@ WARNINGS=0
 
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║   Token Optimisation Framework — Health Check        ║${NC}"
+echo -e "${BLUE}║   TokenLean — Token Optimisation Framework           ║${NC}"
+echo -e "${BLUE}║   Health Check                                       ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo "Project: ${PROJECT_ID}"

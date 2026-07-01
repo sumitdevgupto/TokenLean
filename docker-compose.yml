@@ -1,5 +1,5 @@
 # =============================================================================
-# Docker Compose — Token Optimisation Framework (Local Deployment)
+# Docker Compose — TokenLean — Token Optimisation Framework (Local Deployment)
 # =============================================================================
 # Usage:
 #   docker-compose up -d              # Start all services

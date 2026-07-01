@@ -1,21 +1,24 @@
-# Token Optimisation Framework
+# TokenLean
 
-[![CI](https://github.com/your-org/token-optimisation-framework/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/token-optimisation-framework/actions/workflows/ci.yml)
+> **Cut your LLM token bill 30–70% — with a one-line code change and zero quality loss.**
+
+[![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![GitHub stars](https://img.shields.io/github/stars/your-org/token-optimisation-framework?style=social)](https://github.com/your-org/token-optimisation-framework/stargazers)
+[![Measured savings](https://img.shields.io/badge/measured_savings-55.78%25-brightgreen.svg)](#g0g28-optimisation-groups)
+[![GitHub stars](https://img.shields.io/github/stars/sumitdevgupto/TokenLean?style=social)](https://github.com/sumitdevgupto/TokenLean/stargazers)
 
-A **production-ready proxy** (run locally or GCP-hosted) that transparently applies **28 token optimisation techniques** (G0–G28, G26 reserved — 27 implemented) to every LLM call, reducing costs by 30-70% without changing developer code.
+**TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **22 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
 
-**Key Features:**
-- Drop-in replacement for OpenAI-compatible APIs (one-line code change)
-- **10 first-class LLM providers** out of the box, plus any OpenAI-compatible provider via config alone (see [Supported Providers](#supported-providers))
-- 28 automated optimisation slots (G0–G28, G26 reserved — 27 implemented) from the Token Optimisation Playbook v7
-- Real-time cost tracking with per-call, hourly, billing, SLA, and tenant-overview dashboards
-- 100% OSS stack: LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, Temporal
-- Multi-tenant by default: per-tenant Redis/Qdrant namespacing, rate limits, config overrides
-- Config-driven architecture with hot-reload from GCS (no redeploy needed)
-- Scales to zero on Cloud Run (~$2/month when idle)
+🎯 **55.78% measured** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
+
+**Why teams use it:**
+- 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK
+- 📉 **Broad reduction** — 27 stacked techniques from the Token Optimisation Playbook v7, not just caching
+- 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown; per-call → quarterly Grafana dashboards
+- 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
+- ♻️ **Hot-reload config** — tune or A/B any technique without a redeploy
+- 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, Temporal
 
 ---
 
@@ -81,8 +84,8 @@ product request: **[docs/extensibility.md](docs/extensibility.md)**.
 ### One-Command Deploy
 
 ```bash
-git clone https://github.com/your-org/token-optimisation-framework
-cd token-optimisation-framework
+git clone https://github.com/sumitdevgupto/TokenLean
+cd TokenLean
 cp infra/terraform.tfvars.template infra/terraform.tfvars
 # Edit terraform.tfvars with your GCP project ID
 ./scripts/gcp/gcp-deploy.sh

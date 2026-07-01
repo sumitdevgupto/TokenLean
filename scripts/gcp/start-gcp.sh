@@ -63,7 +63,8 @@ fi
 
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Token Optimisation Framework — START INFRA         ║"
+echo "║   TokenLean — Token Optimisation Framework           ║"
+echo "║   START INFRA                                        ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 

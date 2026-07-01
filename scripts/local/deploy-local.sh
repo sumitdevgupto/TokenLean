@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy-local.sh — Deploy Token Optimisation Framework locally via Docker
+# deploy-local.sh — Deploy TokenLean — Token Optimisation Framework locally via Docker
 # =============================================================================
 # Usage:
 #   ./scripts/local/deploy-local.sh [--seed] [--backup-to-gcs] [--with-grafana] [--recreate] [--tenants TENANT_LIST]

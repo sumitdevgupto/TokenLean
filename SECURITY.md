@@ -1,6 +1,6 @@
 # Security Policy
 
-We take the security of the Token Optimisation Framework seriously. This proxy
+We take the security of the TokenLean — Token Optimisation Framework seriously. This proxy
 sits in the request path of LLM traffic and handles API keys, so we appreciate
 responsible disclosure of any vulnerability.
 

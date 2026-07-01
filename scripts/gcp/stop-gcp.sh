@@ -67,7 +67,8 @@ fi
 
 echo -e "${YELLOW}"
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Token Optimisation Framework — STOP INFRA          ║"
+echo "║   TokenLean — Token Optimisation Framework           ║"
+echo "║   STOP INFRA                                         ║"
 echo "╠══════════════════════════════════════════════════════╣"
 echo "║  This will backup and delete Redis, stop Cloud SQL   ║"
 echo "║  to achieve zero compute billing.                    ║"
