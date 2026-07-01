@@ -80,6 +80,7 @@ billing is per-request); add a row per new provider model.
 |---|---|---|
 | `enabled` | `true` | Enable model routing |
 | `mode` | `heuristic` | Routing mode: `heuristic` (default), `routellm`, or `custom` |
+| `on_unreachable_tier` | `fallback` | When a routed tier model's provider has **no usable credential** (key or ambient creds): `fallback` serves the caller's own requested model (cost-routing no-ops); `error` returns a clean 503 |
 | `confidence_threshold` | `0.88` | Cascade escalation threshold — tune per workload (see *Tuning the cascade threshold* below) |
 | `routellm.enabled` | `true` | Enable RouteLLM sidecar (when mode=routellm) |
 | `routellm.sidecar_url` | `http://routellm-svc` | RouteLLM Cloud Run internal URL |
@@ -95,6 +96,7 @@ billing is per-request); add a row per new provider model.
 **RouteLLM Configuration Notes:**
 - The `mf` and `sw_ranking` routers require an OpenAI API key for embeddings (stored in Secret Manager as `routellm-openai-key`)
 - **No OpenAI key?** The proxy auto-degrades: if `router` is `mf`/`sw_ranking` and no OpenAI key is configured, it falls back to the `causal_llm` router (a local classifier, no embeddings) so routing still works for Anthropic/Gemini-only deployments
+- **Tier models must be reachable.** The default tiers/`weak_model`/`strong_model` are OpenAI models — an OpenAI-free deployment should point them at its own provider's models (e.g. `weak_model: claude-haiku-4-5`, `strong_model: claude-sonnet-4-5`). If a routed tier's provider has no credential, G6 logs the unreachable tier(s) once at first use and, per `on_unreachable_tier`, either falls back to the requested model (default) or returns a clean 503
 - The `mf` router is recommended for best performance with low latency
 - Calibrate the threshold using: `python -m routellm.calibrate_threshold --routers mf --strong-model-pct 0.5`
 - If the RouteLLM sidecar is unavailable, the proxy automatically falls back to heuristic routing

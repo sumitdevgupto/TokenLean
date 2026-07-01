@@ -386,6 +386,10 @@ groups:
     enabled: true
     classifier: cascade
     cascade_execution: false
+    # When a routed tier model's provider has no usable credential (e.g. an OpenAI-free
+    # deployment left the default gpt-4o tiers): `fallback` (default) serves the caller's
+    # own requested model — cost-routing simply no-ops; `error` returns a clean 503.
+    on_unreachable_tier: fallback
     tiers:
       simple:
       - gpt-4o-mini

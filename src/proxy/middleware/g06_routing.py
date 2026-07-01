@@ -50,28 +50,97 @@ def _is_configured_model(model: str) -> bool:
     return any(model.startswith(p) for p in get_provider_model_prefixes().keys())
 
 
-async def _resolve_provider_key(model: str) -> Optional[str]:
-    """Resolve the LLM provider API key for a given model name."""
+def _tier_provider(model: str) -> Optional[str]:
+    """Provider name that owns ``model`` via ``startswith(model_prefixes)`` — the SAME
+    resolution as ``providers.get_provider_entry`` / ``main._resolve_provider``. A substring
+    match is wrong here: ``openrouter/openai/…`` contains the ``openai``/``gpt`` fragment and
+    would mis-resolve to OpenAI (→ the wrong / an absent key)."""
+    try:
+        from providers import get_provider_entry
+        entry = get_provider_entry(model, get_providers())
+        return entry.get("name") if entry else None
+    except Exception:
+        return None
+
+
+def _tier_reachable(model: str) -> bool:
+    """True if ``model``'s provider has a usable credential — an API key, OR ambient
+    credentials (Bedrock SigV4 / Vertex ADC, whose adapter ``requires_api_key()`` is False).
+    Used to avoid routing to a tier whose provider isn't configured (→ a downstream 503)."""
+    if not model:
+        return False
     try:
         from auth.api_key_manager import get_llm_provider_key
-        from config_loader import get_provider_model_prefixes
-        provider_map = get_provider_model_prefixes()
-        provider = None
-        for fragment, prov in provider_map.items():
-            if fragment in model.lower():
-                provider = prov
-                break
+        from providers import get_adapter
+        provider = _tier_provider(model)
+        if not provider:
+            return False
+        if get_llm_provider_key(provider):
+            return True
+        # No bearer key — reachable only if the adapter uses ambient credentials.
+        return not get_adapter(model, get_providers()).requires_api_key()
+    except Exception as exc:
+        logger.warning("G06: reachability check errored for %s: %s", model, exc)
+        return False
+
+
+async def _resolve_provider_key(model: str) -> Optional[str]:
+    """Resolve the LLM provider API key for a given model name (startswith resolution,
+    consistent with ``_tier_provider`` / ``providers.get_provider_entry``)."""
+    try:
+        from auth.api_key_manager import get_llm_provider_key
+        provider = _tier_provider(model)
         if not provider:
             logger.warning("G06: cannot resolve provider for %s", model)
             return None
         key = get_llm_provider_key(provider)
         if not key:
-            logger.warning("G06: no API key for provider %s", provider)
+            logger.warning("G06: no API key for provider %s (model %s)", provider, model)
             return None
         return key
     except Exception as exc:
         logger.warning("G06: provider key resolution error for %s: %s", model, exc)
         return None
+
+
+# Deduped so the tier-reachability audit logs once per tier-config signature, not per request.
+_CASCADE_TIERS_LOGGED: set = set()
+
+
+def _log_cascade_tier_reachability(ctx: RequestContext, cfg: Dict[str, Any]) -> None:
+    """Once per tier-config signature, log which cascade tier models are reachable, so a
+    misconfigured (e.g. OpenAI-free) deployment is flagged loudly at first use — not just
+    silently degraded per request. Covers the classifier tiers AND the routellm weak/strong."""
+    tiers = cfg.get("tiers", {}) or {}
+    routellm = cfg.get("routellm", {}) or {}
+    models: List[str] = []
+    for _k in ("simple", "medium", "complex"):
+        models += tiers.get(_k, []) or []
+    for _k in ("weak_model", "strong_model"):
+        if routellm.get(_k):
+            models.append(routellm[_k])
+    models = [m for m in dict.fromkeys(models) if m]  # dedupe, preserve order
+    if not models:
+        return
+    sig = tuple(models)
+    if sig in _CASCADE_TIERS_LOGGED:
+        return
+    _CASCADE_TIERS_LOGGED.add(sig)
+    unreachable = [m for m in models if not _tier_reachable(m)]
+    on_unreach = str(cfg.get("on_unreachable_tier", "fallback")).lower()
+    if unreachable:
+        logger.warning(
+            "[%s] G06 cascade tier check: %d/%d tier model(s) UNREACHABLE (no API key / ambient "
+            "creds for their provider): %s. on_unreachable_tier=%s → requests routed to these will "
+            "%s. Fix: point the tier at a keyed provider's model, or configure the missing key.",
+            ctx.request_id, len(unreachable), len(models), ", ".join(unreachable), on_unreach,
+            "return a clean 503" if on_unreach == "error" else "fall back to the requested model",
+        )
+    else:
+        logger.info(
+            "[%s] G06 cascade tier check: all %d tier model(s) reachable",
+            ctx.request_id, len(models),
+        )
 
 _COMPLEX_KEYWORDS = re.compile(
     r"\b(analyse|analyze|explain|compare|evaluate|synthesise|synthesize|"
@@ -548,6 +617,9 @@ class G06Routing:
                     )
             return ctx
 
+        # Flag any unreachable cascade tier models loudly (once per config) at first use.
+        _log_cascade_tier_reachability(ctx, cfg)
+
         model_requested = ctx.model  # snapshot before any mutation
         selected_model = ctx.model
         user_override = False
@@ -597,6 +669,34 @@ class G06Routing:
                 if candidates:
                     selected_model = candidates[0]
                 ctx.savings.routing_mode = classifier
+
+        # 2b. Reachability guard (P8 hardening): never hand main.py a routed tier model whose
+        # provider has no usable credential — that becomes a downstream 503. Per
+        # G6_routing.on_unreachable_tier: 'fallback' (default) serves the caller's OWN model
+        # (they chose it, so its key is present); 'error' keeps the unreachable model so main.py's
+        # provider-key guard returns a clean 503 with the reason logged here.
+        if selected_model and selected_model != model_requested and not _tier_reachable(selected_model):
+            _provider = _tier_provider(selected_model) or "?"
+            _mode = str(cfg.get("on_unreachable_tier", "fallback")).lower()
+            if _mode == "error":
+                logger.error(
+                    "[%s] G06: routed tier model %r is UNREACHABLE — provider %r has no API key and no "
+                    "ambient credentials; on_unreachable_tier=error → the request will 503. Configure the "
+                    "key, or point this tier at a keyed provider's model.",
+                    ctx.request_id, selected_model, _provider,
+                )
+                # keep selected_model as-is → main.py's provider-key guard raises a clean 503
+            else:
+                logger.warning(
+                    "[%s] G06: routed tier model %r is UNREACHABLE — provider %r has no API key/ambient "
+                    "creds; falling back to the requested model %r (cost-routing no-op this request). "
+                    "Configure the key or set that tier to a keyed provider's model to restore routing.",
+                    ctx.request_id, selected_model, _provider, model_requested,
+                )
+                selected_model = model_requested
+                ctx.savings.routing_mode = (
+                    getattr(ctx.savings, "routing_mode", None) or "route"
+                ) + "+tier_unreachable_fallback"
 
         # 3. Savings logic
         if selected_model != ctx.model:

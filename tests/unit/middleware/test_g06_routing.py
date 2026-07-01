@@ -25,6 +25,20 @@ class FakeClientError(FakeClient):
         raise Exception("sidecar error")
 
 
+@pytest.fixture(autouse=True)
+def _g06_provider_keys():
+    """Routing now checks tier-model provider reachability (P8 hardening). Provide a providers
+    table + keys by default so these tests exercise classification, not key-gating; the no-key
+    path has dedicated reachability tests (TestG06TierReachability) that override these."""
+    providers = [
+        {"name": "openai", "model_prefixes": ["gpt", "o1", "o3", "o4", "chatgpt"]},
+        {"name": "anthropic", "model_prefixes": ["claude"]},
+    ]
+    with patch("middleware.g06_routing.get_providers", return_value=providers), \
+         patch("auth.api_key_manager.get_llm_provider_key", return_value="sk-test"):
+        yield
+
+
 @pytest.mark.asyncio
 class TestG06Routing:
     async def test_disabled_no_routing(self, make_ctx):
@@ -581,3 +595,80 @@ class TestG06CascadeExecution:
 
         # Falls back to standard classification
         assert "fallback" in ctx.savings.routing_mode
+
+
+class TestG06TierReachability:
+    """P8 hardening: routing must not hand main.py a tier whose provider has no credential."""
+
+    def test_tier_provider_startswith_not_substring(self):
+        # openrouter/openai/... must resolve to openrouter, not openai (the substring trap).
+        from middleware.g06_routing import _tier_provider
+        provs = [
+            {"name": "openai", "model_prefixes": ["gpt"]},
+            {"name": "openrouter", "model_prefixes": ["openrouter/"]},
+        ]
+        with patch("middleware.g06_routing.get_providers", return_value=provs):
+            assert _tier_provider("openrouter/openai/gpt-oss-120b:free") == "openrouter"
+            assert _tier_provider("gpt-4o-mini") == "openai"
+
+    def test_reachable_when_key_present(self):
+        from middleware.g06_routing import _tier_reachable
+        with patch("middleware.g06_routing.get_providers",
+                   return_value=[{"name": "openai", "model_prefixes": ["gpt"]}]), \
+             patch("auth.api_key_manager.get_llm_provider_key", return_value="sk"):
+            assert _tier_reachable("gpt-4o-mini") is True
+
+    def test_unreachable_when_no_key_and_key_required(self):
+        from middleware.g06_routing import _tier_reachable
+        adapter = Mock()
+        adapter.requires_api_key.return_value = True
+        with patch("middleware.g06_routing.get_providers",
+                   return_value=[{"name": "openai", "model_prefixes": ["gpt"]}]), \
+             patch("auth.api_key_manager.get_llm_provider_key", return_value=None), \
+             patch("providers.get_adapter", return_value=adapter):
+            assert _tier_reachable("gpt-4o-mini") is False
+
+    def test_reachable_via_ambient_creds_when_key_not_required(self):
+        # Bedrock/Vertex: no bearer key, but reachable via ambient creds (requires_api_key=False).
+        from middleware.g06_routing import _tier_reachable
+        adapter = Mock()
+        adapter.requires_api_key.return_value = False
+        with patch("middleware.g06_routing.get_providers",
+                   return_value=[{"name": "bedrock", "model_prefixes": ["bedrock/"]}]), \
+             patch("auth.api_key_manager.get_llm_provider_key", return_value=None), \
+             patch("providers.get_adapter", return_value=adapter):
+            assert _tier_reachable("bedrock/amazon.nova-micro-v1:0") is True
+
+
+@pytest.mark.asyncio
+class TestG06UnreachableTierGuard:
+    """The per-request guard: unreachable routed tier → fallback to requested (default) or 503 (error)."""
+
+    def _tiers_cfg(self, ctx, mode):
+        g = ctx.config["groups"]["G6_routing"]
+        g["enabled"] = True
+        g["classifier"] = "cascade"
+        g["cascade_execution"] = False
+        g["on_unreachable_tier"] = mode
+        g["tiers"] = {"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["gpt-4o"]}
+
+    async def test_fallback_serves_requested_model(self, make_ctx):
+        # Simple prompt routes to the gpt-4o-mini tier, but that tier is unreachable → serve
+        # the caller's own model (claude-haiku-4-5, which is reachable).
+        ctx = make_ctx([{"role": "user", "content": "What is Python?"}], model="claude-haiku-4-5")
+        self._tiers_cfg(ctx, "fallback")
+        from middleware.g06_routing import G06Routing
+        with patch("middleware.g06_routing._tier_reachable",
+                   side_effect=lambda m: m == "claude-haiku-4-5"):
+            ctx = await G06Routing().process_request(ctx)
+        assert ctx.routed_model == "claude-haiku-4-5"
+
+    async def test_error_mode_keeps_unreachable_tier(self, make_ctx):
+        # In error mode the unreachable tier is kept so main.py's provider-key guard 503s.
+        ctx = make_ctx([{"role": "user", "content": "What is Python?"}], model="claude-haiku-4-5")
+        self._tiers_cfg(ctx, "error")
+        from middleware.g06_routing import G06Routing
+        with patch("middleware.g06_routing._tier_reachable",
+                   side_effect=lambda m: m == "claude-haiku-4-5"):
+            ctx = await G06Routing().process_request(ctx)
+        assert ctx.routed_model == "gpt-4o-mini"
