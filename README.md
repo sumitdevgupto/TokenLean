@@ -130,26 +130,40 @@ See [docs/developer-onboarding.md](docs/developer-onboarding.md) for Python, Jav
 
 ```mermaid
 flowchart TB
-    Req(["Developer request<br/>OpenAI-compatible client"])
+    Req(["`Developer request
+    OpenAI-compatible client`"])
 
-    Gate["<b>1 · Gate</b><br/>G0 Rate-limit → G24 Adaptive-bypass (loads skip_groups) →<br/>G4 Rules-bypass → G5 Cache read (L1/L2/L3) → G6 Route (3-tier cascade)"]
+    Gate["`**1 · Gate**
+    G0 Rate-limit → G24 Adaptive-bypass (loads skip_groups) →
+    G4 Rules-bypass → G5 Cache read (L1/L2/L3) → G6 Route (3-tier cascade)`"]
 
-    ReqOpt["<b>2 · Request-side optimisation</b>  (each stage skippable via G24)<br/>G1 Compress (LLMLingua-2) → G27 Multimodal → G2 Templates → G20 Prompt-opt →<br/>G7 RAG → G8 Tools (MCP) → G28 CCR → G19 Headroom-prune →<br/>G9 Schema → G10 Memory → G22 Dedup"]
+    ReqOpt["`**2 · Request-side optimisation** (each stage skippable via G24)
+    G1 Compress (LLMLingua-2) → G27 Multimodal → G2 Templates → G20 Prompt-opt →
+    G7 RAG → G8 Tools (MCP) → G28 CCR → G19 Headroom-prune →
+    G9 Schema → G10 Memory → G22 Dedup`"]
 
-    Params["<b>3 · LLM-call parameters</b>  (each stage skippable via G24)<br/>G16 Agent-arch → G11 Output-format → G25 Adaptive-reason →<br/>G12 Reason-budget → G13 Batch/TOON → G17 Loop-budget"]
+    Params["`**3 · LLM-call parameters** (each stage skippable via G24)
+    G16 Agent-arch → G11 Output-format → G25 Adaptive-reason →
+    G12 Reason-budget → G13 Batch/TOON → G17 Loop-budget`"]
 
-    Align["<b>4 · Final alignment</b><br/>G21 Cache-alignment — last step before the provider call"]
+    Align["`**4 · Final alignment**
+    G21 Cache-alignment — last step before the provider call`"]
 
-    LLM{{"LLM provider<br/>any OpenAI-compatible"}}
+    LLM{{"`LLM provider
+    any OpenAI-compatible`"}}
 
-    Resp2["<b>5 · Response-side</b><br/>G14 Tool-output → G28 CCR → G23 Stream-compress → G19 Headroom →<br/>G15 Server-compute → G11 Format-feedback → G18 Observability → G5 Cache-store"]
+    Resp2["`**5 · Response-side**
+    G14 Tool-output → G28 CCR → G23 Stream-compress → G19 Headroom →
+    G15 Server-compute → G11 Format-feedback → G18 Observability → G5 Cache-store`"]
 
-    Out(["Response<br/>+ _token_opt savings breakdown"])
+    Out(["`Response
+    + _token_opt savings breakdown`"])
 
     Req --> Gate --> ReqOpt --> Params --> Align --> LLM --> Resp2 --> Out
 
     Gate -.->|G4 bypass or cache hit| Out
-    Ingest["G3 Knowledge ingestion<br/>offline Cloud Run Job"] -.->|feeds| ReqOpt
+    Ingest["`G3 Knowledge ingestion
+    offline Cloud Run Job`"] -.->|feeds| ReqOpt
     Resp2 -.->|traces and metrics| Dash["Langfuse · Grafana · Prometheus"]
 
     classDef llm fill:#ffe0f0,stroke:#cc3388,stroke-width:2px;
@@ -419,12 +433,7 @@ pytest --cov=src/proxy --cov-report=html
 | [docs/request-flow-diagram.md](docs/request-flow-diagram.md) | Full request/response pipeline (G0–G28) and per-group flow |
 | [docs/oss-licenses.md](docs/oss-licenses.md) | Dependency licenses (SPDX) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Complete deployment and troubleshooting guide |
-
-## Contributing
-
-This project follows a comprehensive implementation of the Token Optimisation Playbook v7. All 28 optimisation slots (G0–G28, G26 reserved — 27 groups) are fully implemented with production-ready code, tests, and documentation.
-
-**Implementation Status:** ✅ 27/28 slots implemented (G26 reserved)
+| [Token Optimisation Blog](https://sumitdevgupto.github.io/token-optimisation-blog/) | Reference article — background and walkthrough of the framework |
 
 ## License
 
