@@ -32,13 +32,13 @@
 Most LLM infrastructure operates at the **gateway** layer — unified routing, key
 management, observability, guardrails. This project is deliberately different: it
 is the **transparent optimisation layer** that targets the one thing gateways
-don't prioritise — **breadth of token reduction** (28 techniques, 30–70% / up to
+don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / up to
 **55.78% measured**) — and drops in *in front of, or inside,* any gateway.
 
 | Capability | **This project** | LiteLLM | Helicone | Portkey | Bifrost |
 |---|---|---|---|---|---|
 | Primary role | **Token-reduction layer** | Unified gateway | Observability-first | Gateway + guardrails | High-perf gateway (Go) |
-| Transparent optimisation techniques | **28 (G0–G28)** | a few (cache, route) | analytics | some (cache, PII) | Code Mode (~50% on tool calls) |
+| Transparent optimisation techniques | **27 (G0–G28, G26 reserved)** | few (cache, routing) | observability-focused | some (cache, guardrails) | few (cache, load-balancing) |
 | Prompt compression (LLMLingua-2) | ✅ | — | — | — | — |
 | Multi-level + semantic cache (L1/L2/L3) | ✅ | basic | — | ✅ | ✅ |
 | Model routing / 3-tier cascade | ✅ (+ RouteLLM) | ✅ | — | ✅ | ✅ |
@@ -48,8 +48,19 @@ don't prioritise — **breadth of token reduction** (28 techniques, 30–70% / u
 | Self-host · Apache-2.0 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Complements your existing gateway | ✅ sits in front / inside | — | — | — | — |
 
-> *Directional comparison based on public docs as of 2026; capabilities evolve —
-> verify against each project's current feature set.*
+> **How to read this table.** ✅ = documented capability. "—" means **not a documented focus** in that
+> project's public docs as of July 2026 — *not* a claim that it is technically impossible or absent from a
+> fork/roadmap. Qualifiers ("few", "basic", "some") are directional summaries, not benchmarks. This space
+> moves fast, so **verify against each project's current docs** — and please
+> [open an issue or PR](https://github.com/sumitdevgupto/TokenLean/issues) if any cell is out of date.
+>
+> This project's own figures (**55.78%**, up to **~84%**, **27 techniques**) are **self-measured** on our
+> live-ablation test harness — directional estimates, not an independent third-party benchmark.
+>
+> **Sources:** [LiteLLM](https://docs.litellm.ai/) · [Helicone](https://docs.helicone.ai/) ·
+> [Portkey](https://portkey.ai/) · [Bifrost](https://docs.getbifrost.ai/). LiteLLM, Helicone, Portkey and
+> Bifrost are trademarks of their respective owners, referenced here for identification and comparison
+> only; no affiliation or endorsement is implied.
 
 **Bottom line:** keep your gateway. Put this in front of it (or point it at one)
 and capture the 30–70% token savings the gateway layer doesn't target.
@@ -117,57 +128,40 @@ See [docs/developer-onboarding.md](docs/developer-onboarding.md) for Python, Jav
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    Req(["Developer request<br/>OpenAI-compatible client"])
+
+    Gate["<b>1 · Gate</b><br/>G0 Rate-limit → G24 Adaptive-bypass (loads skip_groups) →<br/>G4 Rules-bypass → G5 Cache read (L1/L2/L3) → G6 Route (3-tier cascade)"]
+
+    ReqOpt["<b>2 · Request-side optimisation</b>  (each stage skippable via G24)<br/>G1 Compress (LLMLingua-2) → G27 Multimodal → G2 Templates → G20 Prompt-opt →<br/>G7 RAG → G8 Tools (MCP) → G28 CCR → G19 Headroom-prune →<br/>G9 Schema → G10 Memory → G22 Dedup"]
+
+    Params["<b>3 · LLM-call parameters</b>  (each stage skippable via G24)<br/>G16 Agent-arch → G11 Output-format → G25 Adaptive-reason →<br/>G12 Reason-budget → G13 Batch/TOON → G17 Loop-budget"]
+
+    Align["<b>4 · Final alignment</b><br/>G21 Cache-alignment — last step before the provider call"]
+
+    LLM{{"LLM provider<br/>any OpenAI-compatible"}}
+
+    Resp2["<b>5 · Response-side</b><br/>G14 Tool-output → G28 CCR → G23 Stream-compress → G19 Headroom →<br/>G15 Server-compute → G11 Format-feedback → G18 Observability → G5 Cache-store"]
+
+    Out(["Response<br/>+ _token_opt savings breakdown"])
+
+    Req --> Gate --> ReqOpt --> Params --> Align --> LLM --> Resp2 --> Out
+
+    Gate -.->|G4 bypass or cache hit| Out
+    Ingest["G3 Knowledge ingestion<br/>offline Cloud Run Job"] -.->|feeds| ReqOpt
+    Resp2 -.->|traces and metrics| Dash["Langfuse · Grafana · Prometheus"]
+
+    classDef llm fill:#ffe0f0,stroke:#cc3388,stroke-width:2px;
+    classDef io fill:#e6f0ff,stroke:#3366cc;
+    class LLM llm;
+    class Req,Out io;
 ```
-Developer Request
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                     TOKEN OPTIMISATION PROXY (Cloud Run)              │
-│                                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│  │  G0 Rate    │──│  G4 Bypass  │──│  G5 Cache   │──│  G6 Route   │   │
-│  │  Limit      │  │  (Rules)    │  │  (L1/L2)    │  │  (Cascade)  │   │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
-│                                           │                             │
-│       ┌──────────────────────────────────┼────────────────────┐       │
-│       ▼                                  ▼                    ▼       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│  │  G1 Compress│──│  G2 Templates│──│  G7 RAG     │──│  G8 Tools   │   │
-│  │  (LLMLingua)│  │  (Registry) │  │  (pgvector) │  │  (MCP)      │   │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
-│                                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│  │  G9 Schema  │──│  G10 Memory │──│  G16 Agent  │──│  G11 Format │   │
-│  │  (Instruct)│  │  (Mem0)     │  │  (LangGraph)│  │  (Output)   │   │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
-│                                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │
-│  │  G12 Reason │──│  G13 Batch  │──│  G17 Budget │──► LLM Provider  │
-│  │  (Budget)   │  │  (TOON/Kafka│  │  (Loop Ctrl)│    (Any OpenAI  │
-│  └─────────────┘  └─────────────┘  └─────────────┘     compatible)  │
-│                                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │
-│  │  G14 Tool   │──│  G15 Server │──│  G18 Observe│──► Dashboards   │
-│  │  Output     │  │  Compute    │  │  (Langfuse) │    (Grafana)    │
-│  └─────────────┘  └─────────────┘  └─────────────┘                   │
-│                                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│  │  G19 Head-  │──│  G20 Prompt │──│  G21 Cache  │──│  G22 Dedup  │   │
-│  │  room Prune │  │  Optimizer  │  │  Alignment  │  │  (Semantic) │   │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
-│                                                                         │
-│  ┌─────────────┐                                                        │
-│  │  G23 Stream │  (Response-side streaming compression)                 │
-│  │  Compress   │                                                        │
-│  └─────────────┘                                                        │
-└──────────────────────────────────────────────────────────────────────┘
-       │
-       ▼
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  Infrastructure: GCS · Redis · PostgreSQL · Qdrant · Prometheus            │
-  │                  Jaeger (OTel) · Langfuse · Grafana (11 dashboards)         │
-  └─────────────────────────────────────────────────────────────────────────────┘
-```
+
+> Stages run in the exact order above (source of truth: `src/proxy/middleware/pipeline.py`).
+> **G24 runs first** and can skip any later stage per request; **G21** is the last step before the
+> provider call. **G4 bypass** and an **L1/L2/L3 cache hit** short-circuit straight to the response.
+> **G3** is an offline ingestion job that feeds the G7 RAG index. (G26 is a reserved slot.)
 
 ## Deployment Options
 
