@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="TokenLean">
+  <title>TokenLean</title>
+  <defs>
+    <linearGradient id="tl-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="tl-grn" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="1" stop-color="#16a34a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- slate card -->
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#tl-bg)" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- compression brackets squeezing inward -->
+  <path d="M9 21 L15 32 L9 43" fill="none" stroke="url(#tl-grn)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M55 21 L49 32 L55 43" fill="none" stroke="url(#tl-grn)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- token coin -->
+  <circle cx="32" cy="32" r="13" fill="#0b1220" stroke="url(#tl-grn)" stroke-width="3"/>
+  <!-- T monogram = Token -->
+  <path d="M25.5 27 H38.5 M32 27 V39.5" fill="none" stroke="#4ade80" stroke-width="3" stroke-linecap="round"/>
+</svg>

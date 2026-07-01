@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 176" width="500" height="176" role="img" aria-label="TokenLean — the drop-in proxy for any LLM: your app to TokenLean to any LLM, 30 to 70 percent fewer tokens">
+  <title>TokenLean — drop-in LLM proxy</title>
+  <defs>
+    <linearGradient id="tl-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="tl-grn" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="1" stop-color="#16a34a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- slate card -->
+  <rect x="1" y="1" width="498" height="174" rx="20" fill="url(#tl-bg)" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- ===== icon (compressing token) ===== -->
+  <g transform="translate(40,50) scale(1.32)">
+    <path d="M9 21 L15 32 L9 43" fill="none" stroke="url(#tl-grn)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M55 21 L49 32 L55 43" fill="none" stroke="url(#tl-grn)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="32" cy="32" r="13" fill="#0b1220" stroke="url(#tl-grn)" stroke-width="3"/>
+    <path d="M25.5 27 H38.5 M32 27 V39.5" fill="none" stroke="#4ade80" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <!-- ===== wordmark ===== -->
+  <text x="150" y="66" font-family="'Segoe UI','SF Pro Display',system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="44" font-weight="700" letter-spacing="-0.5">
+    <tspan fill="#e2e8f0">Token</tspan><tspan fill="#22c55e">Lean</tspan>
+  </text>
+
+  <!-- ===== proxy descriptor ===== -->
+  <text x="153" y="93" font-family="'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" letter-spacing="2.6"><tspan fill="#94a3b8">TOKEN OPTIMISATION </tspan><tspan fill="#22c55e">PROXY</tspan></text>
+
+  <!-- ===== proxy flow: your app -> TokenLean -> any LLM ===== -->
+  <g font-family="'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="600">
+    <!-- your app chip -->
+    <rect x="152" y="118" width="80" height="28" rx="14" fill="#101a2e" stroke="#334155" stroke-width="1"/>
+    <text x="192" y="136" fill="#cbd5e1" text-anchor="middle">your app</text>
+
+    <!-- arrow in -->
+    <line x1="238" y1="132" x2="262" y2="132" stroke="#22c55e" stroke-width="2.2" stroke-linecap="round"/>
+    <polygon points="262,127 271,132 262,137" fill="#22c55e"/>
+
+    <!-- TokenLean proxy node -->
+    <circle cx="290" cy="132" r="12" fill="#0b1220" stroke="url(#tl-grn)" stroke-width="2.6"/>
+    <path d="M284.5 128 H295.5 M290 128 V138" fill="none" stroke="#4ade80" stroke-width="2.4" stroke-linecap="round"/>
+
+    <!-- arrow out -->
+    <line x1="308" y1="132" x2="332" y2="132" stroke="#22c55e" stroke-width="2.2" stroke-linecap="round"/>
+    <polygon points="332,127 341,132 332,137" fill="#22c55e"/>
+
+    <!-- any LLM chip -->
+    <rect x="346" y="118" width="104" height="28" rx="14" fill="#101a2e" stroke="#334155" stroke-width="1"/>
+    <text x="398" y="136" fill="#cbd5e1" text-anchor="middle">any LLM API</text>
+  </g>
+</svg>

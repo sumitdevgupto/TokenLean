@@ -1,6 +1,11 @@
-# TokenLean
+<p align="center">
+  <img src="assets/logo.svg" alt="TokenLean" width="520">
+</p>
 
-> **Cut your LLM token bill 30–70% — with a one-line code change and zero quality loss.**
+<p align="center">
+  <strong>TokenLean — the Token Optimisation Proxy.</strong><br>
+  Cut your LLM token bill 30–70% with a one-line code change and zero quality loss.
+</p>
 
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
