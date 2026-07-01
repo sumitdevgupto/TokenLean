@@ -31,7 +31,7 @@ import litellm
 litellm.drop_params = True
 
 from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key
-from config_loader import get_config, get_fallback_request_model, get_provider_model_prefixes, load_config, start_hot_reload
+from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
 from middleware.g18_observability import REQUEST_DURATION_MS, HTTP_REQUESTS
 from middleware import RequestContext
@@ -866,12 +866,16 @@ def _require_admin(tenant_metadata: Optional[dict], action: str) -> None:
 
 
 def _resolve_provider(model: str, cfg: Dict[str, Any]) -> str:
-    """Map a model name to its provider name using config providers[].model_prefixes."""
-    model_lower = model.lower()
-    provider_map = get_provider_model_prefixes()
-    for fragment, provider in provider_map.items():
-        if fragment in model_lower:
-            return provider
+    """Map a model name to its provider via providers[].model_prefixes.
+
+    Uses the SAME prefix (startswith) resolution as providers.get_provider_entry /
+    get_adapter, so the key we fetch matches the adapter that will route the call.
+    A substring match here is wrong: 'openrouter/openai/gpt-oss-120b:free' contains
+    the 'openai'/'gpt' fragment and would mis-resolve to OpenAI (→ wrong/absent key).
+    """
+    entry = get_provider_entry(model, cfg.get("providers", []))
+    if entry and entry.get("name"):
+        return entry["name"]
     # Fall back to first configured provider
     providers = cfg.get("providers", [])
     if providers:

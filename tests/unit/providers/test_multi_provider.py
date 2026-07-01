@@ -219,6 +219,18 @@ class TestCapReasoningParams:
         p = AnthropicAdapter().cap_reasoning_params({"thinking": {"budget_tokens": 5000}}, None)
         assert p["thinking"]["budget_tokens"] == 5000
 
+    def test_anthropic_drops_reasoning_effort_when_max_tokens_too_small(self):
+        # G25 sets reasoning_effort; with G12 disabled nothing maps it to `thinking`. A tiny
+        # max_tokens can't fit the 1024 min budget → reasoning_effort must ALSO be dropped, or
+        # litellm expands it into a conflicting thinking budget downstream (Anthropic 400s).
+        p = AnthropicAdapter().cap_reasoning_params({"reasoning_effort": "high"}, 16)
+        assert "reasoning_effort" not in p and "thinking" not in p
+
+    def test_anthropic_keeps_reasoning_effort_when_max_tokens_fits(self):
+        # Plenty of room for a thinking budget → leave reasoning_effort alone.
+        p = AnthropicAdapter().cap_reasoning_params({"reasoning_effort": "high"}, 4096)
+        assert p.get("reasoning_effort") == "high"
+
 
 class TestAllTenProvidersRouteSmoke:
     @pytest.mark.parametrize("name,model,expect", [

@@ -81,10 +81,22 @@ class AnthropicAdapter(ProviderAdapter):
 
     def cap_reasoning_params(self, params: Dict, max_tokens: Optional[int]) -> Dict:
         """Keep ``thinking.budget_tokens`` strictly below ``max_tokens`` — Anthropic 400s
-        when ``max_tokens <= thinking.budget_tokens``. If ``max_tokens`` is too small to fit
-        Anthropic's 1024-token minimum thinking budget, drop thinking entirely.
+        when ``max_tokens <= thinking.budget_tokens``.
+
+        If ``max_tokens`` is too small to fit Anthropic's 1024-token minimum thinking
+        budget, drop reasoning entirely — including a stray ``reasoning_effort`` (which
+        G25 sets and, when G12 is disabled, nothing consumes). litellm would otherwise
+        expand that ``reasoning_effort`` into a thinking budget downstream, re-triggering
+        the same 400 even after the explicit ``thinking`` param is removed.
         """
         if not max_tokens:
+            return params
+        # Can't fit the 1024-token minimum budget → strip both the explicit `thinking`
+        # AND `reasoning_effort` so litellm neither receives an oversized budget nor
+        # re-derives one from the effort string.
+        if max_tokens <= 1024:
+            params.pop("thinking", None)
+            params.pop("reasoning_effort", None)
             return params
         thinking = params.get("thinking")
         if not isinstance(thinking, dict):
@@ -92,11 +104,7 @@ class AnthropicAdapter(ProviderAdapter):
         budget = thinking.get("budget_tokens")
         if budget is None or budget < max_tokens:
             return params
-        new_budget = max_tokens - 1
-        if new_budget < 1024:
-            params.pop("thinking", None)
-        else:
-            thinking["budget_tokens"] = new_budget
+        thinking["budget_tokens"] = max_tokens - 1
         return params
 
     def inject_cache_control(self, messages: List[Dict]) -> List[Dict]:

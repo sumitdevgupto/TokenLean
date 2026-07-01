@@ -41,6 +41,14 @@ class G12ReasoningBudget:
                 if key not in ctx.params:
                     ctx.params[key] = value
                     applied = True
+            # When the provider expresses reasoning via a native param (Anthropic
+            # `thinking`, Gemini `thinking_config`) rather than `reasoning_effort`,
+            # drop the now-redundant `reasoning_effort`. Otherwise litellm ALSO
+            # expands it into a second thinking budget downstream — which Anthropic
+            # 400s on when max_tokens is small (cap_reasoning_params caps the native
+            # param but never sees litellm's reasoning_effort→thinking expansion).
+            if applied and "reasoning_effort" not in reasoning_params:
+                ctx.params.pop("reasoning_effort", None)
 
         # Inject reasoning-suppression prompt for low/medium effort
         suppression_prompts = cfg.get("reasoning_suppression_prompts", {})
