@@ -281,6 +281,7 @@ Every LLM response includes detailed savings metadata:
 | `stop-gcp.sh` | Export Redis to GCS, stop Cloud SQL (cost savings) |
 | `start-gcp.sh` | Restore Redis from GCS, start Cloud SQL |
 | `deploy-local.sh` | Deploy full stack locally via Docker Compose |
+| `live_run_check.sh` | Live per-provider smoke test — preflight (Docker/proxy/config/keys) → real round-trip per provider (auto-generates a proxy key if absent) → PASS/FAIL/SKIP table. `./scripts/local/live_run_check.sh [provider\|all]` |
 | `start-local.sh` | Start local Docker stack |
 | `stop-local.sh` | Stop local Docker stack (zero cost) |
 | `seed-data.sh` | Seed Qdrant (auto-detects GCP or local) |
