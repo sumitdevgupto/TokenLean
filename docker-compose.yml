@@ -11,6 +11,16 @@
 # =============================================================================
 version: '3.8'
 
+# Project name is pinned here so EVERY entrypoint shares ONE set of token-opt-*
+# images, containers and volumes, no matter which directory it is invoked from:
+#   • scripts/local/deploy-local.sh        (repo root)
+#   • examples/benchmark/run.sh            (repo root)
+#   • pitch-test-plan/scripts/local/*.sh   (invoked with -f "$REPO_ROOT/docker-compose.yml")
+#   • pitch-test-plan/src/run_roi_pitch.py (--live health check via `docker compose ps`)
+# Matches COMPOSE_PROJECT_NAME in .env. Do not remove without updating those callers,
+# or they will fragment back into separate <dir>-name image/volume sets.
+name: token-opt
+
 services:
   # ─── Infrastructure Layer ─────────────────────────────────────────────────
   redis:
