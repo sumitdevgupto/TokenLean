@@ -167,8 +167,9 @@ providers:
   openai_compatible: true
   api_base: https://opencode.ai/zen/v1
   route_prefix: opencode/
-  # Free models ($0). Verify the exact slug on the OpenCode Zen dashboard.
+  # Lead model = Kimi K2.7 Code; the free models below are $0. Verify slugs on the OpenCode Zen dashboard.
   models:
+  - opencode/kimi-k2.7-code        # Kimi K2.7 Code (default)
   - opencode/mimo-v2.5             # MiMo V2.5 (free)
   - opencode/qwen3.6-plus          # Qwen3.6 Plus (free)
   - opencode/minimax-m3            # MiniMax M3 (free)
@@ -264,6 +265,9 @@ pricing:
     input: 0.0014
     output: 0.0044
   opencode/kimi-k2.6:
+    input: 0.00095
+    output: 0.004
+  opencode/kimi-k2.7-code:        # estimate — mirrors kimi-k2.6; verify on opencode.ai/zen
     input: 0.00095
     output: 0.004
   opencode/minimax-m2.7:
