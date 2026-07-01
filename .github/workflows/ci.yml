@@ -1,10 +1,13 @@
 name: CI
 
+# CI is temporarily disabled — runs only when triggered manually from the
+# Actions tab. Restore the push/pull_request triggers below to re-enable.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
 
 # Cancel in-progress runs for the same ref to save CI minutes.
 concurrency:
