@@ -51,3 +51,64 @@ jobs:
 
       - name: Unit tests
         run: pytest tests/unit -q
+
+  tier-build:
+    name: Tier build matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Public CI only ever has the FREE (OSS) tree — the commercial files are
+        # gitignored, so the Pro/Enterprise legs run privately via
+        # scripts/test-tiers.sh where those files exist. The matrix is kept as a
+        # list so a commercial CI can add `pro`/`enterprise` legs later.
+        tier: [free]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/proxy/requirements.txt -r tests/requirements-test.txt
+
+      - name: Build the ${{ matrix.tier }} tree (git archive HEAD — commercial files absent)
+        run: |
+          mkdir -p /tmp/${{ matrix.tier }}-tree
+          git archive HEAD | tar -x -C /tmp/${{ matrix.tier }}-tree
+
+      - name: "${{ matrix.tier }}: boot (import main, commercial absent)"
+        working-directory: /tmp/${{ matrix.tier }}-tree/src/proxy
+        env:
+          PYTHONPATH: /tmp/${{ matrix.tier }}-tree/src/proxy
+        run: python -c "import main; print('${{ matrix.tier }} boot OK:', main.app.title)"
+
+      - name: "${{ matrix.tier }}: isolation (no commercial files / no gated imports in core)"
+        run: |
+          tree=/tmp/${{ matrix.tier }}-tree
+          for f in src/proxy/api/portal.py src/proxy/api/gdpr.py src/proxy/billing/tiers.py \
+                   src/proxy/billing/invoicing.py src/proxy/billing/payments.py \
+                   src/proxy/audit/attestation.py src/proxy/commercial_app.py; do
+            if [ -e "$tree/$f" ]; then echo "LEAK: commercial file in ${{ matrix.tier }} tree: $f"; exit 1; fi
+          done
+          if grep -nE "is_group_enabled|include_router\(create_|from billing\.tiers|from api\.portal|from api\.gdpr" \
+               "$tree/src/proxy/main.py" "$tree/src/proxy/middleware/pipeline.py"; then
+            echo "LEAK: gated import/wiring in core"; exit 1
+          fi
+          echo "${{ matrix.tier }} isolation OK"
+
+      - name: "${{ matrix.tier }}: core engines present (never gated)"
+        run: |
+          tree=/tmp/${{ matrix.tier }}-tree
+          for c in src/proxy/billing/metering.py src/proxy/billing/models.py \
+                   src/proxy/billing/api.py src/proxy/audit/log.py; do
+            if [ ! -e "$tree/$c" ]; then echo "MISSING core engine: $c"; exit 1; fi
+          done
+          echo "core engines ship OK"

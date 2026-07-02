@@ -106,6 +106,17 @@ def is_admin_key(metadata: Optional[dict]) -> bool:
     return bool(isinstance(metadata, dict) and metadata.get("admin"))
 
 
+def is_suspended(metadata: Optional[dict]) -> bool:
+    """Return True when a validated key is flagged suspended in its metadata.
+
+    Suspension is set out-of-band by the key-store lifecycle (management console /
+    ``issue-key.sh``); this proxy only *enforces* it — a suspended key authenticates
+    to a known tenant but is rejected (HTTP 403) at ``_authenticate``. Legacy
+    string-format keys (metadata is None) can never be suspended.
+    """
+    return bool(isinstance(metadata, dict) and metadata.get("suspended"))
+
+
 def get_tenant_for_key(api_key: str) -> Optional[dict]:
     """
     Get tenant metadata for a validated API key.

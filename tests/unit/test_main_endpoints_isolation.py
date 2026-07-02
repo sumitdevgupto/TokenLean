@@ -3,6 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "proxy")))
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -48,6 +49,26 @@ class TestMetricsGate:
         with patch.object(main, "_METRICS_SCRAPE_TOKEN", "s3cret"):
             r = _client.get("/metrics", headers={"Authorization": "Bearer s3cret"})
             assert r.status_code == 200
+
+
+# ── H2: suspended keys are rejected at _authenticate (403) ───────────────────
+class TestSuspendedKeyGate:
+    _REQ = SimpleNamespace(headers={"Authorization": "Bearer tok-x"})
+
+    async def test_suspended_key_rejected_403(self):
+        meta = {"tenant_id": "acme", "tier": "pro", "suspended": True}
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)):
+            with pytest.raises(HTTPException) as exc:
+                await main._authenticate(self._REQ)
+        assert exc.value.status_code == 403
+
+    async def test_non_suspended_key_passes(self):
+        meta = {"tenant_id": "acme", "tier": "pro", "suspended": False}
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value={}):
+            user_id, api_key, returned = await main._authenticate(self._REQ)
+        assert user_id == "acme"
+        assert returned == meta
 
 
 # ── H1: admin endpoints require the admin scope ──────────────────────────────

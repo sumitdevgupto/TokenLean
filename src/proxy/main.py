@@ -30,7 +30,7 @@ import litellm
 # belt for OpenAI-compatible custom providers litellm can't introspect.
 litellm.drop_params = True
 
-from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key
+from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
 from middleware.g18_observability import REQUEST_DURATION_MS, HTTP_REQUESTS
@@ -824,6 +824,16 @@ async def _authenticate(request: Request) -> tuple[str, Optional[str], Optional[
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid proxy API key. Contact your platform team for a key.",
+        )
+
+    # Suspended keys authenticate to a known tenant but are rejected here (403).
+    # The suspended flag is set out-of-band by the key-store lifecycle; the proxy
+    # only enforces it. Checked before any X-User-ID override so a suspended key
+    # can never slip through the header path.
+    if is_suspended(tenant_metadata):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API key suspended. Contact your platform team.",
         )
 
     # Check for X-User-ID header override (for testing/tracking)

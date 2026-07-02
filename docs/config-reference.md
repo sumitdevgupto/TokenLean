@@ -18,6 +18,7 @@ commonly tuned keys per group, not every field.
 | `proxy` | Port, log level, CORS, default model |
 | `providers` | LLM provider endpoints (keys in Secret Manager — not here) |
 | `groups` | Per-group enable/disable + tuning parameters |
+| `savings` | Token-savings **estimate** tuning (reporting only — never billed) |
 
 ### proxy
 | Parameter | Default | Description |
@@ -48,6 +49,21 @@ configured; add more here. See [extensibility.md](extensibility.md) for the full
 
 `pricing:` is a flat map of `model-fragment → {input, output}` (USD per 1k tokens, reporting only —
 billing is per-request); add a row per new provider model.
+
+### savings
+
+Token-savings **estimate** tuning. Reporting only — none of this affects the request-count bill.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `non_gpt_tiktoken_fallback` | `true` in the template (`false` when the key is unset) | Non-GPT models (Claude/Gemini/Mistral/…) use `cl100k_base` tiktoken locally for a closer-than-`chars/4` ingress baseline. Approximate, no provider API call; affects the savings-% **estimate** only. Env override: `NON_GPT_TIKTOKEN_FALLBACK`. |
+
+**Persisted savings columns** — the metering engine writes these to Postgres `usage_events` (the value/confidence layer, never billed):
+
+- `proxy_optimised_tokens` — the proxy's post-optimisation token estimate (`y`).
+- `provider_prompt_tokens` — provider-reported prompt tokens from the response `usage` (`z`), when the provider returns them.
+
+(`x` = `baseline_tokens`. Billing is the request **count**, not tokens — see the two-track model in [request-flow-diagram.md](request-flow-diagram.md).)
 
 ## Group parameters
 
@@ -188,6 +204,8 @@ Batch accumulation (Redis Streams) plus TOON compact notation — converts JSON 
 | `et_weights.input` | `1.0` | ET metric input weight |
 | `et_weights.cache_read` | `0.1` | ET metric cache-read weight |
 | `et_weights.output` | `4.0` | ET metric output weight (output costs ~4× input) |
+| `reasoning_rate_multiplier` | `1.0` | Reporting-only price-book refinement: `>1.0` models a reasoning-token surcharge on the `cost_actual` estimate; `1.0` = none. |
+| `batch_discount_multiplier` | `0.5` | Reporting-only: multiplier applied to `cost_actual` **only** for requests served via the native async batch lane (`_native_batch`); `1.0` elsewhere. |
 
 ### G19_headroom
 Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and response paths. Additive to G1's natural-language compression.

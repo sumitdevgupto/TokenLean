@@ -482,6 +482,13 @@ cost_saving_usd       = cost_baseline_usd - cost_actual_usd
 > prompt-cache/batch credits, or reasoning surcharges; `baseline_tokens` is a counterfactual.
 > Treat `cost_*_usd` as directional, **not invoice-grade**.
 
+### Two-track model (savings vs billing)
+
+The savings numbers above are a **confidence/value layer**, kept strictly separate from billing:
+
+- **Track 2 — confidence (this section).** `x` = `baseline_tokens`, `y` = `proxy_optimised_tokens` (post-optimisation estimate), `z` = `provider_prompt_tokens` (provider-reported, when available). Persisted on `usage_events`, surfaced in `_token_opt` / portal / dashboards. **Disclosed estimates — never billed.**
+- **Track 1 — billing.** One served HTTP-2xx request (including cache hits and bypasses) = one billable unit. Invoice = `flat + max(0, requests − included) × overage`. **Tokens are never billed** (the `chars/4`-style estimate over an already-optimised prompt isn't provider-verifiable); the customer independently reproduces the bill by counting their own requests. Provider-token *reconciliation* is intentionally **not** implemented — there is nothing to reconcile when tokens aren't billed.
+
 Each G-group records its own `StepSaving`:
 ```python
 StepSaving(group="G01", description="LLMLingua-2 prompt compression",

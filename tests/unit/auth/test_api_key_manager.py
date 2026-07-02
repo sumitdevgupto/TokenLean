@@ -75,6 +75,24 @@ class TestValidateProxyKey:
         assert metadata == {"tenant_id": "acme", "tier": "enterprise"}
 
 
+class TestIsSuspended:
+    def test_suspended_true(self):
+        from auth.api_key_manager import is_suspended
+        assert is_suspended({"tenant_id": "acme", "suspended": True}) is True
+
+    def test_suspended_false(self):
+        from auth.api_key_manager import is_suspended
+        assert is_suspended({"tenant_id": "acme", "suspended": False}) is False
+
+    def test_suspended_absent_defaults_false(self):
+        from auth.api_key_manager import is_suspended
+        assert is_suspended({"tenant_id": "acme", "tier": "pro"}) is False
+
+    def test_legacy_string_key_never_suspended(self):
+        from auth.api_key_manager import is_suspended
+        assert is_suspended(None) is False
+
+
 class TestGetLLMProviderKey:
     def test_returns_env_var_override(self):
         with patch.dict(os.environ, {"LLM_KEY_OPENAI": "sk-local-test-key"}):
