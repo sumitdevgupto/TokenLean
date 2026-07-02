@@ -24,16 +24,20 @@ output "db_password_secret_name" {
 }
 
 output "prometheus_service_url" {
-  description = "Internal Cloud Run URL for the Prometheus OSS service (use as Grafana data source)"
-  value       = google_cloud_run_v2_service.prometheus.uri
+  description = "Internal Cloud Run URL for the Prometheus OSS service (empty when self-hosted observability is disabled — use Cloud Monitoring)"
+  value       = var.enable_self_hosted_observability ? google_cloud_run_v2_service.prometheus[0].uri : ""
 }
 
 output "redis_host" {
-  description = "Memorystore Redis host — set as REDIS_URL=redis://<host>:6379/0 in Cloud Run env"
-  value       = google_redis_instance.cache.host
+  description = "Redis host for REDIS_URL=redis://<host>:6379/0 — Memorystore host or the docker-Redis GCE VM internal IP"
+  value = (
+    var.redis_backend == "memorystore"
+    ? google_redis_instance.cache[0].host
+    : google_compute_instance.redis[0].network_interface[0].network_ip
+  )
 }
 
 output "qdrant_service_url" {
-  description = "Internal Cloud Run URL for the Qdrant service — set as QDRANT_URL env var"
-  value       = google_cloud_run_v2_service.qdrant.uri
+  description = "Internal Cloud Run URL for the Qdrant service (empty when Qdrant is disabled — use pgvector)"
+  value       = var.enable_qdrant ? google_cloud_run_v2_service.qdrant[0].uri : ""
 }

@@ -67,6 +67,37 @@ variable "qdrant_image" {
   default     = "qdrant/qdrant:v1.9.0"
 }
 
+# ─── Cost-optimization toggles (defaults preserve current OSS behaviour) ──────
+# The commercial lean deploy flips these via infra/commercial.tfvars / -var.
+
+variable "enable_qdrant" {
+  description = "Deploy the Qdrant Cloud Run service. When false, use the G07 pgvector fallback on Cloud SQL (set use_pgvector_fallback: true in config)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_self_hosted_observability" {
+  description = "Deploy the self-hosted Prometheus + Alertmanager Cloud Run services. When false, use Google Cloud Monitoring instead (see infra/commercial.tf alert policies)."
+  type        = bool
+  default     = true
+}
+
+variable "redis_backend" {
+  description = "Redis backend: 'memorystore' (managed Memorystore) or 'docker' (redis container on a small GCE COS VM, cheaper)."
+  type        = string
+  default     = "memorystore"
+  validation {
+    condition     = contains(["memorystore", "docker"], var.redis_backend)
+    error_message = "redis_backend must be 'memorystore' or 'docker'."
+  }
+}
+
+variable "redis_vm_machine_type" {
+  description = "Machine type for the docker-Redis GCE VM (redis_backend = docker)."
+  type        = string
+  default     = "e2-micro"
+}
+
 variable "alert_webhook_url" {
   description = "Alertmanager webhook URL override. When set, used instead of the auto-derived proxy service URL."
   type        = string

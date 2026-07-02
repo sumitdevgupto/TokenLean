@@ -26,6 +26,10 @@ resource "google_project_service" "apis" {
     "secretmanager.googleapis.com",
     "cloudtasks.googleapis.com",
     "artifactregistry.googleapis.com",
+    # compute: GCE docker-Redis VM (redis_backend=docker) + Cloud Run Direct VPC egress
+    "compute.googleapis.com",
+    # monitoring: Cloud Monitoring alert policies (managed observability)
+    "monitoring.googleapis.com",
   ])
   service            = each.value
   disable_on_destroy = false
@@ -248,8 +252,9 @@ resource "google_secret_manager_secret" "langfuse_nextauth_secret" {
   depends_on = [google_project_service.apis]
 }
 
-# NOTE: OpenMeter API key secret moved to infra/commercial.tf (open-core split,
-# item 11) — billing's OpenMeter push is a commercial-layer integration.
+# NOTE: OpenMeter was removed from the stack (2026-07-02) — it needs a full
+# ClickHouse + Kafka backend; billing is computed from the usage_events table
+# (below) without it.
 
 # ─── Billing: usage_events Cloud SQL table migration ─────────────────────────
 # Applied once against the Cloud SQL Postgres instance via a null_resource
@@ -439,6 +444,34 @@ resource "google_project_iam_member" "proxy_run_invoker" {
   member  = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
+# ─── pgvector extension (G07 pgvector fallback — enable_qdrant = false) ───────
+# When Qdrant is disabled, G07 uses PostgreSQL/pgvector on Cloud SQL. Enable the
+# `vector` extension on the token_opt DB so PGVectorRAG can create its table.
+resource "null_resource" "pgvector_extension" {
+  count = var.enable_qdrant ? 0 : 1
+  triggers = {
+    schema_version = "1"
+  }
+  provisioner "local-exec" {
+    command = <<-SHELL
+      DB_PASS=$(gcloud secrets versions access latest \
+        --secret="${google_secret_manager_secret.db_password.secret_id}" \
+        --project="${var.project_id}" 2>/dev/null)
+      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
+        --user=token_opt_app \
+        --database=token_opt \
+        --quiet <<'EOSQL'
+CREATE EXTENSION IF NOT EXISTS vector;
+EOSQL
+    SHELL
+  }
+  depends_on = [
+    google_sql_database.proxy,
+    google_sql_user.app_user,
+    google_secret_manager_secret_version.db_password,
+  ]
+}
+
 # ─── Memorystore Redis (G5 cache, G10 state, G13 streams, G18 turn KPI) ──────
 resource "google_project_service" "redis_api" {
   service            = "redis.googleapis.com"
@@ -446,6 +479,7 @@ resource "google_project_service" "redis_api" {
 }
 
 resource "google_redis_instance" "cache" {
+  count          = var.redis_backend == "memorystore" ? 1 : 0
   name           = "token-opt-redis"
   tier           = var.redis_tier
   memory_size_gb = var.redis_memory_size_gb
@@ -461,8 +495,74 @@ resource "google_redis_instance" "cache" {
   depends_on = [google_project_service.redis_api]
 }
 
+# ─── Docker-Redis on a GCE Container-Optimized-OS VM (redis_backend = docker) ──
+# Cheaper alternative to Memorystore (~$8/mo vs ~$40). Cloud Run reaches it over
+# the VPC via Direct VPC egress (default network). An ephemeral external IP is
+# attached solely so COS can pull the redis image; port 6379 is exposed ONLY to
+# internal source ranges by the firewall rule below. Not HA / not persistent —
+# fine for cache/rate-limit/state at low scale; use redis_backend=memorystore for HA.
+resource "google_compute_instance" "redis" {
+  count        = var.redis_backend == "docker" ? 1 : 0
+  name         = "token-opt-redis-vm"
+  machine_type = var.redis_vm_machine_type
+  zone         = "${var.region}-a"
+
+  tags = ["token-opt-redis"]
+
+  boot_disk {
+    initialize_params {
+      image = "cos-cloud/cos-stable"
+      size  = 10
+    }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {} # ephemeral external IP for image pull only
+  }
+
+  metadata = {
+    gce-container-declaration = <<-EOT
+      spec:
+        containers:
+          - name: redis
+            image: redis:7-alpine
+            args: ["redis-server", "--appendonly", "no", "--save", ""]
+        restartPolicy: Always
+    EOT
+    google-logging-enabled    = "true"
+  }
+
+  labels = {
+    environment  = var.environment
+    component    = "token-opt"
+    container-vm = "cos-stable"
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# Allow Redis (6379) only from internal source ranges (VPC + Direct VPC egress).
+resource "google_compute_firewall" "redis_internal" {
+  count   = var.redis_backend == "docker" ? 1 : 0
+  name    = "token-opt-redis-internal"
+  network = "default"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["6379"]
+  }
+
+  # RFC1918 internal ranges (Cloud Run Direct VPC egress uses VPC-internal IPs).
+  source_ranges = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  target_tags   = ["token-opt-redis"]
+
+  depends_on = [google_project_service.apis]
+}
+
 # ─── Qdrant (G03 doc-pipeline ingestion, G07 hybrid search) ──────────────────
 resource "google_cloud_run_v2_service" "qdrant" {
+  count    = var.enable_qdrant ? 1 : 0
   name     = "token-opt-qdrant"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
@@ -515,9 +615,9 @@ locals {
   prom_alertmanager_host = var.alertmanager_url != "" ? trimprefix(trimprefix(var.alertmanager_url, "https://"), "http://") : "localhost:9093"
 
   prometheus_config = templatefile("${path.module}/prometheus.yml.tmpl", {
-    proxy_host          = local.prom_proxy_host
-    environment         = var.environment
-    alertmanager_host   = local.prom_alertmanager_host
+    proxy_host           = local.prom_proxy_host
+    environment          = var.environment
+    alertmanager_host    = local.prom_alertmanager_host
     metrics_scrape_token = var.metrics_scrape_token
   })
 }
@@ -567,6 +667,7 @@ resource "google_secret_manager_secret_version" "prometheus_alerts" {
 }
 
 resource "google_cloud_run_v2_service" "prometheus" {
+  count    = var.enable_self_hosted_observability ? 1 : 0
   name     = "token-opt-prometheus"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
@@ -674,6 +775,7 @@ EOF
 }
 
 resource "google_cloud_run_v2_service" "alertmanager" {
+  count    = var.enable_self_hosted_observability ? 1 : 0
   name     = "token-opt-alertmanager"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
@@ -724,16 +826,18 @@ resource "google_cloud_run_v2_service" "alertmanager" {
 
 # Allow Grafana (if deployed in same project) to invoke Prometheus
 resource "google_cloud_run_v2_service_iam_member" "prometheus_grafana_invoker" {
+  count    = var.enable_self_hosted_observability ? 1 : 0
   location = var.region
-  name     = google_cloud_run_v2_service.prometheus.name
+  name     = google_cloud_run_v2_service.prometheus[0].name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
 # Allow Prometheus to invoke Alertmanager
 resource "google_cloud_run_v2_service_iam_member" "alertmanager_prometheus_invoker" {
+  count    = var.enable_self_hosted_observability ? 1 : 0
   location = var.region
-  name     = google_cloud_run_v2_service.alertmanager.name
+  name     = google_cloud_run_v2_service.alertmanager[0].name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.proxy_sa.email}"
 }

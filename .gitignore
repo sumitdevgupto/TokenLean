@@ -112,6 +112,8 @@ config/adaptive_bypass_rules.yaml
 config/bypass-rules.yaml
 config/cascade-test.yaml
 config/local-keys.json.backup.*
+# Rendered per-feature param files (the *.yaml.template are the source of truth)
+config/params/*.yaml
 
 # ─── Pitch test plan — INTERNAL (item 62) ─────────────────────────────────────
 # Full ablation + multi-tenant validation + GCP-ops harness, built for internal
@@ -178,6 +180,8 @@ skills/
 # ─── Commercial / release tooling (private — not published) ──────────────────
 # item 54 — open-core gate runner (private)
 scripts/verify-oss-gates.sh
+# item 20 (P2) — tier-build matrix runner (private; exercises commercial builds)
+scripts/test-tiers.sh
 
 # ─── Commercial layer (private — open-core split) ────────────────────────────
 # Pure-commercial source (item 8). Engines STAY in core (billing/metering.py,
@@ -208,6 +212,12 @@ infra/commercial.tf
 infra/alert_rules.yaml
 # Commercial docker services (item 12)
 docker-compose.commercial.yml
+# Commercial proxy image — runs commercial_app:app + bakes in the paid modules.
+# Its own .dockerignore overrides the OSS one so commercial code is NOT stripped.
+src/proxy/Dockerfile.commercial
+src/proxy/Dockerfile.commercial.dockerignore
+# Commercial infra tfvars (lean/flag-driven deploy overrides for the paid stack)
+infra/commercial.tfvars
 # Commercial / gated-module tests (items 31, 58 + B13)
 tests/unit/billing/test_tiers.py
 tests/unit/test_pipeline_tiers.py

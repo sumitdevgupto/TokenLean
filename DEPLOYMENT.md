@@ -449,7 +449,7 @@ source .env.gcp && ./scripts/gcp/gcp-deploy.sh
 - Cloud Tasks queue (G13 batching)
 
 **Cloud Run Services:**
-- `token-proxy` - Main proxy (public endpoint)
+- `token-proxy` - Main proxy (public endpoint; scale ceiling via `PROXY_MAX_INSTANCES`, default 1 — after raising, re-run a concurrent two-tenant isolation smoke)
 - `llmlingua-svc` - G1 compression sidecar (internal)
 - `routellm-svc` - G6 routing sidecar (internal)
 - `tika-svc` - G3 document extraction sidecar (internal, deployed if `src/tika-sidecar/` exists)

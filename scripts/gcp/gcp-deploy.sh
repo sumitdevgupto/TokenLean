@@ -528,7 +528,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --add-cloudsql-instances="${DB_CONNECTION}" \
     --allow-unauthenticated \
     --memory=4Gi --cpu=2 \
-    --min-instances=0 --max-instances=1 \
+    --min-instances=0 --max-instances="${PROXY_MAX_INSTANCES:-1}" \
     --timeout=120 \
     --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},\
 CONFIG_GCS_BUCKET=${CONFIG_BUCKET},\
@@ -554,7 +554,10 @@ LOG_LEVEL=INFO" \
     --update-env-vars="NEXTAUTH_URL=${LANGFUSE_URL}" \
     --quiet
 
-  # Register Grafana OSS
+  # Register Grafana OSS (skipped when self-hosted observability is disabled —
+  # e.g. the commercial lean deploy uses Cloud Monitoring instead)
+  GRAFANA_URL=""
+  if [[ "${ENABLE_SELF_HOSTED_OBS:-true}" == "true" ]]; then
   gcloud run deploy grafana-svc \
     --image="grafana/grafana-oss:10.4.0" \
     --platform=managed \
@@ -574,6 +577,9 @@ LANGFUSE_DB_USER=token_opt_app" \
 
   GRAFANA_URL=$(gcloud run services describe grafana-svc \
     --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
+  else
+    info "Self-hosted observability disabled (ENABLE_SELF_HOSTED_OBS) — skipping Grafana"
+  fi
 
   # Patch config.yaml with real sidecar URLs and re-upload to GCS.
   # We patch the GCS copy directly using gsutil + python — avoids clobbering the
@@ -711,6 +717,10 @@ deploy_jobs() {
 # Temporarily opens Qdrant ingress to all, seeds pitch_docs collection,
 # then reverts to internal-only ingress. Requires sentence-transformers locally.
 seed_qdrant() {
+  if [[ "${ENABLE_QDRANT:-true}" != "true" ]]; then
+    info "Qdrant disabled (ENABLE_QDRANT) — using pgvector; skipping Qdrant seed"
+    return 0
+  fi
   # WHY always seed on deploy:
   # Qdrant runs on Cloud Run with ephemeral (container) storage. Every new revision
   # (every gcp-deploy.sh run that pushes a new image) wipes the filesystem, so any
@@ -791,6 +801,10 @@ except:
 # the two resources that consume them (prometheus config secret + alertmanager
 # config secret), then restarts those Cloud Run services to pick up the change.
 patch_prometheus() {
+  if [[ "${ENABLE_SELF_HOSTED_OBS:-true}" != "true" ]]; then
+    info "Self-hosted observability disabled (ENABLE_SELF_HOSTED_OBS) — using Cloud Monitoring; skipping Prometheus patch"
+    return 0
+  fi
   info "Patching Prometheus/Alertmanager config with real service URLs..."
 
   local tfvars_file="${REPO_ROOT}/infra/terraform.tfvars"
