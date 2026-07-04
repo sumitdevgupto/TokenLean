@@ -114,10 +114,11 @@ report exactly what the quality-preserving pipeline yields.
 > that helps a *unique, first-ask* request, and the facts gate proves the answer survives.
 > It's opt-in per request (`x_compress_user`) and needs the LLMLingua sidecar warm.
 
-> **Scope vs the 55.78% headline.** The 55.78% figure comes from a broader **internal
-> 8-dataset enterprise ablation** (DS1–DS8). This example is a *single* workload, so its
-> number differs — but it is computed the **same way**, so it's comparable in kind. We
-> report whatever this dataset actually yields; we do **not** tune the data to hit a target.
+> **Scope vs the 57.34% headline.** The 57.34% figure is a **quality-gated blend across a
+> broader multi-dataset ablation** — only datasets whose answer quality held (temperature-0,
+> reproducible) are counted toward it. This example is a *single* workload, so its number
+> differs — but it is computed the **same way**, so it's comparable in kind. We report
+> whatever this dataset actually yields; we do **not** tune the data to hit a target.
 
 ## Calibrated result
 

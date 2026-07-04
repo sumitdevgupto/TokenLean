@@ -314,7 +314,11 @@ class TestG06RoutingProcessRequest:
         ctx.config["groups"]["G6_routing"]["classifier"] = "heuristic"
         ctx.config["groups"]["G6_routing"]["cascade_execution"] = False
 
+        # Reachability guard (G06 unreachable-tier fallback) is orthogonal to the routing
+        # decision under test; the tier's provider registry/key isn't set up in this unit
+        # fixture, so stub the tier as reachable (as a keyed deployment would be).
         with patch("middleware.g06_routing.langfuse_tracing"), \
+             patch("middleware.g06_routing._tier_reachable", return_value=True), \
              patch("middleware.g06_routing.estimate_cost", return_value=0.0):
             result = await g06.process_request(ctx)
         # Heuristic should route simple query to gpt-4o-mini
@@ -330,7 +334,10 @@ class TestG06RoutingProcessRequest:
         )
         ctx.model = "gpt-4-5"
 
+        # Reachability guard is orthogonal to the override behaviour under test — stub the
+        # tier as reachable (see the sibling test above).
         with patch("middleware.g06_routing.langfuse_tracing"), \
+             patch("middleware.g06_routing._tier_reachable", return_value=True), \
              patch("middleware.g06_routing.estimate_cost", return_value=0.0):
             result = await g06.process_request(ctx)
         assert result.routed_model == "gpt-4o-mini"

@@ -136,3 +136,94 @@ class TestG16AgentArch:
         ctx = await G16AgentArch().process_request(ctx)
         assert len(ctx.params["tools"]) == 3
         assert not any(s.group == "G16" for s in ctx.savings.step_savings)
+
+
+def _tool_names(tools):
+    """Extract names from either flat {'name': ...} or OpenAI-nested {'function': {'name': ...}} tools."""
+    out = []
+    for t in tools:
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        out.append(fn.get("name"))
+    return out
+
+
+@pytest.mark.asyncio
+class TestG16RelevanceToolSelection:
+    """When more tools than the cap are supplied, keep the ones relevant to the request
+    (not the first N by list order). Reproduces the DS3 failure where get_user_profile,
+    sitting late in the list, was silently dropped even though the user asked for it."""
+
+    async def test_relevance_keeps_referenced_tool_late_in_list(self, make_ctx):
+        # cap = 3; the relevant tool is LAST — a blind tools[:3] slice would drop it.
+        tools = [
+            {"type": "function", "function": {"name": "send_email", "description": "Send an email."}},
+            {"type": "function", "function": {"name": "list_logs", "description": "List log entries."}},
+            {"type": "function", "function": {"name": "calculate_total", "description": "Compute statistics."}},
+            {"type": "function", "function": {"name": "search_kb", "description": "Search the knowledge base."}},
+            {"type": "function", "function": {"name": "get_user_profile", "description": "Retrieve a user profile."}},
+        ]
+        ctx = make_ctx([
+            {"role": "system", "content": "You are an SRE agent."},
+            {"role": "user", "content": "Also get the user profile for the engineer who opened the ticket."},
+        ], params={"tools": tools})
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+        kept = _tool_names(ctx.params["tools"])
+        assert len(kept) == 3
+        assert "get_user_profile" in kept  # the whole point — not dropped despite being last
+
+    async def test_relevance_is_order_independent(self, make_ctx):
+        base = [
+            {"function": {"name": "send_email", "description": "Send an email."}},
+            {"function": {"name": "get_user_profile", "description": "Retrieve a user profile."}},
+            {"function": {"name": "list_logs", "description": "List log entries."}},
+            {"function": {"name": "calculate_total", "description": "Compute totals."}},
+            {"function": {"name": "search_kb", "description": "Search the knowledge base."}},
+        ]
+        msgs = [{"role": "user", "content": "get the user profile please"}]
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx_a = make_ctx(list(msgs), params={"tools": list(base)})
+        ctx_a = await G16AgentArch().process_request(ctx_a)
+        ctx_b = make_ctx(list(msgs), params={"tools": list(reversed(base))})
+        ctx_b = await G16AgentArch().process_request(ctx_b)
+        # Same relevant tool survives regardless of input ordering
+        assert "get_user_profile" in _tool_names(ctx_a.params["tools"])
+        assert "get_user_profile" in _tool_names(ctx_b.params["tools"])
+
+    async def test_relevance_respects_cap(self, make_ctx):
+        tools = [{"function": {"name": f"tool_{i}", "description": "generic"}} for i in range(9)]
+        ctx = make_ctx([{"role": "user", "content": "do something"}], params={"tools": tools})
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+        max_tools = ctx.config["groups"]["G16_agent_arch"]["max_tools_per_agent"]
+        assert len(ctx.params["tools"]) == max_tools
+
+    async def test_order_strategy_keeps_first_n(self, make_ctx):
+        tools = [{"function": {"name": f"tool_{i}", "description": "x"}} for i in range(5)]
+        ctx = make_ctx([{"role": "user", "content": "tool_4 please"}], params={"tools": tools})
+        ctx.config["groups"]["G16_agent_arch"]["tool_selection_strategy"] = "order"
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+        # Explicit opt-out: blind first-N behaviour preserved for backward compat
+        assert _tool_names(ctx.params["tools"]) == ["tool_0", "tool_1", "tool_2"]
+
+    async def test_no_query_overlap_falls_back_to_order(self, make_ctx):
+        # No token overlap → all scores 0 → stable original order (first N)
+        tools = [{"function": {"name": f"alpha{i}", "description": "zzz"}} for i in range(5)]
+        ctx = make_ctx([{"role": "user", "content": "unrelated request text"}], params={"tools": tools})
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+        assert _tool_names(ctx.params["tools"]) == ["alpha0", "alpha1", "alpha2"]
+
+    async def test_malformed_tool_does_not_crash(self, make_ctx):
+        tools = [
+            {"function": {"name": "get_user_profile", "description": "Retrieve a user profile."}},
+            {"weird": "shape"},
+            None,
+            {"function": {"name": "send_email"}},
+            "not-a-dict",
+        ]
+        ctx = make_ctx([{"role": "user", "content": "get the user profile"}], params={"tools": tools})
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)  # must not raise
+        assert len(ctx.params["tools"]) == 3

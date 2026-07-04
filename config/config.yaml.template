@@ -429,7 +429,7 @@ groups:
   G8_tools:
     enabled: true
     registry_path: gs://${CONFIG_GCS_BUCKET}/config/tool-registry.yaml
-    max_tools_per_agent: 10
+    max_tools_per_agent: 20
     registry_cache_ttl_seconds: 300
     mcp_manifest_cache_ttl_seconds: 300
     mcp_http_timeout_seconds: 10.0
@@ -582,7 +582,8 @@ groups:
   G16_agent_arch:
     enabled: true
     max_system_prompt_tokens: 4096
-    max_tools_per_agent: 10
+    max_tools_per_agent: 20               # keep all tools at/below this count; prune only above it
+    tool_selection_strategy: relevance    # relevance | order — when over the cap, keep the tools most relevant to the request (relevance) vs the first N by list order (order)
   G17_loop:
     enabled: true
     max_iterations: 10
@@ -592,6 +593,10 @@ groups:
     wall_clock_timeout_seconds: 300
   G18_observability:
     enabled: true
+    # Langfuse trace emission is OFF by default (OSS). Prometheus + savings metrics
+    # run regardless — this flag gates only Langfuse traces. The commercial deploy
+    # sets it true; Langfuse keys are still required for traces to actually emit.
+    langfuse_enabled: false
     langfuse_host: http://langfuse-svc
     prometheus_enabled: true
     capture_trace_content: true

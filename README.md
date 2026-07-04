@@ -10,12 +10,14 @@
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![Measured savings](https://img.shields.io/badge/measured_savings-55.78%25-brightgreen.svg)](#g0g28-optimisation-groups)
+[![Quality-gated savings](https://img.shields.io/badge/quality--gated_savings-57.34%25-brightgreen.svg)](#g0g28-optimisation-groups)
 [![GitHub stars](https://img.shields.io/github/stars/sumitdevgupto/TokenLean?style=social)](https://github.com/sumitdevgupto/TokenLean/stargazers)
 
 **TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **22 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
 
-🎯 **55.78% measured** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
+🎯 **57.34% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
+
+> **Savings by workload** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 54.7%** · **prose 38.1%** · **reasoning −2.7%**. Input-token savings only — separate from output cost and from request-count billing.
 
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK
@@ -33,7 +35,7 @@ Most LLM infrastructure operates at the **gateway** layer — unified routing, k
 management, observability, guardrails. This project is deliberately different: it
 is the **transparent optimisation layer** that targets the one thing gateways
 don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / up to
-**55.78% measured**) — and drops in *in front of, or inside,* any gateway.
+**57.34% quality-gated**) — and drops in *in front of, or inside,* any gateway.
 
 | Capability | **This project** | LiteLLM | Helicone | Portkey | Bifrost |
 |---|---|---|---|---|---|
@@ -54,7 +56,7 @@ don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / u
 > moves fast, so **verify against each project's current docs** — and please
 > [open an issue or PR](https://github.com/sumitdevgupto/TokenLean/issues) if any cell is out of date.
 >
-> This project's own figures (**55.78%**, up to **~84%**, **27 techniques**) are **self-measured** on our
+> This project's own figures (**57.34%**, up to **~84%**, **27 techniques**) are **self-measured** on our
 > live-ablation test harness — directional estimates, not an independent third-party benchmark.
 >
 > **Sources:** [LiteLLM](https://docs.litellm.ai/) · [Helicone](https://docs.helicone.ai/) ·
@@ -247,6 +249,43 @@ tests/                      # Unit and integration tests (pytest)
 
 See [docs/request-flow-diagram.md](docs/request-flow-diagram.md) for the full pipeline order and per-group flow.
 
+## Tuning Knobs — Savings vs Quality
+
+**Savings never come at the cost of quality by default.** Every group is config-driven (`groups.<G>` in [config/config.yaml.template](config/config.yaml.template)), and each ships a **quality-safe default**. The knobs below are the ones that trade token savings against output quality — turn them up for more savings, or leave them at (or below) the default to protect quality. Every knob is per-tenant overridable and hot-reloaded (~60s, no redeploy). This table lists the highest-impact knob(s) per group; the **complete parameter list with every default lives in [docs/config-reference.md](docs/config-reference.md).**
+
+| Group | Key quality knob(s) — default | Turn **up** savings → | Protect **quality** ← |
+|-------|-------------------------------|------------------------|------------------------|
+| **G1** Compression | `compression_ratio_target` 0.5; `min_tokens_to_compress` 200; `compress_user_messages`/`compress_system_prompt` false | lower ratio, lower min, enable user/system compression | keep user/system **off**; raise min; ratio ≥ 0.5 |
+| **G2** Template Registry | `budgets.<id>.{system_prompt_max, total_input_max, output_max}` | tighter token budgets per template | looser budgets; leave `budget.truncate_enabled` off |
+| **G3** Knowledge Strategy | `chunk_size_tokens` 400; `rag_fallback.top_k` 5; `rag_fallback.similarity_threshold` 0.85 | fewer/smaller chunks, higher threshold | more chunks, lower threshold for recall |
+| **G4** Rules Bypass | `default_confidence_threshold` 0.7; `keyword_weight` 0.4 / `pattern_weight` 0.6 | lower threshold → bypass more | raise threshold → only high-confidence bypass |
+| **G5** Response Caching | `l2_similarity_threshold` 0.9; `l3_similarity_threshold` 0.85; `semantic_skip_multiturn` true; `cache_scope` tenant | lower thresholds → more cache hits | raise thresholds; keep multi-turn skip on; `tenant+model` scope |
+| **G6** Model Routing | `tiers.{simple,medium,complex}`; `cascade_confidence_threshold` 0.7; `routellm.threshold` | route more to cheap tier (lower threshold) | raise threshold → escalate sooner to strong model |
+| **G7** Retrieval | `top_k` 3; `top_k_after_rerank` 1; `similarity_threshold` 0.85; `max_total_context_tokens` 4000 | fewer chunks, higher threshold, smaller context | more chunks / larger context for completeness |
+| **G8** Tool Loading | `max_tools_per_agent` 20 | fewer tools injected | raise cap so no needed tool is pruned |
+| **G9** Context Schema | `enabled` false; `prose_min_length_chars` 80 | enable prose→schema compaction | keep off, or raise min length |
+| **G10** Memory | `sliding_window_turns` 6; `skills_top_k` 2; `skills_similarity_threshold` 0.7 | fewer verbatim turns; fewer skills | keep more turns verbatim; lower skill threshold |
+| **G11** Output Format | `enforce_max_tokens` true; `default_max_tokens_multiplier` 2.0; `tighten_quantile` 0.95; `tighten_multiplier` 1.2 | lower multiplier/quantile → tighter caps | raise multiplier so long answers aren't truncated |
+| **G12** Reasoning Budget | `default_effort` medium; `effort_map.*` per-provider thinking budgets | lower effort / smaller budgets | raise effort for hard reasoning tasks |
+| **G13** Batch / TOON | `toon_require_net_savings` true; `toon_uniform_threshold` 1.0; `provider_native` false | relax uniformity; enable native batch lane | keep `toon_require_net_savings` on (never inflates) |
+| **G14** Tool Output | `field_whitelist.*`; `spreadsheet_compression` true | whitelist fewer fields; keep compression on | whitelist all fields the model needs downstream |
+| **G15** Server Compute | `hooks` (filter/sort/project on tool results) | add hooks that shrink tool payloads | keep hooks that drop only redundant data |
+| **G16** Agent Architecture | `max_system_prompt_tokens` 4096; `max_tools_per_agent` 20; `tool_selection_strategy` relevance | lower caps → more truncation/pruning | raise caps so prompts/tools aren't cut |
+| **G17** Loop Control | `max_iterations` 10; `starting_budget_tokens` 10000; `confidence_stop_threshold` 0.95 | fewer iterations, smaller budget, earlier stop | more iterations/budget for complex workflows |
+| **G18** Observability | *(no quality trade-off — pure metrics/tracing)* | — | — |
+| **G19** Structured Pruning | `min_length_to_compress` 50; `compression_strategies.{json,code,logs,text}` | lower min; enable more strip strategies | raise min; disable lossy strategies (e.g. `strip_comments`) |
+| **G20** Prompt Optimization | `quality_threshold` 0.95; `max_prompt_tokens` 4000 | accept prompts at lower quality score | raise threshold → only accept ≥95% eval-quality prompts |
+| **G21** Cache Alignment | *(zero quality risk by design — request content unchanged)* | `providers.*` control provider cache credit | — |
+| **G22** Deduplication | `dedup_threshold` 0.92; `tenant_thresholds` | lower threshold → collapse more turns | raise threshold → only near-identical turns merged |
+| **G23** Streaming Compression | `min_repeat` 3; `ngram_size` 5 | lower `min_repeat` → compress more | raise `min_repeat` → only heavy repetition collapsed |
+| **G24** Adaptive Bypass | `rules_file` (per-rule skip conditions) | add skip rules for negative-savings patterns | scope rules tightly (token/model/tenant conditions) |
+| **G25** Adaptive Reasoning | `effort_floor` low / `effort_ceiling` high; `{high,medium,low}_keywords` | lower ceiling → cap reasoning effort | raise floor/ceiling for reasoning-heavy workloads |
+| **G26** *(reserved)* | — | — | — |
+| **G27** Multimodal | `quality` 75; `min_bytes` 4096 | lower JPEG quality; lower min bytes | raise quality for detail-critical images |
+| **G28** Context Reuse (CCR) | `enabled` false; `min_tokens` 300; `compress_system_prompt` false | enable for agent clients; lower min | keep `compress_system_prompt` **off** in pass-through |
+
+> Groups **G18** and **G21** have no savings-vs-quality trade-off (observability and prefix-cache alignment respectively). **G26** is a reserved, unimplemented slot.
+
 ## Savings Tracking
 
 Every LLM response includes detailed savings metadata:
@@ -327,6 +366,7 @@ All parameters externalised in `config/config.yaml.template` — no hardcoded va
 - Config stored in GCS and hot-reloaded every 60 seconds
 - Modify config without redeploying code
 - Per-group enable/disable flags for A/B testing
+- **Quality-safe defaults** — every savings-vs-quality knob ships at a quality-preserving default; tune per workload using the [Tuning Knobs table](#tuning-knobs--savings-vs-quality) above
 
 See [docs/config-reference.md](docs/config-reference.md) for all parameters.
 
