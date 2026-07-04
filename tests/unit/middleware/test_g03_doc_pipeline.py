@@ -151,6 +151,7 @@ class TestG03TriggerPipelines:
         assert result is False  # ImportError path, not the doc-count gate
 
     async def test_trigger_fine_tuning_success(self):
+        import contextlib
         from middleware import g03_doc_pipeline
 
         mock_client = MagicMock()
@@ -168,7 +169,20 @@ class TestG03TriggerPipelines:
             if not attr.startswith("_"):
                 setattr(fake_module, attr, getattr(fake_run_v2, attr))
 
-        with patch.dict(sys.modules, {"google.cloud.run_v2": fake_module}):
+        # Force `from google.cloud import run_v2` to resolve to the fake in EVERY
+        # environment. Patching sys.modules alone is not enough when google-cloud-run
+        # is installed (as in CI): the `google.cloud` package already carries a real
+        # `run_v2` attribute that shadows sys.modules, so the real JobsAsyncClient()
+        # gets built and hits GCP Application Default Credentials — which fails in CI
+        # (no creds) while passing on a dev box that has gcloud auth. Patch the
+        # package attribute too so the mock is used regardless.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"google.cloud.run_v2": fake_module}))
+            try:
+                import google.cloud as _gc
+                stack.enter_context(patch.object(_gc, "run_v2", fake_module, create=True))
+            except Exception:
+                pass  # google.cloud not importable → sys.modules patch suffices
             result = await g03_doc_pipeline.trigger_fine_tuning_pipeline("acme-corp", 150)
 
         assert result is True
