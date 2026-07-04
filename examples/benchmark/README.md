@@ -122,20 +122,20 @@ report exactly what the quality-preserving pipeline yields.
 
 ## Calibrated result
 
-Local calibration run (gpt-4o-mini default, 36 requests). Reproducible: token savings land
-at **58.2–58.9%** across repeated runs — the optimisations are deterministic; only the LLM's
-wording (and thus completion tokens / cost) varies run-to-run.
+Local calibration run (gpt-4o-mini default, 36 requests). **Deterministic**: two consecutive
+runs landed on **57.1%** to the token (13,149 / 23,014) — the optimisations are deterministic;
+only the LLM's wording (and thus completion tokens / cost) varies run-to-run. This corroborates
+the internal quality-gated headline (**57.34%**) on an independent, single OSS workload.
 
 ```
-TOTAL TOKEN SAVINGS   58.2%   (13,455 / 23,099 tokens)   8 cache hits   ~73s
-Est. cost savings     63.2%   ($0.0078 -> $0.0029)        QUALITY GATE: 36/36 PASS
+TOTAL TOKEN SAVINGS   57.1%   (13,149 / 23,014 tokens)   8 cache hits   ~88s
+Est. cost savings     ~62%    ($0.0077 -> $0.0030)        QUALITY GATE: 36/36 PASS
 
 Per-group contribution (tokens saved)
-  G05 response cache      40.4%
-  G08 lazy tool loading   40.0%
-  G19 structured pruning  12.9%
-  G22 dedup                4.9%
-  G01 compression          1.8%   (small share, but 34–38% per prose request — see below)
+  G05 response cache      41.3%
+  G08 lazy tool loading   41.0%
+  G22 dedup                5.0%
+  G19 structured pruning   0.1%
   G06 model routing        0.0%   (saves cost, not tokens — see below)
 ```
 
