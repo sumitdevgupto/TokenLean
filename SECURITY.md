@@ -24,7 +24,7 @@ Instead, report privately via one of:
    **"Report a vulnerability"** button under the *Security* tab. This opens a
    private advisory visible only to maintainers.
 2. **Email** — send details to the maintainer security contact
-   (`security@your-domain.example` — replace with your published address before launch).
+   (`sumit.gupta@cbeyond.com`).
 
 Please include:
 

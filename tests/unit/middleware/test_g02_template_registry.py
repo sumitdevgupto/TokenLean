@@ -236,3 +236,72 @@ class TestTemplateMetadataDeprecation:
         assert restored.replaced_by == meta.replaced_by
         assert restored.author == meta.author
         assert restored.description == meta.description
+
+
+@pytest.mark.asyncio
+class TestG02BudgetTruncation:
+    """Item 83(c) — the `budget.truncate_*` enforcement path (previously untested)."""
+
+    _LONG_SYSTEM = "You are a very detailed and extremely thorough assistant. " * 10
+
+    async def test_truncate_enabled_shrinks_over_budget_messages(self, make_ctx):
+        """budget.truncate_enabled=True → over-budget messages are truncated and a
+        'truncated to budget' savings step is recorded."""
+        ctx = make_ctx(
+            [{"role": "system", "content": self._LONG_SYSTEM}, {"role": "user", "content": "hi"}],
+            params={"template_id": "test-template"},
+        )
+        ctx.config["groups"]["G2_template_registry"]["budget"] = {
+            "truncate_enabled": True,
+            "truncate_strategy": "tail_system",
+            "min_keep_user_turns": 1,
+        }
+        original_system_len = len(ctx.messages[0]["content"])
+
+        from middleware.g02_template_registry import G02TemplateRegistry
+        ctx = await G02TemplateRegistry().process_request(ctx)
+
+        # system prompt was trimmed to fit the budget
+        assert len(ctx.messages[0]["content"]) < original_system_len
+        # last user turn is preserved (min_keep_user_turns=1)
+        assert ctx.messages[-1] == {"role": "user", "content": "hi"}
+        descs = [s.description for s in ctx.savings.step_savings]
+        assert any("truncated to budget" in d for d in descs)
+
+    async def test_truncate_disabled_leaves_messages_untouched(self, make_ctx):
+        """Default (truncate_enabled absent/False) → OVER warning only; messages unchanged."""
+        ctx = make_ctx(
+            [{"role": "system", "content": self._LONG_SYSTEM}, {"role": "user", "content": "hi"}],
+            params={"template_id": "test-template"},
+        )
+        # no budget block at all → truncate_enabled defaults False
+        from middleware.g02_template_registry import G02TemplateRegistry
+        ctx = await G02TemplateRegistry().process_request(ctx)
+
+        assert ctx.messages[0]["content"] == self._LONG_SYSTEM  # untouched
+        descs = [s.description for s in ctx.savings.step_savings]
+        assert any("OVER" in d for d in descs)
+        assert not any("truncated" in d for d in descs)
+
+    async def test_truncate_strategy_and_min_keep_read_from_config(self, make_ctx):
+        """The strategy + min_keep_user_turns are read config-first (not hardcoded):
+        min_keep_user_turns=2 keeps both user turns."""
+        ctx = make_ctx(
+            [
+                {"role": "system", "content": self._LONG_SYSTEM},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "second"},
+            ],
+            params={"template_id": "test-template"},
+        )
+        ctx.config["groups"]["G2_template_registry"]["budget"] = {
+            "truncate_enabled": True,
+            "truncate_strategy": "tail_system",
+            "min_keep_user_turns": 2,
+        }
+        from middleware.g02_template_registry import G02TemplateRegistry
+        ctx = await G02TemplateRegistry().process_request(ctx)
+
+        user_contents = [m["content"] for m in ctx.messages if m.get("role") == "user"]
+        assert "first" in user_contents and "second" in user_contents

@@ -108,7 +108,7 @@ Versioned prompt templates with per-template token budgets.
 | `budgets.<id>.total_input_max` | *(per template)* | ⚠ Max total input tokens (budget enforcement) |
 | `budgets.<id>.output_max` | *(per template)* | ⚠ Max output tokens |
 | `budgets.<id>.{version, author, description}` | *(per template)* | Metadata for tracking/stale detection |
-| `deprecation_warn_days` / `template_history_ttl_days` / `max_history_per_version` | `30` / `90` / `1000` | Registry housekeeping — **currently env-driven** (`TEMPLATE_*`); see [appendix](#appendix--knob-coverage-caveats) |
+| `deprecation_warn_days` / `template_history_ttl_days` / `max_history_per_version` | `30` / `90` / `1000` | Registry housekeeping — **config-first, `TEMPLATE_*` env fallback**; see [appendix](#appendix--knob-coverage-caveats) |
 
 ### G3_doc_pipeline
 Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
@@ -211,7 +211,7 @@ Lazy tool-definition loading + MCP manifest fetch + scheduled pruning.
 | `registry_path` | `gs://<bucket>/config/tool-registry.yaml` | Tool registry location |
 | `mcp_servers` | `null` | MCP servers — **list of `{url, filter_tools}` dicts** (not URL strings) |
 | `pruning.{enabled, inactivity_threshold_days, dry_run_first, schedule}` | `true / 30 / true / 0 2 * * *` | Scheduled removal of unused tools |
-| `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days` | `300 / 300 / 10 / 90` | Present in template but **currently env-driven** (`TOOL_REGISTRY_CACHE_TTL_SECONDS` etc.) — see [appendix](#appendix--knob-coverage-caveats) |
+| `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days` | `300 / 300 / 10 / 90` | **Config-first, `TOOL_*` env fallback** (`TOOL_REGISTRY_CACHE_TTL_SECONDS` etc.) — see [appendix](#appendix--knob-coverage-caveats) |
 
 ### G9_context_schema
 Prose→schema compaction (Instructor library) with heuristic fallback. **Off by default.**
@@ -474,15 +474,21 @@ for reference (all now appear in their group's section above):
 | `G16_agent_arch` | *(fallback alignment)* | — | `_MAX_SYSTEM_PROMPT_TOKENS`/`_MAX_TOOLS_COUNT` absent-key fallbacks realigned 800→4096 / 10→20 to match the template |
 | `G27_multimodal` | `provider` | `null` | Override the Headroom provider hint (else auto-detected) |
 
-### B. Phantom template keys (present in template, currently env-driven)
-Setting these in `config.yaml` has **no effect today** — the code reads the environment variable. Use
-the env var, or treat wiring them to config as follow-up.
+### B. Config-first knobs — config wins, env is the fallback (item 83a)
+These read from `groups.<GROUP>.*` in the hot-reloaded proxy config **first**; if a key is absent
+they fall back to the matching env var (or its built-in default). Setting them in `config.yaml` now
+takes effect, and existing env-var deployments keep working unchanged. Resolution is global
+(`config_loader.get_proxy_config()`) — these are infra knobs (cache TTLs / timeouts / pruning), not
+per-tenant quality knobs.
 
-| Group | Template key(s) | Actually read from |
-|---|---|---|
-| `G8_tools` | `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days`, `pruning.inactivity_threshold_days` | `TOOL_REGISTRY_CACHE_TTL_SECONDS`, `MCP_MANIFEST_CACHE_TTL_SECONDS`, `MCP_HTTP_TIMEOUT_SECONDS`, `TOOL_USAGE_TTL_DAYS`, `TOOL_INACTIVITY_THRESHOLD_DAYS` |
-| `G2_template_registry` | `deprecation_warn_days`, `template_history_ttl_days`, `max_history_per_version` | `TEMPLATE_*` env vars |
-| `G5_cache` | `temporal_replay_enabled` | *(no code references — inert)* |
+| Group | Config key(s) | Env fallback | Default |
+|---|---|---|---|
+| `G8_tools` | `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days`, `pruning.inactivity_threshold_days` | `TOOL_REGISTRY_CACHE_TTL_SECONDS`, `MCP_MANIFEST_CACHE_TTL_SECONDS`, `MCP_HTTP_TIMEOUT_SECONDS`, `TOOL_USAGE_TTL_DAYS`, `TOOL_INACTIVITY_THRESHOLD_DAYS` | `300 / 300 / 10.0 / 90 / 30` |
+| `G2_template_registry` | `deprecation_warn_days`, `template_history_ttl_days`, `max_history_per_version` | `TEMPLATE_DEPRECATION_WARN_DAYS`, `TEMPLATE_HISTORY_TTL_DAYS`, `TEMPLATE_MAX_HISTORY_PER_VERSION` | `30 / 90 / 1000` |
+
+> `G5_cache.temporal_replay_enabled` was **removed** (2026-07-04) — it had no reader (a knob for the
+> unwired `G05TemporalActivity` alternate runtime), so it silently did nothing; the key was deleted
+> from the template rather than left as a phantom.
 
 ### C. Env-only knobs (by design)
 | Group | Env var | Default | Purpose |

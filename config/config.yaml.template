@@ -393,7 +393,6 @@ groups:
     auto_ttl_enabled: true
     auto_ttl_min_multiplier: 0.25
     auto_ttl_max_multiplier: 2.0
-    temporal_replay_enabled: true
   G6_routing:
     enabled: true
     classifier: cascade

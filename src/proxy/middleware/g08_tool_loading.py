@@ -43,12 +43,42 @@ _TOOL_USAGE_PREFIX = "tok_opt:tool:usage:"
 _TOOL_PRUNING_LOCK = "tok_opt:tool:pruning_lock"
 
 
+# ── Config-first knob resolution (item 83a) ───────────────────────────────────
+# The env-derived module constants above are now the *fallback defaults*; a value
+# set under `groups.G8_tools.*` in the hot-reloaded proxy config wins. This keeps
+# existing TOOL_*/MCP_* env deployments working while making the documented config
+# keys actually take effect. Resolved per-use so config hot-reload applies. These
+# are infra knobs (cache TTLs / timeouts / pruning), so resolution is global
+# (get_proxy_config) rather than per-tenant.
+def _g8_cfg() -> Dict:
+    try:
+        from config_loader import get_proxy_config
+        return get_proxy_config().get("groups", {}).get("G8_tools", {}) or {}
+    except Exception:
+        return {}
+
+def _registry_cache_ttl() -> int:
+    return int(_g8_cfg().get("registry_cache_ttl_seconds", _REGISTRY_CACHE_TTL))
+
+def _mcp_manifest_ttl() -> int:
+    return int(_g8_cfg().get("mcp_manifest_cache_ttl_seconds", _MCP_MANIFEST_CACHE_TTL))
+
+def _mcp_http_timeout() -> float:
+    return float(_g8_cfg().get("mcp_http_timeout_seconds", _MCP_HTTP_TIMEOUT))
+
+def _tool_usage_ttl_days() -> int:
+    return int(_g8_cfg().get("tool_usage_ttl_days", _TOOL_USAGE_TTL_DAYS))
+
+def _inactivity_threshold_days() -> int:
+    return int(_g8_cfg().get("pruning", {}).get("inactivity_threshold_days", _TOOL_INACTIVITY_THRESHOLD_DAYS))
+
+
 def _load_registry(cfg: Dict) -> List[Dict]:
     global _registry_cache, _registry_loaded_at
     import time
 
     now = time.monotonic()
-    if _registry_cache and (now - _registry_loaded_at) < _REGISTRY_CACHE_TTL:
+    if _registry_cache and (now - _registry_loaded_at) < _registry_cache_ttl():
         return _registry_cache
 
     registry_path = cfg.get("registry_path", "")
@@ -124,12 +154,12 @@ class MCPLazyLoadManifest:
     async def get_tools(self) -> List[Dict]:
         """Fetch tools from MCP server with caching."""
         now = time.time()
-        if self._tools_cache and (now - self._cache_time) < self._cache_ttl:
+        if self._tools_cache and (now - self._cache_time) < _mcp_manifest_ttl():
             return self._tools_cache
         
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=_MCP_HTTP_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_mcp_http_timeout()) as client:
                 # MCP manifest endpoint
                 resp = await client.get(f"{self.server_url}/.well-known/mcp-manifest")
                 resp.raise_for_status()
@@ -192,11 +222,11 @@ class ScheduledToolPruning:
             await self.redis.hincrby(f"{key}:meta", "total_calls", 1)
             
             # Trim to last N days
-            cutoff = now - (_TOOL_USAGE_TTL_DAYS * 86400)
+            cutoff = now - (_tool_usage_ttl_days() * 86400)
             await self.redis.zremrangebyscore(key, 0, cutoff)
 
             # Set expiry
-            await self.redis.expire(key, _TOOL_USAGE_TTL_DAYS * 86400)
+            await self.redis.expire(key, _tool_usage_ttl_days() * 86400)
         except Exception as exc:
             logger.debug("Tool usage recording failed: %s", exc)
     
@@ -216,7 +246,7 @@ class ScheduledToolPruning:
             last_used = float(meta.get("last_used", 0))
             inactivity_days = (time.time() - last_used) / 86400
             
-            return inactivity_days > self._inactivity_threshold_days
+            return inactivity_days > _inactivity_threshold_days()
         except Exception as exc:
             logger.debug("Pruning check failed: %s", exc)
             return False

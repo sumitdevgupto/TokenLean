@@ -32,6 +32,28 @@ _TEMPLATE_HISTORY_TTL_SECONDS = int(_os.getenv("TEMPLATE_HISTORY_TTL_DAYS", "90"
 _TEMPLATE_MAX_HISTORY = int(_os.getenv("TEMPLATE_MAX_HISTORY_PER_VERSION", "1000"))
 
 
+# ── Config-first knob resolution (item 83a) ───────────────────────────────────
+# Env-derived constants above are the *fallback defaults*; values under
+# `groups.G2_template_registry.*` in the hot-reloaded proxy config win. Keeps
+# existing TEMPLATE_* env deployments working while making the documented config
+# keys take effect. Resolved per-use so config hot-reload applies.
+def _g2_cfg() -> Dict[str, Any]:
+    try:
+        from config_loader import get_proxy_config
+        return get_proxy_config().get("groups", {}).get("G2_template_registry", {}) or {}
+    except Exception:
+        return {}
+
+def _deprecation_warn_days() -> int:
+    return int(_g2_cfg().get("deprecation_warn_days", _DEPRECATION_WARNING_DAYS))
+
+def _template_history_ttl_seconds() -> int:
+    return int(_g2_cfg().get("template_history_ttl_days", _TEMPLATE_HISTORY_TTL_SECONDS // 86400)) * 86400
+
+def _template_max_history() -> int:
+    return int(_g2_cfg().get("max_history_per_version", _TEMPLATE_MAX_HISTORY))
+
+
 def _get_redis():
     from cache.redis_pool import get_redis as _pool_get_redis
     return _pool_get_redis()
@@ -94,7 +116,7 @@ class TemplateMetadata:
         
         if self.deprecated_at and self.sunset_at:
             days_remaining = (self.sunset_at - now) / 86400
-            if days_remaining <= _DEPRECATION_WARNING_DAYS:
+            if days_remaining <= _deprecation_warn_days():
                 if self.replaced_by:
                     return ("DEPRECATION_WARNING", days_remaining, 
                             f"Template {self.template_id} deprecated. Migrate to {self.replaced_by} ({days_remaining:.0f} days remaining)")
@@ -153,11 +175,11 @@ class G02TemplateRegistry:
             }
             # Store in sorted set by timestamp, keep last 1000 entries per version
             await redis.zadd(key, {json.dumps(entry): entry["timestamp"]})
-            await redis.expire(key, _TEMPLATE_HISTORY_TTL_SECONDS)
+            await redis.expire(key, _template_history_ttl_seconds())
             # Trim to max history entries per version
             count = await redis.zcard(key)
-            if count > _TEMPLATE_MAX_HISTORY:
-                await redis.zremrangebyrank(key, 0, count - _TEMPLATE_MAX_HISTORY - 1)
+            if count > _template_max_history():
+                await redis.zremrangebyrank(key, 0, count - _template_max_history() - 1)
         except Exception as exc:
             logger.debug("Failed to record token history: %s", exc)
     
