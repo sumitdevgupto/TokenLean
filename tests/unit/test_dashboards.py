@@ -75,12 +75,47 @@ class TestBillingDashboard:
             f"Expected a tokens/savings panel. Got panel titles: {titles}"
         )
 
-    def test_billing_dashboard_has_top_tenants_panel(self):
+    def test_billing_dashboard_has_billing_metric_panel(self):
+        # Billing paradigm: the billable unit is a served 2xx request count, sourced
+        # from the token_opt_http_requests_total counter (with a status filter).
         d = _load_dashboard("billing.json")
-        titles = [p.get("title", "").lower() for p in d.get("panels", [])]
-        assert any("tenant" in t for t in titles), (
-            f"Expected a panel about tenants. Got: {titles}"
+        queries = _all_panel_queries(d)
+        assert any("token_opt_http_requests_total" in q for q in queries), (
+            "billing.json must surface the request-count billing metric "
+            "(token_opt_http_requests_total). Queries: "
+            f"{queries[:3]}"
         )
+        assert any('status=~"2..' in q for q in queries), (
+            "billing.json must have a billable (2xx) request panel"
+        )
+
+    def test_billing_dashboard_has_real_tokens_panel(self):
+        # Row 3 surfaces provider-reported tokens (real input z + real output).
+        d = _load_dashboard("billing.json")
+        queries = _all_panel_queries(d)
+        assert any("provider_prompt_tokens" in q for q in queries), (
+            "billing.json must surface real input tokens (provider_prompt_tokens)"
+        )
+        assert any("response_tokens" in q for q in queries), (
+            "billing.json must surface real output tokens (response_tokens)"
+        )
+
+    def test_billing_dashboard_is_count_token_only_no_dollars(self):
+        # Open-core guardrail: billing-as-a-product (invoicing / $) is commercial-only.
+        # The OSS dashboard shows request counts + token counts, never dollar figures.
+        d = _load_dashboard("billing.json")
+        for panel in d.get("panels", []):
+            unit = (
+                panel.get("fieldConfig", {}).get("defaults", {}).get("unit", "")
+            )
+            assert "currency" not in unit.lower(), (
+                f"billing.json panel '{panel.get('title')}' uses a currency unit "
+                f"({unit!r}); dollar/invoice figures are commercial-only, not OSS."
+            )
+        for q in _all_panel_queries(d):
+            assert "cost_saved_usd" not in q and "cost_actual" not in q, (
+                f"billing.json must not query dollar cost columns. Query: {q}"
+            )
 
     def test_billing_dashboard_schema_version_present(self):
         d = _load_dashboard("billing.json")

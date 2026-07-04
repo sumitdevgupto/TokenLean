@@ -11,424 +11,7 @@
     "from": "now-30d",
     "to": "now"
   },
-  "panels": [
-    {
-      "id": 12,
-      "type": "text",
-      "title": "Cost disclosure (read me)",
-      "gridPos": {
-        "h": 3,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "options": {
-        "mode": "markdown",
-        "content": "**Cost figures are config-priced estimates - directional, not invoice-grade.** Dollar values = token counts x a static pricing table; they exclude negotiated discounts, provider-side prompt caching, batch/reasoning surcharges, and currency effects. baseline_* is a counterfactual. **Token-count savings are measured; dollar figures are estimates.** Provider-reconciled billing is a separate (non-OSS) concern."
-      },
-      "transparent": true
-    },
-    {
-      "id": 1,
-      "type": "stat",
-      "title": "Total Tokens Saved",
-      "gridPos": {
-        "x": 0,
-        "y": 3,
-        "w": 5,
-        "h": 4
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT SUM(tokens_saved) FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
-          "format": "table",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background"
-      }
-    },
-    {
-      "id": 2,
-      "type": "stat",
-      "title": "Total Cost Saved (USD)",
-      "gridPos": {
-        "x": 5,
-        "y": 3,
-        "w": 5,
-        "h": 4
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT ROUND(SUM(cost_saved_usd)::numeric, 4) FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
-          "format": "table",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD",
-          "decimals": 4
-        }
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background"
-      }
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Total Requests",
-      "gridPos": {
-        "x": 10,
-        "y": 3,
-        "w": 4,
-        "h": 4
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT COUNT(*) FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
-          "format": "table",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background"
-      }
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Active Tenants",
-      "gridPos": {
-        "x": 14,
-        "y": 3,
-        "w": 5,
-        "h": 4
-      },
-      "datasource": {
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "count(count by (tenant_id)(token_opt_requests_total{tenant_id=~\"$tenant\"}))",
-          "legendFormat": "tenants"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background"
-      }
-    },
-    {
-      "id": 5,
-      "type": "piechart",
-      "title": "Tier Distribution",
-      "gridPos": {
-        "x": 19,
-        "y": 3,
-        "w": 5,
-        "h": 4
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT pricing_tier, COUNT(*) AS requests FROM usage_events GROUP BY pricing_tier ORDER BY requests DESC",
-          "format": "table",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "values": true,
-          "calc": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "pieType": "pie",
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "values": [
-            "value",
-            "percent"
-          ]
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "desc"
-        },
-        "displayLabels": [
-          "name",
-          "percent"
-        ]
-      }
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "Tokens Saved per Day",
-      "gridPos": {
-        "x": 0,
-        "y": 7,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT date_trunc('day', timestamp) AS time, SUM(tokens_saved) AS tokens_saved FROM usage_events WHERE timestamp >= NOW() - INTERVAL '30 days' AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
-          "format": "time_series",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "lineWidth": 2
-          }
-        }
-      }
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "Cost Saved per Day (USD)",
-      "gridPos": {
-        "x": 12,
-        "y": 7,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT date_trunc('day', timestamp) AS time, ROUND(SUM(cost_saved_usd)::numeric, 4) AS cost_saved FROM usage_events WHERE timestamp >= NOW() - INTERVAL '30 days' AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
-          "format": "time_series",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD",
-          "custom": {
-            "lineWidth": 2
-          }
-        }
-      }
-    },
-    {
-      "id": 8,
-      "type": "table",
-      "title": "Top 10 Tenants by Tokens Saved",
-      "gridPos": {
-        "x": 0,
-        "y": 15,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT tenant_id, pricing_tier, COUNT(*) AS requests, SUM(tokens_saved) AS total_tokens_saved, ROUND(SUM(cost_saved_usd)::numeric, 4) AS total_cost_saved_usd, ROUND(AVG(CASE WHEN baseline_tokens > 0 THEN 100.0 * tokens_saved / baseline_tokens ELSE 0 END)::numeric, 1) AS avg_saving_pct FROM usage_events WHERE ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1, 2 ORDER BY total_tokens_saved DESC LIMIT 10",
-          "format": "table",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "barchart",
-      "title": "Requests by Pricing Tier (This Month)",
-      "gridPos": {
-        "x": 12,
-        "y": 15,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "postgres",
-        "uid": "app-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT pricing_tier, COUNT(*) AS requests FROM usage_events WHERE timestamp >= date_trunc('month', NOW()) GROUP BY pricing_tier ORDER BY requests DESC",
-          "format": "table",
-          "datasource": {
-            "type": "postgres",
-            "uid": "app-postgres"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      }
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "Request Rate by Tenant (Prometheus)",
-      "gridPos": {
-        "x": 0,
-        "y": 23,
-        "w": 24,
-        "h": 8
-      },
-      "datasource": {
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (tenant_id) (rate(token_opt_requests_total{tenant_id=~\"$tenant\"}[5m])) * 300",
-          "legendFormat": "{{tenant_id}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "lineWidth": 2
-          }
-        }
-      }
-    },
-    {
-      "id": 11,
-      "type": "piechart",
-      "title": "$ Saved by Group",
-      "description": "USD saved per optimisation group (G0-G24) over the selected time range. Powered by token_opt_usd_saved_total Prometheus counter (T07).",
-      "gridPos": {
-        "x": 0,
-        "y": 31,
-        "w": 24,
-        "h": 10
-      },
-      "datasource": {
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (group) (increase(token_opt_usd_saved_total{tenant_id=~\"$tenant\"}[$__range]))",
-          "legendFormat": "{{group}}",
-          "instant": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "currencyUSD",
-          "decimals": 4
-        }
-      },
-      "options": {
-        "reduceOptions": {
-          "calc": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "pieType": "pie",
-        "legend": {
-          "displayMode": "list",
-          "placement": "right",
-          "values": [
-            "value"
-          ]
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "desc"
-        },
-        "displayLabels": [
-          "name"
-        ]
-      }
-    }
-  ],
+  "description": "Billing = served 2xx request COUNT (the billable unit). Token rows are disclosed estimates/measurements, never billed. Provider-reconciled invoicing is a separate, non-OSS concern. No dollar figures on this dashboard.",
   "templating": {
     "list": [
       {
@@ -451,5 +34,711 @@
       }
     ]
   },
-  "description": "Cost figures are config-priced estimates (directional, not invoice-grade) - token savings are measured, dollar values are estimated."
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Read me — billing paradigm",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Billable unit = one served 2xx request** (Row 1 count). Token figures (Rows 2-3) are the **free value layer** — disclosed estimates (chars/4) and real provider measurements, **never billed**. Turning counts into money (rate cards, invoices) is a separate, **non-OSS** concern. This dashboard carries **no dollar figures**."
+      },
+      "transparent": true
+    },
+
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Row 1 — Requests & Billing (billable unit = 1 served 2xx request)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 3
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Billable Requests (2xx)",
+      "description": "Billing metric: count of served 2xx requests (200 served + 202 batch-deferred) over the selected range. Counter-reset safe via increase().",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\", status=~\"2..\"}[$__range]))",
+          "legendFormat": "billable (2xx)",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Total Requests (all statuses)",
+      "description": "Every exit path counted, including errors and short-circuits.",
+      "gridPos": {
+        "x": 6,
+        "y": 4,
+        "w": 5,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[$__range]))",
+          "legendFormat": "all",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Error Rate (non-2xx)",
+      "description": "Non-2xx requests / total requests over the selected range.",
+      "gridPos": {
+        "x": 11,
+        "y": 4,
+        "w": 4,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\", status!~\"2..\"}[$__range])) / clamp_min(sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[$__range])), 1)",
+          "legendFormat": "error rate",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 0.01, "color": "yellow" },
+              { "value": 0.05, "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "type": "piechart",
+      "title": "Requests by HTTP Status",
+      "gridPos": {
+        "x": 15,
+        "y": 4,
+        "w": 9,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (status) (increase(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[$__range]))",
+          "legendFormat": "{{status}}",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calc": [
+            "lastNotNull"
+          ],
+          "values": false,
+          "fields": ""
+        },
+        "pieType": "donut",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "desc"
+        },
+        "displayLabels": [
+          "name"
+        ]
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Requests over time (by status)",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (status) (increase(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[$__interval]))",
+          "legendFormat": "{{status}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        }
+      }
+    },
+
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Row 2 — Estimated Tokens (chars/4 — disclosed estimate, never billed)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Input Tokens (actuals · chars/4)",
+      "description": "x = baseline: what the user sent, estimated at chars/4. From the OSS metering engine (usage_events, 2xx rows only).",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(baseline_tokens) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Tokens Passed to LLM (optimised · chars/4)",
+      "description": "y = proxy-optimised input, estimated at chars/4, symmetric with x.",
+      "gridPos": {
+        "x": 6,
+        "y": 17,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(proxy_optimised_tokens) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Tokens Saved (chars/4)",
+      "description": "x - y, on the chars/4 estimate basis.",
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(tokens_saved) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Savings % (chars/4)",
+      "description": "100 * tokens_saved / baseline_tokens.",
+      "gridPos": {
+        "x": 18,
+        "y": 17,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(100.0 * SUM(tokens_saved) / NULLIF(SUM(baseline_tokens), 0), 1) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Estimated tokens per day (chars/4)",
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('day', timestamp) AS time, SUM(baseline_tokens) AS \"input (x)\", SUM(proxy_optimised_tokens) AS \"passed to LLM (y)\", SUM(tokens_saved) AS \"saved\" FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Row 3 — Real Tokens (from actual LLM responses)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Real Input Tokens (provider)",
+      "description": "z = provider-reported prompt_tokens (actual). NULL when the provider returns no usage; COALESCE'd to 0.",
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(COALESCE(provider_prompt_tokens, 0)) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Real Output Tokens",
+      "description": "Provider-reported completion tokens (usage_events.response_tokens). Backfills as 0 for rows written before this column was added — complete only for traffic after deploy.",
+      "gridPos": {
+        "x": 8,
+        "y": 31,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(response_tokens) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Total Real Tokens (input + output)",
+      "gridPos": {
+        "x": 16,
+        "y": 31,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(COALESCE(provider_prompt_tokens, 0) + response_tokens) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Real tokens per day (provider)",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('day', timestamp) AS time, SUM(COALESCE(provider_prompt_tokens, 0)) AS \"real input\", SUM(response_tokens) AS \"real output\" FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Live token throughput (Prometheus cross-check)",
+      "description": "Real input/output token rate from the G18 counters — a live cross-check against the per-day Postgres view.",
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_prompt_tokens_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
+          "legendFormat": "real input tok/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "sum(rate(token_opt_completion_tokens_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
+          "legendFormat": "real output tok/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    }
+  ]
 }

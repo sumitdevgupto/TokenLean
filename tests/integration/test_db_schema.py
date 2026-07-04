@@ -26,6 +26,7 @@ REQUIRED_COLUMNS = {
     "pricing_tier",
     "proxy_optimised_tokens",
     "provider_prompt_tokens",
+    "response_tokens",
 }
 
 
@@ -67,7 +68,8 @@ class TestUsageEventsTable:
                 groups_applied   TEXT[]        NOT NULL DEFAULT '{}',
                 pricing_tier     TEXT          NOT NULL DEFAULT 'basic',
                 proxy_optimised_tokens INT     NOT NULL DEFAULT 0,
-                provider_prompt_tokens INT
+                provider_prompt_tokens INT,
+                response_tokens  INT           NOT NULL DEFAULT 0
             )
         """)
 

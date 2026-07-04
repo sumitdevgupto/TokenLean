@@ -77,6 +77,17 @@ class TestUsageMeterBuildsEvent:
         assert event.proxy_optimised_tokens == 320   # y
         assert event.provider_prompt_tokens == 300   # z
 
+    def test_build_event_carries_response_tokens(self):
+        # Real output tokens (observability): mapped from savings.response_tokens.
+        meter = UsageMeter()
+        ctx = _make_ctx()
+        ctx.savings.response_tokens = 145
+        event = meter._build_event(ctx, {})
+        assert event.response_tokens == 145
+        # Defaults to 0 when absent (defer / no-usage paths).
+        ctx2 = _make_ctx()
+        assert meter._build_event(ctx2, {}).response_tokens == 0
+
     def test_build_event_cache_hit_shows_estimated_cost_saved(self):
         # C2: cache-hit rows skip G18 (cost_saving_usd == 0) — derive the avoided
         # input cost so the confidence story isn't $0 on cached traffic.

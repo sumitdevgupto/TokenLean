@@ -538,6 +538,15 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
             # output-side savings the (skipped) response pipeline would have. The live chunks
             # are emitted unchanged — rewriting them mid-stream would corrupt the SSE output.
             _apply_stream_g23(ctx, "".join(parts))
+            # The response pipeline (incl. G18) is skipped for streamed calls, so wire the
+            # provider's real usage from the final chunk into savings here — otherwise the
+            # billed row records real input/output tokens (z / response_tokens) as 0.
+            if last_usage:
+                try:
+                    ctx.savings.provider_prompt_tokens = last_usage.get("prompt_tokens")
+                    ctx.savings.response_tokens = last_usage.get("completion_tokens", 0) or 0
+                except Exception:
+                    pass
             try:
                 _record_outcome(
                     ctx, request_start, "200", {"usage": last_usage} if last_usage else None

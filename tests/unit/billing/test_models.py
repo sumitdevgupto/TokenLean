@@ -62,6 +62,11 @@ class TestUsageEvent:
         e = self._make_event(otel_trace_id="abcd1234" * 4)
         assert len(e.otel_trace_id) == 32
 
+    def test_response_tokens_defaults_zero_and_settable(self):
+        # Real output tokens (observability); 0 on defer / no-usage paths.
+        assert self._make_event().response_tokens == 0
+        assert self._make_event(response_tokens=145).response_tokens == 145
+
 
 class TestUsageEventsDDL:
     def test_ddl_is_string(self):
@@ -73,7 +78,8 @@ class TestUsageEventsDDL:
 
     def test_ddl_contains_required_columns(self):
         for col in ["tenant_id", "request_id", "tokens_saved", "cost_saved_usd",
-                    "groups_applied", "pricing_tier", "otel_trace_id"]:
+                    "groups_applied", "pricing_tier", "otel_trace_id",
+                    "response_tokens"]:
             assert col in USAGE_EVENTS_DDL, f"DDL missing column: {col}"
 
     def test_ddl_has_create_index(self):

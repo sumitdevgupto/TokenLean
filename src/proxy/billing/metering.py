@@ -67,6 +67,7 @@ class UsageMeter:
             otel_trace_id=trace_id,
             proxy_optimised_tokens=getattr(savings, "proxy_optimised_tokens", 0),
             provider_prompt_tokens=getattr(savings, "provider_prompt_tokens", None),
+            response_tokens=getattr(savings, "response_tokens", 0),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -77,8 +78,8 @@ class UsageMeter:
                 (tenant_id, request_id, timestamp, baseline_tokens, optimised_tokens,
                  tokens_saved, cost_saved_usd, groups_applied, pricing_tier,
                  model, routed_model, otel_trace_id,
-                 proxy_optimised_tokens, provider_prompt_tokens)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                 proxy_optimised_tokens, provider_prompt_tokens, response_tokens)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -91,6 +92,7 @@ class UsageMeter:
                     event.groups_applied, event.pricing_tier,
                     event.model, event.routed_model, event.otel_trace_id,
                     event.proxy_optimised_tokens, event.provider_prompt_tokens,
+                    event.response_tokens,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)
