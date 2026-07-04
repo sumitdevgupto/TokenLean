@@ -174,6 +174,7 @@ def _minimal_config() -> Dict[str, Any]:
             },
             "G18_observability": {
                 "enabled": True,
+                "langfuse_enabled": True,
                 "langfuse_host": "http://mock-langfuse",
                 "et_weights": {"input": 1.0, "cache_read": 0.1, "output": 4.0},
             },

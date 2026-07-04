@@ -1,9 +1,10 @@
 billing:
-  enabled: false                        # set true to activate usage metering
-  openmeter_url: ""                     # e.g. http://openmeter:8888
-  openmeter_api_key: ""                 # injected from Secret Manager at runtime
-  default_tier: basic                   # tier applied when tenant has no explicit tier
-  # NOTE: the per-tier G-group feature map (`tiers:`) is a commercial-layer
-  # concern and lives in the gitignored config/params/tiers.yaml.template
-  # (item 40). config_loader.merge_params_dir() merges it back under `billing:`
-  # in private builds; in OSS it is simply absent (no tier gating).
+  # Request-count metering to the Postgres `usage_events` table. Metering runs
+  # unconditionally in main.py once DATABASE_URL is set — this flag only gates the
+  # legacy G18 meter path (and is forced true by the commercial deploy). Default
+  # false in OSS.
+  enabled: false
+  # The request-count rate card (`rate_card:`) and the legacy tier map live in the
+  # commercial-only config/params/tiers.yaml.template, merged back under `billing:`
+  # in private builds and simply absent in OSS. OpenMeter was removed (2026-07-02):
+  # its push in metering.py is a dormant no-op configured via env vars, never here.

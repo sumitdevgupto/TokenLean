@@ -89,6 +89,13 @@ cmd_issue() {
   local tenant="${TENANT_ID:-$USER_ID}"
   [[ -z "$tenant" ]] && error "--tenant (or --user) is required for issue"
 
+  # Pricing tier is bound to the key and flows into usage_events.pricing_tier →
+  # invoicing. Reject typos here so a bad tier never silently bills at the basic card.
+  case "$TIER" in
+    basic|pro|enterprise) ;;
+    *) error "--tier must be basic|pro|enterprise (got '${TIER}')" ;;
+  esac
+
   local raw_key
   raw_key="tok-$(openssl rand -hex 24)"
   local key_hash

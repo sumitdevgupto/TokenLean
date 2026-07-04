@@ -31,6 +31,21 @@ _KEY_TO_TENANT: Dict[str, TenantContext] = {}
 _VALID_TIERS = {"basic", "pro", "enterprise"}
 
 
+def _normalise_tier(tier: str) -> str:
+    """Return a valid pricing tier, defaulting unknown/blank values to ``basic``.
+
+    The tier is bound to the API key at issuance (``issue-key.sh``) and arrives via
+    the key's metadata. A typo or legacy value must not silently bill at an arbitrary
+    tier, so normalise to the known set (case/whitespace-insensitive) and fall back to
+    ``basic`` with a warning that surfaces in logs.
+    """
+    t = (tier or "").strip().lower()
+    if t in _VALID_TIERS:
+        return t
+    logger.warning("resolve_tenant: unknown pricing tier %r — defaulting to 'basic'", tier)
+    return "basic"
+
+
 def resolve_tenant(
     headers: Dict[str, str],
     key_tenant_id: Optional[str] = None,
@@ -52,6 +67,7 @@ def resolve_tenant(
     Returns:
         A fully-populated ``TenantContext``.
     """
+    key_tier = _normalise_tier(key_tier)
     registry = tenant_registry if tenant_registry is not None else _KEY_TO_TENANT
     header_tenant = headers.get("x-tenant-id", "").strip()
 

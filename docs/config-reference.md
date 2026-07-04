@@ -17,6 +17,7 @@ commonly tuned keys per group, not every field.
 |---|---|
 | `proxy` | Port, log level, CORS, default model |
 | `providers` | LLM provider endpoints (keys in Secret Manager — not here) |
+| `rate_limit` | G0 request throttling (top-level, not under `groups`) |
 | `groups` | Per-group enable/disable + tuning parameters |
 | `savings` | Token-savings **estimate** tuning (reporting only — never billed) |
 
@@ -65,7 +66,25 @@ Token-savings **estimate** tuning. Reporting only — none of this affects the r
 
 (`x` = `baseline_tokens`. Billing is the request **count**, not tokens — see the two-track model in [request-flow-diagram.md](request-flow-diagram.md).)
 
+### rate_limit  *(G0 — top-level section)*
+
+Request throttling at the gate (token bucket). Lives at the top level, not under `groups`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable rate limiting |
+| `default.requests_per_minute` | `60` | Per-minute limit applied to all callers without an override |
+| `default.requests_per_hour` | `1000` | Per-hour limit applied to all callers without an override |
+| `per_user.<id>.requests_per_minute` / `.requests_per_hour` | *(per user)* | Override limits for a specific proxy user/key |
+| `per_team.<id>.requests_per_minute` / `.requests_per_hour` | *(per team)* | Override limits for a team |
+
 ## Group parameters
+
+> **Quality-impact legend.** ⚠ = tightening this knob for more savings can degrade output
+> quality (the description gives the direction); — = no quality trade-off (safety/ops/cost-reporting
+> only). Every knob ships at a quality-safe default. See the
+> [Tuning Knobs table in the README](../README.md#tuning-knobs--savings-vs-quality) for the
+> per-group savings↔quality summary. Tables show the commonly-tuned keys, not every field.
 
 ### G1_compression
 | Parameter | Default | Description |
@@ -74,7 +93,39 @@ Token-savings **estimate** tuning. Reporting only — none of this affects the r
 | `min_tokens_to_compress` | `200` | Skip compression below this token count |
 | `compression_ratio_target` | `0.5` | Target ratio (0.5 = 50% compression) |
 | `sidecar_url` | `http://llmlingua-svc` | LLMLingua-2 Cloud Run internal URL |
-| `compress_user_messages` | `false` | Opt-in: also apply compression to `role="user"` messages (default only compresses `system`/`assistant`) |
+| `compress_user_messages` | `false` | ⚠ Opt-in: also apply compression to `role="user"` messages (default only compresses `system`/`assistant`) |
+| `compress_system_prompt` | `false` | ⚠ Opt-in: compress the system prompt (keep off — losing system policy/facts degrades answers) |
+
+Also settable (read by code, add to config to tune): `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates). See the [appendix](#appendix--knob-coverage-caveats) for `kompress_*`.
+
+### G2_template_registry
+Versioned prompt templates with per-template token budgets.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable template registry |
+| `budgets.<id>.system_prompt_max` | *(per template)* | ⚠ Max system-prompt tokens for this template |
+| `budgets.<id>.total_input_max` | *(per template)* | ⚠ Max total input tokens (budget enforcement) |
+| `budgets.<id>.output_max` | *(per template)* | ⚠ Max output tokens |
+| `budgets.<id>.{version, author, description}` | *(per template)* | Metadata for tracking/stale detection |
+| `deprecation_warn_days` / `template_history_ttl_days` / `max_history_per_version` | `30` / `90` / `1000` | Registry housekeeping — **currently env-driven** (`TEMPLATE_*`); see [appendix](#appendix--knob-coverage-caveats) |
+
+### G3_doc_pipeline
+Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable doc pipeline |
+| `chunk_size_tokens` | `400` | ⚠ Chunk size for retrieval (smaller = fewer tokens, less context per chunk) |
+| `chunk_overlap_tokens` | `50` | Overlap between chunks |
+| `rag_fallback.top_k` | `5` | ⚠ Chunks retrieved in fallback (fewer = cheaper, lower recall) |
+| `rag_fallback.similarity_threshold` | `0.85` | ⚠ Min score to include a chunk (higher = stricter, may drop relevant context) |
+| `rag_fallback.strategies` | `[strict_hybrid, relaxed_hybrid, dense_only, sparse_only]` | Fallback retrieval order |
+| `fine_tuning.{enabled, min_docs, stability_days, auto_trigger}` | `true / 100 / 30 / false` | Fine-tuning break-even trigger |
+| `tika_sidecar.{enabled, url}` | `false / http://tika-svc:9998` | Apache Tika document extraction |
+| `sparse_model` / `dense_model` | `Qdrant/bm25` / `all-MiniLM-L6-v2` | Retrieval models |
+
+*(OOD detection `OOD_SIMILARITY_THRESHOLD` (0.65) / `OOD_MAX_RETRIES` (3) are env-only — see [appendix](#appendix--knob-coverage-caveats).)*
 
 ### G4_bypass
 | Parameter | Default | Description |
@@ -138,9 +189,39 @@ It runs each case tier-1 → LLM judge → optional tier-3 escalation, sweeps th
 |---|---|---|
 | `enabled` | `true` | Enable RAG retrieval optimisation |
 | `chunk_size_tokens` | `256` | Chunk size for RAG documents |
-| `top_k` | `3` | Retrieve top-K before reranking |
-| `top_k_after_rerank` | `1` | Inject only top-N after reranking |
-| `similarity_threshold` | `0.85` | Minimum score to include a chunk |
+| `top_k` | `3` | ⚠ Retrieve top-K before reranking (fewer = cheaper, lower recall) |
+| `top_k_after_rerank` | `1` | ⚠ Inject only top-N after reranking |
+| `similarity_threshold` | `0.85` | ⚠ Minimum score to include a chunk (higher = stricter) |
+| `max_total_context_tokens` | `4000` | ⚠ Hard cap on total injected context |
+| `max_chunk_tokens` | `1000` | ⚠ Per-chunk token guard |
+| `rrf_alpha` | `0.5` | Dense-vs-sparse fusion weight (Reciprocal Rank Fusion) |
+
+Also present: `dense_model`, `sparse_model`, `reranker_model`, `rrf_k` (60), `jit_retrieval_enabled` (true), `use_pgvector_fallback` (false).
+
+### G8_tools
+Lazy tool-definition loading + MCP manifest fetch + scheduled pruning.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable tool loading |
+| `max_tools_per_agent` | `20` | ⚠ Prune tools beyond this count (too low → the model loses a tool it needs) |
+| `registry_path` | `gs://<bucket>/config/tool-registry.yaml` | Tool registry location |
+| `mcp_servers` | `null` | MCP servers — **list of `{url, filter_tools}` dicts** (not URL strings) |
+| `pruning.{enabled, inactivity_threshold_days, dry_run_first, schedule}` | `true / 30 / true / 0 2 * * *` | Scheduled removal of unused tools |
+| `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days` | `300 / 300 / 10 / 90` | Present in template but **currently env-driven** (`TOOL_REGISTRY_CACHE_TTL_SECONDS` etc.) — see [appendix](#appendix--knob-coverage-caveats) |
+
+### G9_context_schema
+Prose→schema compaction (Instructor library) with heuristic fallback. **Off by default.**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `false` | ⚠ Enable prose→schema compaction (lossy — extracts fields, drops surrounding prose) |
+| `prose_min_length_chars` | `80` | ⚠ Min prose length before compaction fires |
+| `use_instructor` | `true` | Use Instructor LLM vs heuristic extraction |
+| `instructor_model` | `gpt-4o-mini` | Model for compaction |
+| `instructor_timeout_ms` | `3000` | Compaction call timeout |
+| `instructor_fallback_to_heuristic` | `true` | Fall back to heuristic on failure/timeout |
+| `schema_fields` | `null` | Fields to extract (e.g. `{cust: "customer name"}`) |
 
 ### G10_memory
 | Parameter | Default | Description |
@@ -186,18 +267,51 @@ Batch accumulation (Redis Streams) plus TOON compact notation — converts JSON 
 | `toon_require_net_savings` | `true` | Revert to JSON unless the TOON form is strictly smaller (never inflate) |
 | `toon_max_block_chars` | `20000` | Max JSON array-block size to scan (raised from the legacy 2000) |
 
+### G14_tool_output
+Minimises tool-result payloads before they re-enter context.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable tool-output minimisation |
+| `field_whitelist.<tool>` | `{}` | ⚠ Keep only these fields per tool (all others dropped — whitelist everything the model needs downstream) |
+| `spreadsheet_compression` | `true` | ⚠ Apply Headroom SmartCrusher to CSV/JSON arrays |
+
+*(Per-field/result token caps are module constants today — see [appendix](#appendix--knob-coverage-caveats).)*
+
+### G15_server_compute
+Server-side compute dispatch + Headroom MCP tool hosting.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable server-side compute hooks |
+| `headroom_mcp_server` | `true` | Host Headroom MCP tools (`headroom_compress`/`retrieve`/`stats`) |
+| `hooks` | `[]` | ⚠ Config-driven transforms (filter/sort/project) applied to tool results before they return |
+
+### G16_agent_arch
+Agent-architecture enforcement — bounds system-prompt size and tool count.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enable agent-architecture enforcement |
+| `max_system_prompt_tokens` | `4096` | ⚠ Truncate oversized system prompts to this budget (too low silently strips instructions — note: code fallback when the key is **absent** is 800; keep the key set) |
+| `max_tools_per_agent` | `20` | ⚠ Prune tools above this count |
+| `tool_selection_strategy` | `relevance` | When over the cap: `relevance` (keep most-relevant) vs `order` (first N) |
+
 ### G17_loop
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable loop control |
-| `max_iterations` | `10` | Hard iteration limit per workflow |
-| `starting_budget_tokens` | `10000` | Initial token budget per workflow |
-| `compact_output_below_tokens` | `500` | Inject compact-mode when budget < this |
+| `max_iterations` | `10` | ⚠ Hard iteration limit per workflow (too low → workflow stops before completing) |
+| `starting_budget_tokens` | `10000` | ⚠ Initial token budget per workflow |
+| `compact_output_below_tokens` | `500` | ⚠ Inject compact-mode when budget < this |
+| `confidence_stop_threshold` | `0.95` | ⚠ Stop early when confidence ≥ this (needs `x_confidence_score`) |
+| `wall_clock_timeout_seconds` | `300` | Hard wall-clock stop for a workflow |
 
 ### G18_observability
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Enable Langfuse tracing |
+| `enabled` | `true` | Enable G18 observability (Prometheus counters + savings metrics) |
+| `langfuse_enabled` | `false` | Emit Langfuse traces. Requires `enabled` **and** Langfuse keys. Gates only trace emission (Prometheus/savings metrics run regardless). OSS default off; the commercial deploy sets it true. |
 | `langfuse_host` | `http://langfuse-svc` | Langfuse internal URL (local: `http://langfuse-svc:3000`) |
 | `prometheus_enabled` | `true` | Expose `/metrics` Prometheus counters |
 | `openllmetry_enabled` | `false` | Enable OTLP auto-instrumentation (set OTLP endpoint first) |
@@ -328,3 +442,46 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `ttl_seconds` | `86400` | Redis TTL for stored content (24h) |
 | `expose_mcp_tools` | `true` | Inject `headroom_*` tools into the request |
 | `compress_system_prompt` | `false` | Allow CCR to replace the system instruction (keep false for pass-through) |
+
+## Appendix — knob coverage caveats
+
+A source audit (2026-07-03) found four classes of knob where the template surface and the code
+don't fully line up. Documented here so the reference stays honest; the first group is safe to use
+today, the rest are follow-up work.
+
+### A. Settable in code but not in the template
+These are read by **wired** middleware via `cfg.get(...)` with the defaults shown — add them under the
+group in your `config.yaml` to tune. (They should also be added to `config.yaml.template`; tracked as
+follow-up.)
+
+| Group | Key | Default | Effect |
+|---|---|---|---|
+| `G1_compression` | `kompress_enabled` / `kompress_model` / `kompress_max_new_tokens` | `true` / `microsoft/Kompress-v2-base` / `256` | Kompress-v2 fallback compression for logs/errors |
+| `G2_template_registry` | `budget.truncate_enabled` / `budget.truncate_strategy` / `budget.min_keep_user_turns` | `false` / `tail_system` / `1` | ⚠ Truncate over-budget prompts (`budget` singular ≠ `budgets` registry) |
+| `G10_memory` | `skills_qdrant_enabled` | `true` | `false` → non-Qdrant skill-injection fallback |
+| `G11_output` | `absolute_default_max_tokens` | `1024` | ⚠ Absolute cap on the heuristic `max_tokens` |
+| `G27_multimodal` | `provider` | `null` | Override the Headroom provider hint (else auto-detected) |
+
+### B. Phantom template keys (present in template, currently env-driven)
+Setting these in `config.yaml` has **no effect today** — the code reads the environment variable. Use
+the env var, or treat wiring them to config as follow-up.
+
+| Group | Template key(s) | Actually read from |
+|---|---|---|
+| `G8_tools` | `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days`, `pruning.inactivity_threshold_days` | `TOOL_REGISTRY_CACHE_TTL_SECONDS`, `MCP_MANIFEST_CACHE_TTL_SECONDS`, `MCP_HTTP_TIMEOUT_SECONDS`, `TOOL_USAGE_TTL_DAYS`, `TOOL_INACTIVITY_THRESHOLD_DAYS` |
+| `G2_template_registry` | `deprecation_warn_days`, `template_history_ttl_days`, `max_history_per_version` | `TEMPLATE_*` env vars |
+| `G5_cache` | `temporal_replay_enabled` | *(no code references — inert)* |
+
+### C. Env-only knobs (by design)
+| Group | Env var | Default | Purpose |
+|---|---|---|---|
+| `G13_batch` | `G13_USE_KAFKA`, `KAFKA_BROKERS`, `KAFKA_BATCH_TOPIC`, `KAFKA_CONSUMER_GROUP` | `false` / `localhost:9092` / … | Kafka batch backend (else Redis Streams) |
+| `G7_retrieval` | `QDRANT_LOCAL_NOAUTH` | `0` | Skip GCP token fetch on local/non-GCP |
+| `G3_doc_pipeline` | `OOD_SIMILARITY_THRESHOLD`, `OOD_MAX_RETRIES` | `0.65`, `3` | ⚠ Out-of-distribution detection for RAG fallback |
+
+### D. Pending wiring (source-audit finding — verify before relying)
+The following knobs are read by classes that the audit reports are **not registered in
+`pipeline.py`**, so they are inert until the class is wired: `G4` `fuzzy_similarity_threshold`
+(`G04DBResolution`), `G5` `temporal_activity_cache` / `idempotent_activities` /
+`activity_cache_ttl_seconds` (`G05TemporalActivity`), `G8` `mcp_enabled` (`G08MCPLoader`), `G14`
+`combine_tool_calls` (`G14ToolCombining`), `G16` `langgraph_enabled` (`G16LangGraphRuntime`).

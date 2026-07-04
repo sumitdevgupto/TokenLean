@@ -116,3 +116,34 @@ class TestResolveByApiKey:
         tc = resolve_tenant({}, api_key_hash="hash-abc", tenant_registry=registry)
         assert tc.tenant_id == "corp"
         assert tc.pricing_tier == "pro"
+
+
+class TestTierNormalisation:
+    """An unknown/blank tier must never flow through to billing — it normalises to
+    'basic' so a mis-issued key can't silently bill at an arbitrary card."""
+
+    def test_unknown_tier_falls_back_to_basic(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING):
+            tc = resolve_tenant({}, key_tenant_id="corp", key_tier="gold")
+        assert tc.pricing_tier == "basic"
+        assert any("unknown pricing tier" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("bad", ["", None])
+    def test_blank_tier_falls_back_to_basic(self, bad):
+        tc = resolve_tenant({}, key_tenant_id="corp", key_tier=bad)
+        assert tc.pricing_tier == "basic"
+
+    @pytest.mark.parametrize("raw,expected", [("PRO", "pro"), (" Pro ", "pro"), ("ENTERPRISE", "enterprise")])
+    def test_case_and_whitespace_normalised(self, raw, expected):
+        tc = resolve_tenant({}, key_tenant_id="corp", key_tier=raw)
+        assert tc.pricing_tier == expected
+
+    def test_valid_tier_passes_through(self):
+        tc = resolve_tenant({}, key_tenant_id="corp", key_tier="enterprise")
+        assert tc.pricing_tier == "enterprise"
+
+    def test_admin_impersonation_with_junk_tier_normalises(self):
+        tc = resolve_tenant({"x-tenant-id": "acme"}, key_is_admin=True, key_tier="platinum")
+        assert tc.tenant_id == "acme"
+        assert tc.pricing_tier == "basic"

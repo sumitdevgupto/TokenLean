@@ -220,6 +220,7 @@ src/proxy/Dockerfile.commercial.dockerignore
 infra/commercial.tfvars
 # Commercial / gated-module tests (items 31, 58 + B13)
 tests/unit/billing/test_tiers.py
+tests/unit/billing/test_merge_billing_config.py
 tests/unit/test_pipeline_tiers.py
 tests/unit/test_alert_rules.py
 tests/unit/api/test_portal.py

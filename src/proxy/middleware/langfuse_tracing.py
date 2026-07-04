@@ -72,7 +72,11 @@ def _should_capture_content(ctx: "RequestContext") -> bool:
 def start_trace(ctx: "RequestContext") -> Optional[Any]:
     """Create a Langfuse trace at the beginning of a request and store it on ctx."""
     cfg = ctx.config.get("groups", {}).get("G18_observability", {})
-    if not cfg.get("enabled", False):
+    # Two gates: G18 observability on, AND Langfuse tracing explicitly enabled.
+    # `langfuse_enabled` defaults False so OSS ships tracing OFF; the commercial
+    # deploy flips it true. This gates only Langfuse trace emission — Prometheus
+    # and savings metrics are unaffected, and keys are still required (get_client).
+    if not cfg.get("enabled", False) or not cfg.get("langfuse_enabled", False):
         return None
 
     client = get_client()

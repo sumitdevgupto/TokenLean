@@ -175,7 +175,7 @@ class TestStartTraceIdentityMetadata:
     async def test_start_trace_includes_user_id_in_metadata(self, make_ctx):
         ctx = make_ctx()
         ctx.user_id = "acme-pitch"
-        ctx.config["groups"]["G18_observability"] = {"enabled": True}
+        ctx.config["groups"]["G18_observability"] = {"enabled": True, "langfuse_enabled": True}
 
         mock_client = MagicMock()
         mock_trace = MagicMock()
@@ -191,7 +191,7 @@ class TestStartTraceIdentityMetadata:
     async def test_start_trace_includes_tenant_id_in_metadata(self, make_ctx):
         ctx = make_ctx()
         ctx.tenant_id = "nova-med"
-        ctx.config["groups"]["G18_observability"] = {"enabled": True}
+        ctx.config["groups"]["G18_observability"] = {"enabled": True, "langfuse_enabled": True}
 
         mock_client = MagicMock()
         mock_trace = MagicMock()
@@ -218,3 +218,39 @@ class TestStartTraceIdentityMetadata:
         _, _, kwargs = update_calls[0]
         assert kwargs["metadata"]["tenant_id"] == "nova-med"
         assert kwargs["metadata"]["user_id"] == "nova-med-pitch"
+
+
+@pytest.mark.asyncio
+class TestLangfuseEnabledGate:
+    """`langfuse_enabled` gates trace emission. OSS default OFF (absent → off);
+    the commercial deploy sets it true. Keys are still required to actually emit."""
+
+    def _cfg(self, ctx, **g18):
+        ctx.config["groups"]["G18_observability"] = g18
+        return ctx
+
+    async def test_no_trace_when_langfuse_disabled(self, make_ctx):
+        ctx = self._cfg(make_ctx(), enabled=True)  # langfuse_enabled absent → OFF
+        mock_client = MagicMock()
+        from middleware import langfuse_tracing
+        with patch.object(langfuse_tracing, "get_client", return_value=mock_client):
+            trace = langfuse_tracing.start_trace(ctx)
+        assert trace is None
+        mock_client.trace.assert_not_called()
+
+    async def test_trace_created_when_enabled(self, make_ctx):
+        ctx = self._cfg(make_ctx(), enabled=True, langfuse_enabled=True)
+        mock_client = MagicMock()
+        mock_client.trace.return_value = MagicMock()
+        from middleware import langfuse_tracing
+        with patch.object(langfuse_tracing, "get_client", return_value=mock_client):
+            trace = langfuse_tracing.start_trace(ctx)
+        assert trace is not None
+        mock_client.trace.assert_called_once()
+
+    async def test_no_trace_when_flag_true_but_no_keys(self, make_ctx):
+        ctx = self._cfg(make_ctx(), enabled=True, langfuse_enabled=True)
+        from middleware import langfuse_tracing
+        with patch.object(langfuse_tracing, "get_client", return_value=None):  # keys absent
+            trace = langfuse_tracing.start_trace(ctx)
+        assert trace is None
