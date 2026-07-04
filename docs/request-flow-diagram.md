@@ -378,6 +378,65 @@ Request → Auth → Context → G00 … G13 (batchable) → Return 202 Accepted
 > from the `usage_events` table. Exported `cost_saved_usd` is a **config-priced estimate, not
 > provider-reconciled billing** (see Savings Calculation).
 
+## Document Ingestion Pipeline (G03)
+
+G03 is a **companion pipeline, not an inline request stage** — it populates the RAG vector store
+that G07 later retrieves from. It runs **asynchronously, outside the `/v1/chat/completions` path**,
+as a Cloud Run **Job** triggered by a GCS object notification.
+
+### End-to-end flow
+
+```
+                        ┌──────────────────────────────┐
+   1. Upload doc  ────► │  GCS bucket (docs/…)          │
+                        └───────────────┬──────────────┘
+                                        │ 2. Object-finalize notification
+                                        ▼  (Pub/Sub push)
+                        ┌──────────────────────────────┐
+                        │  Proxy  POST /ingest-doc      │  main.py:442
+                        │  body: { bucket, name }       │
+                        └───────────────┬──────────────┘
+                                        │ 3. trigger_doc_ingestion(bucket, name)
+                                        ▼   (g03_doc_pipeline.py:40 → run_v2 JobsAsyncClient)
+                        ┌──────────────────────────────┐
+                        │  Cloud Run Job                │  src/doc-pipeline/pipeline.py
+                        │  env: GCS_BUCKET, GCS_OBJECT  │
+                        └───────────────┬──────────────┘
+                                        │ 4. download → extract → chunk → embed → upsert
+                                        ▼
+                        ┌──────────────────────────────┐
+                        │  Qdrant collection            │  read later by G07 retrieval
+                        └──────────────────────────────┘
+```
+
+### Job steps (`src/doc-pipeline/pipeline.py:run()`)
+
+1. **Download** the object from GCS (`GCS_BUCKET` / `GCS_OBJECT`).
+2. **Extract text** — Apache Tika sidecar when `USE_TIKA=true`, else Unstructured, else UTF-8 decode.
+3. **Strip boilerplate** — headers/footers, base64 blobs, residual HTML, page numbers.
+4. **Tables → CSV** — markdown tables compacted to CSV rows (≈40–60% fewer tokens on table-heavy docs).
+5. **Chunk** — 256–512-token overlapping chunks (`CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS`).
+6. **Summarise oversized chunks** — any chunk over `MAX_CHUNK_TOKENS` (4,000) is condensed with a cheap model.
+7. **Embed** — dense (MiniLM-L6-v2) + sparse (BM25/SPLADE via fastembed).
+8. **Upsert** to the Qdrant collection as named `dense`/`sparse` vectors.
+
+### Key environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GCS_BUCKET` / `GCS_OBJECT` | — | The object to ingest (injected per-run as container overrides) |
+| `QDRANT_URL` / `QDRANT_COLLECTION` | `…:6333` / `rag_docs` | Target vector store + collection |
+| `USE_TIKA` / `TIKA_SIDECAR_URL` | `false` / `http://tika-svc:9998` | Prefer Tika extraction |
+| `CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS` | `400` / `50` | Chunk sizing |
+| `MAX_CHUNK_TOKENS` | `4000` | Oversized-chunk summarisation threshold |
+| `DOC_PIPELINE_JOB_NAME` / `GCP_REGION` | `token-opt-doc-pipeline` / `us-central1` | Which Cloud Run Job the webhook launches |
+
+> **Scope of what's implemented.** The proxy does **not** expose a raw file-upload API — a document
+> must already be in GCS; ingestion is triggered by the object-finalize notification hitting
+> `POST /ingest-doc`. The webhook has no auth/tenant guard, and the Job's `QDRANT_COLLECTION`
+> defaults to a shared `rag_docs` collection (not the per-tenant `ctx.qdrant_collection` used on the
+> read path). Multi-tenant deployments must set `QDRANT_COLLECTION` per ingestion run accordingly.
+
 ## Key Data Structures
 
 ### RequestContext (`middleware/__init__.py`)

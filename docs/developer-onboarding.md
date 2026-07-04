@@ -99,6 +99,42 @@ Pass these in `extra_body` (Python) or `putAdditionalBodyProperty` (Java) for ex
 | `template_id` | Reference a registered prompt template | G02 |
 | `user` | Your user ID for per-user savings tracking | G18 |
 
+## Uploading documents for retrieval (G03)
+
+If your team uses RAG (the `rag_query` hint above), your reference documents need to be ingested
+into the vector store first. Ingestion is handled by the **G03 doc pipeline** — a background Cloud
+Run Job, not part of the request path.
+
+**How ingestion is triggered today:** the proxy does **not** accept a file directly. A document is
+ingested when it lands in the configured **GCS bucket** and the resulting object notification reaches
+the proxy's `POST /ingest-doc` webhook (wired via GCS → Pub/Sub push). The Job then downloads,
+extracts (Apache Tika / Unstructured), strips boilerplate, chunks, embeds (dense + sparse), and
+upserts into Qdrant for retrieval.
+
+Typical flow:
+
+```bash
+# 1. Drop your document into the ingestion bucket (ask your platform team for the bucket name)
+gsutil cp handbook.pdf gs://<your-ingest-bucket>/docs/handbook.pdf
+
+# 2. The GCS object notification fires POST /ingest-doc automatically → the Job runs.
+#    (No further action needed. Supported inputs: PDF, DOCX, HTML, TXT, and other Tika/Unstructured types.)
+
+# 3. Once ingested, retrieval works via the rag_query hint:
+```
+```python
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "What is our PTO policy?"}],
+    extra_body={"rag_query": "PTO policy"},   # G07 pulls the matching chunks
+)
+```
+
+> **What's not available:** there is currently **no direct HTTP upload endpoint** on the proxy
+> (you cannot `POST` file bytes and have them ingested). Documents must be placed in GCS first.
+> Contact your platform team for the ingestion bucket name and write access. Full flow, Job steps,
+> and env vars are documented in [request-flow-diagram.md](request-flow-diagram.md#document-ingestion-pipeline-g03).
+
 ## Dashboard
 
 View your savings at: `https://grafana-<hash>-uc.a.run.app`
