@@ -89,6 +89,15 @@ class TestG11OutputFormat:
             ctx = await G11OutputFormat().process_request(ctx)
         assert ctx.params["max_tokens"] <= 1024
 
+    async def test_absolute_default_max_tokens_config_override(self, make_ctx):
+        # absolute_default_max_tokens is now a template knob; overriding it must move the cap.
+        ctx = make_ctx([{"role": "user", "content": "word " * 2000}])
+        ctx.config["groups"]["G11_output"]["absolute_default_max_tokens"] = 256
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis in this test")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        assert ctx.params["max_tokens"] <= 256
+
     async def test_p95_historical_tightens_max_tokens(self, make_ctx):
         """With 10 mocked Redis entries, assert max_tokens is tightened to p95×1.2."""
         # Build 10 Redis ZSET entries with max_tokens = 100..190

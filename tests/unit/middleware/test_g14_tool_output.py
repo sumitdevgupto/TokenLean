@@ -80,6 +80,15 @@ class TestG14ToolOutput:
             step = next(s for s in ctx.savings.step_savings if s.group == "G14")
             assert step.tokens_after < step.tokens_before
 
+    async def test_max_result_tokens_config_truncates_string_result(self, make_ctx):
+        ctx = make_ctx()
+        ctx.config["groups"]["G14_tool_output"]["max_result_tokens"] = 10
+        response = _response_with_tool_call("get_blob", "z" * 2000)
+        from middleware.g14_tool_output import G14ToolOutput
+        resp = await G14ToolOutput().process_response(ctx, response)
+        result = resp["choices"][0]["message"]["tool_calls"][0]["function"]["result"]
+        assert isinstance(result, str) and "...[truncated]" in result
+
 
 # ─── T32: spreadsheet compression ────────────────────────────────────────────
 
@@ -185,3 +194,25 @@ class TestT32SpreadsheetCompression:
         result = result_resp["choices"][0]["message"]["tool_calls"][0]["function"]["result"]
         # Should remain as list (no schema conversion)
         assert isinstance(result, list)
+
+
+# ─── Configurable per-field / per-result truncation caps ─────────────────────
+
+class TestConfigurableTruncationCaps:
+    """G14 field/result token caps are config-driven (config.yaml.template)."""
+
+    def test_truncate_respects_config_result_cap(self):
+        from middleware.g14_tool_output import _truncate
+        long = "x" * 4000  # ~1000 tokens
+        out = _truncate(long, "gpt-4o", max_result_tokens=10)
+        assert "...[truncated]" in out
+        assert len(out) <= 10 * 4 + len("...[truncated]")
+
+    def test_truncate_respects_config_field_cap(self):
+        from middleware.g14_tool_output import _truncate
+        out = _truncate({"note": "y" * 400}, "gpt-4o", max_field_tokens=5)
+        assert out["note"].endswith("...[truncated]")
+
+    def test_truncate_uses_module_defaults_when_not_overridden(self):
+        from middleware.g14_tool_output import _truncate
+        assert _truncate("short", "gpt-4o") == "short"

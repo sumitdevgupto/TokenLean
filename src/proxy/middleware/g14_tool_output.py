@@ -45,6 +45,8 @@ class G14ToolOutput:
 
         field_whitelist: Dict[str, List[str]] = cfg.get("field_whitelist", {})
         spreadsheet_enabled: bool = cfg.get("spreadsheet_compression", True)
+        max_field_tokens: int = cfg.get("max_field_tokens", _MAX_FIELD_TOKENS)
+        max_result_tokens: int = cfg.get("max_result_tokens", _MAX_RESULT_TOKENS)
         choices = response.get("choices", [])
         changed = False
 
@@ -63,7 +65,7 @@ class G14ToolOutput:
 
                 # Step 1: field projection + truncation (existing logic)
                 projected = _project(raw_result, field_whitelist.get(fn_name))
-                current = _truncate(projected, ctx.routed_model)
+                current = _truncate(projected, ctx.routed_model, max_field_tokens, max_result_tokens)
 
                 # Step 2: headroom.compress_spreadsheet for CSV / JSON-array outputs
                 if spreadsheet_enabled:
@@ -91,13 +93,18 @@ def _project(result: Any, whitelist: Optional[List[str]]) -> Any:
     return {k: v for k, v in result.items() if k in whitelist}
 
 
-def _truncate(result: Any, model: str) -> Any:
+def _truncate(
+    result: Any,
+    model: str,
+    max_field_tokens: int = _MAX_FIELD_TOKENS,
+    max_result_tokens: int = _MAX_RESULT_TOKENS,
+) -> Any:
     """Truncate large text fields and oversized results."""
     if isinstance(result, str):
         tokens = estimate_tokens(result, model)
-        if tokens > _MAX_RESULT_TOKENS:
-            # Truncate to approximately _MAX_RESULT_TOKENS worth of chars
-            char_limit = _MAX_RESULT_TOKENS * 4
+        if tokens > max_result_tokens:
+            # Truncate to approximately max_result_tokens worth of chars
+            char_limit = max_result_tokens * 4
             return result[:char_limit] + "...[truncated]"
         return result
 
@@ -106,15 +113,15 @@ def _truncate(result: Any, model: str) -> Any:
         for k, v in result.items():
             if isinstance(v, str):
                 t = estimate_tokens(v, model)
-                if t > _MAX_FIELD_TOKENS:
-                    v = v[: _MAX_FIELD_TOKENS * 4] + "...[truncated]"
+                if t > max_field_tokens:
+                    v = v[: max_field_tokens * 4] + "...[truncated]"
             truncated[k] = v
         return truncated
 
     if isinstance(result, list):
         # Compact list: if items are primitive, keep as compact array
         total = estimate_tokens(str(result), model)
-        if total > _MAX_RESULT_TOKENS:
+        if total > max_result_tokens:
             return result[:20]  # keep first 20 items
         return result
 

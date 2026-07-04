@@ -310,8 +310,19 @@ groups:
     selective_context_enabled: false
     selective_context_max_tokens: 4000
     build_time_compression: true
+    # Kompress-v2 fallback compression for logs/errors (applied when LLMLingua is not a fit)
+    kompress_enabled: true
+    kompress_model: microsoft/Kompress-v2-base
+    kompress_max_new_tokens: 256
   G2_template_registry:
     enabled: true
+    # `budget` (singular) — global truncation policy applied when a prompt exceeds a template's
+    # `budgets` (plural, per-template, below). truncate_enabled off = enforce budgets by reporting
+    # only; on = actually shrink over-budget prompts (⚠ quality — drops content).
+    budget:
+      truncate_enabled: false
+      truncate_strategy: tail_system
+      min_keep_user_turns: 1
     deprecation_warn_days: 30
     template_history_ttl_days: 90
     max_history_per_version: 1000
@@ -350,6 +361,7 @@ groups:
   G4_bypass:
     enabled: true
     database_first: true
+    db_cache_ttl_seconds: 60         # how long DB-resolved bypass rules are cached before re-fetch
     default_confidence_threshold: 0.7
     keyword_weight: 0.4
     pattern_weight: 0.6
@@ -469,6 +481,7 @@ groups:
     sliding_window_turns: 6
     summary_model: gpt-4o-mini
     skills_enabled: false
+    skills_qdrant_enabled: true      # false → non-Qdrant heuristic skill-injection fallback
     skills_qdrant_collection: agent_skills
     skills_top_k: 2
     skills_similarity_threshold: 0.7
@@ -479,6 +492,7 @@ groups:
     enforce_max_tokens: true
     skip_max_tokens_for_reasoning: true
     default_max_tokens_multiplier: 2.0
+    absolute_default_max_tokens: 1024   # ⚠ absolute cap on the heuristic max_tokens (raise if long answers get cut)
     force_json_for_all: false
     provider_structured_output: true
     max_tokens_feedback_loop: true
@@ -575,6 +589,8 @@ groups:
     enabled: true
     field_whitelist: {}
     spreadsheet_compression: true
+    max_field_tokens: 200            # ⚠ truncate any single tool-result text field above this
+    max_result_tokens: 500           # ⚠ truncate/compact an entire tool result above this
   G15_server_compute:
     enabled: true
     headroom_mcp_server: true
@@ -701,6 +717,7 @@ groups:
     enabled: true
     min_bytes: 4096
     quality: 75
+    provider: null                   # optional Headroom provider hint; null = auto-detect from the active adapter
   G24_adaptive_bypass:
     enabled: true
     rules_file: config/adaptive_bypass_rules.yaml

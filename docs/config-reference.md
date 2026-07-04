@@ -96,7 +96,7 @@ Request throttling at the gate (token bucket). Lives at the top level, not under
 | `compress_user_messages` | `false` | ⚠ Opt-in: also apply compression to `role="user"` messages (default only compresses `system`/`assistant`) |
 | `compress_system_prompt` | `false` | ⚠ Opt-in: compress the system prompt (keep off — losing system policy/facts degrades answers) |
 
-Also settable (read by code, add to config to tune): `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates). See the [appendix](#appendix--knob-coverage-caveats) for `kompress_*`.
+Also in the template: `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates), and the Kompress-v2 fallback `kompress_enabled` (true) / `kompress_model` / `kompress_max_new_tokens` (256).
 
 ### G2_template_registry
 Versioned prompt templates with per-template token budgets.
@@ -131,6 +131,9 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable rules-based bypass |
+| `default_confidence_threshold` | `0.7` | ⚠ Min confidence to bypass (lower = bypass more, higher = only high-confidence) |
+| `keyword_weight` / `pattern_weight` | `0.4` / `0.6` | ⚠ Weights blended into the confidence score |
+| `db_cache_ttl_seconds` | `60` | How long DB-resolved rules are cached before re-fetch |
 | `rules` | `[]` | List of bypass rules — see `config/bypass-rules.yaml` |
 
 ### G5_cache
@@ -227,7 +230,10 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable conversation memory management |
-| `sliding_window_turns` | `6` | Keep last N turns verbatim |
+| `sliding_window_turns` | `6` | ⚠ Keep last N turns verbatim (fewer = cheaper, less recent context) |
+| `skills_top_k` | `2` | ⚠ Skills retrieved per task |
+| `skills_similarity_threshold` | `0.7` | ⚠ Min score to inject a skill |
+| `skills_qdrant_enabled` | `true` | `false` → non-Qdrant heuristic skill-injection fallback |
 | `summary_model` | `gemini-flash-lite` | Cheap model for history summarisation |
 
 ### G11_output
@@ -235,7 +241,9 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 |---|---|---|
 | `enabled` | `true` | Enable output format control |
 | `enforce_max_tokens` | `true` | Auto-set max_tokens if not provided |
-| `default_max_tokens_multiplier` | `2.0` | max_tokens = 2× estimated output |
+| `default_max_tokens_multiplier` | `2.0` | ⚠ max_tokens = 2× estimated output (lower = tighter caps) |
+| `absolute_default_max_tokens` | `1024` | ⚠ Absolute cap on the heuristic max_tokens (raise if long answers get cut) |
+| `tighten_quantile` / `tighten_multiplier` | `0.95` / `1.2` | ⚠ Historical-p95 auto-tightening of max_tokens |
 | `verbosity_steering.enabled` | `false` | Append a terseness suffix to steer shorter output |
 | `output_holdout.enabled` | `false` | A3 holdout: route a % of traffic to a control cohort that **skips** G11 shaping, so the real output-token reduction can be measured (treatment vs holdout) via the `g11_output_holdout_completion_tokens` metric. Opt-in — control traffic is intentionally un-optimised. |
 | `output_holdout.fraction` | `0.05` | Share of requests in the control cohort (0.0–1.0) |
@@ -275,8 +283,8 @@ Minimises tool-result payloads before they re-enter context.
 | `enabled` | `true` | Enable tool-output minimisation |
 | `field_whitelist.<tool>` | `{}` | ⚠ Keep only these fields per tool (all others dropped — whitelist everything the model needs downstream) |
 | `spreadsheet_compression` | `true` | ⚠ Apply Headroom SmartCrusher to CSV/JSON arrays |
-
-*(Per-field/result token caps are module constants today — see [appendix](#appendix--knob-coverage-caveats).)*
+| `max_field_tokens` | `200` | ⚠ Truncate any single tool-result text field above this |
+| `max_result_tokens` | `500` | ⚠ Truncate/compact an entire tool result above this |
 
 ### G15_server_compute
 Server-side compute dispatch + Headroom MCP tool hosting.
@@ -293,7 +301,7 @@ Agent-architecture enforcement — bounds system-prompt size and tool count.
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable agent-architecture enforcement |
-| `max_system_prompt_tokens` | `4096` | ⚠ Truncate oversized system prompts to this budget (too low silently strips instructions — note: code fallback when the key is **absent** is 800; keep the key set) |
+| `max_system_prompt_tokens` | `4096` | ⚠ Truncate oversized system prompts to this budget (too low silently strips instructions; code fallback when the key is absent is also 4096) |
 | `max_tools_per_agent` | `20` | ⚠ Prune tools above this count |
 | `tool_selection_strategy` | `relevance` | When over the cap: `relevance` (keep most-relevant) vs `order` (first N) |
 
@@ -427,8 +435,9 @@ Compresses inline base64 image blocks before the LLM call via `headroom.compress
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable multimodal image optimisation |
-| `min_bytes` | `4096` | Skip images smaller than this (raw bytes) |
-| `quality` | `75` | JPEG quality target (1–95; lower = more compression) |
+| `min_bytes` | `4096` | ⚠ Skip images smaller than this (raw bytes) |
+| `quality` | `75` | ⚠ JPEG quality target (1–95; lower = more compression, less detail) |
+| `provider` | `null` | Optional Headroom provider hint; `null` = auto-detect from the active adapter |
 
 ### G28_ccr
 Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token before the call, then exposes MCP tools (`headroom_compress`/`retrieve`/`stats`) so the model can fetch the full text on demand. Runs on both request and response paths. Falls back gracefully without `headroom.ccr` or Redis.
@@ -449,17 +458,20 @@ A source audit (2026-07-03) found four classes of knob where the template surfac
 don't fully line up. Documented here so the reference stays honest; the first group is safe to use
 today, the rest are follow-up work.
 
-### A. Settable in code but not in the template
-These are read by **wired** middleware via `cfg.get(...)` with the defaults shown — add them under the
-group in your `config.yaml` to tune. (They should also be added to `config.yaml.template`; tracked as
-follow-up.)
+### A. Surfaced into the template on 2026-07-04
+These knobs are read by **wired** middleware via `cfg.get(...)` and were previously code-only defaults;
+they were added to `config.yaml.template` on 2026-07-04 so they are visible and tunable. Listed here
+for reference (all now appear in their group's section above):
 
 | Group | Key | Default | Effect |
 |---|---|---|---|
 | `G1_compression` | `kompress_enabled` / `kompress_model` / `kompress_max_new_tokens` | `true` / `microsoft/Kompress-v2-base` / `256` | Kompress-v2 fallback compression for logs/errors |
 | `G2_template_registry` | `budget.truncate_enabled` / `budget.truncate_strategy` / `budget.min_keep_user_turns` | `false` / `tail_system` / `1` | ⚠ Truncate over-budget prompts (`budget` singular ≠ `budgets` registry) |
+| `G4_bypass` | `db_cache_ttl_seconds` | `60` | DB-rule cache TTL (was a hardcoded constant) |
 | `G10_memory` | `skills_qdrant_enabled` | `true` | `false` → non-Qdrant skill-injection fallback |
 | `G11_output` | `absolute_default_max_tokens` | `1024` | ⚠ Absolute cap on the heuristic `max_tokens` |
+| `G14_tool_output` | `max_field_tokens` / `max_result_tokens` | `200` / `500` | ⚠ Per-field / whole-result truncation caps (were module constants) |
+| `G16_agent_arch` | *(fallback alignment)* | — | `_MAX_SYSTEM_PROMPT_TOKENS`/`_MAX_TOOLS_COUNT` absent-key fallbacks realigned 800→4096 / 10→20 to match the template |
 | `G27_multimodal` | `provider` | `null` | Override the Headroom provider hint (else auto-detected) |
 
 ### B. Phantom template keys (present in template, currently env-driven)

@@ -380,23 +380,32 @@ Add to your `config/config.yaml`:
 
 ```yaml
 groups:
-  G8_tool_loading:
-    mcp_enabled: true
+  # G8 — lazy tool-manifest loading (wired). `mcp_servers` is a list of OBJECTS.
+  G8_tools:
     mcp_servers:
-      - "https://mcp-server-1.example.com"
-      - "https://mcp-server-2.example.com"
-    lazy_load: true           # Load tools on first use (recommended)
-    cache_ttl_seconds: 3600   # Manifest cache TTL
-    prune_after_days: 30      # Auto-remove unused tools
+      - url: "https://mcp-server-1.example.com"
+        filter_tools: []          # optional allow-list of tool names ([] / omit = all)
+      - url: "https://mcp-server-2.example.com"
+    max_tools_per_agent: 20       # prune beyond this count
+    pruning:
+      enabled: true
+      inactivity_threshold_days: 30
 
+  # G15 — server-side compute + Headroom MCP tool hosting (wired).
   G15_server_compute:
-    mcp_dispatch_enabled: true
-    mcp_servers:
-      - "https://mcp-server-1.example.com"
-      - "https://mcp-server-2.example.com"
-    timeout_seconds: 30
-    max_retries: 3
+    enabled: true
+    headroom_mcp_server: true     # host headroom_compress/retrieve/stats MCP tools
+    hooks: []                     # optional filter/sort/project transforms on tool results
 ```
+
+> **Notes.**
+> - `G8_tools.mcp_servers` entries are **objects** (`{url, filter_tools}`), not bare URL strings.
+> - Manifest/registry cache TTLs and the pruning threshold are **environment variables**
+>   (`MCP_MANIFEST_CACHE_TTL_SECONDS`, `TOOL_REGISTRY_CACHE_TTL_SECONDS`,
+>   `TOOL_INACTIVITY_THRESHOLD_DAYS`), not config keys — see [docs/config-reference.md](docs/config-reference.md).
+> - The low-level dispatch handler registry (`G15MCPDispatch` in `g15_mcp_dispatch.py`, with
+>   `mcp_dispatch_enabled` / `mcp_servers`) is an **SDK module not wired into the default pipeline**;
+>   the wired server-compute path is `G15ServerCompute` shown above.
 
 ### How It Works
 
@@ -434,7 +443,8 @@ Your MCP servers must expose:
 1. **Manifest endpoint**: `GET /.well-known/mcp-manifest.json` returning tool definitions
 2. **Tool endpoint**: `POST /tools/{tool_name}` accepting JSON input and returning results
 
-See `src/proxy/middleware/g08_mcp_loader.py` and `g15_mcp_dispatch.py` for SDK integration details.
+The wired tool-loading path is `src/proxy/middleware/g08_tool_loading.py`. For the lower-level SDK
+modules (not in the default pipeline) see `g08_mcp_loader.py` and `g15_mcp_dispatch.py`.
 
 ## Security
 

@@ -29,6 +29,49 @@ class TestG04Bypass:
         ctx = await G04Bypass().process_request(ctx)
         assert ctx.bypassed is False
 
+    async def test_db_cache_ttl_seconds_caches_within_window(self, make_ctx):
+        # db_cache_ttl_seconds (now config-driven) keeps DB rules cached within the window.
+        # Deterministic clock: each time.time() call advances by 1s, so the two requests are
+        # a few seconds apart — well inside a 3600s window.
+        import middleware.g04_bypass as mod
+        db_rule = [{"name": "x", "keywords": ["zzz"], "confidence_threshold": 0.9}]
+        clock = [1_700_000_000.0]
+
+        def _tick():
+            clock[0] += 1.0
+            return clock[0]
+
+        with patch.object(mod, "_load_rules_from_db", new=AsyncMock(return_value=db_rule)) as m, \
+                patch.object(mod.time, "time", side_effect=_tick):
+            bypass = mod.G04Bypass()
+            for content in ("unrelated one", "unrelated two"):
+                ctx = make_ctx([{"role": "user", "content": content}])
+                ctx.config["groups"]["G4_bypass"]["database_first"] = True
+                ctx.config["groups"]["G4_bypass"]["db_cache_ttl_seconds"] = 3600
+                await bypass.process_request(ctx)
+            assert m.call_count == 1  # cached within the TTL window
+
+    async def test_db_cache_ttl_zero_refetches_each_call(self, make_ctx):
+        # With ttl=0 every request re-fetches. Deterministic clock guarantees the second
+        # request's timestamp is strictly greater than the first load's, so (now - last) > 0.
+        import middleware.g04_bypass as mod
+        db_rule = [{"name": "x", "keywords": ["zzz"], "confidence_threshold": 0.9}]
+        clock = [1_700_000_000.0]
+
+        def _tick():
+            clock[0] += 1.0
+            return clock[0]
+
+        with patch.object(mod, "_load_rules_from_db", new=AsyncMock(return_value=db_rule)) as m, \
+                patch.object(mod.time, "time", side_effect=_tick):
+            bypass = mod.G04Bypass()
+            for content in ("unrelated a", "unrelated b"):
+                ctx = make_ctx([{"role": "user", "content": content}])
+                ctx.config["groups"]["G4_bypass"]["database_first"] = True
+                ctx.config["groups"]["G4_bypass"]["db_cache_ttl_seconds"] = 0
+                await bypass.process_request(ctx)
+            assert m.call_count == 2  # TTL 0 → re-fetch each call
+
     async def test_bypass_records_step_saving(self, make_ctx):
         ctx = make_ctx([{"role": "user", "content": "hi there"}])
         from middleware.g04_bypass import G04Bypass

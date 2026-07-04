@@ -165,9 +165,10 @@ class G04Bypass:
         default_confidence = cfg.get("default_confidence_threshold", 0.70)
         keyword_weight = cfg.get("keyword_weight", 0.4)
         pattern_weight = cfg.get("pattern_weight", 0.6)
+        db_cache_ttl = cfg.get("db_cache_ttl_seconds", self._db_cache_ttl)
 
         # Database-first resolution (if enabled)
-        if cfg.get("database_first", True) and (now - self._last_db_load.get(tenant_id, 0)) > self._db_cache_ttl:
+        if cfg.get("database_first", True) and (now - self._last_db_load.get(tenant_id, 0)) > db_cache_ttl:
             db_rules = await _load_rules_from_db(tenant_id)
             if db_rules:
                 self._rules[tenant_id] = [BypassRule(r, default_confidence, keyword_weight, pattern_weight) for r in db_rules]

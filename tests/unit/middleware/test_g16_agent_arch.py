@@ -14,6 +14,29 @@ class TestG16AgentArch:
         ctx = await G16AgentArch().process_request(ctx)
         assert "_token_opt_warnings" not in ctx.params
 
+    async def test_absent_system_prompt_key_uses_4096_fallback(self, make_ctx):
+        # With the config key absent, the code fallback is 4096 (aligned to the template),
+        # not the legacy 800 — a ~1000-token system prompt must NOT be truncated.
+        from middleware.g16_agent_arch import G16AgentArch, _MAX_SYSTEM_PROMPT_TOKENS
+        assert _MAX_SYSTEM_PROMPT_TOKENS == 4096
+        system = "word " * 1000  # over the old 800 fallback, well under 4096
+        ctx = make_ctx([
+            {"role": "system", "content": system},
+            {"role": "user", "content": "hi"},
+        ])
+        del ctx.config["groups"]["G16_agent_arch"]["max_system_prompt_tokens"]
+        ctx = await G16AgentArch().process_request(ctx)
+        system_msg = next(m for m in ctx.messages if m["role"] == "system")
+        assert system_msg["content"] == system  # under the 4096 fallback → untouched
+
+    async def test_absent_tools_key_uses_20_fallback(self, make_ctx):
+        from middleware.g16_agent_arch import G16AgentArch, _MAX_TOOLS_COUNT
+        assert _MAX_TOOLS_COUNT == 20
+        ctx = make_ctx(params={"tools": [{"name": f"t{i}"} for i in range(15)]})
+        del ctx.config["groups"]["G16_agent_arch"]["max_tools_per_agent"]
+        ctx = await G16AgentArch().process_request(ctx)
+        assert len(ctx.params["tools"]) == 15  # 15 < 20 fallback → no pruning
+
     async def test_small_system_prompt_no_warning(self, make_ctx):
         ctx = make_ctx([
             {"role": "system", "content": "Be helpful."},

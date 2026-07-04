@@ -20,8 +20,8 @@ from savings.calculator import count_messages_tokens, estimate_tokens
 logger = logging.getLogger(__name__)
 GROUP = "G16"
 
-_MAX_SYSTEM_PROMPT_TOKENS = 800   # truncate above this
-_MAX_TOOLS_COUNT = 10              # prune above this (role stacking signal)
+_MAX_SYSTEM_PROMPT_TOKENS = 4096  # truncate above this (fallback when the config key is absent; matches config.yaml.template)
+_MAX_TOOLS_COUNT = 20             # prune above this (role stacking signal; fallback matches config.yaml.template)
 _TOOL_SELECTION_STRATEGY = "relevance"  # relevance | order — how to pick which tools to keep when over the cap
 _NAME_TOKEN_WEIGHT = 3.0          # a tool-name token matching the request is the strongest relevance signal
 _DESC_TOKEN_WEIGHT = 1.0          # description/parameter tokens matter, but less than the name
