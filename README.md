@@ -206,7 +206,7 @@ src/
 ├── tika-sidecar/           # Apache Tika 2.9.1 for document parsing
 └── templates/              # G16: Developer starter kits (Python / Java / Go)
 config/                     # Externalised config (hot-reloaded from GCS)
-dashboard/                  # Grafana dashboards (per-call/hourly/daily/weekly/quarterly)
+dashboard/                  # Grafana dashboards (per-call/live/trends/quarterly)
 infra/                      # Terraform (Cloud Run, Cloud SQL, Redis, Secret Manager)
 scripts/                    # Deployment, validation, and operational scripts
 ci/                         # Cloud Build + budget validation pipelines
@@ -322,7 +322,7 @@ Every LLM response includes detailed savings metadata:
 > savings are measured directly; dollar figures are an estimate. Provider-reconciled
 > billing is a separate, non-OSS concern.
 
-**Dashboards:** Access Grafana at `https://grafana-<hash>-uc.a.run.app` for per-call, hourly, daily, weekly, and quarterly aggregations. (Dollar panels use the same config-priced estimate — see the caveat above.)
+**Dashboards:** Access Grafana at `https://grafana-<hash>-uc.a.run.app` for per-call, live, trends (switch bucket via the `Granularity` variable: hour/day/week/month/quarter), and all-time quarterly aggregations. (Dollar panels use the same config-priced estimate — see the caveat above.)
 
 **How dashboard values are calculated.** Grafana never reads `config.yaml` directly — it queries Postgres. The data flow is:
 

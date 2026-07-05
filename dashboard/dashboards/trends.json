@@ -1,0 +1,418 @@
+{
+  "title": "Token Savings - Trends",
+  "uid": "token-opt-trends",
+  "tags": [
+    "token-optimisation"
+  ],
+  "schemaVersion": 38,
+  "refresh": "5m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Tokens Saved",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM((metadata->>'total_abs_saving')::int) FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Cost Saved (USD)",
+      "gridPos": {
+        "x": 5,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric, 2) FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 6
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Avg Saving %",
+      "gridPos": {
+        "x": 10,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric, 1) FROM traces WHERE $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Total Calls",
+      "gridPos": {
+        "x": 15,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) FROM traces WHERE $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Unique Users",
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(DISTINCT metadata->>'user_id') FROM traces WHERE $__timeFilter(created_at)",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Tokens Saved per $granularity",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('${granularity}', created_at) AS time, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Call Volume per User",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('${granularity}', created_at) AS time, metadata->>'user_id' AS metric, COUNT(*) AS calls FROM traces WHERE $__timeFilter(created_at) GROUP BY 1, 2 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "piechart",
+      "title": "Savings by G-Group",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT key AS group, SUM((value->>'abs_saving')::int) AS total_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY total_saved DESC LIMIT 10",
+          "format": "table"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": true,
+          "calc": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "pieType": "pie",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "desc"
+        },
+        "displayLabels": [
+          "name",
+          "percent"
+        ]
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Cost Saved per User (USD)",
+      "gridPos": {
+        "x": 8,
+        "y": 12,
+        "w": 16,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('${granularity}', created_at) AS time, metadata->>'user_id' AS metric, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,4) AS cost_saved FROM traces WHERE $__timeFilter(created_at) GROUP BY 1, 2 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {
+            "lineWidth": 2
+          },
+          "decimals": 6
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "barchart",
+      "title": "Period-over-Period Comparison",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT to_char(date_trunc('${granularity}', created_at), 'YYYY-MM-DD') AS period, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,2) AS cost_saved FROM traces WHERE $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY MIN(created_at)",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "piechart",
+      "title": "Model Tier Distribution",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'routed_model' AS model, COUNT(*) AS calls FROM traces WHERE $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY calls DESC",
+          "format": "table"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": true,
+          "calc": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "pieType": "pie",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "desc"
+        },
+        "displayLabels": [
+          "name",
+          "percent"
+        ]
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Savings by User",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('${granularity}', created_at) AS period, metadata->>'user_id' AS user_id, COUNT(*) AS calls, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved, ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS avg_pct_saving, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,4) AS cost_saved_usd FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1,2 ORDER BY 1 DESC, tokens_saved DESC",
+          "format": "table"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "granularity",
+        "type": "custom",
+        "label": "Granularity",
+        "query": "hour,day,week,month,quarter",
+        "current": {
+          "text": "day",
+          "value": "day"
+        },
+        "options": [
+          {
+            "text": "hour",
+            "value": "hour",
+            "selected": false
+          },
+          {
+            "text": "day",
+            "value": "day",
+            "selected": true
+          },
+          {
+            "text": "week",
+            "value": "week",
+            "selected": false
+          },
+          {
+            "text": "month",
+            "value": "month",
+            "selected": false
+          },
+          {
+            "text": "quarter",
+            "value": "quarter",
+            "selected": false
+          }
+        ],
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "user_id",
+        "type": "query",
+        "label": "User",
+        "datasource": {
+          "uid": "langfuse-postgres"
+        },
+        "query": "SELECT DISTINCT metadata->>'user_id' FROM traces WHERE created_at >= NOW() - INTERVAL '1 year' ORDER BY 1",
+        "current": {
+          "value": "All",
+          "text": "All"
+        },
+        "includeAll": true,
+        "allValue": "All",
+        "multi": false,
+        "refresh": 2
+      },
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  }
+}
