@@ -324,6 +324,19 @@ Every LLM response includes detailed savings metadata:
 
 **Dashboards:** Access Grafana at `https://grafana-<hash>-uc.a.run.app` for per-call, hourly, daily, weekly, and quarterly aggregations. (Dollar panels use the same config-priced estimate — see the caveat above.)
 
+**How dashboard values are calculated.** Grafana never reads `config.yaml` directly — it queries Postgres. The data flow is:
+
+```
+config.yaml pricing: table ─┐
+                            ├─► savings/calculator.py ─► _token_opt block ─┬─► Langfuse trace metadata ─► Grafana (savings panels)
+request tokens (measured) ──┘                                             └─► response body
+main._record_outcome ─────────────────────────────────► token_opt.usage_events ─► Grafana (billing / tenant / SLA panels)
+```
+
+- **Savings panels** (tokens saved, % saved, $ saved) read the Langfuse DB `traces` table — e.g. `SUM((metadata->>'total_abs_saving')::int)`, `AVG((metadata->>'total_pct_saving')::float)`, `SUM((metadata->>'cost_saving_usd')::float)`. These come straight from the per-call `_token_opt` values recorded to the trace.
+- **Billing / tenant-overview / SLA panels** read the application DB `token_opt.usage_events` table (via the separate `AppDB` datasource). This is the **request-count** billing track — one served request = one row — and is independent of tokens.
+- **Tokens are measured, dollars are estimated.** `total_abs_saving` / `total_pct_saving` are counted directly from the request; only the `cost_*_usd` columns are derived from the static `pricing:` table, so the config-priced caveat above applies to the **dollar panels only**, not the token or request-count panels.
+
 ## Operational Scripts
 
 | Script | Purpose |
