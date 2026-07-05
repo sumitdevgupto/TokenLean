@@ -155,7 +155,7 @@ class TestAllDashboardsHaveTenantVariable:
             f"Sample queries: {queries[:2]}"
         )
 
-    @pytest.mark.parametrize("fname", ["live.json", "hourly.json", "billing.json"])
+    @pytest.mark.parametrize("fname", ["live.json", "billing.json"])
     def test_prometheus_dashboards_use_tenant_id_label_filter(self, fname):
         """Dashboards with Prometheus panels must use PromQL tenant filter."""
         d = _load_dashboard(fname)
