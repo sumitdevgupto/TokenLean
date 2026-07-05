@@ -236,6 +236,48 @@ class TestSLADashboard:
         d = _load_dashboard("sla.json")
         assert d.get("uid")
 
+    def test_sla_dashboard_has_overall_and_proxy_only_rows(self):
+        d = _load_dashboard("sla.json")
+        row_titles = [
+            p.get("title", "").lower()
+            for p in d.get("panels", [])
+            if p.get("type") == "row"
+        ]
+        assert any("overall" in t for t in row_titles), (
+            f"SLA dashboard missing 'Overall (end-to-end)' row. Rows: {row_titles}"
+        )
+        assert any("proxy only" in t for t in row_titles), (
+            f"SLA dashboard missing 'Proxy only' row. Rows: {row_titles}"
+        )
+
+    def test_sla_dashboard_proxy_row_uses_overhead_metric(self):
+        # The 'Proxy only' latency cards must query the proxy-overhead histogram,
+        # not the end-to-end one (p99/p95/p50 → three quantile queries).
+        d = _load_dashboard("sla.json")
+        queries = _all_panel_queries(d)
+        overhead_queries = [q for q in queries if "token_opt_proxy_overhead_ms_bucket" in q]
+        assert len(overhead_queries) >= 3, (
+            f"Expected ≥3 proxy-overhead quantile queries, got: {overhead_queries}"
+        )
+
+    def test_sla_dashboard_copies_in_sync(self):
+        # A duplicate sla.json lives in the internal pitch-test-plan harness; keep
+        # it identical to the canonical root copy (the root dir is what the local
+        # stacks actually mount — see the grafana volumes in docker-compose.yml).
+        # pitch-test-plan/ is gitignored (internal-only), so it does not exist in
+        # the public OSS checkout — skip there instead of breaking OSS pytest
+        # (same hazard class as the gitignore-excluded G21/DS8 test).
+        root = Path(__file__).parent.parent.parent
+        pitch_path = root / "pitch-test-plan" / "dashboard" / "dashboards" / "sla.json"
+        if not pitch_path.exists():
+            pytest.skip("pitch-test-plan/ (internal, gitignored) absent in this checkout")
+        main_copy = (root / "dashboard" / "dashboards" / "sla.json").read_text()
+        pitch_copy = pitch_path.read_text()
+        assert main_copy == pitch_copy, (
+            "dashboard/dashboards/sla.json and pitch-test-plan/dashboard/dashboards/"
+            "sla.json have diverged — copy the main one over the pitch-test-plan copy."
+        )
+
 
 # ── E6-T: tenant-overview.json validity ───────────────────────────────────────
 
