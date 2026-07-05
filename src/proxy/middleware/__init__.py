@@ -52,6 +52,10 @@ class RequestContext:
     # Provider adapter — set by OptimisationPipeline early in process_request.
     # Type is Any to avoid importing providers here; callers cast as needed.
     provider_adapter: Optional[Any] = None
+    # Wall-clock ms spent inside the provider LLM call. 0 = no provider call
+    # (cache hit / bypass / pre-LLM error). Set by main.py; the SLA metrics use
+    # it to split proxy-induced latency from provider latency.
+    llm_elapsed_ms: float = 0.0
 
     @property
     def current_token_count(self) -> int:

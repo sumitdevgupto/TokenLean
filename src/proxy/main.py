@@ -33,7 +33,12 @@ litellm.drop_params = True
 from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
-from middleware.g18_observability import REQUEST_DURATION_MS, HTTP_REQUESTS
+from middleware.g18_observability import (
+    REQUEST_DURATION_MS,
+    HTTP_REQUESTS,
+    LLM_DURATION_MS,
+    PROXY_OVERHEAD_MS,
+)
 from middleware import RequestContext
 from middleware.g00_rate_limit import RateLimitExceeded
 from middleware.g03_doc_pipeline import trigger_doc_ingestion
@@ -486,9 +491,17 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
     are never billed; batch-deferred (202) is billed separately at defer (C1b)."""
     tenant_id = getattr(ctx, "tenant_id", "default") if ctx is not None else "default"
     elapsed_ms = (time.time() - start_ts) * 1000
+    llm_ms = getattr(ctx, "llm_elapsed_ms", 0.0) if ctx is not None else 0.0
     try:
         REQUEST_DURATION_MS.labels(tenant_id=tenant_id, status=status).observe(elapsed_ms)
         HTTP_REQUESTS.labels(tenant_id=tenant_id, status=status).inc()
+        # Proxy-vs-LLM latency split: overhead = end-to-end minus provider call
+        # time. Cache hits/bypasses have llm_ms=0 → full duration is proxy time.
+        PROXY_OVERHEAD_MS.labels(tenant_id=tenant_id, status=status).observe(
+            max(0.0, elapsed_ms - llm_ms)
+        )
+        if llm_ms > 0:
+            LLM_DURATION_MS.labels(tenant_id=tenant_id).observe(llm_ms)
     except Exception as exc:  # never let metrics break the response
         logger.debug("SLA metric record failed: %s", exc)
     # C1: one billable row per served 2xx request (best-effort, never blocks).
@@ -514,6 +527,7 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
     async def event_gen():
         last_usage = {}
         parts = []  # accumulated assistant text for chunk-aware G23 (measurement only)
+        _llm_start = time.time()
         try:
             stream = await litellm.acompletion(
                 model=call_model, messages=ctx.messages, **call_kwargs, **params
@@ -548,6 +562,9 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 except Exception:
                     pass
             try:
+                # For streamed calls the provider owns the whole stream lifetime,
+                # so LLM time = acompletion start → last chunk consumed.
+                ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
                 _record_outcome(
                     ctx, request_start, "200", {"usage": last_usage} if last_usage else None
                 )
@@ -765,20 +782,24 @@ async def chat_completions(request: Request):
             **outgoing_params,
         )
         _llm_ms = (time.time() - _llm_start) * 1000
+        ctx.llm_elapsed_ms = _llm_ms
         (logger.warning if _llm_ms > 10000 else logger.info)(
             "[%s] LLM call %s completed in %.0fms", request_id, ctx.routed_model, _llm_ms
         )
         response_dict = llm_response.model_dump() if hasattr(llm_response, "model_dump") else dict(llm_response)
     except litellm.exceptions.AuthenticationError as exc:
         logger.error("LLM auth error: %s", exc)
+        ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "401")
         raise HTTPException(status_code=401, detail="LLM provider authentication failed")
     except litellm.exceptions.RateLimitError as exc:
         logger.warning("LLM rate limit: %s", exc)
+        ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "429")
         raise HTTPException(status_code=429, detail="LLM provider rate limit reached")
     except Exception as exc:
         logger.error("LLM call failed: %s", exc)
+        ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "502")
         raise HTTPException(status_code=502, detail=f"LLM provider error: {str(exc)}")
 

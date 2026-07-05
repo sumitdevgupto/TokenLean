@@ -87,6 +87,21 @@ REQUEST_DURATION_MS = Histogram(
     ["tenant_id", "status"],
     buckets=[50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000],
 )
+LLM_DURATION_MS = Histogram(
+    "token_opt_llm_duration_ms",
+    "Provider LLM call latency in milliseconds; cache hits and bypasses never "
+    "reach the provider and are not observed here",
+    ["tenant_id"],
+    buckets=[50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000],
+)
+PROXY_OVERHEAD_MS = Histogram(
+    "token_opt_proxy_overhead_ms",
+    "Proxy-induced latency in milliseconds: end-to-end duration minus provider "
+    "LLM call time. Cache hits and bypasses skip the provider, so their full "
+    "duration counts as proxy time (used by SLA dashboard 'Proxy only' row)",
+    ["tenant_id", "status"],
+    buckets=[10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000],
+)
 HTTP_REQUESTS = Counter(
     "token_opt_http_requests_total",
     "HTTP requests by outcome status, counting every exit path including "

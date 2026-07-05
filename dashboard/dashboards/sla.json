@@ -13,12 +13,25 @@
   },
   "panels": [
     {
+      "id": 9,
+      "type": "row",
+      "title": "Overall (end-to-end)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
       "id": 1,
       "type": "stat",
       "title": "p99 Latency (ms)",
       "gridPos": {
         "x": 0,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -68,7 +81,7 @@
       "title": "p95 Latency (ms)",
       "gridPos": {
         "x": 6,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -101,7 +114,7 @@
       "title": "p50 Latency (ms)",
       "gridPos": {
         "x": 12,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -134,7 +147,7 @@
       "title": "Error Rate (%)",
       "gridPos": {
         "x": 18,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -179,12 +192,195 @@
       }
     },
     {
+      "id": 10,
+      "type": "row",
+      "title": "Proxy only",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "p99 Latency (ms)",
+      "description": "Proxy-induced latency only: end-to-end duration minus provider LLM call time. Cache hits and bypasses never reach the provider, so their full duration counts as proxy time.",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(token_opt_proxy_overhead_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "red",
+                "value": 500
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "p95 Latency (ms)",
+      "description": "Proxy-induced latency only: end-to-end duration minus provider LLM call time.",
+      "gridPos": {
+        "x": 6,
+        "y": 6,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(token_opt_proxy_overhead_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "p50 Latency (ms)",
+      "description": "Proxy-induced latency only: end-to-end duration minus provider LLM call time.",
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(token_opt_proxy_overhead_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Error Rate (%)",
+      "description": "Proxy-originated 5xx only — excludes 502s, which are provider-side LLM failures.",
+      "gridPos": {
+        "x": 18,
+        "y": 6,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "(sum(rate(token_opt_http_requests_total{status=~\"5..\",status!=\"502\",tenant_id=~\"$tenant\"}[5m])) or vector(0)) / sum(rate(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[5m])) * 100",
+          "legendFormat": "error_rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 1.0
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
       "id": 5,
       "type": "timeseries",
       "title": "p99 Latency Trend",
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 10,
         "w": 12,
         "h": 8
       },
@@ -212,7 +408,7 @@
       "title": "Error Rate Trend",
       "gridPos": {
         "x": 12,
-        "y": 4,
+        "y": 10,
         "w": 12,
         "h": 8
       },
@@ -240,7 +436,7 @@
       "title": "Uptime %",
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 18,
         "w": 8,
         "h": 4
       },
@@ -275,7 +471,7 @@
       "title": "Tokens Saved vs SLA Target",
       "gridPos": {
         "x": 8,
-        "y": 12,
+        "y": 18,
         "w": 16,
         "h": 8
       },
