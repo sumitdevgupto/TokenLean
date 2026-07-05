@@ -2,7 +2,10 @@ import hashlib
 import json
 import logging
 import os
-from typing import Optional, Tuple
+import secrets
+import threading
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -143,3 +146,191 @@ def get_llm_provider_key(provider: str) -> Optional[str]:
     if value:
         return value
     return _fetch_secret(secret_name)
+
+
+# ─── Key-store lifecycle engine (write side) ──────────────────────────────────
+# Read/enforce (validate_proxy_key / is_suspended / is_admin_key) is used by core
+# main.py. These WRITE helpers are the programmatic equivalent of scripts/issue-key.sh
+# (create/revoke) plus a suspend that previously had no tool. They ship in the OSS core
+# as an UNWIRED engine — self-hosters can drive them, and the commercial management
+# console (api/admin.py) is the paid product that exposes them over HTTP. Core main.py /
+# pipeline.py never import these; the barricade holds.
+#
+# Store shape is unchanged: { sha256(raw_key): {tenant_id, tier, created_at, admin?, suspended?} }.
+# Every mutation is a fresh load-modify-persist under a lock (never trusts the TTL cache),
+# and refreshes the in-process cache so a running proxy sees the change immediately.
+
+_KEY_PREFIX = "tok-"
+_STORE_WRITE_LOCK = threading.Lock()
+
+
+def _using_local_backend() -> bool:
+    """True when keys live in a local JSON file rather than Secret Manager."""
+    storage_backend = os.getenv("STORAGE_BACKEND", "gcs").lower().strip()
+    return bool(_LOCAL_PROXY_KEYS_FILE) or storage_backend == "local"
+
+
+def _load_full_store() -> dict:
+    """Read the COMPLETE key store fresh from the active backend (bypasses the TTL cache).
+
+    Lifecycle writes operate on this, never on ``_KEY_CACHE``, so a mutation can't drop
+    entries that were added since the last cache load. Returns ``{}`` if the store is
+    missing/empty; re-raises on corrupt JSON (refuse to overwrite a broken store).
+    """
+    if _using_local_backend():
+        if not _LOCAL_PROXY_KEYS_FILE:
+            raise RuntimeError("LOCAL_PROXY_KEYS_FILE must be set for key-store writes")
+        try:
+            with open(_LOCAL_PROXY_KEYS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+    raw = _fetch_secret(_PROXY_KEYS_SECRET)
+    if not raw:
+        return {}
+    return json.loads(raw)
+
+
+def _write_secret_version(secret_name: str, payload: str) -> None:
+    """Add a new version to a Secret Manager secret (GCP backend)."""
+    from google.cloud import secretmanager
+
+    client = secretmanager.SecretManagerServiceClient()
+    parent = f"projects/{_GCP_PROJECT}/secrets/{secret_name}"
+    client.add_secret_version(
+        request={"parent": parent, "payload": {"data": payload.encode("utf-8")}}
+    )
+
+
+def _persist_store(store: dict) -> None:
+    """Write the full store back to the active backend + refresh the in-process cache."""
+    payload = json.dumps(store, indent=2)
+    if _using_local_backend():
+        if not _LOCAL_PROXY_KEYS_FILE:
+            raise RuntimeError("LOCAL_PROXY_KEYS_FILE must be set for key-store writes")
+        # Atomic write: temp file + os.replace so a crash never truncates the store.
+        tmp = f"{_LOCAL_PROXY_KEYS_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, _LOCAL_PROXY_KEYS_FILE)
+    else:
+        _write_secret_version(_PROXY_KEYS_SECRET, payload)
+    global _KEY_CACHE, _CACHE_LOADED_AT
+    _KEY_CACHE = store
+    _CACHE_LOADED_AT = time.monotonic()
+
+
+def create_key(
+    tenant_id: str,
+    tier: str = "basic",
+    admin: bool = False,
+    raw_key: Optional[str] = None,
+) -> Tuple[str, str, dict]:
+    """Create a proxy key for a tenant, persist it, refresh the cache.
+
+    Returns ``(raw_key, key_hash, metadata)``. The RAW key is returned exactly once —
+    the store only ever holds its sha256 hash, so it can never be recovered later.
+    Pass ``raw_key`` only for deterministic tests; production always auto-generates.
+    """
+    tenant_id = (tenant_id or "").strip()
+    if not tenant_id:
+        raise ValueError("tenant_id is required")
+    raw = raw_key or f"{_KEY_PREFIX}{secrets.token_hex(24)}"
+    key_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    metadata: dict = {
+        "tenant_id": tenant_id,
+        "tier": (tier or "basic").strip().lower(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if admin:
+        metadata["admin"] = True
+    with _STORE_WRITE_LOCK:
+        store = _load_full_store()
+        if key_hash in store:
+            raise ValueError("key already exists")
+        store[key_hash] = metadata
+        _persist_store(store)
+    logger.info(
+        "Created proxy key tenant=%s tier=%s admin=%s", tenant_id, metadata["tier"], admin
+    )
+    return raw, key_hash, metadata
+
+
+def set_suspended(tenant_id: str, suspended: bool = True) -> int:
+    """Set/clear the ``suspended`` flag on ALL keys for a tenant. Returns count changed.
+
+    Enforcement already exists (``is_suspended`` → HTTP 403 at ``main.py`` ``_authenticate``);
+    this is the tool that was missing to actually set the flag. Idempotent.
+    """
+    tenant_id = (tenant_id or "").strip()
+    changed = 0
+    with _STORE_WRITE_LOCK:
+        store = _load_full_store()
+        for entry in store.values():
+            if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id:
+                if bool(entry.get("suspended")) != bool(suspended):
+                    if suspended:
+                        entry["suspended"] = True
+                    else:
+                        entry.pop("suspended", None)
+                    changed += 1
+        if changed:
+            _persist_store(store)
+    logger.info(
+        "%s %d key(s) tenant=%s", "Suspended" if suspended else "Unsuspended", changed, tenant_id
+    )
+    return changed
+
+
+def delete_tenant_keys(tenant_id: str) -> int:
+    """Remove ALL keys for a tenant from the store. Returns count removed.
+
+    Revokes access but does NOT erase the tenant's stored data — use the GDPR erase
+    endpoint (``api/gdpr.py``) for right-to-erasure. Irreversible.
+    """
+    tenant_id = (tenant_id or "").strip()
+    with _STORE_WRITE_LOCK:
+        store = _load_full_store()
+        to_remove = [
+            h for h, e in store.items()
+            if isinstance(e, dict) and e.get("tenant_id") == tenant_id
+        ]
+        for h in to_remove:
+            del store[h]
+        if to_remove:
+            _persist_store(store)
+    logger.info("Deleted %d key(s) tenant=%s", len(to_remove), tenant_id)
+    return len(to_remove)
+
+
+def list_tenants() -> List[dict]:
+    """Aggregate the key store by tenant for the management console.
+
+    Returns ``[{tenant_id, tier, admin, suspended, key_count, created_at}]`` sorted by
+    tenant_id — NEVER any raw key or hash. Legacy string-format entries group under their
+    user_id with tier ``"legacy"``.
+    """
+    store = _load_full_store()
+    tenants: dict = {}
+    for entry in store.values():
+        if isinstance(entry, dict):
+            tid = entry.get("tenant_id", "default")
+            agg = tenants.setdefault(tid, {
+                "tenant_id": tid, "tier": entry.get("tier", "basic"),
+                "admin": False, "suspended": False, "key_count": 0,
+                "created_at": entry.get("created_at"),
+            })
+            agg["key_count"] += 1
+            agg["admin"] = agg["admin"] or bool(entry.get("admin"))
+            agg["suspended"] = agg["suspended"] or bool(entry.get("suspended"))
+            ca = entry.get("created_at")
+            if ca and (agg["created_at"] is None or ca < agg["created_at"]):
+                agg["created_at"] = ca
+        else:
+            tid = str(entry)
+            agg = tenants.setdefault(tid, {
+                "tenant_id": tid, "tier": "legacy", "admin": False,
+                "suspended": False, "key_count": 0, "created_at": None,
+            })
+            agg["key_count"] += 1
+    return sorted(tenants.values(), key=lambda t: t["tenant_id"])

@@ -188,6 +188,10 @@ scripts/test-tiers.sh
 # billing/models.py, audit/, tenancy/) — only tier-gating + portal + gdpr gated.
 src/proxy/api/portal.py
 src/proxy/api/gdpr.py
+# Multi-tenant management console API (H2) — tenant lifecycle over HTTP (create/suspend/
+# delete/list + pricing + invoice run). The key-store WRITE engine stays core+unwired
+# (auth/api_key_manager.py); THIS router is the commercial product that exposes it.
+src/proxy/api/admin.py
 src/proxy/billing/tiers.py
 # Request-count invoicing (E2) — the paid product's billing calculation. Engines
 # (metering/models/audit) stay in core; the invoice generator is commercial.
@@ -224,6 +228,8 @@ tests/unit/billing/test_merge_billing_config.py
 tests/unit/test_pipeline_tiers.py
 tests/unit/test_alert_rules.py
 tests/unit/api/test_portal.py
+tests/unit/api/test_admin.py
+tests/unit/api/test_rls_scoping.py
 tests/test_gdpr_compliance.py
 tests/integration/test_portal.py
 tests/integration/test_openmeter.py
