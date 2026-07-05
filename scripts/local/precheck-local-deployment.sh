@@ -113,7 +113,22 @@ info "Checking port availability..."
 REQUIRED_PORTS=(4000 8080 8081 6333 9998 3000 3100)
 PORT_ERRORS=0
 
+# Ports published by our OWN already-running stack are not conflicts on a
+# re-deploy — `docker compose up -d` will reconcile those containers in place.
+# Collect them so we don't false-fail when the stack is already up.
+OWN_PORTS=""
+if command -v docker &>/dev/null && docker info >/dev/null 2>&1; then
+    OWN_PORTS="$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
+        | grep -E '(^| )token-opt-' \
+        | grep -oE '(0\.0\.0\.0|127\.0\.0\.1|\[::\]|\*):[0-9]+' \
+        | grep -oE '[0-9]+$' | sort -u | tr '\n' ' ')"
+fi
+
 for port in "${REQUIRED_PORTS[@]}"; do
+    if [[ " ${OWN_PORTS} " == *" ${port} "* ]]; then
+        success "Port ${port} is in use by our own token-opt-* container (stack already running) — OK"
+        continue
+    fi
     if command -v nc &>/dev/null; then
         # nc available (Linux/Mac)
         if nc -z localhost "${port}" 2>/dev/null; then

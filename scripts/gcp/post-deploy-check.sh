@@ -24,16 +24,13 @@ REGION="asia-south1"
 SQL_INSTANCE="token-opt-pg"
 REDIS_INSTANCE="token-opt-redis"
 
-# Cloud Run services to check
+# Cloud Run services to check (base — always present). Toggle-gated services
+# (Qdrant, self-hosted observability) are appended after .env is loaded, below.
 SERVICES=(
   "token-proxy"
   "llmlingua-svc"
   "routellm-svc"
   "langfuse-svc"
-  "grafana-svc"
-  "token-opt-qdrant"
-  "token-opt-prometheus"
-  "token-opt-alertmanager"
 )
 
 # Colors
@@ -91,6 +88,25 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 echo "Project: ${PROJECT_ID}"
 echo "Region:  ${REGION}"
+echo ""
+
+# ─── Deployment toggles (match gcp-deploy.sh guards; default = enabled) ────────
+# A cost-optimized deploy can disable Qdrant (G07 → pgvector fallback) and/or
+# self-hosted observability (→ Cloud Monitoring). Those services then never
+# exist, so checking for them must NOT count as UNHEALTHY.
+ENABLE_QDRANT="${ENABLE_QDRANT:-true}"
+ENABLE_SELF_HOSTED_OBS="${ENABLE_SELF_HOSTED_OBS:-true}"
+
+if [[ "$ENABLE_SELF_HOSTED_OBS" == "true" ]]; then
+  SERVICES+=("grafana-svc" "token-opt-prometheus" "token-opt-alertmanager")
+else
+  info "Self-hosted observability disabled (ENABLE_SELF_HOSTED_OBS=${ENABLE_SELF_HOSTED_OBS}) — skipping Prometheus/Grafana/Alertmanager checks (Cloud Monitoring in use)."
+fi
+if [[ "$ENABLE_QDRANT" == "true" ]]; then
+  SERVICES+=("token-opt-qdrant")
+else
+  info "Qdrant disabled (ENABLE_QDRANT=${ENABLE_QDRANT}) — skipping Qdrant checks (G07 pgvector fallback in use)."
+fi
 echo ""
 
 # ─── Check 1: Cloud SQL ───────────────────────────────────────────────────────
@@ -236,42 +252,46 @@ if [[ -n "$ROUTELLM_URL" ]]; then
   fi
 fi
 
-# Check Qdrant
-QDRANT_URL=$(gcloud run services describe token-opt-qdrant \
-  --project="$PROJECT_ID" \
-  --region="$REGION" \
-  --format="value(status.uri)" 2>/dev/null || echo "")
+# Check Qdrant (only when enabled — otherwise G07 uses pgvector fallback)
+if [[ "$ENABLE_QDRANT" == "true" ]]; then
+  QDRANT_URL=$(gcloud run services describe token-opt-qdrant \
+    --project="$PROJECT_ID" \
+    --region="$REGION" \
+    --format="value(status.uri)" 2>/dev/null || echo "")
 
-if [[ -n "$QDRANT_URL" ]]; then
-  # Qdrant has a health endpoint at /healthz or we can check root
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${QDRANT_URL}" 2>/dev/null || echo "000")
-  if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "403" ]]; then
-    # 403 is OK for internal services (they block external ingress)
-    success "token-opt-qdrant: Reachable (${HTTP_STATUS})"
-    ((HEALTHY++))
-  else
-    warn "token-opt-qdrant: HTTP ${HTTP_STATUS}"
-    ((WARNINGS++))
+  if [[ -n "$QDRANT_URL" ]]; then
+    # Qdrant has a health endpoint at /healthz or we can check root
+    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${QDRANT_URL}" 2>/dev/null || echo "000")
+    if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "403" ]]; then
+      # 403 is OK for internal services (they block external ingress)
+      success "token-opt-qdrant: Reachable (${HTTP_STATUS})"
+      ((HEALTHY++))
+    else
+      warn "token-opt-qdrant: HTTP ${HTTP_STATUS}"
+      ((WARNINGS++))
+    fi
   fi
 fi
 
-# Check Prometheus
-PROM_URL=$(gcloud run services describe token-opt-prometheus \
-  --project="$PROJECT_ID" \
-  --region="$REGION" \
-  --format="value(status.uri)" 2>/dev/null || echo "")
+# Check Prometheus (only when self-hosted observability is enabled)
+if [[ "$ENABLE_SELF_HOSTED_OBS" == "true" ]]; then
+  PROM_URL=$(gcloud run services describe token-opt-prometheus \
+    --project="$PROJECT_ID" \
+    --region="$REGION" \
+    --format="value(status.uri)" 2>/dev/null || echo "")
 
-if [[ -n "$PROM_URL" ]]; then
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROM_URL}/-/healthy" 2>/dev/null || echo "000")
-  if [[ "$HTTP_STATUS" == "200" ]]; then
-    success "token-opt-prometheus: HTTP ${HTTP_STATUS}"
-    ((HEALTHY++))
-  elif [[ "$HTTP_STATUS" == "403" ]]; then
-    success "token-opt-prometheus: Reachable (internal service)"
-    ((HEALTHY++))
-  else
-    warn "token-opt-prometheus: HTTP ${HTTP_STATUS}"
-    ((WARNINGS++))
+  if [[ -n "$PROM_URL" ]]; then
+    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROM_URL}/-/healthy" 2>/dev/null || echo "000")
+    if [[ "$HTTP_STATUS" == "200" ]]; then
+      success "token-opt-prometheus: HTTP ${HTTP_STATUS}"
+      ((HEALTHY++))
+    elif [[ "$HTTP_STATUS" == "403" ]]; then
+      success "token-opt-prometheus: Reachable (internal service)"
+      ((HEALTHY++))
+    else
+      warn "token-opt-prometheus: HTTP ${HTTP_STATUS}"
+      ((WARNINGS++))
+    fi
   fi
 fi
 

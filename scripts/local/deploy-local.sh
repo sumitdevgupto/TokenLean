@@ -3,7 +3,7 @@
 # deploy-local.sh — Deploy TokenLean — Token Optimisation Framework locally via Docker
 # =============================================================================
 # Usage:
-#   ./scripts/local/deploy-local.sh [--seed] [--backup-to-gcs] [--with-grafana] [--recreate] [--tenants TENANT_LIST]
+#   ./scripts/local/deploy-local.sh [--seed] [--backup-to-gcs] [--with-grafana] [--recreate] [--tenants TENANT_LIST] [--no-check]
 #
 # Options:
 #   --seed              Seed Qdrant with pitch_docs collection
@@ -11,6 +11,7 @@
 #   --with-grafana      Start observability stack (Prometheus + Grafana)
 #   --recreate          Force rebuild --no-cache (use after code changes)
 #   --tenants LIST      Comma-separated tenant IDs for multi-tenant seeding (e.g., nova-med,shop-bot)
+#   --no-check          Skip the post-deployment health check at the end
 #
 # What this does:
 #   1. Checks Docker is running
@@ -31,6 +32,7 @@ BACKUP_TO_GCS=false
 WITH_GRAFANA=false
 RECREATE=false
 TENANTS=""
+RUN_CHECK=true
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --with-grafana) WITH_GRAFANA=true; shift ;;
     --recreate)    RECREATE=true; shift ;;
     --tenants)     TENANTS="$2"; shift 2 ;;
+    --no-check)    RUN_CHECK=false; shift ;;
     --help)
       sed -n '/^# Usage:/,/^# ===/p' "$0" | head -20
       exit 0 ;;
@@ -184,6 +187,20 @@ fi
 if [[ "$BACKUP_TO_GCS" == true ]]; then
   info "Backing up to GCS..."
   "${SCRIPT_DIR}/docker-backup.sh" || warn "Backup failed"
+fi
+
+# ─── Post-deployment health check ─────────────────────────────────────────────
+# Non-fatal by design: the deploy has completed, so we surface any problems
+# loudly but don't exit non-zero (callers/orchestrators still get a 0 deploy).
+# Skip with --no-check.
+if [[ "$RUN_CHECK" == true ]]; then
+  echo ""
+  info "Running post-deployment health check..."
+  if "${SCRIPT_DIR}/post-deploy-check-local.sh"; then
+    success "Post-deployment health check passed"
+  else
+    warn "Post-deployment health check reported issues (see above) — deploy finished, but verify before sending traffic"
+  fi
 fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
