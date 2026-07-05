@@ -6,6 +6,7 @@ without importing the Langfuse SDK directly.
 """
 import logging
 import os
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -15,35 +16,54 @@ _LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 _LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
 
 _client = None
-_client_init_attempted = False  # sentinel: True once we've tried (keys absent or init failed)
+_disabled = False               # permanent off: keys absent or SDK incompatible (restart to change)
+_last_init_attempt = 0.0        # monotonic ts of the last *failed* init, for retry throttling
+_INIT_RETRY_COOLDOWN = float(os.getenv("LANGFUSE_INIT_RETRY_COOLDOWN", "30"))
 
 
 def get_client() -> Optional[Any]:
-    """Return a cached Langfuse client, or None if keys are missing."""
-    global _client, _client_init_attempted
+    """Return a cached Langfuse client, or None if unavailable.
+
+    A *transient* init failure (e.g. Langfuse not yet reachable during a
+    startup/recreate race) must NOT permanently disable tracing — that would
+    silently starve every Langfuse-backed dashboard for the whole process
+    lifetime. Such failures are retried on a cooldown. Only a genuinely
+    permanent condition (keys absent / incompatible SDK) latches off.
+    """
+    global _client, _disabled, _last_init_attempt
     if _client is not None:
         return _client
-    if _client_init_attempted:
-        return None  # already know it's unavailable — skip repeated checks
-    _client_init_attempted = True
+    if _disabled:
+        return None
+    if not _LANGFUSE_PUBLIC_KEY or not _LANGFUSE_SECRET_KEY:
+        _disabled = True  # config-level, won't change without a restart
+        logger.warning("Langfuse keys not configured — tracing disabled for this process")
+        return None
+    # Throttle re-init so a truly-down Langfuse doesn't get hammered per request.
+    now = time.monotonic()
+    if _last_init_attempt and (now - _last_init_attempt) < _INIT_RETRY_COOLDOWN:
+        return None
+    _last_init_attempt = now
     try:
         from langfuse import Langfuse
-        if not _LANGFUSE_PUBLIC_KEY or not _LANGFUSE_SECRET_KEY:
-            logger.debug("Langfuse keys not configured, skipping tracing")
-            return None
-        _client = Langfuse(
+        client = Langfuse(
             host=_LANGFUSE_HOST,
             public_key=_LANGFUSE_PUBLIC_KEY,
             secret_key=_LANGFUSE_SECRET_KEY,
         )
         # Verify SDK is compatible — langfuse>=2.x uses .trace(), v3 uses different API
-        if not hasattr(_client, "trace"):
+        if not hasattr(client, "trace"):
             logger.warning("Langfuse SDK does not support .trace() — tracing disabled")
-            _client = None
+            _disabled = True  # SDK incompatibility won't change at runtime
             return None
+        _client = client
+        logger.info("Langfuse client initialised (host=%s)", _LANGFUSE_HOST)
         return _client
     except Exception as exc:
-        logger.warning("Langfuse client init failed: %s", exc)
+        logger.warning(
+            "Langfuse client init failed (will retry in ~%.0fs): %s",
+            _INIT_RETRY_COOLDOWN, exc,
+        )
         return None
 
 
