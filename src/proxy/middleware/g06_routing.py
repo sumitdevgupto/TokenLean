@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -23,6 +24,25 @@ from providers import build_litellm_call
 
 logger = logging.getLogger(__name__)
 GROUP = "G06"
+
+
+async def _timed_llm(ctx: RequestContext, coro):
+    """Await an LLM-bearing coroutine and add its wall-clock time to
+    ``ctx.llm_elapsed_ms``.
+
+    G06's cascade tiers and judge calls are real provider calls made *inside*
+    the request pipeline. Without this, that time would be booked as proxy
+    overhead in the SLA split (elapsed − llm_elapsed_ms) — inflating the
+    "Proxy only" latency with what is actually LLM-layer time.
+    """
+    t0 = time.time()
+    try:
+        return await coro
+    finally:
+        try:
+            ctx.llm_elapsed_ms += (time.time() - t0) * 1000.0
+        except Exception:
+            pass
 
 
 def _openai_key_available() -> bool:
@@ -319,19 +339,19 @@ async def _execute_three_tier_cascade(
         tier1_max_tokens = ctx.params.get("max_tokens") or 512
         tier1_temperature = ctx.params.get("temperature", 0.0)
         _t1_model, _t1_kwargs = build_litellm_call(tier1_model, get_providers(), provider_key)
-        tier1_response = await litellm.acompletion(
+        tier1_response = await _timed_llm(ctx, litellm.acompletion(
             model=_t1_model,
             messages=ctx.messages,
             **_t1_kwargs,
             max_tokens=tier1_max_tokens,
             temperature=tier1_temperature,
-        )
+        ))
 
         # Evaluate confidence using judge model or heuristic
         if judge_model:
-            confidence = await _evaluate_response_confidence(
+            confidence = await _timed_llm(ctx, _evaluate_response_confidence(
                 ctx.messages, tier1_response, judge_model
-            )
+            ))
         else:
             # Fallback to heuristic confidence (returns tier, confidence)
             _, confidence = _classify_heuristic(ctx.messages, ctx.params)
@@ -366,19 +386,19 @@ async def _execute_three_tier_cascade(
             try:
                 tier2_provider_key = await _resolve_provider_key(tier2_model) or provider_key
                 _t2_model, _t2_kwargs = build_litellm_call(tier2_model, get_providers(), tier2_provider_key)
-                tier2_response = await litellm.acompletion(
+                tier2_response = await _timed_llm(ctx, litellm.acompletion(
                     model=_t2_model,
                     messages=ctx.messages,
                     **_t2_kwargs,
                     **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
-                )
+                ))
                 logger.info("G06 cascade: escalated to tier2 model %s", tier2_model)
                 # Tier2 succeeded — promote it as the best fallback before confidence check
                 best_model = tier2_model
                 best_response = tier2_response
                 # Re-evaluate confidence after tier2; if still low, try tier3
                 if judge_model:
-                    confidence2 = await _evaluate_response_confidence(ctx.messages, tier2_response, judge_model)
+                    confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model))
                 else:
                     _, confidence2 = _classify_heuristic(ctx.messages, ctx.params)
                 if confidence2 >= confidence_threshold:
@@ -404,12 +424,12 @@ async def _execute_three_tier_cascade(
             try:
                 tier3_provider_key = await _resolve_provider_key(tier3_model) or provider_key
                 _t3_model, _t3_kwargs = build_litellm_call(tier3_model, get_providers(), tier3_provider_key)
-                tier3_response = await litellm.acompletion(
+                tier3_response = await _timed_llm(ctx, litellm.acompletion(
                     model=_t3_model,
                     messages=ctx.messages,
                     **_t3_kwargs,
                     **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
-                )
+                ))
                 logger.info("G06 cascade: escalated to tier3 model %s", tier3_model)
                 return tier3_model, tier3_response.model_dump() if hasattr(tier3_response, "model_dump") else dict(tier3_response)
             except Exception as exc:
@@ -658,13 +678,13 @@ class G06Routing:
                     )
                 else:
                     # Fallback to standard classification
-                    complexity = await _dispatch_classifier(ctx, cfg)
+                    complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, cfg))
                     candidates = tiers.get(complexity, tiers.get("medium", []))
                     if candidates:
                         selected_model = candidates[0]
                     ctx.savings.routing_mode = f"{classifier}_fallback"
             else:
-                complexity = await _dispatch_classifier(ctx, cfg)
+                complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, cfg))
                 candidates = tiers.get(complexity, tiers.get("medium", []))
                 if candidates:
                     selected_model = candidates[0]

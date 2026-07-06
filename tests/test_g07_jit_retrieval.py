@@ -135,6 +135,47 @@ class TestG07JITAutoExtraction:
         assert result.messages == original_messages
 
     @pytest.mark.asyncio
+    async def test_require_rag_intent_skips_when_no_intent(self):
+        """jit_require_rag_intent=true + no rag_query/x_rag_collection → retrieval
+        skipped (no embed/search) even though JIT is enabled. This spares every
+        non-RAG chat request the embed + Qdrant search + rerank cost."""
+        ctx = _ctx(
+            messages=[{"role": "user", "content": "Explain vector databases"}],
+            jit_enabled=True,
+        )
+        ctx.config["groups"]["G7_retrieval"]["jit_require_rag_intent"] = True
+        original_messages = list(ctx.messages)
+
+        with patch("middleware.g07_retrieval._hybrid_search", new_callable=AsyncMock) as mock_search, \
+             patch("middleware.g07_retrieval._extract_rag_query") as mock_extract:
+            result = await G07Retrieval().process_request(ctx)
+
+        mock_extract.assert_not_called()  # never even builds a query
+        mock_search.assert_not_called()
+        assert result.messages == original_messages
+
+    @pytest.mark.asyncio
+    async def test_require_rag_intent_fires_when_collection_header_present(self):
+        """jit_require_rag_intent=true still retrieves when the caller signals RAG
+        intent via x_rag_collection — the query is auto-extracted as usual."""
+        ctx = _ctx(
+            messages=[{"role": "user", "content": "Explain vector databases"}],
+            params={"x_rag_collection": "my-docs"},
+            jit_enabled=True,
+        )
+        ctx.is_admin_key = True  # honour client-supplied collection
+        ctx.config["groups"]["G7_retrieval"]["jit_require_rag_intent"] = True
+        chunks = [_chunk("Vector databases store embeddings.")]
+
+        with patch("middleware.g07_retrieval._hybrid_search", new_callable=AsyncMock, return_value=chunks) as mock_search, \
+             patch("middleware.g07_retrieval._rerank", new_callable=AsyncMock, return_value=chunks), \
+             patch("middleware.g07_retrieval.langfuse_tracing"), \
+             patch("middleware.g07_retrieval.count_messages_tokens", return_value=120):
+            await G07Retrieval().process_request(ctx)
+
+        mock_search.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_explicit_rag_query_param_takes_priority(self):
         """Explicit rag_query param is used as-is; auto-extraction is not needed."""
         ctx = _ctx(

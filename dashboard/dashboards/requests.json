@@ -1,0 +1,282 @@
+{
+  "title": "Token Optimisation - Requests Explorer",
+  "uid": "token-opt-requests",
+  "tags": [
+    "token-optimisation",
+    "requests"
+  ],
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Matching Requests",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 3 },
+      "datasource": { "type": "postgres", "uid": "app-postgres" },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) AS matching_requests FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') AND ('${model}' = '.*' OR model = '${model}') AND ('${routed_model}' = '.*' OR routed_model = '${routed_model}') AND ('${tier}' = '.*' OR pricing_tier = '${tier}') AND ('${ggroup}' = '.*' OR '${ggroup}' = ANY(groups_applied)) AND ('$cache' = 'All' OR ('$cache' = 'hit') = cache_hit) AND ('$tier_complexity' = 'All' OR complexity_tier = '$tier_complexity') AND ('$bypassed' = 'All' OR ('$bypassed' = 'yes') = bypassed) AND ('${user_search}' = '' OR user_id ILIKE '%${user_search}%') AND ('${request_search}' = '' OR request_id ILIKE '${request_search}%') AND (COALESCE(NULLIF('${min_savings_pct}','')::numeric,0) = 0 OR (100.0*tokens_saved/NULLIF(baseline_tokens,0)) >= COALESCE(NULLIF('${min_savings_pct}','')::numeric,0)) AND tokens_saved >= COALESCE(NULLIF('${min_tokens_saved}','')::int,0)",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": { "titleSize": 15, "valueSize": 26 }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Tokens Saved (filtered)",
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 3 },
+      "datasource": { "type": "postgres", "uid": "app-postgres" },
+      "targets": [
+        {
+          "rawSql": "SELECT COALESCE(SUM(tokens_saved),0) AS tokens_saved FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') AND ('${model}' = '.*' OR model = '${model}') AND ('${routed_model}' = '.*' OR routed_model = '${routed_model}') AND ('${tier}' = '.*' OR pricing_tier = '${tier}') AND ('${ggroup}' = '.*' OR '${ggroup}' = ANY(groups_applied)) AND ('$cache' = 'All' OR ('$cache' = 'hit') = cache_hit) AND ('$tier_complexity' = 'All' OR complexity_tier = '$tier_complexity') AND ('$bypassed' = 'All' OR ('$bypassed' = 'yes') = bypassed) AND ('${user_search}' = '' OR user_id ILIKE '%${user_search}%') AND ('${request_search}' = '' OR request_id ILIKE '${request_search}%') AND (COALESCE(NULLIF('${min_savings_pct}','')::numeric,0) = 0 OR (100.0*tokens_saved/NULLIF(baseline_tokens,0)) >= COALESCE(NULLIF('${min_savings_pct}','')::numeric,0)) AND tokens_saved >= COALESCE(NULLIF('${min_tokens_saved}','')::int,0)",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": { "titleSize": 15, "valueSize": 26 }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cost Saved (filtered, est.)",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 3 },
+      "datasource": { "type": "postgres", "uid": "app-postgres" },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(COALESCE(SUM(cost_saved_usd),0)::numeric,4) AS cost_saved FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') AND ('${model}' = '.*' OR model = '${model}') AND ('${routed_model}' = '.*' OR routed_model = '${routed_model}') AND ('${tier}' = '.*' OR pricing_tier = '${tier}') AND ('${ggroup}' = '.*' OR '${ggroup}' = ANY(groups_applied)) AND ('$cache' = 'All' OR ('$cache' = 'hit') = cache_hit) AND ('$tier_complexity' = 'All' OR complexity_tier = '$tier_complexity') AND ('$bypassed' = 'All' OR ('$bypassed' = 'yes') = bypassed) AND ('${user_search}' = '' OR user_id ILIKE '%${user_search}%') AND ('${request_search}' = '' OR request_id ILIKE '${request_search}%') AND (COALESCE(NULLIF('${min_savings_pct}','')::numeric,0) = 0 OR (100.0*tokens_saved/NULLIF(baseline_tokens,0)) >= COALESCE(NULLIF('${min_savings_pct}','')::numeric,0)) AND tokens_saved >= COALESCE(NULLIF('${min_tokens_saved}','')::int,0)",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": { "titleSize": 15, "valueSize": 26 }
+      }
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Requests — filtered (click a Request ID to open its per-call breakdown)",
+      "gridPos": { "x": 0, "y": 3, "w": 24, "h": 20 },
+      "datasource": { "type": "postgres", "uid": "app-postgres" },
+      "targets": [
+        {
+          "rawSql": "SELECT timestamp AS \"Time\", request_id AS \"Request ID\", tenant_id AS \"Tenant\", user_id AS \"User\", pricing_tier AS \"Tier\", model AS \"Model\", routed_model AS \"Routed\", tokens_saved AS \"Tokens Saved\", ROUND((100.0*tokens_saved/NULLIF(baseline_tokens,0))::numeric,1) AS \"Savings %\", ROUND(cost_saved_usd::numeric,6) AS \"Cost Saved $\", CASE WHEN cache_hit THEN COALESCE(NULLIF(cache_level,''),'hit') ELSE 'miss' END AS \"Cache\", CASE WHEN bypassed THEN 'yes' ELSE 'no' END AS \"Bypassed\", complexity_tier AS \"Complexity\", array_to_string(groups_applied, ',') AS \"Groups\" FROM usage_events WHERE $__timeFilter(timestamp) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') AND ('${model}' = '.*' OR model = '${model}') AND ('${routed_model}' = '.*' OR routed_model = '${routed_model}') AND ('${tier}' = '.*' OR pricing_tier = '${tier}') AND ('${ggroup}' = '.*' OR '${ggroup}' = ANY(groups_applied)) AND ('$cache' = 'All' OR ('$cache' = 'hit') = cache_hit) AND ('$tier_complexity' = 'All' OR complexity_tier = '$tier_complexity') AND ('$bypassed' = 'All' OR ('$bypassed' = 'yes') = bypassed) AND ('${user_search}' = '' OR user_id ILIKE '%${user_search}%') AND ('${request_search}' = '' OR request_id ILIKE '${request_search}%') AND (COALESCE(NULLIF('${min_savings_pct}','')::numeric,0) = 0 OR (100.0*tokens_saved/NULLIF(baseline_tokens,0)) >= COALESCE(NULLIF('${min_savings_pct}','')::numeric,0)) AND tokens_saved >= COALESCE(NULLIF('${min_tokens_saved}','')::int,0) ORDER BY timestamp DESC LIMIT ${row_limit}",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Request ID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open per-call breakdown",
+                    "url": "/d/token-opt-per-call/token-savings-per-call?var-request_id=${__value.raw}&var-tenant=${tenant}&${__url_time_range}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Savings %" },
+            "properties": [{ "id": "unit", "value": "percent" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Cost Saved $" },
+            "properties": [{ "id": "unit", "value": "currencyUSD" }]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "sortBy": [{ "displayName": "Time", "desc": true }]
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": { "uid": "prometheus" },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": { "value": "$__all", "text": "All" },
+        "refresh": 2
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "label": "Model",
+        "datasource": { "type": "postgres", "uid": "app-postgres" },
+        "definition": "SELECT DISTINCT model FROM usage_events WHERE model <> '' ORDER BY 1",
+        "query": "SELECT DISTINCT model FROM usage_events WHERE model <> '' ORDER BY 1",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": { "value": "$__all", "text": "All" },
+        "refresh": 2
+      },
+      {
+        "name": "routed_model",
+        "type": "query",
+        "label": "Routed model",
+        "datasource": { "type": "postgres", "uid": "app-postgres" },
+        "definition": "SELECT DISTINCT routed_model FROM usage_events WHERE routed_model <> '' ORDER BY 1",
+        "query": "SELECT DISTINCT routed_model FROM usage_events WHERE routed_model <> '' ORDER BY 1",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": { "value": "$__all", "text": "All" },
+        "refresh": 2
+      },
+      {
+        "name": "tier",
+        "type": "query",
+        "label": "Pricing tier",
+        "datasource": { "type": "postgres", "uid": "app-postgres" },
+        "definition": "SELECT DISTINCT pricing_tier FROM usage_events ORDER BY 1",
+        "query": "SELECT DISTINCT pricing_tier FROM usage_events ORDER BY 1",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": { "value": "$__all", "text": "All" },
+        "refresh": 2
+      },
+      {
+        "name": "ggroup",
+        "type": "query",
+        "label": "G-group applied",
+        "datasource": { "type": "postgres", "uid": "app-postgres" },
+        "definition": "SELECT DISTINCT unnest(groups_applied) AS g FROM usage_events ORDER BY 1",
+        "query": "SELECT DISTINCT unnest(groups_applied) AS g FROM usage_events ORDER BY 1",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": { "value": "$__all", "text": "All" },
+        "refresh": 2
+      },
+      {
+        "name": "cache",
+        "type": "custom",
+        "label": "Cache",
+        "query": "All,hit,miss",
+        "current": { "text": "All", "value": "All" },
+        "options": [
+          { "text": "All", "value": "All", "selected": true },
+          { "text": "hit", "value": "hit", "selected": false },
+          { "text": "miss", "value": "miss", "selected": false }
+        ],
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "tier_complexity",
+        "type": "custom",
+        "label": "Complexity",
+        "query": "All,simple,medium,complex",
+        "current": { "text": "All", "value": "All" },
+        "options": [
+          { "text": "All", "value": "All", "selected": true },
+          { "text": "simple", "value": "simple", "selected": false },
+          { "text": "medium", "value": "medium", "selected": false },
+          { "text": "complex", "value": "complex", "selected": false }
+        ],
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "bypassed",
+        "type": "custom",
+        "label": "Bypassed",
+        "query": "All,yes,no",
+        "current": { "text": "All", "value": "All" },
+        "options": [
+          { "text": "All", "value": "All", "selected": true },
+          { "text": "yes", "value": "yes", "selected": false },
+          { "text": "no", "value": "no", "selected": false }
+        ],
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "user_search",
+        "type": "textbox",
+        "label": "User contains",
+        "query": "",
+        "current": { "value": "" }
+      },
+      {
+        "name": "request_search",
+        "type": "textbox",
+        "label": "Request ID prefix",
+        "query": "",
+        "current": { "value": "" }
+      },
+      {
+        "name": "min_savings_pct",
+        "type": "textbox",
+        "label": "Min savings %",
+        "query": "0",
+        "current": { "value": "0" }
+      },
+      {
+        "name": "min_tokens_saved",
+        "type": "textbox",
+        "label": "Min tokens saved",
+        "query": "0",
+        "current": { "value": "0" }
+      },
+      {
+        "name": "row_limit",
+        "type": "custom",
+        "label": "Row limit",
+        "query": "100,200,500,1000",
+        "current": { "text": "200", "value": "200" },
+        "options": [
+          { "text": "100", "value": "100", "selected": false },
+          { "text": "200", "value": "200", "selected": true },
+          { "text": "500", "value": "500", "selected": false },
+          { "text": "1000", "value": "1000", "selected": false }
+        ],
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  }
+}

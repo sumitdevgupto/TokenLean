@@ -681,13 +681,21 @@ class G05Cache:
 
 async def _embed(text: str, model_name: str = _DEFAULT_L2_EMBEDDING_MODEL) -> list:
     """Embed text using sentence-transformers (local, no API call).
-    
+
     Model name is config-driven via G5_cache.l2_embedding_model.
     Default: BAAI/bge-small-en-v1.5 (MIT, 384-dim, higher MTEB than all-MiniLM-L6-v2).
+
+    ``model.encode`` is a synchronous, CPU-bound call (and a cold load is 1–2s).
+    Run it in a worker thread so it does not block the event loop and stall every
+    other in-flight request behind this one embedding.
     """
     from ml_models import get_sentence_transformer
-    model = get_sentence_transformer(model_name)
-    return model.encode(text).tolist()
+
+    def _encode() -> list:
+        model = get_sentence_transformer(model_name)
+        return model.encode(text).tolist()
+
+    return await asyncio.to_thread(_encode)
 
 
 # Guard so the cache_l2 schema self-heal runs at most once per process.

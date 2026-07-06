@@ -73,8 +73,8 @@
       "gridPos": {
         "x": 0,
         "y": 4,
-        "w": 6,
-        "h": 5
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -108,8 +108,13 @@
           ]
         },
         "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value"
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -118,10 +123,10 @@
       "title": "Total Requests (all statuses)",
       "description": "Every exit path counted, including errors and short-circuits.",
       "gridPos": {
-        "x": 6,
+        "x": 5,
         "y": 4,
-        "w": 5,
-        "h": 5
+        "w": 4,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -152,7 +157,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -161,10 +171,10 @@
       "title": "Error Rate (non-2xx)",
       "description": "Non-2xx requests / total requests over the selected range.",
       "gridPos": {
-        "x": 11,
+        "x": 9,
         "y": 4,
-        "w": 4,
-        "h": 5
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -172,7 +182,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\", status!~\"2..\"}[$__range])) / clamp_min(sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[$__range])), 1)",
+          "expr": "(sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\", status!~\"2..\"}[$__range])) or vector(0)) / clamp_min(sum(increase(token_opt_http_requests_total{tenant_id=~\"$tenant\"}[$__range])), 1)",
           "legendFormat": "error rate",
           "instant": true,
           "datasource": {
@@ -203,7 +213,12 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -322,8 +337,8 @@
       "gridPos": {
         "x": 0,
         "y": 17,
-        "w": 6,
-        "h": 5
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -353,7 +368,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -362,10 +382,10 @@
       "title": "Tokens Passed to LLM (optimised · chars/4)",
       "description": "y = proxy-optimised input, estimated at chars/4, symmetric with x.",
       "gridPos": {
-        "x": 6,
+        "x": 5,
         "y": 17,
-        "w": 6,
-        "h": 5
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -395,7 +415,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -404,10 +429,10 @@
       "title": "Tokens Saved (chars/4)",
       "description": "x - y, on the chars/4 estimate basis.",
       "gridPos": {
-        "x": 12,
+        "x": 10,
         "y": 17,
-        "w": 6,
-        "h": 5
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -441,7 +466,12 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -450,10 +480,10 @@
       "title": "Savings % (chars/4)",
       "description": "100 * tokens_saved / baseline_tokens.",
       "gridPos": {
-        "x": 18,
+        "x": 15,
         "y": 17,
-        "w": 6,
-        "h": 5
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -483,7 +513,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -492,7 +527,7 @@
       "title": "Estimated tokens per day (chars/4)",
       "gridPos": {
         "x": 0,
-        "y": 22,
+        "y": 20,
         "w": 24,
         "h": 8
       },
@@ -530,7 +565,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 28
       },
       "panels": []
     },
@@ -541,9 +576,9 @@
       "description": "z = provider-reported prompt_tokens (actual). NULL when the provider returns no usage; COALESCE'd to 0.",
       "gridPos": {
         "x": 0,
-        "y": 31,
-        "w": 8,
-        "h": 5
+        "y": 29,
+        "w": 7,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -573,7 +608,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -582,10 +622,10 @@
       "title": "Real Output Tokens",
       "description": "Provider-reported completion tokens (usage_events.response_tokens). Backfills as 0 for rows written before this column was added — complete only for traffic after deploy.",
       "gridPos": {
-        "x": 8,
-        "y": 31,
-        "w": 8,
-        "h": 5
+        "x": 7,
+        "y": 29,
+        "w": 7,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -615,7 +655,12 @@
         },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -623,10 +668,10 @@
       "type": "stat",
       "title": "Total Real Tokens (input + output)",
       "gridPos": {
-        "x": 16,
-        "y": 31,
-        "w": 8,
-        "h": 5
+        "x": 14,
+        "y": 29,
+        "w": 7,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -660,7 +705,12 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -669,7 +719,7 @@
       "title": "Real tokens per day (provider)",
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 32,
         "w": 12,
         "h": 8
       },
@@ -704,7 +754,7 @@
       "description": "Real input/output token rate from the G18 counters — a live cross-check against the per-day Postgres view.",
       "gridPos": {
         "x": 12,
-        "y": 36,
+        "y": 32,
         "w": 12,
         "h": 8
       },

@@ -11,6 +11,7 @@ Features:
   - pgvector RAG fallback: PostgreSQL/pgvector as alternative vector store
   - Chunk guard: Size limits and validation for retrieved chunks
 """
+import asyncio
 import logging
 import os
 import re
@@ -137,11 +138,9 @@ async def _pgvector_search(
 
     try:
         from cache.pg_pool import get_pg_pool
-        from ml_models import get_text_embedding
 
-        # Embed query
-        model = get_text_embedding(_DENSE_MODEL)
-        query_embedding = list(model.embed([query]))[0].tolist()
+        # Embed query (threaded via _embed_dense so it doesn't block the loop).
+        query_embedding = await _embed_dense(query)
         embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
         pool = await get_pg_pool(db_url)
@@ -230,7 +229,14 @@ class G07Retrieval:
 
         # Explicit param takes priority; JIT mode auto-extracts from last user message
         rag_query = ctx.params.get("rag_query")
-        if not rag_query and jit_enabled:
+        # jit_require_rag_intent (default false = current behaviour): when true, do
+        # NOT auto-extract a query from an arbitrary chat turn — only run retrieval
+        # when the caller actually signalled RAG intent (rag_query or the
+        # x_rag_collection header). This spares every non-RAG request the embed +
+        # Qdrant hybrid search + cross-encoder rerank it currently pays for.
+        require_intent = cfg.get("jit_require_rag_intent", False)
+        has_rag_intent = bool(rag_query) or bool(ctx.params.get("x_rag_collection"))
+        if not rag_query and jit_enabled and (not require_intent or has_rag_intent):
             rag_query = _extract_rag_query(ctx.messages)
         if not rag_query:
             return ctx
@@ -340,8 +346,14 @@ def _inject_context(messages: List[Dict], context: str) -> List[Dict]:
 
 async def _embed_dense(text: str) -> List[float]:
     from ml_models import get_text_embedding
-    model = get_text_embedding(_DENSE_MODEL)
-    return list(model.embed([text]))[0].tolist()
+
+    # Synchronous, CPU-bound (cold load 1–2s) — offload so it doesn't block the
+    # event loop and serialise every concurrent request behind it.
+    def _embed() -> List[float]:
+        model = get_text_embedding(_DENSE_MODEL)
+        return list(model.embed([text]))[0].tolist()
+
+    return await asyncio.to_thread(_embed)
 
 
 async def _embed_sparse(text: str) -> Optional[object]:
@@ -352,12 +364,17 @@ async def _embed_sparse(text: str) -> Optional[object]:
     try:
         from qdrant_client.models import SparseVector
         from ml_models import get_sparse_text_embedding
-        model = get_sparse_text_embedding(_SPARSE_MODEL)
-        sparse = list(model.embed([text]))[0]
-        return SparseVector(
-            indices=sparse.indices.tolist(),
-            values=sparse.values.tolist(),
-        )
+
+        def _embed():
+            model = get_sparse_text_embedding(_SPARSE_MODEL)
+            sparse = list(model.embed([text]))[0]
+            return SparseVector(
+                indices=sparse.indices.tolist(),
+                values=sparse.values.tolist(),
+            )
+
+        # Synchronous, CPU-bound — offload to keep the event loop responsive.
+        return await asyncio.to_thread(_embed)
     except ImportError as e:
         logger.debug("G07 fastembed unavailable for sparse embedding: %s", e)
         return None
@@ -461,9 +478,15 @@ async def _rerank(
         return []
     try:
         from ml_models import get_cross_encoder
-        model = get_cross_encoder(model_name)
-        pairs = [(query, c["text"]) for c in chunks]
-        scores = model.predict(pairs)
+
+        # Cross-encoder inference is synchronous and CPU-bound (cold load 1–2s) —
+        # offload so a rerank never freezes the event loop for other requests.
+        def _predict():
+            model = get_cross_encoder(model_name)
+            pairs = [(query, c["text"]) for c in chunks]
+            return model.predict(pairs)
+
+        scores = await asyncio.to_thread(_predict)
         ranked = sorted(
             zip(chunks, scores), key=lambda x: x[1], reverse=True
         )

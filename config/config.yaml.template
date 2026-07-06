@@ -434,6 +434,12 @@ groups:
     rrf_k: 60
     rrf_alpha: 0.5
     jit_retrieval_enabled: true
+    # When true, JIT retrieval only runs if the caller signalled RAG intent
+    # (rag_query param or X-Rag-Collection header) — non-RAG chat requests skip
+    # the embed + Qdrant hybrid search + cross-encoder rerank entirely. Default
+    # false preserves the current behaviour (auto-extract a query from the last
+    # user message on every request).
+    jit_require_rag_intent: false
     use_pgvector_fallback: false
     max_chunk_tokens: 1000
     max_total_context_tokens: 4000

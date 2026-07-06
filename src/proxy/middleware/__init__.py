@@ -52,10 +52,16 @@ class RequestContext:
     # Provider adapter — set by OptimisationPipeline early in process_request.
     # Type is Any to avoid importing providers here; callers cast as needed.
     provider_adapter: Optional[Any] = None
-    # Wall-clock ms spent inside the provider LLM call. 0 = no provider call
-    # (cache hit / bypass / pre-LLM error). Set by main.py; the SLA metrics use
-    # it to split proxy-induced latency from provider latency.
+    # Wall-clock ms spent inside provider LLM calls — the main call plus any
+    # provider calls made inside middleware (G06 cascade/judge, G10 summary,
+    # G09 schema). 0 = no provider call yet (cache hit / bypass / pre-LLM
+    # error). The SLA metrics use it to split proxy latency from LLM latency.
     llm_elapsed_ms: float = 0.0
+    # G06 cascade execution result. When set, G06 already produced the final
+    # answer by running the tier cascade, so main.py returns it directly and
+    # MUST NOT call the LLM again (avoids a duplicate provider call). None =
+    # normal path (main.py makes the call).
+    cascade_response: Optional[Dict] = None
 
     @property
     def current_token_count(self) -> int:

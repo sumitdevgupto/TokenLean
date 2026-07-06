@@ -19,8 +19,8 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -42,7 +42,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -50,10 +57,10 @@
       "type": "stat",
       "title": "Total Tokens Saved",
       "gridPos": {
-        "x": 6,
+        "x": 5,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -80,7 +87,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -88,10 +102,10 @@
       "type": "stat",
       "title": "Total Cost Saved (USD)",
       "gridPos": {
-        "x": 12,
+        "x": 10,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "type": "postgres",
@@ -118,7 +132,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -180,7 +201,7 @@
         "x": 0,
         "y": 4,
         "w": 12,
-        "h": 10
+        "h": 9
       },
       "datasource": {
         "type": "postgres",
@@ -195,7 +216,10 @@
             "uid": "app-postgres"
           }
         }
-      ]
+      ],
+      "options": {
+        "cellHeight": "md"
+      }
     },
     {
       "id": 6,
@@ -205,7 +229,7 @@
         "x": 12,
         "y": 4,
         "w": 12,
-        "h": 10
+        "h": 9
       },
       "datasource": {
         "uid": "prometheus"
@@ -231,9 +255,9 @@
       "title": "Requests per Tier",
       "gridPos": {
         "x": 0,
-        "y": 14,
+        "y": 13,
         "w": 12,
-        "h": 6
+        "h": 5
       },
       "datasource": {
         "type": "postgres",
@@ -251,7 +275,19 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          }
+        }
+      },
+      "options": {
+        "barWidth": 0.4,
+        "showValue": "always",
+        "orientation": "auto",
+        "text": {
+          "valueSize": 14
         }
       }
     },
@@ -261,7 +297,7 @@
       "title": "New Tenants Over Time",
       "gridPos": {
         "x": 12,
-        "y": 14,
+        "y": 13,
         "w": 12,
         "h": 6
       },

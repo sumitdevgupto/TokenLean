@@ -236,6 +236,14 @@ def finish_trace(ctx: "RequestContext", response: Optional[Dict[str, Any]] = Non
         if rag_collection:
             trace_meta["rag_collection"] = rag_collection
             trace_meta["x_rag_collection"] = rag_collection
+        # Workload complexity tier (simple/medium/complex) — set from the
+        # X-Complexity-Tier header (auto-mapped to params.x_complexity_tier).
+        # Lets the pitch dashboard classify Simple/Medium/Complex requests by an
+        # intrinsic workload label instead of a hardcoded model name (the
+        # "complex" model is per-run/per-tenant config). Mirrors rag_collection.
+        complexity_tier = ctx.params.get("x_complexity_tier") or ctx.params.get("complexity_tier")
+        if complexity_tier:
+            trace_meta["complexity_tier"] = complexity_tier
         trace.update(metadata=trace_meta)
 
         _add_scores(ctx, trace)
