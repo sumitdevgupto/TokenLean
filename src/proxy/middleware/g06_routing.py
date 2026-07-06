@@ -174,6 +174,18 @@ _SIMPLE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Escalation order for the execution cascade's classified-tier cap.
+_TIER_ORDER = {"simple": 0, "medium": 1, "complex": 2}
+
+# Refusal markers for the no-judge response-confidence heuristic. Anchored to the
+# start of the response so a mid-answer quote ("the bot said 'I can't…'") doesn't
+# false-positive; checked against the first ~200 chars only.
+_REFUSAL_RE = re.compile(
+    r"^\s*(i(’|')?m sorry|i am sorry|i can(’|')?t\b|i cannot\b|i(’|')?m unable|"
+    r"i am unable|i do(n(’|')t| not) have (access|the ability)|as an ai\b)",
+    re.IGNORECASE,
+)
+
 
 def _classify_heuristic(messages: List[Dict], params: Dict) -> Tuple[str, float]:
     """
@@ -326,9 +338,24 @@ async def _execute_three_tier_cascade(
     judge_model = cfg.get("judge_model", "")
     max_escalation_cost = cfg.get("max_escalation_cost_usd", 0.01)
 
+    # Over-escalation guards. The cascade may climb at most to the tier the request
+    # itself classifies as (x_complexity override bypasses the cascade upstream in
+    # process_request), and — unless explicitly allowed — never into a model costlier
+    # than the one the caller requested.
+    cap_enabled = cfg.get("cascade_cap_to_classified_tier", True)
+    allow_above_requested = cfg.get("allow_escalation_above_requested", False)
+    request_tier, _ = _classify_heuristic(ctx.messages, ctx.params)
+    max_tier_idx = _TIER_ORDER[request_tier] if cap_enabled else 2
+
+    # Cost is judged as input + expected output (0-output undercounts reasoning tiers,
+    # whose output tokens dominate cost), as a delta vs the previous tier and against
+    # the caller's own model.
+    expected_output_tokens = int(ctx.params.get("max_tokens") or 512)
+    requested_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, ctx.model)
+
     # Tier 1: Try cheap model
     tier1_model = simple_models[0]
-    tier1_cost = estimate_cost(ctx.current_token_count, 0, tier1_model)
+    tier1_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier1_model)
 
     try:
         provider_key = await _resolve_provider_key(tier1_model)
@@ -347,14 +374,16 @@ async def _execute_three_tier_cascade(
             temperature=tier1_temperature,
         ))
 
-        # Evaluate confidence using judge model or heuristic
+        # Evaluate confidence from the RESPONSE — via judge model, or a cheap
+        # response-quality heuristic when no judge is configured. (The old no-judge
+        # fallback scored the request text, which never changes across tiers and so
+        # escalated every "medium" query all the way to the complex tier.)
         if judge_model:
             confidence = await _timed_llm(ctx, _evaluate_response_confidence(
                 ctx.messages, tier1_response, judge_model
             ))
         else:
-            # Fallback to heuristic confidence (returns tier, confidence)
-            _, confidence = _classify_heuristic(ctx.messages, ctx.params)
+            confidence = _heuristic_response_confidence(tier1_response, cfg)
 
         logger.debug(
             "G06 cascade tier1: model=%s confidence=%.2f threshold=%.2f",
@@ -366,22 +395,25 @@ async def _execute_three_tier_cascade(
             logger.info("G06 cascade: using tier1 model %s (confidence %.2f)", tier1_model, confidence)
             return tier1_model, tier1_response.model_dump() if hasattr(tier1_response, "model_dump") else dict(tier1_response)
 
-        # Track best response so far — tier3 failure falls back to this, not always tier1
+        # Track best response so far — an escalation block or tier3 failure falls back
+        # to this, not always tier1. best_cost drives the per-step cost-delta guard.
         best_model = tier1_model
         best_response = tier1_response
+        best_cost = tier1_cost
 
-        # Tier 2: Escalate to medium model
-        if medium_models:
+        # Tier 2: Escalate to medium model (only if the request classifies at/above medium)
+        if medium_models and max_tier_idx >= 1:
             tier2_model = medium_models[0]
-            tier2_cost = estimate_cost(ctx.current_token_count, 0, tier2_model)
-            escalation_cost = tier2_cost - tier1_cost
+            tier2_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier2_model)
 
-            if escalation_cost > max_escalation_cost:
+            block_reason = _escalation_block_reason(
+                tier2_cost, best_cost, requested_cost, max_escalation_cost, allow_above_requested
+            )
+            if block_reason:
                 logger.warning(
-                    "G06 cascade: tier2 cost $%.6f exceeds threshold $%.6f, using tier1",
-                    escalation_cost, max_escalation_cost
+                    "G06 cascade: tier2 escalation blocked (%s), using %s", block_reason, best_model
                 )
-                return tier1_model, tier1_response.model_dump() if hasattr(tier1_response, "model_dump") else dict(tier1_response)
+                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
             try:
                 tier2_provider_key = await _resolve_provider_key(tier2_model) or provider_key
@@ -396,30 +428,32 @@ async def _execute_three_tier_cascade(
                 # Tier2 succeeded — promote it as the best fallback before confidence check
                 best_model = tier2_model
                 best_response = tier2_response
+                best_cost = tier2_cost
                 # Re-evaluate confidence after tier2; if still low, try tier3
                 if judge_model:
                     confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model))
                 else:
-                    _, confidence2 = _classify_heuristic(ctx.messages, ctx.params)
+                    confidence2 = _heuristic_response_confidence(tier2_response, cfg)
                 if confidence2 >= confidence_threshold:
                     logger.info("G06 cascade: using tier2 model %s (confidence %.2f)", tier2_model, confidence2)
                     return tier2_model, tier2_response.model_dump() if hasattr(tier2_response, "model_dump") else dict(tier2_response)
             except Exception as exc:
-                logger.warning("G06 cascade tier2 failed: %s, rolling back to tier1", exc)
-                return tier1_model, tier1_response.model_dump() if hasattr(tier1_response, "model_dump") else dict(tier1_response)
+                logger.warning("G06 cascade tier2 failed: %s, rolling back to %s", exc, best_model)
+                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
-        # Tier 3: Escalate to complex model
-        if complex_models:
+        # Tier 3: Escalate to complex model (only if the request classifies complex)
+        if complex_models and max_tier_idx >= 2:
             tier3_model = complex_models[0]
-            tier3_cost = estimate_cost(ctx.current_token_count, 0, tier3_model)
-            escalation_cost = tier3_cost - tier1_cost
+            tier3_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier3_model)
 
-            if escalation_cost > max_escalation_cost:
+            block_reason = _escalation_block_reason(
+                tier3_cost, best_cost, requested_cost, max_escalation_cost, allow_above_requested
+            )
+            if block_reason:
                 logger.warning(
-                    "G06 cascade: tier3 cost $%.6f exceeds threshold $%.6f, using tier1",
-                    escalation_cost, max_escalation_cost
+                    "G06 cascade: tier3 escalation blocked (%s), using %s", block_reason, best_model
                 )
-                return tier1_model, tier1_response.model_dump() if hasattr(tier1_response, "model_dump") else dict(tier1_response)
+                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
             try:
                 tier3_provider_key = await _resolve_provider_key(tier3_model) or provider_key
@@ -436,12 +470,81 @@ async def _execute_three_tier_cascade(
                 logger.warning("G06 cascade tier3 failed: %s, rolling back to best tier (%s)", exc, best_model)
                 return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
-        # No escalation path available, return tier1
-        return tier1_model, tier1_response.model_dump() if hasattr(tier1_response, "model_dump") else dict(tier1_response)
+        # No further escalation available (tiers exhausted or capped) — return the best
+        # response produced so far (tier2 if it ran, else tier1), not always tier1.
+        return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
     except Exception as exc:
         logger.error("G06 cascade tier1 failed: %s", exc)
         return None, {"error": str(exc)}
+
+
+def _escalation_block_reason(
+    next_cost: float,
+    prev_cost: float,
+    requested_cost: float,
+    max_escalation_cost: float,
+    allow_above_requested: bool,
+) -> Optional[str]:
+    """Return a reason string if escalating to ``next_cost`` should be blocked, else None.
+
+    Two guards, applied identically at every tier hop:
+    - the per-step cost jump vs the PREVIOUS tier must not exceed ``max_escalation_cost``;
+    - the next tier must not cost more than the model the caller originally requested,
+      unless ``allow_above_requested`` is set.
+    Costs are input + expected-output estimates (0-output undercounts reasoning tiers).
+    """
+    if next_cost - prev_cost > max_escalation_cost:
+        return f"step cost delta ${next_cost - prev_cost:.6f} > ${max_escalation_cost:.6f}"
+    if not allow_above_requested and next_cost > requested_cost:
+        return f"tier cost ${next_cost:.6f} > requested-model cost ${requested_cost:.6f}"
+    return None
+
+
+def _heuristic_response_confidence(response: Any, cfg: Dict[str, Any]) -> float:
+    """
+    Cheap, no-LLM confidence score for a tier RESPONSE (not the request).
+
+    Used by the execution cascade when no ``judge_model`` is configured. The
+    previous fallback scored the *request* text via ``_classify_heuristic``,
+    which never changes between tiers — so any "medium" query (confidence 0.50
+    < threshold 0.70) deterministically escalated tier1→tier2→tier3 regardless
+    of how good the cheap tier's answer actually was. This scores the answer:
+
+    - no choices / empty content        → ``response_confidence.empty``     (0.0)
+    - finish_reason == "length"         → ``response_confidence.truncated`` (0.30)
+    - content_filter or refusal opening → ``response_confidence.refusal``   (0.40)
+    - otherwise (real content)          → ``response_confidence.ok``        (0.85)
+
+    Short-but-adequate answers ("4" for "what is 2+2") are deliberately NOT
+    penalised — only empty ones. Unparseable responses return 0.5, mirroring
+    the judge-failure convention (below threshold → escalate one capped tier).
+    """
+    scores = cfg.get("response_confidence", {}) or {}
+    ok = float(scores.get("ok", 0.85))
+    truncated = float(scores.get("truncated", 0.30))
+    refusal = float(scores.get("refusal", 0.40))
+    empty = float(scores.get("empty", 0.0))
+
+    try:
+        rd = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+        choices = rd.get("choices") or []
+        if not choices:
+            return empty
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        finish_reason = choice.get("finish_reason")
+
+        if not str(content).strip():
+            return empty
+        if finish_reason == "length":
+            return truncated
+        if finish_reason == "content_filter" or _REFUSAL_RE.search(str(content)[:200]):
+            return refusal
+        return ok
+    except Exception:
+        return 0.5
 
 
 async def _evaluate_response_confidence(

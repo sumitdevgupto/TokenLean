@@ -25,6 +25,45 @@ class FakeClientError(FakeClient):
         raise Exception("sidecar error")
 
 
+def _faithful_cost(input_tokens, output_tokens, model):
+    """Per-model cost estimate ($/1M in, $/1M out) mirroring the real pricing spread —
+    for tests that exercise the cost/requested-model escalation guards, since the unit
+    pricing table maps every model to one default rate."""
+    m = model or ""
+    if "mini" in m:
+        cin, cout = 0.15, 0.60
+    elif "4-5" in m:
+        cin, cout = 75.0, 150.0
+    else:  # gpt-4o and friends
+        cin, cout = 5.0, 15.0
+    return input_tokens * cin / 1e6 + output_tokens * cout / 1e6
+
+
+def _mk_resp(model, content="An adequate answer.", finish_reason="stop"):
+    """Build a MagicMock litellm response whose model_dump() carries the fields the
+    cascade's response-confidence heuristic reads (choices[0].finish_reason / content)."""
+    resp = MagicMock()
+    resp.model_dump.return_value = {
+        "choices": [{"finish_reason": finish_reason, "message": {"content": content}}],
+        "model": model,
+    }
+    return resp
+
+
+# A ~100-word prompt with no complex/simple keywords → _classify_heuristic == "medium".
+# This is the DS9 shape: a substantive but non-complex query the cheap tier handles.
+_MEDIUM_PROMPT = (
+    "Our nightly export job moved about forty thousand customer records into the "
+    "reporting warehouse and then paused for roughly nine minutes before finishing "
+    "the remaining batches without any operator action taken at all. The dashboard "
+    "showed the queue depth climbing steadily and then draining back down to zero on "
+    "its own while the on call engineer was still reading the very first alert page. "
+    "Walk me through what the most likely sequence of events was here and whether the "
+    "pause should be treated as expected backpressure behaviour or a genuine incident "
+    "worth escalating to the wider platform team for a deeper follow up review tomorrow."
+)
+
+
 @pytest.fixture(autouse=True)
 def _g06_provider_keys():
     """Routing now checks tier-model provider reachability (P8 hardening). Provide a providers
@@ -469,7 +508,9 @@ class TestG06CascadeExecution:
     async def test_cascade_execution_rolls_back_on_tier3_failure(self, make_ctx):
         """Tier 3 fails — roll back to best previous tier (tier 2)."""
         ctx = make_ctx(
-            [{"role": "user", "content": "Complex architectural analysis required."}],
+            # Must classify complex (hits "analyze") so the classified-tier cap permits
+            # escalation past tier1; a short 4-word prompt would classify simple and be capped.
+            [{"role": "user", "content": "Analyze and architect a strategy for this complex system."}],
             model="gpt-4o",
         )
         ctx.config["groups"]["G6_routing"]["classifier"] = "cascade"
@@ -595,6 +636,254 @@ class TestG06CascadeExecution:
 
         # Falls back to standard classification
         assert "fallback" in ctx.savings.routing_mode
+
+
+@pytest.mark.asyncio
+class TestG06CascadeOverEscalationGuards:
+    """Guards against the cascade over-escalating cheap-answerable queries to expensive
+    tiers (the DS9 regression). Covers: response-derived confidence in the no-judge path,
+    the classified-tier cap, and the cost/requested-model escalation guards."""
+
+    @staticmethod
+    def _cfg(ctx, **overrides):
+        g = ctx.config["groups"]["G6_routing"]
+        g["classifier"] = "cascade"
+        g["cascade_execution"] = True
+        g["judge_model"] = ""
+        g["cascade_confidence_threshold"] = 0.70
+        g["tiers"] = {"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["gpt-4-5"]}
+        g.update(overrides)
+        return g
+
+    async def _run(self, ctx, mock_acompletion, judge=None, cost_fn=None):
+        patches = [
+            patch("middleware.g06_routing.litellm.acompletion", mock_acompletion),
+            patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"),
+        ]
+        if judge is not None:
+            patches.append(patch("middleware.g06_routing._evaluate_response_confidence", judge))
+        if cost_fn is not None:
+            # The unit-test pricing table maps every model to the same default rate, so the
+            # cost guards can't differentiate tiers. Inject faithful per-model pricing.
+            patches.append(patch("middleware.g06_routing.estimate_cost", cost_fn))
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            from middleware.g06_routing import G06Routing
+            return await G06Routing().process_request(ctx)
+
+    # ── No-judge response-derived confidence ──────────────────────────────────
+
+    async def test_cascade_no_judge_medium_query_stays_tier1_when_response_adequate(self, make_ctx):
+        """DS9 regression: a medium query whose cheap-tier answer is adequate must NOT escalate."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o-mini")
+        self._cfg(ctx)
+        calls = 0
+        async def mock(*a, **k):
+            nonlocal calls; calls += 1
+            return _mk_resp(k.get("model", ""), "A clear, complete answer.", "stop")
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o-mini"
+        assert calls == 1  # served by the cheap tier, no escalation
+
+    async def test_cascade_no_judge_escalates_on_truncated_response(self, make_ctx):
+        """Tier1 truncated (finish_reason=length) → escalate to tier2."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx)
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "mini" in m:
+                return _mk_resp(m, "partial...", "length")
+            if "4-5" in m:
+                raise AssertionError("tier3 must not be reached for a medium query")
+            return _mk_resp(m, "Full tier2 answer.", "stop")
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o"
+
+    async def test_cascade_no_judge_escalates_on_refusal_response(self, make_ctx):
+        """Tier1 refusal opening → low confidence → escalate to tier2."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx)
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "mini" in m:
+                return _mk_resp(m, "I'm sorry, I can't help with that.", "stop")
+            return _mk_resp(m, "Full tier2 answer.", "stop")
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o"
+
+    async def test_cascade_no_judge_empty_response_escalates(self, make_ctx):
+        """Tier1 empty content → confidence 0.0 → escalate to tier2."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx)
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "mini" in m:
+                return _mk_resp(m, "", "stop")
+            return _mk_resp(m, "Full tier2 answer.", "stop")
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o"
+
+    # ── Classified-tier cap ───────────────────────────────────────────────────
+
+    async def test_cascade_cap_blocks_complex_tier_for_medium_query(self, make_ctx):
+        """Medium query, tier1+tier2 both weak → capped at tier2, never reaches complex tier."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx)
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "4-5" in m:
+                raise AssertionError("complex tier must be capped out for a medium query")
+            return _mk_resp(m, "weak...", "length")  # both tier1 and tier2 truncated
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o"  # best available under the cap
+
+    async def test_cascade_cap_blocks_all_escalation_for_simple_query(self, make_ctx):
+        """Simple query, even a weak tier1 answer → stays at tier1 (cap at simple)."""
+        ctx = make_ctx([{"role": "user", "content": "What is Python?"}], model="gpt-4o")
+        self._cfg(ctx)
+        calls = 0
+        async def mock(*a, **k):
+            nonlocal calls; calls += 1
+            m = k.get("model", "")
+            if "mini" not in m:
+                raise AssertionError("no escalation allowed for a simple query")
+            return _mk_resp(m, "weak...", "length")
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o-mini"
+        assert calls == 1
+
+    async def test_cascade_cap_disabled_restores_full_escalation(self, make_ctx):
+        """cap off + allow-above + generous budget → medium query can reach the complex tier."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(
+            ctx,
+            cascade_cap_to_classified_tier=False,
+            allow_escalation_above_requested=True,
+            max_escalation_cost_usd=100.0,
+        )
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "4-5" in m:
+                return _mk_resp(m, "Deep complex answer.", "stop")
+            return _mk_resp(m, "weak...", "length")  # tier1 + tier2 truncated
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4-5"
+
+    async def test_cascade_cap_applies_to_judge_path(self, make_ctx):
+        """A flaky judge that always scores low still can't push a medium query past its tier."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx, judge_model="gpt-4o-mini", cascade_confidence_threshold=0.90)
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "4-5" in m:
+                raise AssertionError("complex tier must be capped out even on the judge path")
+            return _mk_resp(m, "answer", "stop")
+        async def judge(*a, **k):
+            return 0.40  # always below threshold
+        ctx = await self._run(ctx, mock, judge=judge)
+        assert ctx.routed_model == "gpt-4o"
+
+    # ── x_complexity override ─────────────────────────────────────────────────
+
+    async def test_x_complexity_override_bypasses_cascade(self, make_ctx):
+        """An explicit x_complexity override routes directly, without running the cascade."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx)
+        ctx.params["x_complexity"] = "complex"
+        calls = 0
+        async def mock(*a, **k):
+            nonlocal calls; calls += 1
+            return _mk_resp(k.get("model", ""))
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4-5"
+        assert ctx.savings.routing_mode == "user_override"
+        assert calls == 0  # cascade never ran
+
+    # ── Cost / requested-model guards ─────────────────────────────────────────
+
+    async def test_cost_guard_includes_expected_output_cost_and_returns_best(self, make_ctx):
+        """Complex query, large max_tokens → complex tier blocked by output-inclusive cost,
+        returns the best tier reached (tier2), not tier1."""
+        ctx = make_ctx(
+            [{"role": "user", "content": "Analyze and architect a strategy for this complex system."}],
+            model="gpt-4o",
+        )
+        self._cfg(ctx, max_escalation_cost_usd=1.0)  # per-step delta not the limiter here
+        ctx.params["max_tokens"] = 4096  # amplifies the complex tier's output cost
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "4-5" in m:
+                raise AssertionError("complex tier blocked by cost guard, must not be called")
+            return _mk_resp(m, "weak...", "length")  # tier1 + tier2 both weak
+        ctx = await self._run(ctx, mock, cost_fn=_faithful_cost)
+        assert ctx.routed_model == "gpt-4o"  # best reached, not rolled back to tier1
+
+    async def test_cost_guard_blocks_escalation_above_requested_model(self, make_ctx):
+        """Caller requested the cheap model → cascade won't escalate above it by default."""
+        ctx = make_ctx(
+            [{"role": "user", "content": "Analyze and architect a strategy for this complex system."}],
+            model="gpt-4o-mini",
+        )
+        self._cfg(ctx)
+        calls = 0
+        async def mock(*a, **k):
+            nonlocal calls; calls += 1
+            m = k.get("model", "")
+            if "mini" not in m:
+                raise AssertionError("must not escalate above the requested gpt-4o-mini")
+            return _mk_resp(m, "weak...", "length")
+        ctx = await self._run(ctx, mock, cost_fn=_faithful_cost)
+        assert ctx.routed_model == "gpt-4o-mini"
+        assert calls == 1
+
+    async def test_allow_escalation_above_requested_true_permits_escalation(self, make_ctx):
+        """With the knob on, escalation above the requested model is allowed."""
+        ctx = make_ctx(
+            [{"role": "user", "content": "Analyze and architect a strategy for this complex system."}],
+            model="gpt-4o-mini",
+        )
+        self._cfg(ctx, allow_escalation_above_requested=True)
+        async def mock(*a, **k):
+            m = k.get("model", "")
+            if "mini" in m:
+                return _mk_resp(m, "weak...", "length")
+            return _mk_resp(m, "Full tier2 answer.", "stop")
+        ctx = await self._run(ctx, mock, cost_fn=_faithful_cost)
+        assert ctx.routed_model == "gpt-4o"
+
+
+class TestG06ResponseConfidenceHeuristic:
+    """Direct unit tests for _heuristic_response_confidence (no LLM call)."""
+
+    def test_scores_by_finish_reason_and_content(self):
+        from middleware.g06_routing import _heuristic_response_confidence as h
+        def resp(content, finish_reason="stop"):
+            return {"choices": [{"finish_reason": finish_reason, "message": {"content": content}}]}
+        assert h(resp("A real answer."), {}) == 0.85           # clean stop
+        assert h(resp("partial", "length"), {}) == 0.30         # truncated
+        assert h(resp("I'm sorry, I can't help."), {}) == 0.40  # refusal opening
+        assert h(resp("blocked", "content_filter"), {}) == 0.40 # content filter
+        assert h(resp(""), {}) == 0.0                           # empty content
+        assert h(resp("   "), {}) == 0.0                        # whitespace only
+        assert h({"choices": []}, {}) == 0.0                    # no choices
+        assert h(object(), {}) == 0.5                           # unparseable → neutral
+
+    def test_short_but_adequate_answer_is_not_penalised(self):
+        from middleware.g06_routing import _heuristic_response_confidence as h
+        resp = {"choices": [{"finish_reason": "stop", "message": {"content": "4"}}]}
+        assert h(resp, {}) == 0.85
+
+    def test_custom_scores_from_config_are_honoured(self):
+        from middleware.g06_routing import _heuristic_response_confidence as h
+        cfg = {"response_confidence": {"ok": 0.99, "truncated": 0.11, "refusal": 0.22, "empty": 0.01}}
+        def resp(content, finish_reason="stop"):
+            return {"choices": [{"finish_reason": finish_reason, "message": {"content": content}}]}
+        assert h(resp("ok"), cfg) == 0.99
+        assert h(resp("x", "length"), cfg) == 0.11
+        assert h(resp("I cannot do that."), cfg) == 0.22
+        assert h(resp(""), cfg) == 0.01
 
 
 class TestG06TierReachability:

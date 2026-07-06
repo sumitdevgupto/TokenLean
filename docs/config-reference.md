@@ -149,10 +149,17 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable model routing |
-| `mode` | `heuristic` | Routing mode: `heuristic` (default), `routellm`, or `custom` |
+| `classifier` | `cascade` | Complexity classifier: `cascade` (default), `heuristic`, `llm_judge`, or `routellm` |
+| `cascade_execution` | `false` | When `classifier: cascade`, run the true tier1→tier2→tier3 execution cascade (call cheap model, escalate only if its answer is inadequate) instead of classify-then-route |
 | `on_unreachable_tier` | `fallback` | When a routed tier model's provider has **no usable credential** (key or ambient creds): `fallback` serves the caller's own requested model (cost-routing no-ops); `error` returns a clean 503 |
-| `confidence_threshold` | `0.88` | Cascade escalation threshold — tune per workload (see *Tuning the cascade threshold* below) |
-| `routellm.enabled` | `true` | Enable RouteLLM sidecar (when mode=routellm) |
+| `cascade_confidence_threshold` | `0.70` | Escalate to the next tier when the current tier's confidence is below this (see *Tuning the cascade threshold* below) |
+| `judge_model` | `""` (empty) | Optional model that scores each tier's response for confidence. Empty → a cheap no-LLM response-adequacy heuristic (`response_confidence.*`) is used instead |
+| `judge_timeout_ms` | `2000` | Max wait for a `judge_model` confidence score before falling back |
+| `max_escalation_cost_usd` | `0.01` | Max cost **delta** (input + expected output, vs the **previous** tier) a single escalation may add. Blocks small requests from jumping into a pricey tier |
+| `cascade_cap_to_classified_tier` | `true` | Cap the execution cascade at the tier the request itself classifies as — a plain "medium" query is never pushed to the expensive complex tier. An `x_complexity` request override bypasses the cascade (and this cap) entirely. Set `false` for unbounded confidence-driven escalation |
+| `allow_escalation_above_requested` | `false` | When `false`, the cascade never routes to a model costlier than the one the caller requested — escalation only ever saves cost. Set `true` to allow escalating above the requested model |
+| `response_confidence.ok` / `.truncated` / `.refusal` / `.empty` | `0.85` / `0.30` / `0.40` / `0.0` | No-judge response-adequacy scores (used when `judge_model` is empty), compared against `cascade_confidence_threshold`: `ok` = clean stop, `truncated` = hit `max_tokens`, `refusal` = content-filter / "I can't help" opening, `empty` = blank content |
+| `routellm.enabled` | `true` | Enable RouteLLM sidecar (when classifier=routellm) |
 | `routellm.sidecar_url` | `http://routellm-svc` | RouteLLM Cloud Run internal URL |
 | `routellm.router` | `mf` | RouteLLM router: `mf` (recommended), `sw_ranking`, or `random` |
 | `routellm.threshold` | `0.11593` | Cost threshold (calibrate per workload) |
@@ -170,11 +177,13 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 - The `mf` router is recommended for best performance with low latency
 - Calibrate the threshold using: `python -m routellm.calibrate_threshold --routers mf --strong-model-pct 0.5`
 - If the RouteLLM sidecar is unavailable, the proxy automatically falls back to heuristic routing
-- Switch between modes by changing `mode` in config and re-uploading to GCS (no code deploy needed)
+- Switch between classifiers by changing `classifier` in config and re-uploading to GCS (no code deploy needed)
 
-**Tuning the cascade threshold (offline).** This is for `confidence_threshold` (the cascade escalation dial) — **not** the same as `routellm.threshold`, which is calibrated separately via `routellm.calibrate_threshold` above.
+> **Over-escalation guards (execution cascade).** With `cascade_execution: true` and no `judge_model`, the cascade judges each tier's *response* (via `response_confidence.*`) — not the request text — so an adequately-answered cheap-tier query is no longer escalated. Two guards bound the blast radius: `cascade_cap_to_classified_tier` (never climb past the request's own complexity tier) and `allow_escalation_above_requested` (never route costlier than the caller's model). These ship safe (`cascade_execution: false`) so default OSS deployments are unaffected; turning the cascade on inherits the guards.
 
-`scripts/validate-cascade.py` measures the accuracy/cost trade-off of the cascade against a ground-truth dataset so you can set `confidence_threshold` with evidence instead of guessing:
+**Tuning the cascade threshold (offline).** This is for `cascade_confidence_threshold` (the cascade escalation dial) — **not** the same as `routellm.threshold`, which is calibrated separately via `routellm.calibrate_threshold` above.
+
+`scripts/validate-cascade.py` measures the accuracy/cost trade-off of the cascade against a ground-truth dataset so you can set `cascade_confidence_threshold` with evidence instead of guessing:
 
 ```bash
 cp config/cascade-test.yaml.template config/cascade-test.yaml   # edit tiers/judge_model to match your config
@@ -185,7 +194,7 @@ python scripts/validate-cascade.py \
 # proxy must be running; pass the key via --proxy-key or the PROXY_API_KEY env var
 ```
 
-It runs each case tier-1 → LLM judge → optional tier-3 escalation, sweeps thresholds `[0.5 … 0.95]`, and reports accuracy, cost-saving %, and escalation rate per threshold — plus an optimal threshold (best accuracy keeping >50% cost saving) and per-`workload_tag` recommendations. Set the recommended value back into `confidence_threshold`. Run it before enabling the cascade, after changing tier models, when onboarding a new workload, or on suspected drift. It makes real (paid) LLM calls — keep validation sets small.
+It runs each case tier-1 → LLM judge → optional tier-3 escalation, sweeps thresholds `[0.5 … 0.95]`, and reports accuracy, cost-saving %, and escalation rate per threshold — plus an optimal threshold (best accuracy keeping >50% cost saving) and per-`workload_tag` recommendations. Set the recommended value back into `cascade_confidence_threshold`. Run it before enabling the cascade, after changing tier models, when onboarding a new workload, or on suspected drift. It makes real (paid) LLM calls — keep validation sets small.
 
 ### G7_retrieval
 | Parameter | Default | Description |

@@ -411,7 +411,26 @@ groups:
     judge_model: ${G06_JUDGE_MODEL:-}
     judge_timeout_ms: 2000
     cascade_confidence_threshold: 0.7
+    # Max cost DELTA (input + expected output, vs the previous tier) a single cascade
+    # escalation may add. Small requests jumping into a pricey tier are blocked here.
     max_escalation_cost_usd: 0.01
+    # Over-escalation guards (execution cascade only). cap_to_classified_tier: the
+    # cascade may climb at most to the tier the request itself classifies as, so a
+    # plain "medium" query is never pushed to the expensive complex tier (an
+    # x_complexity override bypasses the cascade entirely). allow_escalation_above_
+    # requested: when false (default), the cascade never routes to a model costlier
+    # than the one the caller requested — escalation only ever saves cost, never adds it.
+    cascade_cap_to_classified_tier: true
+    allow_escalation_above_requested: false
+    # No-judge response-adequacy scores (used when judge_model is empty), compared
+    # against cascade_confidence_threshold to decide whether to escalate. Scores the
+    # tier's actual answer: ok = clean stop, truncated = hit max_tokens, refusal =
+    # content-filter / "I can't help" opening, empty = blank content.
+    response_confidence:
+      ok: 0.85
+      truncated: 0.30
+      refusal: 0.40
+      empty: 0.0
     routellm:
       url: http://routellm-svc:8081
       router: mf
