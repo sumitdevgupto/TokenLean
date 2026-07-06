@@ -18,8 +18,8 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -34,6 +34,15 @@
         "defaults": {
           "unit": "short"
         }
+      },
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -41,10 +50,10 @@
       "type": "stat",
       "title": "Cumulative Cost Saved (All Time, USD)",
       "gridPos": {
-        "x": 6,
+        "x": 5,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -60,6 +69,15 @@
           "unit": "currencyUSD",
           "decimals": 6
         }
+      },
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -67,10 +85,10 @@
       "type": "stat",
       "title": "Avg Saving % (All Time)",
       "gridPos": {
-        "x": 12,
+        "x": 10,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -85,6 +103,15 @@
         "defaults": {
           "unit": "percent"
         }
+      },
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -92,10 +119,10 @@
       "type": "stat",
       "title": "Total LLM Calls (All Time)",
       "gridPos": {
-        "x": 18,
+        "x": 15,
         "y": 0,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -105,7 +132,16 @@
           "rawSql": "SELECT COUNT(*) FROM traces WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}')",
           "format": "table"
         }
-      ]
+      ],
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      }
     },
     {
       "id": 5,
@@ -113,7 +149,7 @@
       "title": "Quarterly Cumulative Cost Saved",
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 3,
         "w": 12,
         "h": 8
       },
@@ -139,9 +175,9 @@
       "title": "G-Group ROI Ranking (All Time)",
       "gridPos": {
         "x": 12,
-        "y": 4,
+        "y": 3,
         "w": 12,
-        "h": 8
+        "h": 7
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -151,7 +187,23 @@
           "rawSql": "SELECT key AS g_group, SUM((value->>'abs_saving')::int) AS total_tokens_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY total_tokens_saved DESC",
           "format": "table"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          }
+        }
+      },
+      "options": {
+        "barWidth": 0.4,
+        "showValue": "always",
+        "orientation": "auto",
+        "text": {
+          "valueSize": 14
+        }
+      }
     },
     {
       "id": 8,
@@ -159,9 +211,9 @@
       "title": "Quarterly Cost by User (Stacked)",
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 11,
         "w": 24,
-        "h": 8
+        "h": 7
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -175,11 +227,21 @@
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
-          "decimals": 6
+          "decimals": 6,
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          }
         }
       },
       "options": {
-        "stacking": "normal"
+        "stacking": "normal",
+        "barWidth": 0.4,
+        "showValue": "always",
+        "orientation": "auto",
+        "text": {
+          "valueSize": 14
+        }
       }
     },
     {
@@ -188,7 +250,7 @@
       "title": "Quarterly Summary",
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 18,
         "w": 24,
         "h": 8
       },
@@ -200,7 +262,10 @@
           "rawSql": "SELECT to_char(date_trunc('quarter', created_at), 'YYYY-\"Q\"Q') AS quarter, COUNT(*) AS total_calls, SUM((metadata->>'total_abs_saving')::int) AS tokens_saved, ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS avg_pct_saving, ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,2) AS cost_saved_usd, COUNT(DISTINCT metadata->>'user_id') AS unique_users FROM traces WHERE ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY 1 DESC",
           "format": "table"
         }
-      ]
+      ],
+      "options": {
+        "cellHeight": "md"
+      }
     }
   ],
   "templating": {

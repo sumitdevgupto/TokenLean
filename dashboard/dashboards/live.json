@@ -19,8 +19,8 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 4,
-        "h": 4
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -38,7 +38,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       },
       "fieldConfig": {
         "defaults": {
@@ -70,10 +77,10 @@
       "type": "stat",
       "title": "Requests / sec",
       "gridPos": {
-        "x": 4,
+        "x": 3,
         "y": 0,
-        "w": 4,
-        "h": 4
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -84,6 +91,15 @@
           "legendFormat": "req/s"
         }
       ],
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
@@ -96,10 +112,10 @@
       "type": "stat",
       "title": "Cache Hit Rate",
       "gridPos": {
-        "x": 8,
+        "x": 6,
         "y": 0,
-        "w": 4,
-        "h": 4
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -111,6 +127,15 @@
           "instant": false
         }
       ],
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
@@ -139,22 +164,31 @@
       "type": "stat",
       "title": "Avg Saving %",
       "gridPos": {
-        "x": 12,
+        "x": 9,
         "y": 0,
-        "w": 4,
-        "h": 4
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
       },
       "targets": [
         {
-          "expr": "increase(token_opt_savings_pct_sum[$__range]) / increase(token_opt_savings_pct_count[$__range])",
+          "expr": "sum(increase(token_opt_savings_pct_sum[$__range])) / sum(increase(token_opt_savings_pct_count[$__range]))",
           "format": "time_series",
           "legendFormat": "Avg Saving %",
           "instant": true
         }
       ],
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent"
@@ -166,10 +200,10 @@
       "type": "stat",
       "title": "Active Teams",
       "gridPos": {
-        "x": 16,
+        "x": 12,
         "y": 0,
-        "w": 4,
-        "h": 4
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -181,6 +215,15 @@
           "legendFormat": "active teams"
         }
       ],
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short"
@@ -192,10 +235,10 @@
       "type": "stat",
       "title": "Cost (USD)",
       "gridPos": {
-        "x": 20,
+        "x": 15,
         "y": 0,
-        "w": 4,
-        "h": 4
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -207,6 +250,15 @@
           "legendFormat": "cost USD"
         }
       ],
+      "options": {
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
@@ -220,7 +272,7 @@
       "title": "Requests / min - All Users",
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 3,
         "w": 12,
         "h": 8
       },
@@ -248,7 +300,7 @@
       "title": "Requests / min - by Team",
       "gridPos": {
         "x": 12,
-        "y": 4,
+        "y": 3,
         "w": 12,
         "h": 8
       },
@@ -276,7 +328,7 @@
       "title": "Token Savings % (rolling)",
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 11,
         "w": 12,
         "h": 8
       },
@@ -304,7 +356,7 @@
       "title": "Per-Group Token Savings (live, by G0X)",
       "gridPos": {
         "x": 0,
-        "y": 32,
+        "y": 30,
         "w": 24,
         "h": 8
       },
@@ -332,9 +384,9 @@
       "title": "Active Users (by calls)",
       "gridPos": {
         "x": 12,
-        "y": 12,
+        "y": 11,
         "w": 12,
-        "h": 8
+        "h": 7
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -345,9 +397,21 @@
           "format": "table"
         }
       ],
+      "options": {
+        "barWidth": 0.4,
+        "showValue": "always",
+        "orientation": "auto",
+        "text": {
+          "valueSize": 14
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1
+          }
         }
       }
     },
@@ -357,9 +421,9 @@
       "title": "Last 50 Calls",
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 19,
         "w": 24,
-        "h": 12
+        "h": 11
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -376,7 +440,8 @@
             "displayName": "Time",
             "desc": true
           }
-        ]
+        ],
+        "cellHeight": "md"
       }
     }
   ],

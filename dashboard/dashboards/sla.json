@@ -32,8 +32,8 @@
       "gridPos": {
         "x": 0,
         "y": 1,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -72,7 +72,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -80,10 +87,10 @@
       "type": "stat",
       "title": "p95 Latency (ms)",
       "gridPos": {
-        "x": 6,
+        "x": 5,
         "y": 1,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -105,7 +112,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -113,10 +127,10 @@
       "type": "stat",
       "title": "p50 Latency (ms)",
       "gridPos": {
-        "x": 12,
+        "x": 10,
         "y": 1,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -138,7 +152,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -146,10 +167,10 @@
       "type": "stat",
       "title": "Error Rate (%)",
       "gridPos": {
-        "x": 18,
+        "x": 15,
         "y": 1,
-        "w": 6,
-        "h": 4
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -188,7 +209,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -198,7 +226,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 5,
+        "y": 4,
         "w": 24,
         "h": 1
       },
@@ -211,9 +239,9 @@
       "description": "Proxy-induced latency only: end-to-end duration minus provider LLM call time. Cache hits and bypasses never reach the provider, so their full duration counts as proxy time.",
       "gridPos": {
         "x": 0,
-        "y": 6,
-        "w": 6,
-        "h": 4
+        "y": 5,
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -252,7 +280,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -261,10 +296,10 @@
       "title": "p95 Latency (ms)",
       "description": "Proxy-induced latency only: end-to-end duration minus provider LLM call time.",
       "gridPos": {
-        "x": 6,
-        "y": 6,
-        "w": 6,
-        "h": 4
+        "x": 5,
+        "y": 5,
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -286,7 +321,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -295,10 +337,10 @@
       "title": "p50 Latency (ms)",
       "description": "Proxy-induced latency only: end-to-end duration minus provider LLM call time.",
       "gridPos": {
-        "x": 12,
-        "y": 6,
-        "w": 6,
-        "h": 4
+        "x": 10,
+        "y": 5,
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -320,7 +362,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -329,10 +378,10 @@
       "title": "Error Rate (%)",
       "description": "Proxy-originated 5xx only — excludes 502s, which are provider-side LLM failures.",
       "gridPos": {
-        "x": 18,
-        "y": 6,
-        "w": 6,
-        "h": 4
+        "x": 15,
+        "y": 5,
+        "w": 5,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -371,7 +420,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -380,7 +436,7 @@
       "title": "p99 Latency Trend",
       "gridPos": {
         "x": 0,
-        "y": 10,
+        "y": 8,
         "w": 12,
         "h": 8
       },
@@ -408,7 +464,7 @@
       "title": "Error Rate Trend",
       "gridPos": {
         "x": 12,
-        "y": 10,
+        "y": 8,
         "w": 12,
         "h": 8
       },
@@ -436,9 +492,9 @@
       "title": "Uptime %",
       "gridPos": {
         "x": 0,
-        "y": 18,
-        "w": 8,
-        "h": 4
+        "y": 16,
+        "w": 7,
+        "h": 3
       },
       "datasource": {
         "uid": "prometheus"
@@ -462,7 +518,14 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background"
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
@@ -471,7 +534,7 @@
       "title": "Tokens Saved vs SLA Target",
       "gridPos": {
         "x": 8,
-        "y": 18,
+        "y": 16,
         "w": 16,
         "h": 8
       },
@@ -495,6 +558,50 @@
           "custom": {
             "lineWidth": 2
           }
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Proxy time by stage — p95 (ms)",
+      "description": "Per-pipeline-stage p95 latency (G-group granularity) — shows which stage drives the 'Proxy only' latency above. Note: provider calls made inside a stage (G06 cascade/judge, G10 summary) appear here as stage time but are counted as LLM time in the 'Proxy only' cards, not proxy overhead.",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       }
     }

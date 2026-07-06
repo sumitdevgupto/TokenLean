@@ -15,19 +15,19 @@
     {
       "id": 1,
       "type": "stat",
-      "title": "Simple - FAQ Bot % Reduction",
+      "title": "Simple — FAQ Bot % Reduction",
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 8,
-        "h": 5
+        "w": 4,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'model_requested' = 'gpt-4o-mini' OR metadata->>'model' = 'gpt-4o-mini')",
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND metadata->>'complexity_tier' = 'simple'",
           "format": "table"
         }
       ],
@@ -46,7 +46,18 @@
               }
             ]
           },
-          "mappings": []
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "No runs",
+                  "index": 0
+                }
+              }
+            }
+          ]
         }
       },
       "options": {
@@ -57,25 +68,30 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
       "id": 2,
       "type": "stat",
-      "title": "Medium - Doc Q&A % Reduction",
+      "title": "Medium — Doc Q&A % Reduction",
       "gridPos": {
-        "x": 8,
+        "x": 4,
         "y": 0,
-        "w": 8,
-        "h": 5
+        "w": 4,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'x_rag_collection' IS NOT NULL OR metadata->>'rag_collection' IS NOT NULL)",
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND metadata->>'complexity_tier' = 'medium'",
           "format": "table"
         }
       ],
@@ -93,7 +109,19 @@
                 "value": 25
               }
             ]
-          }
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "No runs",
+                  "index": 0
+                }
+              }
+            }
+          ]
         }
       },
       "options": {
@@ -104,25 +132,30 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
       }
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Complex - Code Agent % Reduction",
+      "title": "Complex — Code Agent % Reduction",
       "gridPos": {
-        "x": 16,
+        "x": 8,
         "y": 0,
-        "w": 8,
-        "h": 5
+        "w": 4,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'model_requested' = 'gpt-4o' OR metadata->>'model' = 'gpt-4o') AND (metadata->>'x_rag_collection') IS NULL",
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND metadata->>'complexity_tier' = 'complex'",
           "format": "table"
         }
       ],
@@ -140,7 +173,19 @@
                 "value": 30
               }
             ]
-          }
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "No runs",
+                  "index": 0
+                }
+              }
+            }
+          ]
         }
       },
       "options": {
@@ -151,47 +196,23 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
-      }
-    },
-    {
-      "id": 4,
-      "type": "barchart",
-      "title": "Baseline vs Optimized - Tokens per Run",
-      "gridPos": {
-        "x": 0,
-        "y": 5,
-        "w": 14,
-        "h": 9
-      },
-      "datasource": {
-        "uid": "langfuse-postgres"
-      },
-      "targets": [
-        {
-          "rawSql": "SELECT metadata->>'user_id' AS run_type, ROUND(AVG((metadata->>'baseline_tokens')::float)) AS avg_baseline_tokens, ROUND(AVG((metadata->>'final_tokens_sent')::float)) AS avg_final_tokens FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') GROUP BY 1 ORDER BY 1",
-          "format": "table"
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
         }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      },
-      "options": {
-        "barWidth": 0.7,
-        "groupWidth": 0.7
       }
     },
     {
       "id": 5,
       "type": "stat",
-      "title": "Total Cost Saved (All 3 Optimized Runs)",
+      "title": "Total Cost Saved",
       "gridPos": {
-        "x": 14,
-        "y": 5,
-        "w": 5,
-        "h": 4
+        "x": 12,
+        "y": 0,
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -204,23 +225,41 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "currencyUSD"
+          "unit": "currencyUSD",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "No runs",
+                  "index": 0
+                }
+              }
+            }
+          ]
         }
       },
       "options": {
         "colorMode": "background",
-        "graphMode": "none"
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 15,
+          "valueSize": 22
+        }
       }
     },
     {
       "id": 6,
       "type": "stat",
-      "title": "Cache Hits (Optimized Runs)",
+      "title": "Cache Hits",
       "gridPos": {
-        "x": 19,
-        "y": 5,
-        "w": 5,
-        "h": 4
+        "x": 15,
+        "y": 0,
+        "w": 3,
+        "h": 3
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -230,17 +269,76 @@
           "rawSql": "SELECT COUNT(*) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'cache_hit')::boolean = true",
           "format": "table"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 15,
+          "valueSize": 22
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "barchart",
+      "title": "Baseline vs Optimized — Tokens per Run",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 10,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "langfuse-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT metadata->>'user_id' AS run_type, ROUND(AVG((metadata->>'baseline_tokens')::float)) AS avg_baseline_tokens, ROUND(AVG((metadata->>'final_tokens_sent')::float)) AS avg_final_tokens FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') GROUP BY 1 ORDER BY 1",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "",
+            "lineWidth": 1,
+            "fillOpacity": 80
+          }
+        }
+      },
+      "options": {
+        "barWidth": 0.35,
+        "groupWidth": 0.5,
+        "showValue": "always",
+        "orientation": "auto",
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom",
+          "displayMode": "list"
+        },
+        "text": {
+          "valueSize": 14
+        }
+      }
     },
     {
       "id": 7,
       "type": "barchart",
-      "title": "G-Group Savings Contribution (Optimized Runs)",
+      "title": "G-Group Savings Contribution (Tokens)",
       "gridPos": {
-        "x": 0,
-        "y": 14,
+        "x": 10,
+        "y": 3,
         "w": 14,
-        "h": 9
+        "h": 7
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -253,22 +351,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "custom": {
+            "axisLabel": "",
+            "lineWidth": 1,
+            "fillOpacity": 80
+          }
         }
       },
       "options": {
-        "barWidth": 0.7
+        "barWidth": 0.4,
+        "showValue": "always",
+        "orientation": "auto",
+        "legend": {
+          "showLegend": false
+        },
+        "text": {
+          "valueSize": 14
+        }
       }
     },
     {
       "id": 8,
       "type": "table",
-      "title": "Per-Step Breakdown - All Optimized Runs",
+      "title": "Per-Step Breakdown — Latest Optimized Runs",
       "gridPos": {
-        "x": 14,
-        "y": 9,
-        "w": 10,
-        "h": 14
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -278,17 +389,20 @@
           "rawSql": "SELECT id AS request_id, created_at::time(0) AS time, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline, (metadata->>'final_tokens_sent')::int AS final, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' ORDER BY created_at DESC LIMIT 10",
           "format": "table"
         }
-      ]
+      ],
+      "options": {
+        "cellHeight": "md"
+      }
     },
     {
       "id": 9,
       "type": "table",
-      "title": "Waterfall - Step Savings per Optimized Call",
+      "title": "Waterfall — Step Savings per Optimized Call",
       "gridPos": {
-        "x": 0,
-        "y": 23,
-        "w": 24,
-        "h": 10
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -298,17 +412,20 @@
           "rawSql": "SELECT t.id AS request_id, t.metadata->>'model_requested' AS model, s.key AS g_group, (s.value->>'abs_saving')::int AS tokens_saved, ROUND((s.value->>'pct_saving_vs_baseline')::numeric,1) AS pct_of_baseline, s.value->>'description' AS description FROM traces t, jsonb_each(t.metadata->'step_savings') s WHERE t.metadata->>'user_id' = 'pitch-optimized' AND (s.value->>'abs_saving')::int > 0 ORDER BY t.created_at DESC, s.key",
           "format": "table"
         }
-      ]
+      ],
+      "options": {
+        "cellHeight": "md"
+      }
     },
     {
       "id": 10,
       "type": "table",
-      "title": "Side-by-Side - Last 6 Runs (Baseline + Optimized)",
+      "title": "Side-by-Side — Last 6 Runs (Baseline + Optimized)",
       "gridPos": {
         "x": 0,
-        "y": 33,
+        "y": 18,
         "w": 24,
-        "h": 8
+        "h": 7
       },
       "datasource": {
         "uid": "langfuse-postgres"
@@ -318,7 +435,10 @@
           "rawSql": "SELECT metadata->>'user_id' AS run_type, created_at, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline_tokens, (metadata->>'final_tokens_sent')::int AS final_tokens, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved_usd, (metadata->>'cache_hit')::boolean AS cache_hit, metadata->>'routed_model' AS routed_model FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') ORDER BY created_at DESC LIMIT 6",
           "format": "table"
         }
-      ]
+      ],
+      "options": {
+        "cellHeight": "md"
+      }
     }
   ],
   "annotations": {

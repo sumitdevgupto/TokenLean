@@ -260,6 +260,18 @@ class TestSLADashboard:
             f"Expected ≥3 proxy-overhead quantile queries, got: {overhead_queries}"
         )
 
+    def test_sla_dashboard_has_per_stage_panel(self):
+        # The per-stage breakdown answers "which G-group drives the proxy latency".
+        d = _load_dashboard("sla.json")
+        titles = [p.get("title", "").lower() for p in d.get("panels", [])]
+        assert any("by stage" in t for t in titles), (
+            f"SLA dashboard missing a per-stage latency panel. Titles: {titles}"
+        )
+        queries = _all_panel_queries(d)
+        assert any("token_opt_stage_duration_ms_bucket" in q for q in queries), (
+            "Per-stage panel must query the token_opt_stage_duration_ms histogram"
+        )
+
     def test_sla_dashboard_copies_in_sync(self):
         # A duplicate sla.json lives in the internal pitch-test-plan harness; keep
         # it identical to the canonical root copy (the root dir is what the local
