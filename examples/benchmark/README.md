@@ -114,7 +114,7 @@ report exactly what the quality-preserving pipeline yields.
 > that helps a *unique, first-ask* request, and the facts gate proves the answer survives.
 > It's opt-in per request (`x_compress_user`) and needs the LLMLingua sidecar warm.
 
-> **Scope vs the 57.34% headline.** The 57.34% figure is a **quality-gated blend across a
+> **Scope vs the 54.1% headline.** The 54.1% figure is a **quality-gated blend across a
 > broader multi-dataset ablation** — only datasets whose answer quality held (temperature-0,
 > reproducible) are counted toward it. This example is a *single* workload, so its number
 > differs — but it is computed the **same way**, so it's comparable in kind. We report
@@ -125,7 +125,7 @@ report exactly what the quality-preserving pipeline yields.
 Local calibration run (gpt-4o-mini default, 36 requests). **Deterministic**: two consecutive
 runs landed on **57.1%** to the token (13,149 / 23,014) — the optimisations are deterministic;
 only the LLM's wording (and thus completion tokens / cost) varies run-to-run. This corroborates
-the internal quality-gated headline (**57.34%**) on an independent, single OSS workload.
+the internal quality-gated headline (**54.1%**) on an independent, single OSS workload.
 
 ```
 TOTAL TOKEN SAVINGS   57.1%   (13,149 / 23,014 tokens)   8 cache hits   ~88s

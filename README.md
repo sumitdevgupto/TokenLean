@@ -10,14 +10,14 @@
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![Quality-gated savings](https://img.shields.io/badge/quality--gated_savings-57.34%25-brightgreen.svg)](#g0g28-optimisation-groups)
+[![Quality-gated savings](https://img.shields.io/badge/quality--gated_savings-54.1%25-brightgreen.svg)](#g0g28-optimisation-groups)
 [![GitHub stars](https://img.shields.io/github/stars/sumitdevgupto/TokenLean?style=social)](https://github.com/sumitdevgupto/TokenLean/stargazers)
 
 **TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **22 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
 
-🎯 **57.34% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
+🎯 **54.1% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
 
-> **Savings by workload** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 54.7%** · **prose 38.1%** · **reasoning −2.7%**. Input-token savings only — separate from output cost and from request-count billing.
+> **Savings by workload** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 46.0%** · **prose 38.1%** · **reasoning −2.7%**. Input-token savings only — separate from output cost and from request-count billing.
 
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK
@@ -35,7 +35,7 @@ Most LLM infrastructure operates at the **gateway** layer — unified routing, k
 management, observability, guardrails. This project is deliberately different: it
 is the **transparent optimisation layer** that targets the one thing gateways
 don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / up to
-**57.34% quality-gated**) — and drops in *in front of, or inside,* any gateway.
+**54.1% quality-gated**) — and drops in *in front of, or inside,* any gateway.
 
 | Capability | **This project** | LiteLLM | Helicone | Portkey | Bifrost |
 |---|---|---|---|---|---|
@@ -56,7 +56,7 @@ don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / u
 > moves fast, so **verify against each project's current docs** — and please
 > [open an issue or PR](https://github.com/sumitdevgupto/TokenLean/issues) if any cell is out of date.
 >
-> This project's own figures (**57.34%**, up to **~84%**, **27 techniques**) are **self-measured** on our
+> This project's own figures (**54.1%**, up to **~84%**, **27 techniques**) are **self-measured** on our
 > live-ablation test harness — directional estimates, not an independent third-party benchmark.
 >
 > **Sources:** [LiteLLM](https://docs.litellm.ai/) · [Helicone](https://docs.helicone.ai/) ·
