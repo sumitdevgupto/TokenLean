@@ -25,7 +25,7 @@ from middleware.g14_tool_output import G14ToolOutput
 from middleware.g15_server_compute import G15ServerCompute
 from middleware.g16_agent_arch import G16AgentArch
 from middleware.g17_loop_control import G17LoopControl
-from middleware.g18_observability import G18Observability
+from middleware.g18_observability import G18Observability, STAGE_DURATION_MS
 from middleware.g19_headroom import G19Headroom
 from middleware.g20_prompt_optimizer import G20PromptOptimizer
 from middleware.g21_cache_alignment import G21CacheAlignment
@@ -100,6 +100,12 @@ class OptimisationPipeline:
                 logger.warning("[%s] STAGE %s SLOW: %.0fms", rid, name, _dt)
             else:
                 logger.debug("[%s] stage %s %.0fms", rid, name, _dt)
+            try:
+                STAGE_DURATION_MS.labels(
+                    stage=name, tenant_id=getattr(ctx, "tenant_id", "default")
+                ).observe(_dt)
+            except Exception:  # never let metrics break the pipeline
+                pass
             otel.end_span(_s)
 
     async def process_request(self, ctx: RequestContext, request_headers: Optional[Dict[str, str]] = None) -> RequestContext:

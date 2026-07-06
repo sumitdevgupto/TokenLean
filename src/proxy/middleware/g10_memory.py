@@ -632,20 +632,29 @@ async def _summarise(turns: List[Dict], summary_model: str, ctx: RequestContext)
             get_provider_entry(summary_model, ctx.config.get("providers", [])) or {},
             provider_key,
         )
-        response = await litellm.acompletion(
-            model=_call_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Summarise this conversation history in 3-4 compact sentences. "
-                        f"Preserve key facts, decisions, and context:\n\n{text}"
-                    ),
-                }
-            ],
-            **_call_kwargs,
-            max_tokens=150,
-        )
+        # This is a real provider call made inside the request pipeline; count its
+        # wall-time as LLM (not proxy) time so the SLA latency split stays honest.
+        _t0 = time.time()
+        try:
+            response = await litellm.acompletion(
+                model=_call_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Summarise this conversation history in 3-4 compact sentences. "
+                            f"Preserve key facts, decisions, and context:\n\n{text}"
+                        ),
+                    }
+                ],
+                **_call_kwargs,
+                max_tokens=150,
+            )
+        finally:
+            try:
+                ctx.llm_elapsed_ms += (time.time() - _t0) * 1000.0
+            except Exception:
+                pass
         return response.choices[0].message.content or ""
     except Exception as exc:
         logger.warning("G10 summarisation failed: %s", exc)

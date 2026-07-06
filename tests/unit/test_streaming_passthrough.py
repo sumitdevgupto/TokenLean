@@ -14,6 +14,9 @@ class _Ctx:
         self.config = {}
         self.tenant_id = "default"
         self.request_id = "req-1"
+        # Mirror RequestContext: the streaming path accumulates the stream's
+        # wall-time into this (via +=), so it must exist as a number.
+        self.llm_elapsed_ms = 0.0
 
 
 async def _collect(streaming_response):

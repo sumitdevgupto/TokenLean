@@ -563,8 +563,10 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                     pass
             try:
                 # For streamed calls the provider owns the whole stream lifetime,
-                # so LLM time = acompletion start → last chunk consumed.
-                ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
+                # so LLM time = acompletion start → last chunk consumed. += to
+                # preserve any provider time already booked by request-side
+                # middleware (e.g. G06 judge).
+                ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
                 _record_outcome(
                     ctx, request_start, "200", {"usage": last_usage} if last_usage else None
                 )
@@ -596,6 +598,32 @@ def _apply_stream_g23(ctx, content: str) -> None:
             )
     except Exception as exc:
         logger.debug("[%s] stream G23 failed: %s", ctx.request_id, exc)
+
+
+def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResponse:
+    """Finalise a served 2xx response: attach savings metadata + headers, record
+    SLA/billing (`_record_outcome`), and return the JSONResponse.
+
+    Shared by the normal LLM path and the G06 cascade short-circuit so both bill
+    and surface headers identically.
+    """
+    response_dict.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
+
+    headers = {"x-savings-usd": f"{ctx.savings.cost_saving_usd:.6f}"}
+    # G17: expose InterAgentState via x-token-opt-state header for downstream agents
+    token_budget_state = ctx.params.get("_token_budget")
+    if token_budget_state:
+        import base64
+        import json
+
+        headers["x-token-opt-state"] = base64.b64encode(
+            json.dumps(token_budget_state, separators=(",", ":")).encode("utf-8")
+        ).decode("utf-8")
+
+    # C1: SLA metrics + the billable usage_events row, centralised so every
+    # 2xx-served path bills exactly once.
+    _record_outcome(ctx, request_start, "200", response_dict)
+    return JSONResponse(content=response_dict, headers=headers)
 
 
 @app.post("/v1/chat/completions")
@@ -696,6 +724,20 @@ async def chat_completions(request: Request):
             content={"status": "queued", "request_id": request_id},
         )
 
+    # G06 cascade-execution already produced the final answer by running the tier
+    # cascade inline (its provider time is already accumulated in
+    # ctx.llm_elapsed_ms). Return it directly — calling the LLM again here would
+    # be a duplicate provider round-trip. Fix: ctx.cascade_response was set by
+    # G06 "for direct return in main.py" but was never consumed, so cascade
+    # requests paid for the cascade AND a second main call.
+    if ctx.cascade_response is not None:
+        logger.info(
+            "[%s] Using G06 cascade result (model=%s); skipping duplicate main LLM call",
+            request_id, ctx.routed_model,
+        )
+        ctx, response_dict = await _pipeline.process_response(ctx, ctx.cascade_response)
+        return _served_response(ctx, response_dict, _request_start)
+
     # Resolve provider key for the routed model
     provider = _resolve_provider(ctx.routed_model, cfg)
     provider_key = get_llm_provider_key(provider)
@@ -782,53 +824,34 @@ async def chat_completions(request: Request):
             **outgoing_params,
         )
         _llm_ms = (time.time() - _llm_start) * 1000
-        ctx.llm_elapsed_ms = _llm_ms
+        # += (not =) so any provider time already accumulated by middleware (G06
+        # judge/cascade fallback, G10 summary, G09 schema) is preserved alongside
+        # the main call — the SLA split needs the TOTAL provider time.
+        ctx.llm_elapsed_ms += _llm_ms
         (logger.warning if _llm_ms > 10000 else logger.info)(
             "[%s] LLM call %s completed in %.0fms", request_id, ctx.routed_model, _llm_ms
         )
         response_dict = llm_response.model_dump() if hasattr(llm_response, "model_dump") else dict(llm_response)
     except litellm.exceptions.AuthenticationError as exc:
         logger.error("LLM auth error: %s", exc)
-        ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
+        ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "401")
         raise HTTPException(status_code=401, detail="LLM provider authentication failed")
     except litellm.exceptions.RateLimitError as exc:
         logger.warning("LLM rate limit: %s", exc)
-        ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
+        ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "429")
         raise HTTPException(status_code=429, detail="LLM provider rate limit reached")
     except Exception as exc:
         logger.error("LLM call failed: %s", exc)
-        ctx.llm_elapsed_ms = (time.time() - _llm_start) * 1000
+        ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "502")
         raise HTTPException(status_code=502, detail=f"LLM provider error: {str(exc)}")
 
-    # Run G14-G18 response pipeline
+    # Run G14-G18 response pipeline, then finalise (savings metadata, headers,
+    # SLA metrics + billing) via the shared helper.
     ctx, response_dict = await _pipeline.process_response(ctx, response_dict)
-
-    # Attach savings metadata to response for developer visibility
-    response_dict.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
-
-    # Build response headers
-    headers = {
-        "x-savings-usd": f"{ctx.savings.cost_saving_usd:.6f}",
-    }
-
-    # G17: Expose InterAgentState via x-token-opt-state header for downstream agents
-    token_budget_state = ctx.params.get("_token_budget")
-    if token_budget_state:
-        import base64
-        import json
-
-        headers["x-token-opt-state"] = base64.b64encode(
-            json.dumps(token_budget_state, separators=(",", ":")).encode("utf-8")
-        ).decode("utf-8")
-
-    # C1: SLA metrics + the billable usage_events row for this served request,
-    # centralised in _record_outcome so every 2xx-served path bills exactly once.
-    _record_outcome(ctx, _request_start, "200", response_dict)
-
-    return JSONResponse(content=response_dict, headers=headers)
+    return _served_response(ctx, response_dict, _request_start)
 
 
 # ---------------------------------------------------------------------------

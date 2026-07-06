@@ -96,11 +96,21 @@ LLM_DURATION_MS = Histogram(
 )
 PROXY_OVERHEAD_MS = Histogram(
     "token_opt_proxy_overhead_ms",
-    "Proxy-induced latency in milliseconds: end-to-end duration minus provider "
-    "LLM call time. Cache hits and bypasses skip the provider, so their full "
-    "duration counts as proxy time (used by SLA dashboard 'Proxy only' row)",
+    "Proxy-induced latency in milliseconds: end-to-end duration minus total "
+    "provider LLM call time (main call plus any provider calls made inside "
+    "middleware — G06 cascade/judge, G10 summarisation, G09 schema). Cache hits "
+    "and bypasses skip the provider, so their full duration counts as proxy "
+    "time (used by SLA dashboard 'Proxy only' row)",
     ["tenant_id", "status"],
     buckets=[10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000],
+)
+STAGE_DURATION_MS = Histogram(
+    "token_opt_stage_duration_ms",
+    "Per-pipeline-stage wall-clock latency in milliseconds (G-group granularity); "
+    "attributes proxy overhead to the stage that caused it (SLA 'Proxy time by "
+    "stage' panel). Coarse buckets keep label cardinality bounded",
+    ["stage", "tenant_id"],
+    buckets=[50, 250, 1000, 5000, 30000],
 )
 HTTP_REQUESTS = Counter(
     "token_opt_http_requests_total",

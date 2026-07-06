@@ -10,6 +10,7 @@ Technique: Detect and flag prose-heavy inter-agent context blocks.
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
@@ -99,6 +100,7 @@ class G09ContextSchema:
                 compacted = None
                 # Try schema-based compaction first if enabled
                 if use_instructor and schema_fields and provider_key:
+                    _t0 = time.time()
                     try:
                         compacted = await asyncio.wait_for(
                             _compact_with_schema(
@@ -116,6 +118,13 @@ class G09ContextSchema:
                             "[%s] G09 Instructor compaction failed: %s",
                             ctx.request_id, exc,
                         )
+                    finally:
+                        # Real provider call inside the pipeline — attribute its
+                        # wall-time to LLM (not proxy) time in the SLA split.
+                        try:
+                            ctx.llm_elapsed_ms += (time.time() - _t0) * 1000.0
+                        except Exception:
+                            pass
 
                     if compacted and len(compacted) < len(content) * 0.7:
                         new_messages.append({**msg, "content": compacted})
