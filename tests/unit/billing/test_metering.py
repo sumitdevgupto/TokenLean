@@ -88,6 +88,33 @@ class TestUsageMeterBuildsEvent:
         ctx2 = _make_ctx()
         assert meter._build_event(ctx2, {}).response_tokens == 0
 
+    def test_build_event_carries_user_and_flags(self):
+        # Requests Explorer filter columns mirror the request-context flags;
+        # complexity_tier comes from params.x_complexity_tier (X-Complexity-Tier header).
+        meter = UsageMeter()
+        ctx = _make_ctx()
+        ctx.user_id = "u-77"
+        ctx.cache_hit = True
+        ctx.cache_level = "L2"
+        ctx.bypassed = True
+        ctx.params = {"x_complexity_tier": "complex"}
+        event = meter._build_event(ctx, {})
+        assert event.user_id == "u-77"
+        assert event.cache_hit is True
+        assert event.cache_level == "L2"
+        assert event.complexity_tier == "complex"
+        assert event.bypassed is True
+
+    def test_build_event_filter_fields_default_safely(self):
+        # Empty params / falsy ctx flags → safe, non-null defaults.
+        meter = UsageMeter()
+        ctx = _make_ctx()  # params={}, cache_level=None, cache_hit/bypassed=False
+        event = meter._build_event(ctx, {})
+        assert event.cache_level == ""
+        assert event.complexity_tier == ""
+        assert event.cache_hit is False
+        assert event.bypassed is False
+
     def test_build_event_cache_hit_shows_estimated_cost_saved(self):
         # C2: cache-hit rows skip G18 (cost_saving_usd == 0) — derive the avoided
         # input cost so the confidence story isn't $0 on cached traffic.

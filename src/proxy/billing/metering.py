@@ -68,6 +68,16 @@ class UsageMeter:
             proxy_optimised_tokens=getattr(savings, "proxy_optimised_tokens", 0),
             provider_prompt_tokens=getattr(savings, "provider_prompt_tokens", None),
             response_tokens=getattr(savings, "response_tokens", 0),
+            # Requests Explorer filter columns — mirror the request-context flags so the
+            # indexed usage_events table carries every filterable field. complexity_tier
+            # comes from the X-Complexity-Tier header (params.x_complexity_tier), same
+            # source as the Langfuse trace tag.
+            user_id=getattr(ctx, "user_id", "") or "",
+            cache_hit=bool(getattr(ctx, "cache_hit", False)),
+            cache_level=getattr(ctx, "cache_level", "") or "",
+            complexity_tier=(ctx.params.get("x_complexity_tier")
+                             or ctx.params.get("complexity_tier") or ""),
+            bypassed=bool(getattr(ctx, "bypassed", False)),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -78,8 +88,10 @@ class UsageMeter:
                 (tenant_id, request_id, timestamp, baseline_tokens, optimised_tokens,
                  tokens_saved, cost_saved_usd, groups_applied, pricing_tier,
                  model, routed_model, otel_trace_id,
-                 proxy_optimised_tokens, provider_prompt_tokens, response_tokens)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 proxy_optimised_tokens, provider_prompt_tokens, response_tokens,
+                 user_id, cache_hit, cache_level, complexity_tier, bypassed)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                    $16,$17,$18,$19,$20)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -93,6 +105,8 @@ class UsageMeter:
                     event.model, event.routed_model, event.otel_trace_id,
                     event.proxy_optimised_tokens, event.provider_prompt_tokens,
                     event.response_tokens,
+                    event.user_id, event.cache_hit, event.cache_level,
+                    event.complexity_tier, event.bypassed,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

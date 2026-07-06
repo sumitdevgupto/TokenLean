@@ -67,6 +67,24 @@ class TestUsageEvent:
         assert self._make_event().response_tokens == 0
         assert self._make_event(response_tokens=145).response_tokens == 145
 
+    def test_explorer_filter_fields_default_and_settable(self):
+        # Requests Explorer filter columns (never billed) — safe defaults + settable.
+        e = self._make_event()
+        assert e.user_id == ""
+        assert e.cache_hit is False
+        assert e.cache_level == ""
+        assert e.complexity_tier == ""
+        assert e.bypassed is False
+        e2 = self._make_event(
+            user_id="u-42", cache_hit=True, cache_level="L2",
+            complexity_tier="complex", bypassed=True,
+        )
+        assert e2.user_id == "u-42"
+        assert e2.cache_hit is True
+        assert e2.cache_level == "L2"
+        assert e2.complexity_tier == "complex"
+        assert e2.bypassed is True
+
 
 class TestUsageEventsDDL:
     def test_ddl_is_string(self):
@@ -79,7 +97,8 @@ class TestUsageEventsDDL:
     def test_ddl_contains_required_columns(self):
         for col in ["tenant_id", "request_id", "tokens_saved", "cost_saved_usd",
                     "groups_applied", "pricing_tier", "otel_trace_id",
-                    "response_tokens"]:
+                    "response_tokens", "user_id", "cache_hit", "cache_level",
+                    "complexity_tier", "bypassed"]:
             assert col in USAGE_EVENTS_DDL, f"DDL missing column: {col}"
 
     def test_ddl_has_create_index(self):

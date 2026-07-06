@@ -292,6 +292,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_id
   ON usage_events (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp
   ON usage_events (timestamp DESC);
+-- Requests Explorer filter columns (the app's startup DDL also self-heals these
+-- via ALTER ... IF NOT EXISTS; kept here so a fresh GCP provision matches).
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_level TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS complexity_tier TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS bypassed BOOLEAN NOT NULL DEFAULT false;
 EOSQL
     SHELL
   }

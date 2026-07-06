@@ -26,6 +26,14 @@ class UsageEvent:
     # Pairs with provider_prompt_tokens (z, real input) so the metering engine holds the
     # full real input+output picture, not just input. 0 on defer / no-usage paths.
     response_tokens: int = 0
+    # Filter/observability metadata for the Requests Explorer dashboard (never billed).
+    # Mirror the request-context flags so the fast, indexed usage_events table carries
+    # every filterable field — avoids querying the unindexed Langfuse traces JSONB blob.
+    user_id: str = ""
+    cache_hit: bool = False
+    cache_level: str = ""
+    complexity_tier: str = ""
+    bypassed: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -51,7 +59,12 @@ CREATE TABLE IF NOT EXISTS usage_events (
     otel_trace_id   TEXT        NOT NULL DEFAULT '',
     proxy_optimised_tokens INTEGER NOT NULL DEFAULT 0,
     provider_prompt_tokens INTEGER,
-    response_tokens INTEGER NOT NULL DEFAULT 0
+    response_tokens INTEGER NOT NULL DEFAULT 0,
+    user_id         TEXT        NOT NULL DEFAULT '',
+    cache_hit       BOOLEAN     NOT NULL DEFAULT false,
+    cache_level     TEXT        NOT NULL DEFAULT '',
+    complexity_tier TEXT        NOT NULL DEFAULT '',
+    bypassed        BOOLEAN     NOT NULL DEFAULT false
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
@@ -61,4 +74,10 @@ CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_optimised_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider_prompt_tokens INTEGER;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS response_tokens INTEGER NOT NULL DEFAULT 0;
+-- Requests Explorer filter/observability columns (non-destructive; never billed)
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_level TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS complexity_tier TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS bypassed BOOLEAN NOT NULL DEFAULT false;
 """

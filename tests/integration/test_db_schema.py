@@ -27,6 +27,11 @@ REQUIRED_COLUMNS = {
     "proxy_optimised_tokens",
     "provider_prompt_tokens",
     "response_tokens",
+    "user_id",
+    "cache_hit",
+    "cache_level",
+    "complexity_tier",
+    "bypassed",
 }
 
 
@@ -69,7 +74,12 @@ class TestUsageEventsTable:
                 pricing_tier     TEXT          NOT NULL DEFAULT 'basic',
                 proxy_optimised_tokens INT     NOT NULL DEFAULT 0,
                 provider_prompt_tokens INT,
-                response_tokens  INT           NOT NULL DEFAULT 0
+                response_tokens  INT           NOT NULL DEFAULT 0,
+                user_id          TEXT          NOT NULL DEFAULT '',
+                cache_hit        BOOLEAN       NOT NULL DEFAULT false,
+                cache_level      TEXT          NOT NULL DEFAULT '',
+                complexity_tier  TEXT          NOT NULL DEFAULT '',
+                bypassed         BOOLEAN       NOT NULL DEFAULT false
             )
         """)
 
