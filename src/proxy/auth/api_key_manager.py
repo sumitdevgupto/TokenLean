@@ -18,6 +18,11 @@ _KEY_CACHE: dict = {}
 _CACHE_TTL_SECONDS = int(os.getenv("KEY_CACHE_TTL_SECONDS", "300"))
 import time
 _CACHE_LOADED_AT: float = 0.0
+# Reload-on-miss throttle: a key just issued on another instance/worker may not be in
+# this process's TTL cache yet. On a miss we force one reload, but no more often than
+# this interval so a bad-key flood can't hammer Secret Manager.
+_last_forced_reload: float = 0.0
+_FORCED_RELOAD_MIN_INTERVAL = int(os.getenv("KEY_FORCED_RELOAD_MIN_INTERVAL_SECONDS", "5"))
 
 
 def _fetch_secret(secret_name: str) -> Optional[str]:
@@ -76,14 +81,22 @@ def validate_proxy_key(api_key: str) -> Tuple[bool, Optional[str], Optional[dict
     Proxy admins add keys via gcp-deploy.sh / admin CLI.
     Developers never see LLM provider keys — only their proxy key.
     """
-    global _CACHE_LOADED_AT
+    global _CACHE_LOADED_AT, _last_forced_reload
     now = time.monotonic()
     if not _KEY_CACHE or (now - _CACHE_LOADED_AT) > _CACHE_TTL_SECONDS:
         _load_key_cache()
 
     key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     entry = _KEY_CACHE.get(key_hash)
-    
+
+    # Reload-on-miss: a freshly issued key (e.g. self-serve signup on another instance)
+    # may not be in this process's TTL cache yet. On a miss, force one throttled reload
+    # and re-check so new keys work within seconds everywhere, not after the full TTL.
+    if entry is None and (now - _last_forced_reload) >= _FORCED_RELOAD_MIN_INTERVAL:
+        _last_forced_reload = now
+        _load_key_cache()
+        entry = _KEY_CACHE.get(key_hash)
+
     if entry is None:
         return False, None, None
     

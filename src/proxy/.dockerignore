@@ -4,6 +4,8 @@
 # the commercial .gitignore. Engines STAY in the image: billing/metering.py,
 # billing/models.py, billing/api.py, audit/, tenancy/.
 api/portal.py
+api/portal_auth.py
+api/email_sender.py
 api/gdpr.py
 commercial_app.py
 billing/tiers.py
