@@ -362,16 +362,23 @@ async def _execute_three_tier_cascade(
         if not provider_key:
             return None, {"error": "provider_resolution_failed"}
 
-        # Call tier1 model — preserve original max_tokens and temperature from user request
+        # Call tier1 model — forward the SAME passthrough params (tools, tool_choice,
+        # response_format, ...) as tier2/tier3, so a request that legitimately stays at
+        # tier1 still gets its tools. Previously tier1 sent only messages/max_tokens/
+        # temperature; a tool-requiring request that short-circuited at tier1 silently
+        # lost its tool calls — it only ever worked because such requests always escalated
+        # to a tier that did forward them.
         tier1_max_tokens = ctx.params.get("max_tokens") or 512
         tier1_temperature = ctx.params.get("temperature", 0.0)
+        _t1_passthrough = {k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")}
+        _t1_passthrough.setdefault("max_tokens", tier1_max_tokens)
+        _t1_passthrough.setdefault("temperature", tier1_temperature)
         _t1_model, _t1_kwargs = build_litellm_call(tier1_model, get_providers(), provider_key)
         tier1_response = await _timed_llm(ctx, litellm.acompletion(
             model=_t1_model,
             messages=ctx.messages,
             **_t1_kwargs,
-            max_tokens=tier1_max_tokens,
-            temperature=tier1_temperature,
+            **_t1_passthrough,
         ))
 
         # Evaluate confidence from the RESPONSE — via judge model, or a cheap
@@ -511,6 +518,7 @@ def _heuristic_response_confidence(response: Any, cfg: Dict[str, Any]) -> float:
     < threshold 0.70) deterministically escalated tier1→tier2→tier3 regardless
     of how good the cheap tier's answer actually was. This scores the answer:
 
+    - tool_calls present                → ``response_confidence.ok``        (0.85)
     - no choices / empty content        → ``response_confidence.empty``     (0.0)
     - finish_reason == "length"         → ``response_confidence.truncated`` (0.30)
     - content_filter or refusal opening → ``response_confidence.refusal``   (0.40)
@@ -536,6 +544,11 @@ def _heuristic_response_confidence(response: Any, cfg: Dict[str, Any]) -> float:
         content = message.get("content") or ""
         finish_reason = choice.get("finish_reason")
 
+        # A tool call is a valid, complete response even with empty content — treat it as
+        # adequate so a tier that correctly emits tool calls isn't scored "empty" and
+        # needlessly escalated (which would also lose the tool call the caller asked for).
+        if message.get("tool_calls") or finish_reason == "tool_calls":
+            return ok
         if not str(content).strip():
             return empty
         if finish_reason == "length":

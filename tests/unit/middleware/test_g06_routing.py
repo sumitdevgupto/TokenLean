@@ -725,6 +725,33 @@ class TestG06CascadeOverEscalationGuards:
         ctx = await self._run(ctx, mock)
         assert ctx.routed_model == "gpt-4o"
 
+    async def test_cascade_tier1_forwards_tools_and_keeps_tool_call(self, make_ctx):
+        """Regression (DS3/DS7/DS13): a tool-requiring request that stays at tier1 must still
+        receive its tools, and its tool-call response must short-circuit — not escalate, not
+        get dropped. Before the fix, tier1 omitted `tools` and returned a tool-less answer."""
+        tools = [{"type": "function", "function": {"name": "get_logs", "parameters": {}}}]
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o-mini",
+                       params={"tools": tools})
+        self._cfg(ctx)
+        seen_tools = {}
+        calls = 0
+        async def mock(*a, **k):
+            nonlocal calls; calls += 1
+            m = k.get("model", "")
+            seen_tools[m] = k.get("tools")
+            resp = MagicMock()
+            resp.model_dump.return_value = {
+                "choices": [{"finish_reason": "tool_calls", "message": {
+                    "content": None,
+                    "tool_calls": [{"id": "c1", "function": {"name": "get_logs"}}]}}],
+                "model": m,
+            }
+            return resp
+        ctx = await self._run(ctx, mock)
+        assert ctx.routed_model == "gpt-4o-mini"          # stayed at tier1
+        assert calls == 1                                  # no escalation
+        assert seen_tools.get("gpt-4o-mini") == tools      # tier1 actually received the tools
+
     # ── Classified-tier cap ───────────────────────────────────────────────────
 
     async def test_cascade_cap_blocks_complex_tier_for_medium_query(self, make_ctx):
@@ -869,6 +896,17 @@ class TestG06ResponseConfidenceHeuristic:
         assert h(resp("   "), {}) == 0.0                        # whitespace only
         assert h({"choices": []}, {}) == 0.0                    # no choices
         assert h(object(), {}) == 0.5                           # unparseable → neutral
+
+    def test_tool_call_response_is_adequate_not_empty(self):
+        """A tool-call response (empty content + tool_calls / finish_reason=tool_calls) is a
+        valid, complete response — must score ok, never 'empty', so it isn't escalated."""
+        from middleware.g06_routing import _heuristic_response_confidence as h
+        tc = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "content": None, "tool_calls": [{"id": "c1", "function": {"name": "get_logs"}}]}}]}
+        assert h(tc, {}) == 0.85
+        # tool_calls present even if finish_reason is absent/other
+        tc2 = {"choices": [{"message": {"content": "", "tool_calls": [{"id": "c2"}]}}]}
+        assert h(tc2, {}) == 0.85
 
     def test_short_but_adequate_answer_is_not_penalised(self):
         from middleware.g06_routing import _heuristic_response_confidence as h
