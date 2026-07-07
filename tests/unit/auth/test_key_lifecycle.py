@@ -24,9 +24,9 @@ def temp_store(tmp_path, monkeypatch):
 
 
 def test_create_key_persists_hash_only_and_validates(temp_store):
-    raw, key_hash, meta = akm.create_key("acme", tier="pro")
+    raw, key_hash, meta = akm.create_key("acme", tier="enterprise")
     assert raw.startswith("tok-")
-    assert meta["tenant_id"] == "acme" and meta["tier"] == "pro"
+    assert meta["tenant_id"] == "acme" and meta["tier"] == "enterprise"
     # only the hash is persisted — the raw key never touches disk
     text = temp_store.read_text()
     assert key_hash in text and raw not in text
@@ -54,7 +54,7 @@ def test_create_rejects_duplicate_raw_key(temp_store):
 
 
 def test_suspend_enforced_then_lifted(temp_store):
-    raw, _h, _m = akm.create_key("acme", tier="pro")
+    raw, _h, _m = akm.create_key("acme", tier="enterprise")
     assert akm.set_suspended("acme", True) == 1
     ok, _tid, meta = akm.validate_proxy_key(raw)
     assert ok is True                       # still authenticates...
@@ -80,9 +80,9 @@ def test_delete_unknown_tenant_returns_zero(temp_store):
 
 
 def test_list_tenants_never_leaks_key_material(temp_store):
-    akm.create_key("acme", tier="pro")
-    akm.create_key("acme", tier="pro")
-    akm.create_key("beta", tier="basic", admin=True)
+    akm.create_key("acme", tier="enterprise")
+    akm.create_key("acme", tier="enterprise")
+    akm.create_key("beta", tier="free", admin=True)
     akm.set_suspended("beta", True)
     tenants = {t["tenant_id"]: t for t in akm.list_tenants()}
     assert set(tenants) == {"acme", "beta"}

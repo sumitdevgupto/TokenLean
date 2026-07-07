@@ -48,9 +48,9 @@ class TestRequestContextTenantDefaults:
         ctx = _base_ctx()
         assert ctx.qdrant_collection == "rag_docs"
 
-    def test_pricing_tier_defaults_to_basic(self):
+    def test_pricing_tier_defaults_to_free(self):
         ctx = _base_ctx()
-        assert ctx.pricing_tier == "basic"
+        assert ctx.pricing_tier == "free"
 
     def test_otel_span_defaults_to_none(self):
         ctx = _base_ctx()
@@ -93,7 +93,7 @@ class TestRequestContextCreate:
         assert ctx.tenant_id == "default"
         assert ctx.redis_prefix == ""
         assert ctx.qdrant_collection == "rag_docs"
-        assert ctx.pricing_tier == "basic"
+        assert ctx.pricing_tier == "free"
 
     def test_create_with_tenant_args(self):
         ctx = RequestContext.create(
@@ -106,12 +106,12 @@ class TestRequestContextCreate:
             tenant_id="acme",
             redis_prefix="t:acme:",
             qdrant_collection="rag_acme",
-            pricing_tier="pro",
+            pricing_tier="enterprise",
         )
         assert ctx.tenant_id == "acme"
         assert ctx.redis_prefix == "t:acme:"
         assert ctx.qdrant_collection == "rag_acme"
-        assert ctx.pricing_tier == "pro"
+        assert ctx.pricing_tier == "enterprise"
 
     def test_create_deep_copies_messages(self):
         msgs = [{"role": "user", "content": "hello"}]

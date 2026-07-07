@@ -86,7 +86,7 @@ class TestIsSuspended:
 
     def test_suspended_absent_defaults_false(self):
         from auth.api_key_manager import is_suspended
-        assert is_suspended({"tenant_id": "acme", "tier": "pro"}) is False
+        assert is_suspended({"tenant_id": "acme", "tier": "enterprise"}) is False
 
     def test_legacy_string_key_never_suspended(self):
         from auth.api_key_manager import is_suspended

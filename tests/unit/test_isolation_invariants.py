@@ -21,7 +21,7 @@ from auth.api_key_manager import is_admin_key
 # ── C1: the authenticated key is authoritative for tenant identity ───────────
 class TestKeyAuthoritativeResolution:
     def test_no_header_uses_key_tenant(self):
-        tc = resolve_tenant({}, key_tenant_id="nova-med", key_tier="pro")
+        tc = resolve_tenant({}, key_tenant_id="nova-med", key_tier="enterprise")
         assert tc.tenant_id == "nova-med"
         assert tc.redis_prefix == "t:nova-med:"
 
@@ -34,13 +34,13 @@ class TestKeyAuthoritativeResolution:
 
     def test_non_admin_cannot_cross_tenants_via_header(self):
         tc = resolve_tenant(
-            {"x-tenant-id": "victim"}, key_tenant_id="attacker", key_tier="basic"
+            {"x-tenant-id": "victim"}, key_tenant_id="attacker", key_tier="enterprise"
         )
         assert tc.tenant_id == "attacker"  # header ignored, key wins
 
     def test_admin_key_may_impersonate(self):
         tc = resolve_tenant(
-            {"x-tenant-id": "target"}, key_tenant_id="ops", key_tier="pro", key_is_admin=True
+            {"x-tenant-id": "target"}, key_tenant_id="ops", key_tier="enterprise", key_is_admin=True
         )
         assert tc.tenant_id == "target"
 
@@ -63,7 +63,7 @@ class TestAdminScope:
         assert is_admin_key({"tenant_id": "ops", "admin": True}) is True
 
     def test_plain_tenant_key_is_not_admin(self):
-        assert is_admin_key({"tenant_id": "nova-med", "tier": "pro"}) is False
+        assert is_admin_key({"tenant_id": "nova-med", "tier": "enterprise"}) is False
 
     def test_legacy_string_key_is_not_admin(self):
         assert is_admin_key(None) is False

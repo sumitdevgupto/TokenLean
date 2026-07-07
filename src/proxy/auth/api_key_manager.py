@@ -222,7 +222,7 @@ def _persist_store(store: dict) -> None:
 
 def create_key(
     tenant_id: str,
-    tier: str = "basic",
+    tier: str = "free",
     admin: bool = False,
     raw_key: Optional[str] = None,
 ) -> Tuple[str, str, dict]:
@@ -239,7 +239,7 @@ def create_key(
     key_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     metadata: dict = {
         "tenant_id": tenant_id,
-        "tier": (tier or "basic").strip().lower(),
+        "tier": (tier or "free").strip().lower(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if admin:
@@ -316,7 +316,7 @@ def list_tenants() -> List[dict]:
         if isinstance(entry, dict):
             tid = entry.get("tenant_id", "default")
             agg = tenants.setdefault(tid, {
-                "tenant_id": tid, "tier": entry.get("tier", "basic"),
+                "tenant_id": tid, "tier": entry.get("tier", "free"),
                 "admin": False, "suspended": False, "key_count": 0,
                 "created_at": entry.get("created_at"),
             })

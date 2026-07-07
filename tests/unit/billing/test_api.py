@@ -43,7 +43,7 @@ USAGE_ROWS = [
         tokens_saved=400,
         cost_saved_usd=0.002,
         groups_applied=["G01", "G05"],
-        pricing_tier="pro",
+        pricing_tier="enterprise",
     )
 ]
 

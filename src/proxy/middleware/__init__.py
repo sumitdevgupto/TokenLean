@@ -37,8 +37,9 @@ class RequestContext:
     # Qdrant collection scoped to this tenant.  Default matches the legacy env
     # var so existing single-tenant deployments are unaffected.
     qdrant_collection: str = "rag_docs"
-    # Pricing tier controls which G-groups run (basic/pro/enterprise).
-    pricing_tier: str = "basic"
+    # Pricing tier — free (self-host / $0 floor) or enterprise (managed SaaS). Billing/
+    # console only; optimisations are never gated by tier.
+    pricing_tier: str = "free"
     # True when the authenticated key carries the admin/impersonation scope.
     # Gates cross-tenant header impersonation (resolver), arbitrary
     # x_rag_collection (G07), and the cross-tenant admin/GDPR endpoints.
@@ -85,7 +86,7 @@ class RequestContext:
         tenant_id: str = "default",
         redis_prefix: str = "",
         qdrant_collection: str = "rag_docs",
-        pricing_tier: str = "basic",
+        pricing_tier: str = "free",
     ) -> "RequestContext":
         import copy
 

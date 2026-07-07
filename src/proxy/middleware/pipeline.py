@@ -116,7 +116,7 @@ class OptimisationPipeline:
         # header is honoured only for admin keys (resolve_tenant enforces this).
         headers = {k.lower(): v for k, v in (request_headers or {}).items()}
         key_tenant_id = ctx.params.get("_auth_tenant_id")
-        key_tier = ctx.params.get("_auth_tier", "basic")
+        key_tier = ctx.params.get("_auth_tier", "free")
         key_is_admin = bool(ctx.params.get("_auth_admin", False))
         tenant = resolve_tenant(
             headers,

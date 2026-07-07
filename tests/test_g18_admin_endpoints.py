@@ -217,7 +217,7 @@ class TestUsageExport:
             "tokens_saved": 40,
             "cost_saved_usd": 0.0123,
             "groups_applied": ["G01", "G05"],
-            "pricing_tier": "basic",
+            "pricing_tier": "free",
             "model": "gpt-4o",
             "routed_model": "gpt-4o-mini",
         }]

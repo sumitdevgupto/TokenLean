@@ -29,7 +29,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 COMMAND=""
 USER_ID=""
 TENANT_ID=""
-TIER="basic"
+TIER="free"
 ADMIN="false"
 PROJECT_ID=""
 SECRET_NAME="${PROXY_KEYS_SECRET_NAME:-token-proxy-api-keys}"
@@ -90,10 +90,11 @@ cmd_issue() {
   [[ -z "$tenant" ]] && error "--tenant (or --user) is required for issue"
 
   # Pricing tier is bound to the key and flows into usage_events.pricing_tier →
-  # invoicing. Reject typos here so a bad tier never silently bills at the basic card.
+  # invoicing. Two tiers only — free (self-host / $0 floor) or enterprise (managed SaaS).
+  # Reject typos here so a bad tier never silently bills at the wrong card.
   case "$TIER" in
-    basic|pro|enterprise) ;;
-    *) error "--tier must be basic|pro|enterprise (got '${TIER}')" ;;
+    free|enterprise) ;;
+    *) error "--tier must be free|enterprise (got '${TIER}')" ;;
   esac
 
   local raw_key

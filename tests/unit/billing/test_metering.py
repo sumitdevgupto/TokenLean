@@ -35,7 +35,7 @@ def _make_ctx():
         config={"groups": {}},
         savings=savings,
         tenant_id="acme",
-        pricing_tier="pro",
+        pricing_tier="enterprise",
     )
 
 
@@ -64,7 +64,7 @@ class TestUsageMeterBuildsEvent:
         meter = UsageMeter()
         ctx = _make_ctx()
         event = meter._build_event(ctx, {})
-        assert event.pricing_tier == "pro"
+        assert event.pricing_tier == "enterprise"
 
     def test_build_event_carries_xyz(self):
         # C2: x = baseline_tokens, y = proxy_optimised_tokens, z = provider_prompt_tokens.

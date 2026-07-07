@@ -59,7 +59,7 @@ if ((-not $key) -and (-not (Test-Path "config/local-keys.json"))) {
     # the X-Tenant-ID header (post key-authoritative tenancy). A legacy
     # {"hash":"admin"} string key would resolve to "default" and break the
     # benchmark's t:<tenant>: namespacing + clear-cache cleanup.
-    "{`"$hash`": {`"tenant_id`": `"bench`", `"tier`": `"pro`", `"admin`": true}}" | Set-Content -Path "config/local-keys.json" -Encoding ascii
+    "{`"$hash`": {`"tenant_id`": `"bench`", `"tier`": `"enterprise`", `"admin`": true}}" | Set-Content -Path "config/local-keys.json" -Encoding ascii
     Info "wrote config/local-keys.json (proxy loads it on start)"
     $rebuild = $true   # force a (re)start so the proxy picks up the new key
 }

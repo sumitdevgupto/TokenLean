@@ -51,9 +51,9 @@ class TestTenantContextDefault:
         tc = TenantContext.default()
         assert tc.tenant_id == "default"
 
-    def test_default_tier_is_basic(self):
+    def test_default_tier_is_free(self):
         tc = TenantContext.default()
-        assert tc.pricing_tier == "basic"
+        assert tc.pricing_tier == "free"
 
 
 class TestResolveByHeader:
@@ -66,10 +66,10 @@ class TestResolveByHeader:
         assert tc.tenant_id == "default"
 
     def test_admin_key_header_impersonates(self):
-        tc = resolve_tenant({"x-tenant-id": "acme"}, key_is_admin=True, key_tier="pro")
+        tc = resolve_tenant({"x-tenant-id": "acme"}, key_is_admin=True, key_tier="enterprise")
         assert tc.tenant_id == "acme"
         assert tc.redis_prefix == "t:acme:"
-        assert tc.pricing_tier == "pro"
+        assert tc.pricing_tier == "enterprise"
 
     def test_empty_header_falls_back_to_default(self):
         tc = resolve_tenant({"x-tenant-id": ""})
@@ -84,9 +84,9 @@ class TestResolveByApiKey:
     """The authenticated key's tenant is authoritative (C1)."""
 
     def test_key_tenant_resolves(self):
-        tc = resolve_tenant({}, key_tenant_id="corp", key_tier="pro")
+        tc = resolve_tenant({}, key_tenant_id="corp", key_tier="enterprise")
         assert tc.tenant_id == "corp"
-        assert tc.pricing_tier == "pro"
+        assert tc.pricing_tier == "enterprise"
 
     def test_no_signal_falls_back_to_default(self):
         tc = resolve_tenant({})
@@ -112,29 +112,30 @@ class TestResolveByApiKey:
         assert tc.tenant_id == "other"
 
     def test_legacy_registry_fallback_still_works(self):
-        registry = {"hash-abc": TenantContext.for_tenant("corp", pricing_tier="pro")}
+        registry = {"hash-abc": TenantContext.for_tenant("corp", pricing_tier="enterprise")}
         tc = resolve_tenant({}, api_key_hash="hash-abc", tenant_registry=registry)
         assert tc.tenant_id == "corp"
-        assert tc.pricing_tier == "pro"
+        assert tc.pricing_tier == "enterprise"
 
 
 class TestTierNormalisation:
     """An unknown/blank tier must never flow through to billing — it normalises to
-    'basic' so a mis-issued key can't silently bill at an arbitrary card."""
+    'free' (the $0 self-host floor) so a mis-issued key can't silently bill at an
+    arbitrary card."""
 
-    def test_unknown_tier_falls_back_to_basic(self, caplog):
+    def test_unknown_tier_falls_back_to_free(self, caplog):
         import logging
         with caplog.at_level(logging.WARNING):
             tc = resolve_tenant({}, key_tenant_id="corp", key_tier="gold")
-        assert tc.pricing_tier == "basic"
+        assert tc.pricing_tier == "free"
         assert any("unknown pricing tier" in r.message for r in caplog.records)
 
     @pytest.mark.parametrize("bad", ["", None])
-    def test_blank_tier_falls_back_to_basic(self, bad):
+    def test_blank_tier_falls_back_to_free(self, bad):
         tc = resolve_tenant({}, key_tenant_id="corp", key_tier=bad)
-        assert tc.pricing_tier == "basic"
+        assert tc.pricing_tier == "free"
 
-    @pytest.mark.parametrize("raw,expected", [("PRO", "pro"), (" Pro ", "pro"), ("ENTERPRISE", "enterprise")])
+    @pytest.mark.parametrize("raw,expected", [("ENTERPRISE", "enterprise"), (" Enterprise ", "enterprise"), ("FREE", "free")])
     def test_case_and_whitespace_normalised(self, raw, expected):
         tc = resolve_tenant({}, key_tenant_id="corp", key_tier=raw)
         assert tc.pricing_tier == expected
@@ -146,4 +147,4 @@ class TestTierNormalisation:
     def test_admin_impersonation_with_junk_tier_normalises(self):
         tc = resolve_tenant({"x-tenant-id": "acme"}, key_is_admin=True, key_tier="platinum")
         assert tc.tenant_id == "acme"
-        assert tc.pricing_tier == "basic"
+        assert tc.pricing_tier == "free"

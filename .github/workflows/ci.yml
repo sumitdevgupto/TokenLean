@@ -59,9 +59,9 @@ jobs:
       fail-fast: false
       matrix:
         # Public CI only ever has the FREE (OSS) tree — the commercial files are
-        # gitignored, so the Pro/Enterprise legs run privately via
+        # gitignored, so the ENTERPRISE leg runs privately via
         # scripts/test-tiers.sh where those files exist. The matrix is kept as a
-        # list so a commercial CI can add `pro`/`enterprise` legs later.
+        # list so a commercial CI can add the `enterprise` leg later.
         tier: [free]
     steps:
       - name: Checkout

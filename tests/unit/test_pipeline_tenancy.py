@@ -56,13 +56,13 @@ class TestPipelineTenantInjection:
         assert ctx.tenant_id == "default"
         assert ctx.redis_prefix == ""
         assert ctx.qdrant_collection == "rag_docs"
-        assert ctx.pricing_tier == "basic"
+        assert ctx.pricing_tier == "free"
 
     def test_tenant_id_set_from_key(self):
         from tenancy.resolver import resolve_tenant
         ctx = _make_ctx()
         # C1: the authenticated key is authoritative for the tenant.
-        tenant = resolve_tenant({}, key_tenant_id="acme", key_tier="pro")
+        tenant = resolve_tenant({}, key_tenant_id="acme", key_tier="enterprise")
         ctx.tenant_id = tenant.tenant_id
         ctx.redis_prefix = tenant.redis_prefix
 
@@ -90,7 +90,7 @@ class TestPipelineTenantInjection:
             tenant_id="corp",
             redis_prefix="t:corp:",
             qdrant_collection="rag_corp",
-            pricing_tier="pro",
+            pricing_tier="enterprise",
             config_overrides={"groups": {"G1_compression": {"min_tokens": 50}}},
         )
 

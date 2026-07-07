@@ -164,14 +164,14 @@ class TestParamsDirMerge:
             # Write a tenancy param file
             tenancy_path = os.path.join(tmpdir, "tenancy.yaml")
             with open(tenancy_path, "w") as f:
-                yaml.dump({"tenancy": {"enabled": True, "default_tier": "pro"}}, f)
+                yaml.dump({"tenancy": {"enabled": True, "default_tier": "enterprise"}}, f)
 
             base = {"proxy": {"port": 4000}}
             merged = config_loader.merge_params_dir(base, tmpdir)
 
             assert merged["proxy"]["port"] == 4000
             assert merged["tenancy"]["enabled"] is True
-            assert merged["tenancy"]["default_tier"] == "pro"
+            assert merged["tenancy"]["default_tier"] == "enterprise"
 
     def test_params_dir_missing_logs_warning_no_crash(self):
         """Non-existent params_dir logs a warning and returns config unchanged."""
@@ -289,7 +289,7 @@ class TestTenancyConfigKeys:
             "  tenant_configs_table: tenant_configs\n"
             "  config_cache_ttl_seconds: 60\n"
             "  default_tenant_id: default\n"
-            "  default_tier: basic\n"
+            "  default_tier: free\n"
             "  redis_prefix_template: 't:{tenant_id}:'\n"
             "  qdrant_collection_template: 'rag_{tenant_id}'\n"
             + extra
@@ -322,7 +322,7 @@ class TestTenancyConfigKeys:
 
     def test_default_tier_key_present(self):
         merged = self._merge_tenancy()
-        assert merged["tenancy"]["default_tier"] == "basic"
+        assert merged["tenancy"]["default_tier"] == "free"
 
 
 class TestAuditAndPortalConfigKeys:

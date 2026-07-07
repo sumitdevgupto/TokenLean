@@ -663,7 +663,7 @@ async def chat_completions(request: Request):
     # params are stripped before the LLM call.
     if isinstance(tenant_metadata, dict):
         params["_auth_tenant_id"] = tenant_metadata.get("tenant_id")
-        params["_auth_tier"] = tenant_metadata.get("tier", "basic")
+        params["_auth_tier"] = tenant_metadata.get("tier", "free")
         params["_auth_admin"] = bool(tenant_metadata.get("admin", False))
 
     cfg = get_config()

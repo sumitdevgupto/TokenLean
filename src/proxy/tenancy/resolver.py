@@ -11,7 +11,7 @@ Resolution order:
   1. Admin impersonation   (admin key + X-Tenant-ID → that tenant)
   2. Key-authoritative      (key's own tenant_id/tier; header ignored if present)
   3. Legacy registry        (back-compat: api_key_hash → TenantContext, tests only)
-  4. Fallback               (tenant_id="default", no namespace, basic tier)
+  4. Fallback               (tenant_id="default", no namespace, free tier)
 
 The resolver is synchronous so it can be called from both async FastAPI request
 handlers and sync test helpers.
@@ -28,28 +28,28 @@ logger = logging.getLogger(__name__)
 # callers/tests that inject a registry keep working.
 _KEY_TO_TENANT: Dict[str, TenantContext] = {}
 
-_VALID_TIERS = {"basic", "pro", "enterprise"}
+_VALID_TIERS = {"free", "enterprise"}
 
 
 def _normalise_tier(tier: str) -> str:
-    """Return a valid pricing tier, defaulting unknown/blank values to ``basic``.
+    """Return a valid pricing tier, defaulting unknown/blank values to ``free``.
 
     The tier is bound to the API key at issuance (``issue-key.sh``) and arrives via
     the key's metadata. A typo or legacy value must not silently bill at an arbitrary
     tier, so normalise to the known set (case/whitespace-insensitive) and fall back to
-    ``basic`` with a warning that surfaces in logs.
+    ``free`` (the $0 self-host floor) with a warning that surfaces in logs.
     """
     t = (tier or "").strip().lower()
     if t in _VALID_TIERS:
         return t
-    logger.warning("resolve_tenant: unknown pricing tier %r — defaulting to 'basic'", tier)
-    return "basic"
+    logger.warning("resolve_tenant: unknown pricing tier %r — defaulting to 'free'", tier)
+    return "free"
 
 
 def resolve_tenant(
     headers: Dict[str, str],
     key_tenant_id: Optional[str] = None,
-    key_tier: str = "basic",
+    key_tier: str = "free",
     key_is_admin: bool = False,
     api_key_hash: Optional[str] = None,
     tenant_registry: Optional[Dict[str, TenantContext]] = None,

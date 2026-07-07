@@ -34,8 +34,9 @@ class TenantContext:
     """Immutable per-request tenant identity resolved before G0 runs."""
 
     tenant_id: str
-    # Pricing tier controls which G-groups are active (basic / pro / enterprise).
-    pricing_tier: str = "basic"
+    # Pricing tier — free (self-host / $0 floor) or enterprise (managed SaaS). Billing/
+    # console only; optimisations are never gated by tier.
+    pricing_tier: str = "free"
     # Redis key namespace: all cache / session writes are prefixed with this
     # string.  Empty string disables namespacing (single-tenant / test mode).
     redis_prefix: str = ""
@@ -46,7 +47,7 @@ class TenantContext:
     config_overrides: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def for_tenant(cls, tenant_id: str, pricing_tier: str = "basic") -> "TenantContext":
+    def for_tenant(cls, tenant_id: str, pricing_tier: str = "free") -> "TenantContext":
         """Build a TenantContext with standard namespacing for the given tenant."""
         safe_id = sanitise_tenant_id(tenant_id)
         return cls(

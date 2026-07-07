@@ -23,8 +23,8 @@ tenancy:
   default_tenant_id: default
 
   # Default pricing tier for tenants not explicitly registered.
-  # Allowed values: basic | pro | enterprise
-  default_tier: basic
+  # Allowed values: free | enterprise
+  default_tier: free
 
   # Redis key namespace template.  {tenant_id} is substituted at runtime.
   # Default "t:{tenant_id}:" prefixes all cache keys.  Set to "" to disable.

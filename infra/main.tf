@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
   tokens_saved      INT     NOT NULL DEFAULT 0,
   cost_saved_usd    NUMERIC(12,8) NOT NULL DEFAULT 0,
   groups_applied    TEXT[]  NOT NULL DEFAULT '{}',
-  pricing_tier      TEXT    NOT NULL DEFAULT 'basic'
+  pricing_tier      TEXT    NOT NULL DEFAULT 'free'
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_id
   ON usage_events (tenant_id);

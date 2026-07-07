@@ -66,7 +66,7 @@ if [ -z "$key" ] && [ ! -f config/local-keys.json ]; then
   # the X-Tenant-ID header (post key-authoritative tenancy). A legacy
   # {"hash":"admin"} string key would resolve to the "default" tenant and break
   # the benchmark's t:<tenant>: namespacing + clear-cache cleanup.
-  printf '{"%s": {"tenant_id": "bench", "tier": "pro", "admin": true}}\n' "$hash" > config/local-keys.json
+  printf '{"%s": {"tenant_id": "bench", "tier": "enterprise", "admin": true}}\n' "$hash" > config/local-keys.json
   info "wrote config/local-keys.json (proxy loads it on start)"
   REBUILD=1   # force a (re)start so the proxy picks up the new key
 fi

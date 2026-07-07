@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     tokens_saved    INTEGER     NOT NULL DEFAULT 0,
     cost_saved_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
     groups_applied  TEXT[]      NOT NULL DEFAULT '{}',
-    pricing_tier    TEXT        NOT NULL DEFAULT 'basic',
+    pricing_tier    TEXT        NOT NULL DEFAULT 'free',
     model           TEXT        NOT NULL DEFAULT '',
     routed_model    TEXT        NOT NULL DEFAULT '',
     otel_trace_id   TEXT        NOT NULL DEFAULT '',
@@ -71,6 +71,9 @@ CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
     ON usage_events (tenant_id, timestamp DESC);
 
 -- C2: idempotent migration for already-existing tables (non-destructive)
+-- FREE/ENTERPRISE tier collapse: default new rows to the $0 self-host floor. Existing
+-- legacy-tier rows (e.g. 'basic') are left as-is and invoice at $0 via the invoicing fallback.
+ALTER TABLE usage_events ALTER COLUMN pricing_tier SET DEFAULT 'free';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_optimised_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider_prompt_tokens INTEGER;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS response_tokens INTEGER NOT NULL DEFAULT 0;

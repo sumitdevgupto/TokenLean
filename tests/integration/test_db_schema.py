@@ -71,7 +71,7 @@ class TestUsageEventsTable:
                 tokens_saved     INT           NOT NULL DEFAULT 0,
                 cost_saved_usd   NUMERIC(12,8) NOT NULL DEFAULT 0,
                 groups_applied   TEXT[]        NOT NULL DEFAULT '{}',
-                pricing_tier     TEXT          NOT NULL DEFAULT 'basic',
+                pricing_tier     TEXT          NOT NULL DEFAULT 'free',
                 proxy_optimised_tokens INT     NOT NULL DEFAULT 0,
                 provider_prompt_tokens INT,
                 response_tokens  INT           NOT NULL DEFAULT 0,
@@ -111,7 +111,7 @@ class TestUsageEventsTable:
                  tokens_saved, cost_saved_usd, groups_applied, pricing_tier)
             VALUES
                 ('test-tenant', 'req-schema-test-001', 1000, 600,
-                 400, 0.002, '{G01,G05}', 'pro')
+                 400, 0.002, '{G01,G05}', 'enterprise')
             ON CONFLICT (request_id) DO NOTHING
         """)
         self.cur.execute(
@@ -128,7 +128,7 @@ class TestUsageEventsTable:
                  tokens_saved, cost_saved_usd, groups_applied, pricing_tier)
             VALUES
                 ('test-tenant', 'req-schema-test-002', 100, 50,
-                 50, 0.00000001, '{}', 'basic')
+                 50, 0.00000001, '{}', 'free')
             ON CONFLICT (request_id) DO NOTHING
         """)
         self.cur.execute(

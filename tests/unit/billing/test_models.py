@@ -19,7 +19,7 @@ class TestUsageEvent:
             tokens_saved=200,
             cost_saved_usd=0.004,
             groups_applied=["G01", "G05"],
-            pricing_tier="pro",
+            pricing_tier="enterprise",
             model="gpt-4o",
             routed_model="gpt-4o-mini",
         )
@@ -31,7 +31,7 @@ class TestUsageEvent:
         assert e.tenant_id == "acme"
         assert e.request_id == "req-001"
         assert e.tokens_saved == 200
-        assert e.pricing_tier == "pro"
+        assert e.pricing_tier == "enterprise"
 
     def test_to_dict_contains_all_fields(self):
         e = self._make_event()

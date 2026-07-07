@@ -53,7 +53,7 @@ def _no_billing(monkeypatch):
 
 
 async def _fake_auth(request):
-    return "acme", "tok-x", {"tenant_id": "acme", "tier": "pro"}
+    return "acme", "tok-x", {"tenant_id": "acme", "tier": "enterprise"}
 
 
 def test_cascade_response_skips_duplicate_main_llm_call(monkeypatch):

@@ -49,7 +49,7 @@ class TestStartTraceCalledAfterTenantInjection:
         ctx = _make_ctx()
         # C1: tenant comes from the authenticated key (main.py stashes _auth_*).
         ctx.params["_auth_tenant_id"] = "corp"
-        ctx.params["_auth_tier"] = "basic"
+        ctx.params["_auth_tier"] = "enterprise"
         observed_tenant_ids = []
 
         def _record_tenant(passed_ctx):

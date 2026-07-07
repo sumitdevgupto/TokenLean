@@ -61,7 +61,7 @@ class UsageMeter:
             tokens_saved=savings.total_absolute_saving,
             cost_saved_usd=cost_saved,
             groups_applied=groups,
-            pricing_tier=getattr(ctx, "pricing_tier", "basic"),
+            pricing_tier=getattr(ctx, "pricing_tier", "free"),
             model=ctx.model,
             routed_model=ctx.routed_model,
             otel_trace_id=trace_id,

@@ -1,9 +1,8 @@
 """Generate proxy API keys with tenant metadata for local development.
 
 Usage:
-    python scripts/generate_proxy_key.py --tenant nova-med --tier pro
-    python scripts/generate_proxy_key.py --tenant shop-bot --tier basic
-    python scripts/generate_proxy_key.py --tenant build-co --tier enterprise
+    python scripts/generate_proxy_key.py --tenant nova-med --tier enterprise
+    python scripts/generate_proxy_key.py --tenant shop-bot --tier free
 
 Outputs:
     - Appends to config/local-keys.json (format: {hash: {tenant_id, tier}})
@@ -18,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-def generate_key(tenant_id: str, tier: str = "basic", admin: bool = False) -> tuple[str, str, dict]:
+def generate_key(tenant_id: str, tier: str = "free", admin: bool = False) -> tuple[str, str, dict]:
     """Generate a new proxy key and its metadata.
 
     Returns:
@@ -51,9 +50,9 @@ def main():
     )
     parser.add_argument(
         "--tier",
-        default="basic",
-        choices=["basic", "pro", "enterprise"],
-        help="Pricing tier for this tenant (default: basic)"
+        default="free",
+        choices=["free", "enterprise"],
+        help="Pricing tier for this tenant (default: free)"
     )
     parser.add_argument(
         "--admin",

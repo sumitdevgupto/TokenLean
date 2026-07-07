@@ -128,7 +128,7 @@ provision_key() {  # generate an ephemeral proxy key, reload proxy, set $PROXY_K
   local tmp=".livecheck_key.$$.tmp"     # relative → Windows-python can open it
   note "auto-provisioning a proxy key for tenant '${GEN_TENANT}' (--no-auto-key to disable)…"
   if ! "$PY" pitch-test-plan/scripts/common/generate_proxy_key.py \
-        --tenant "$GEN_TENANT" --tier pro \
+        --tenant "$GEN_TENANT" --tier enterprise \
         --output config/local-keys.json --env-file "$tmp" >/dev/null 2>&1; then
     bad "key generation failed (pitch-test-plan/scripts/common/generate_proxy_key.py)"; rm -f "$tmp"; return 1
   fi
@@ -177,7 +177,7 @@ elif [[ $fail -eq 0 ]] && (( AUTO_KEY )); then
   provision_key || fail=1
 else
   bad "no proxy Bearer key (tok-…). Set PROXY_KEY=tok-…, drop --no-auto-key to auto-generate, or:"
-  echo "      python pitch-test-plan/scripts/common/generate_proxy_key.py --tenant nova-med --tier pro --env-file .env"
+  echo "      python pitch-test-plan/scripts/common/generate_proxy_key.py --tenant nova-med --tier enterprise --env-file .env"
   echo "      ${DIM}(send the plaintext tok-… value, NOT the sha256 hash from local-keys.json)${NC}"
   fail=1
 fi

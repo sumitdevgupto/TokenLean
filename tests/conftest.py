@@ -320,7 +320,7 @@ _VALID_KEYS_JSON = _json.dumps({
     hashlib.sha256(_TEST_KEY.encode()).hexdigest(): "test-user",
     # New-format admin key: is_admin_key() requires a dict with admin=True, so the
     # /admin/* endpoints (guarded by _require_admin → 403) accept this key.
-    hashlib.sha256(_ADMIN_KEY.encode()).hexdigest(): {"tenant_id": "admin-user", "tier": "pro", "admin": True},
+    hashlib.sha256(_ADMIN_KEY.encode()).hexdigest(): {"tenant_id": "admin-user", "tier": "enterprise", "admin": True},
     hashlib.sha256(_INTEGRATION_KEY.encode()).hexdigest(): "integration-user",
 })
 
@@ -359,7 +359,7 @@ def _setup_auth_keys():
     return {
         hashlib.sha256("test-key".encode()).hexdigest(): "test-user",
         # admin scope required by is_admin_key() for the /admin/* endpoints
-        hashlib.sha256("admin-key".encode()).hexdigest(): {"tenant_id": "admin-user", "tier": "pro", "admin": True},
+        hashlib.sha256("admin-key".encode()).hexdigest(): {"tenant_id": "admin-user", "tier": "enterprise", "admin": True},
         hashlib.sha256("test-proxy-key-integration".encode()).hexdigest(): "integration-user",
     }
 
