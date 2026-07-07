@@ -140,15 +140,21 @@ class OptimisationPipeline:
                 "[%s] IMPERSONATION: admin key (tenant=%s) acting as tenant=%s",
                 ctx.request_id, ctx.impersonator_tenant_id, ctx.tenant_id,
             )
-        # Merge per-tenant config overrides (shallow merge at groups level)
+        # Merge per-tenant config overrides (DEEP merge so a single knob override does not
+        # wipe its sibling knobs within a group, e.g. setting G1 compression_ratio_target
+        # must not drop G1's sidecar_url).
         if tenant.config_overrides:
             import copy
+
+            def _dm(base, ov):
+                for k, v in ov.items():
+                    if isinstance(v, dict) and isinstance(base.get(k), dict):
+                        _dm(base[k], v)
+                    else:
+                        base[k] = v
+
             merged = copy.deepcopy(ctx.config)
-            for k, v in tenant.config_overrides.items():
-                if isinstance(v, dict) and isinstance(merged.get(k), dict):
-                    merged[k].update(v)
-                else:
-                    merged[k] = v
+            _dm(merged, tenant.config_overrides)
             ctx.config = merged
 
         # Load per-tenant config overrides from Postgres (E3)

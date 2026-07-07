@@ -48,12 +48,15 @@ class TenantConfigLoader:
         if not overrides:
             return
 
+        def _dm(base, ov):
+            for k, v in ov.items():
+                if isinstance(v, dict) and isinstance(base.get(k), dict):
+                    _dm(base[k], v)
+                else:
+                    base[k] = v
+
         merged = copy.deepcopy(ctx.config)
-        for k, v in overrides.items():
-            if isinstance(v, dict) and isinstance(merged.get(k), dict):
-                merged[k].update(v)
-            else:
-                merged[k] = v
+        _dm(merged, overrides)
         ctx.config = merged
         logger.debug(
             "TenantConfigLoader: applied %d override key(s) for tenant %s",
