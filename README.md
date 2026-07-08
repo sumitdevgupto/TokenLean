@@ -17,7 +17,9 @@
 
 🎯 **54.1% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
 
-> **Savings by workload** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 46.0%** · **prose 38.1%** · **reasoning −2.7%**. Input-token savings only — separate from output cost and from request-count billing.
+> **Savings by workload** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 46.0%** · **prose 38.1%** · **reasoning −2.7%**. Input-token savings only — separate from output cost and from request-count billing. The headline carries run-to-run variance (borderline datasets flip PASS/FAIL under model nondeterminism even at temperature-0: **~51–56% observed** across gated runs; ungated ceiling ~52%).
+
+> 💵 **Cost savings** run **~70%** on the same gated workloads (config-priced estimate — **directional, not invoice-grade**, and run-variable). Reported separately from the token metric on purpose: routing swaps models (a cost lever) without always cutting input tokens, and dollar figures come from a static price table, not real invoices.
 
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK
