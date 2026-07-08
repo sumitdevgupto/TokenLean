@@ -613,11 +613,17 @@ async def _summarise(turns: List[Dict], summary_model: str, ctx: RequestContext)
         return ""
     try:
         import litellm
-        from auth.api_key_manager import get_llm_provider_key
-
         from providers import get_adapter, get_provider_entry
+        from providers.key_resolver import resolve_provider_key, ProviderKeyError
         summary_adapter = get_adapter(summary_model, ctx.config.get("providers", []))
-        provider_key = get_llm_provider_key(summary_adapter.name)
+        # BYOK: resolve the summary model's key for THIS tenant (strict denial or no key →
+        # skip summarisation gracefully, exactly like the prior missing-key path).
+        try:
+            provider_key = await resolve_provider_key(
+                summary_adapter.name, getattr(ctx, "tenant_id", "default"), ctx
+            )
+        except ProviderKeyError:
+            return "[summary unavailable]"
         if not provider_key and summary_adapter.requires_api_key():
             logger.warning(
                 "G10 summarisation: provider key unavailable for %s", summary_adapter.name

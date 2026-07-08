@@ -106,7 +106,11 @@ class TestG18Observability:
         mock_lf.trace.assert_called_once()
         mock_trace.generation.assert_called_once()
         mock_trace.score.assert_any_call(name="savings_pct", value=mock_trace.score.call_args_list[0][1]["value"])
-        mock_lf.flush.assert_called_once()
+        # finish_trace deliberately does NOT flush synchronously — a per-request
+        # client.flush() would block the response on a Langfuse round-trip. The
+        # persistent client's background consumer flushes on an interval + at exit,
+        # so delivery is unchanged; only the timing moves off the critical path.
+        mock_lf.flush.assert_not_called()
 
     async def test_effective_token_et_in_metadata(self, make_ctx):
         ctx = make_ctx()

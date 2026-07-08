@@ -7,7 +7,7 @@ from middleware import RequestContext
 from middleware.g00_rate_limit import G00RateLimit, RateLimitExceeded
 from providers import get_adapter
 from tenancy.resolver import resolve_tenant
-from tenancy.config import TenantConfigLoader
+from tenancy.config import TenantConfigLoader, deep_merge
 from tracing import otel
 from middleware.g01_compression import G01Compression
 from middleware.g02_template_registry import G02TemplateRegistry
@@ -82,6 +82,15 @@ class OptimisationPipeline:
         self.g27 = G27MultimodalOptimizer()
         self.g28 = G28CCR()
 
+    def set_db_pool(self, pool) -> None:
+        """Inject the asyncpg pool into the tenant-config loader after startup.
+
+        D1 fix: this module-level pipeline is constructed with db_pool=None, so without
+        this call TenantConfigLoader.load() no-ops and per-tenant config_overrides
+        (model prefs, G-group knobs) are persisted but NEVER applied at runtime.
+        """
+        self._tenant_config_loader.set_db_pool(pool)
+
     async def _run_timed(self, name: str, ctx: RequestContext, coro: Awaitable[Any]) -> Any:
         """Await `coro` inside an OTel span while measuring wall-clock time.
 
@@ -140,25 +149,26 @@ class OptimisationPipeline:
                 "[%s] IMPERSONATION: admin key (tenant=%s) acting as tenant=%s",
                 ctx.request_id, ctx.impersonator_tenant_id, ctx.tenant_id,
             )
-        # Merge per-tenant config overrides (DEEP merge so a single knob override does not
-        # wipe its sibling knobs within a group, e.g. setting G1 compression_ratio_target
-        # must not drop G1's sidecar_url).
+        # Deprecated Mechanism C: TenantContext.config_overrides is never populated by
+        # resolve_tenant in production (always empty). Kept as a harmless no-op merge for
+        # back-compat; the live per-tenant path is TenantConfigLoader (Postgres) below.
         if tenant.config_overrides:
             import copy
+            ctx.config = deep_merge(copy.deepcopy(ctx.config), tenant.config_overrides)
 
-            def _dm(base, ov):
-                for k, v in ov.items():
-                    if isinstance(v, dict) and isinstance(base.get(k), dict):
-                        _dm(base[k], v)
-                    else:
-                        base[k] = v
-
-            merged = copy.deepcopy(ctx.config)
-            _dm(merged, tenant.config_overrides)
-            ctx.config = merged
-
-        # Load per-tenant config overrides from Postgres (E3)
+        # Load per-tenant config overrides from Postgres (E3) — the LIVE mechanism (D1).
         await self._tenant_config_loader.load(ctx)
+
+        # Per-tenant default model: when the request omitted `model`, honour the tenant's
+        # proxy.default_model / fallback_request_model from the now-merged ctx.config. This
+        # must run BEFORE the adapter + G06 so routing/caching/savings all see the tenant
+        # model (main.py's global fallback was only a placeholder).
+        if ctx.params.get("_model_defaulted"):
+            _pcfg = ctx.config.get("proxy", {}) or {}
+            _m = _pcfg.get("fallback_request_model") or _pcfg.get("default_model")
+            if _m and _m != ctx.model:
+                ctx.model = _m
+                ctx.routed_model = _m
 
         # ── Provider adapter (resolves once per request based on routed model) ─
         ctx.provider_adapter = get_adapter(

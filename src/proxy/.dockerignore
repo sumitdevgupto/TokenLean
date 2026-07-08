@@ -6,6 +6,7 @@
 api/portal.py
 api/portal_auth.py
 api/email_sender.py
+api/tenant_keys.py
 api/gdpr.py
 commercial_app.py
 billing/tiers.py

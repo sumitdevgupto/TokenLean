@@ -14,6 +14,22 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge ``override`` into ``base`` IN PLACE and return ``base``.
+
+    Nested dicts merge key-by-key so overriding one knob never wipes its sibling
+    knobs (e.g. a tenant's ``G1_compression.compression_ratio_target`` must not
+    drop the group's ``sidecar_url``). The single shared implementation — pipeline,
+    portal, and per-group tenant overlays all use this instead of private copies.
+    """
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 class TenantConfigLoader:
     """Load per-tenant config overrides from Postgres `tenant_configs` table.
 
@@ -29,6 +45,24 @@ class TenantConfigLoader:
         self._db_pool = db_pool
         self._cache_ttl = cache_ttl
         self._cache: Dict[str, tuple] = {}  # tenant_id → (overrides, expires_at)
+
+    def set_db_pool(self, db_pool) -> None:
+        """Inject the asyncpg pool after construction (main.py builds it at startup).
+
+        Fixes D1: the module-level pipeline is created with db_pool=None, so without
+        this the loader silently no-ops and per-tenant overrides are never applied.
+        """
+        self._db_pool = db_pool
+
+    def invalidate(self, tenant_id: Optional[str] = None) -> None:
+        """Drop cached overrides so the next load re-reads Postgres (None = clear all).
+
+        Same-process fast path after a portal write; cross-process still uses the TTL.
+        """
+        if tenant_id is None:
+            self._cache.clear()
+        else:
+            self._cache.pop(tenant_id, None)
 
     async def load(self, ctx) -> None:
         """Merge per-tenant config overrides into ctx.config.
@@ -48,15 +82,7 @@ class TenantConfigLoader:
         if not overrides:
             return
 
-        def _dm(base, ov):
-            for k, v in ov.items():
-                if isinstance(v, dict) and isinstance(base.get(k), dict):
-                    _dm(base[k], v)
-                else:
-                    base[k] = v
-
-        merged = copy.deepcopy(ctx.config)
-        _dm(merged, overrides)
+        merged = deep_merge(copy.deepcopy(ctx.config), overrides)
         ctx.config = merged
         logger.debug(
             "TenantConfigLoader: applied %d override key(s) for tenant %s",

@@ -78,6 +78,10 @@ class UsageMeter:
             complexity_tier=(ctx.params.get("x_complexity_tier")
                              or ctx.params.get("complexity_tier") or ""),
             bypassed=bool(getattr(ctx, "bypassed", False)),
+            # Token & cost transparency (observability only; never billed).
+            cost_actual_usd=float(getattr(savings, "cost_actual_usd", 0.0) or 0.0),
+            cost_baseline_usd=float(getattr(savings, "cost_baseline_usd", 0.0) or 0.0),
+            provider=(getattr(getattr(ctx, "provider_adapter", None), "name", "") or ""),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -89,9 +93,10 @@ class UsageMeter:
                  tokens_saved, cost_saved_usd, groups_applied, pricing_tier,
                  model, routed_model, otel_trace_id,
                  proxy_optimised_tokens, provider_prompt_tokens, response_tokens,
-                 user_id, cache_hit, cache_level, complexity_tier, bypassed)
+                 user_id, cache_hit, cache_level, complexity_tier, bypassed,
+                 cost_actual_usd, cost_baseline_usd, provider)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                    $16,$17,$18,$19,$20)
+                    $16,$17,$18,$19,$20,$21,$22,$23)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -107,6 +112,7 @@ class UsageMeter:
                     event.response_tokens,
                     event.user_id, event.cache_hit, event.cache_level,
                     event.complexity_tier, event.bypassed,
+                    event.cost_actual_usd, event.cost_baseline_usd, event.provider,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

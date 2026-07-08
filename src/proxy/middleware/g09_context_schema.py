@@ -55,18 +55,25 @@ class G09ContextSchema:
         provider_key = None
         if use_instructor and schema_fields:
             try:
-                from auth.api_key_manager import get_llm_provider_key
                 from config_loader import get_provider_model_prefixes
-                
+                from providers.key_resolver import resolve_provider_key, ProviderKeyError
+
                 provider_map = get_provider_model_prefixes()
                 provider = None
                 for fragment, prov in provider_map.items():
                     if fragment in instructor_model.lower():
                         provider = prov
                         break
-                
+
                 if provider:
-                    provider_key = get_llm_provider_key(provider)
+                    # BYOK: instructor uses the TENANT's key; strict denial or no key → skip
+                    # instructor and fall back to the heuristic compactor (existing behaviour).
+                    try:
+                        provider_key = await resolve_provider_key(
+                            provider, getattr(ctx, "tenant_id", "default"), ctx
+                        )
+                    except ProviderKeyError:
+                        provider_key = None
             except Exception as exc:
                 logger.warning("G09 failed to get provider key for instructor: %s", exc)
 

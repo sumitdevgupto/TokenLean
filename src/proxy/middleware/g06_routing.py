@@ -84,9 +84,15 @@ def _tier_provider(model: str) -> Optional[str]:
 
 
 def _tier_reachable(model: str) -> bool:
-    """True if ``model``'s provider has a usable credential — an API key, OR ambient
+    """True if ``model``'s provider has a usable PLATFORM credential — an API key, OR ambient
     credentials (Bedrock SigV4 / Vertex ADC, whose adapter ``requires_api_key()`` is False).
-    Used to avoid routing to a tier whose provider isn't configured (→ a downstream 503)."""
+    Used to avoid routing to a tier whose provider isn't configured (→ a downstream 503).
+
+    BYOK note: this is a best-effort, PLATFORM-level routing pre-filter (kept sync). The real
+    per-tenant key enforcement happens at the actual tier/main call via ``_resolve_provider_key``
+    / the BYOK seam; a keyless strict tenant degrades there (or the main path 402s). A tenant
+    with only their own key may thus be routed through a platform-reachable tier and fail at the
+    call — acceptable v1 (strict BYOK still never spends the platform key at the answer path)."""
     if not model:
         return False
     try:
@@ -104,16 +110,24 @@ def _tier_reachable(model: str) -> bool:
         return False
 
 
-async def _resolve_provider_key(model: str) -> Optional[str]:
-    """Resolve the LLM provider API key for a given model name (startswith resolution,
-    consistent with ``_tier_provider`` / ``providers.get_provider_entry``)."""
+async def _resolve_provider_key(model: str, tenant_id: str = "default") -> Optional[str]:
+    """Resolve the LLM key for ``model`` via the BYOK seam — the TENANT's key when
+    configured, else the platform key (OSS / exempt / enforce-off). A strict-BYOK denial
+    (``ProviderKeyError``) returns ``None`` so the cascade degrades; the main chat path then
+    surfaces the actionable 402. Startswith resolution, consistent with ``_tier_provider``."""
     try:
-        from auth.api_key_manager import get_llm_provider_key
+        from providers.key_resolver import resolve_provider_key, ProviderKeyError
         provider = _tier_provider(model)
         if not provider:
             logger.warning("G06: cannot resolve provider for %s", model)
             return None
-        key = get_llm_provider_key(provider)
+        try:
+            key = await resolve_provider_key(provider, tenant_id, None)
+        except ProviderKeyError:
+            logger.info(
+                "G06: BYOK denial for provider %s (tenant %s) — degrading tier", provider, tenant_id
+            )
+            return None
         if not key:
             logger.warning("G06: no API key for provider %s (model %s)", provider, model)
             return None
@@ -257,7 +271,7 @@ async def _classify_llm_judge(
     ]
 
     try:
-        _judge_key = await _resolve_provider_key(judge_model)
+        _judge_key = await _resolve_provider_key(judge_model, params.get("_auth_tenant_id") or "default")
         _judge_model, _judge_kwargs = build_litellm_call(judge_model, get_providers(), _judge_key)
         response = await asyncio.wait_for(
             litellm.acompletion(
@@ -358,7 +372,7 @@ async def _execute_three_tier_cascade(
     tier1_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier1_model)
 
     try:
-        provider_key = await _resolve_provider_key(tier1_model)
+        provider_key = await _resolve_provider_key(tier1_model, ctx.tenant_id)
         if not provider_key:
             return None, {"error": "provider_resolution_failed"}
 
@@ -387,7 +401,7 @@ async def _execute_three_tier_cascade(
         # escalated every "medium" query all the way to the complex tier.)
         if judge_model:
             confidence = await _timed_llm(ctx, _evaluate_response_confidence(
-                ctx.messages, tier1_response, judge_model
+                ctx.messages, tier1_response, judge_model, ctx.tenant_id
             ))
         else:
             confidence = _heuristic_response_confidence(tier1_response, cfg)
@@ -423,7 +437,7 @@ async def _execute_three_tier_cascade(
                 return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
             try:
-                tier2_provider_key = await _resolve_provider_key(tier2_model) or provider_key
+                tier2_provider_key = await _resolve_provider_key(tier2_model, ctx.tenant_id)
                 _t2_model, _t2_kwargs = build_litellm_call(tier2_model, get_providers(), tier2_provider_key)
                 tier2_response = await _timed_llm(ctx, litellm.acompletion(
                     model=_t2_model,
@@ -438,7 +452,7 @@ async def _execute_three_tier_cascade(
                 best_cost = tier2_cost
                 # Re-evaluate confidence after tier2; if still low, try tier3
                 if judge_model:
-                    confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model))
+                    confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model, ctx.tenant_id))
                 else:
                     confidence2 = _heuristic_response_confidence(tier2_response, cfg)
                 if confidence2 >= confidence_threshold:
@@ -463,7 +477,7 @@ async def _execute_three_tier_cascade(
                 return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
 
             try:
-                tier3_provider_key = await _resolve_provider_key(tier3_model) or provider_key
+                tier3_provider_key = await _resolve_provider_key(tier3_model, ctx.tenant_id)
                 _t3_model, _t3_kwargs = build_litellm_call(tier3_model, get_providers(), tier3_provider_key)
                 tier3_response = await _timed_llm(ctx, litellm.acompletion(
                     model=_t3_model,
@@ -561,7 +575,7 @@ def _heuristic_response_confidence(response: Any, cfg: Dict[str, Any]) -> float:
 
 
 async def _evaluate_response_confidence(
-    messages: List[Dict], response: Any, judge_model: str
+    messages: List[Dict], response: Any, judge_model: str, tenant_id: str = "default"
 ) -> float:
     """
     Use a judge model to evaluate confidence in the tier1 response.
@@ -581,7 +595,7 @@ async def _evaluate_response_confidence(
             f"Response to evaluate:\n{response_text[:500]}"
         )
 
-        _judge_key = await _resolve_provider_key(judge_model)
+        _judge_key = await _resolve_provider_key(judge_model, tenant_id)
         _judge_model, _judge_kwargs = build_litellm_call(judge_model, get_providers(), _judge_key)
         judge_response = await asyncio.wait_for(
             litellm.acompletion(

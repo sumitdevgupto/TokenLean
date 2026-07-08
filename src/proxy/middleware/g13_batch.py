@@ -330,7 +330,8 @@ async def _accumulate(ctx: RequestContext, topic: str) -> None:
     stream = f"{_BATCH_STREAM_PREFIX}:{topic}"
     payload = json.dumps({
         "request_id": ctx.request_id,
-        "messages": ctx.messages,
+        "tenant_id": getattr(ctx, "tenant_id", "default"),  # BYOK: stamp so the background
+        "messages": ctx.messages,                            # flush resolves the tenant's key
         "params": ctx.params,
         "model": ctx.model,
         "timestamp": time.time(),
@@ -548,6 +549,12 @@ async def _flush_batch_native(
 
     Records each job for the background poller. Any provider without native batch
     support, a missing key, or a submit error falls back to the per-item loop.
+
+    BYOK v1 LIMITATION: the native lane submits with the PLATFORM key (get_llm_provider_key),
+    because a provider-native batch aggregates many requests into one job. Do NOT enable
+    ``provider_native`` together with strict BYOK — tenant batches would bill the platform
+    account. The default per-item flush lane (``_flush_batch_loop``) IS tenant-key aware.
+    Per-(provider, tenant) native grouping is a documented v2 follow-up.
     """
     from providers import get_adapter
     from auth.api_key_manager import get_llm_provider_key
@@ -619,11 +626,24 @@ async def _flush_batch_loop(
                 from config_loader import get_default_provider
                 provider = get_default_provider()
 
-            provider_key = get_llm_provider_key(provider)
+            # BYOK: resolve the batched request's key for ITS tenant (stamped at accumulate).
+            tenant_id = item.get("tenant_id", "default")
+            try:
+                from providers.key_resolver import resolve_provider_key, ProviderKeyError
+                provider_key = await resolve_provider_key(provider, tenant_id, None)
+            except ProviderKeyError as _pke:
+                await _store_batch_result(
+                    request_id, {"status": "failed", "error": _pke.public_message}
+                )
+                continue
             if not provider_key:
                 logger.warning(
                     "G13 batch item %s: provider key unavailable for %s",
                     request_id, provider,
+                )
+                await _store_batch_result(
+                    request_id,
+                    {"status": "failed", "error": f"provider key unavailable for {provider}"},
                 )
                 continue
 

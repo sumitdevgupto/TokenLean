@@ -34,6 +34,12 @@ class UsageEvent:
     cache_level: str = ""
     complexity_tier: str = ""
     bypassed: bool = False
+    # Token & cost transparency (observability — NEVER billed; billing = request count).
+    # cost_actual_usd = what this call cost at config prices; cost_baseline_usd = the
+    # unoptimised would-have-cost; provider = resolved provider name (openai/anthropic/…).
+    cost_actual_usd: float = 0.0
+    cost_baseline_usd: float = 0.0
+    provider: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -64,11 +70,17 @@ CREATE TABLE IF NOT EXISTS usage_events (
     cache_hit       BOOLEAN     NOT NULL DEFAULT false,
     cache_level     TEXT        NOT NULL DEFAULT '',
     complexity_tier TEXT        NOT NULL DEFAULT '',
-    bypassed        BOOLEAN     NOT NULL DEFAULT false
+    bypassed        BOOLEAN     NOT NULL DEFAULT false,
+    cost_actual_usd   NUMERIC(12,6) NOT NULL DEFAULT 0,
+    cost_baseline_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+    provider        TEXT        NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
     ON usage_events (tenant_id, timestamp DESC);
+-- Per-user token/cost rollups (item 18 + token transparency) stay fast at scale.
+CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx
+    ON usage_events (tenant_id, user_id);
 
 -- C2: idempotent migration for already-existing tables (non-destructive)
 -- FREE/ENTERPRISE tier collapse: default new rows to the $0 self-host floor. Existing
@@ -83,4 +95,9 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEF
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_level TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS complexity_tier TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS bypassed BOOLEAN NOT NULL DEFAULT false;
+-- Token & cost transparency (observability; never billed)
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_actual_usd NUMERIC(12,6) NOT NULL DEFAULT 0;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_baseline_usd NUMERIC(12,6) NOT NULL DEFAULT 0;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_id, user_id);
 """

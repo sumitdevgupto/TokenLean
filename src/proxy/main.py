@@ -33,6 +33,7 @@ litellm.drop_params = True
 from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
+from providers.key_resolver import resolve_provider_key, ProviderKeyError
 from middleware.g18_observability import (
     REQUEST_DURATION_MS,
     HTTP_REQUESTS,
@@ -103,7 +104,10 @@ async def startup_event():
         async with pg.acquire() as conn:
             await conn.execute(USAGE_EVENTS_DDL)
         _usage_meter = UsageMeter(db_pool=pg)
-        logger.info("Billing: usage_events table ready")
+        # D1 fix: inject the pool into the pipeline so per-tenant config_overrides
+        # (model prefs + G-group knobs from the portal) are actually applied at runtime.
+        _pipeline.set_db_pool(pg)
+        logger.info("Billing: usage_events table ready; tenant-config loader wired")
     except Exception as exc:
         logger.warning("Billing: could not initialise usage_events: %s", exc)
     if not _METRICS_SCRAPE_TOKEN:
@@ -635,8 +639,14 @@ async def chat_completions(request: Request):
     body = await request.json()
 
     messages = body.get("messages", [])
-    model = body.get("model") or get_fallback_request_model()
+    _body_model = body.get("model")
+    model = _body_model or get_fallback_request_model()
     params = {k: v for k, v in body.items() if k not in ("messages", "model")}
+    # When the client omits `model`, flag it so the pipeline can re-resolve the default
+    # from the TENANT's proxy.default_model after the per-tenant config merge (the global
+    # get_fallback_request_model() above is only a placeholder). `_`-prefix → stripped
+    # from outbound params.
+    params["_model_defaulted"] = not bool(_body_model)
 
     # Map X-* proxy headers into ctx.params as x_ keys so middleware can read them
     # e.g. X-Template-ID → x_template_id, X-Rag-Collection → x_rag_collection
@@ -739,10 +749,28 @@ async def chat_completions(request: Request):
         ctx, response_dict = await _pipeline.process_response(ctx, ctx.cascade_response)
         return _served_response(ctx, response_dict, _request_start)
 
-    # Resolve provider key for the routed model
-    provider = _resolve_provider(ctx.routed_model, cfg)
-    provider_key = get_llm_provider_key(provider)
-    routed_adapter = get_adapter(ctx.routed_model, cfg.get("providers", []))
+    # Split-brain fix: resolve provider/adapter/entry from the TENANT-merged ctx.config
+    # (the pipeline made it per-tenant), not the global cfg snapshot.
+    eff_cfg = ctx.config or cfg
+
+    # Resolve the provider key via the BYOK seam (tenant key when configured; strict
+    # tenants without one raise ProviderKeyError → 402). Core default = global platform key.
+    provider = _resolve_provider(ctx.routed_model, eff_cfg)
+    try:
+        provider_key = await resolve_provider_key(provider, ctx.tenant_id, ctx)
+    except ProviderKeyError as exc:
+        langfuse_tracing.finish_trace(ctx, None)
+        _record_outcome(ctx, _request_start, "402")
+        return JSONResponse(
+            status_code=402,
+            content={"error": {
+                "message": exc.public_message,
+                "type": "invalid_request_error",
+                "code": "provider_key_missing",
+                "param": "model",
+            }},
+        )
+    routed_adapter = get_adapter(ctx.routed_model, eff_cfg.get("providers", []))
     # Providers using ambient / multi-field credentials (AWS SigV4 for Bedrock, Vertex ADC)
     # need no single bearer key — skip the guard for them (requires_api_key() == False).
     if not provider_key and routed_adapter.requires_api_key():
@@ -794,7 +822,7 @@ async def chat_completions(request: Request):
     # Provider-native context editing (per-tenant opt-in; no-op for non-Anthropic
     # adapters, so this is safe to call unconditionally — Standard-3 compliant).
     outgoing_params = apply_context_management(
-        outgoing_params, routed_adapter, cfg, ctx.tenant_id
+        outgoing_params, routed_adapter, eff_cfg, ctx.tenant_id
     )
 
     # Resolve provider routing (model string + api_base / api_version / custom_llm_provider)
@@ -802,7 +830,7 @@ async def chat_completions(request: Request):
     # reachable — litellm's model-name heuristics alone can't reach them.
     _call_model, _call_kwargs = routed_adapter.build_call(
         ctx.routed_model,
-        get_provider_entry(ctx.routed_model, cfg.get("providers", [])) or {},
+        get_provider_entry(ctx.routed_model, eff_cfg.get("providers", [])) or {},
         provider_key,
     )
 
