@@ -1,8 +1,8 @@
 """Generate proxy API keys with tenant metadata for local development.
 
 Usage:
-    python scripts/generate_proxy_key.py --tenant nova-med --tier enterprise
-    python scripts/generate_proxy_key.py --tenant shop-bot --tier free
+    python scripts/generate_proxy_key.py --tenant NOVA-STG-01 --tier enterprise
+    python scripts/generate_proxy_key.py --tenant SHOP-STG-01 --tier free
 
 Outputs:
     - Appends to config/local-keys.json (format: {hash: {tenant_id, tier}})
@@ -46,7 +46,7 @@ def main():
     parser.add_argument(
         "--tenant",
         required=True,
-        help="Tenant ID (e.g., nova-med, shop-bot, build-co)"
+        help="Tenant ID (e.g., NOVA-STG-01, SHOP-STG-01, BUIL-STG-01)"
     )
     parser.add_argument(
         "--tier",

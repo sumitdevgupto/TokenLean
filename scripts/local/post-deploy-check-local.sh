@@ -140,7 +140,7 @@ info "Test 4: Checking Qdrant tenant collections..."
 if [[ "$BACKEND" != "qdrant" ]]; then
   warn "G07 backend is '${BACKEND}' — Qdrant tenant collections are not part of this deploy; skipping."
 else
-  TENANTS=("nova-med" "shop-bot" "build-co")
+  TENANTS=("NOVA-STG-01" "SHOP-STG-01" "BUIL-STG-01")
   MISSING_COLLECTIONS=0
   for tenant in "${TENANTS[@]}"; do
     # Collection name = rag_<tenant_id> with hyphens preserved (see seed_qdrant_tenants.py).
@@ -191,7 +191,7 @@ if [[ $ERRORS -eq 0 ]]; then
   echo -e "${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo "Next step:"
-  echo "  python pitch-test-plan/src/run_roi_pitch.py --live --dataset DS1 --tenant-id nova-med --sample-size 3"
+  echo "  python pitch-test-plan/src/run_roi_pitch.py --live --dataset DS1 --tenant-id NOVA-STG-01 --sample-size 3"
   exit 0
 else
   echo -e "${RED}║  VALIDATION FAILED — $ERRORS error(s) found                      ║${NC}"

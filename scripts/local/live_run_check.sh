@@ -177,7 +177,7 @@ elif [[ $fail -eq 0 ]] && (( AUTO_KEY )); then
   provision_key || fail=1
 else
   bad "no proxy Bearer key (tok-…). Set PROXY_KEY=tok-…, drop --no-auto-key to auto-generate, or:"
-  echo "      python pitch-test-plan/scripts/common/generate_proxy_key.py --tenant nova-med --tier enterprise --env-file .env"
+  echo "      python pitch-test-plan/scripts/common/generate_proxy_key.py --tenant NOVA-STG-01 --tier enterprise --env-file .env"
   echo "      ${DIM}(send the plaintext tok-… value, NOT the sha256 hash from local-keys.json)${NC}"
   fail=1
 fi

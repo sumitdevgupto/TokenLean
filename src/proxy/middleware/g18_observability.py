@@ -361,8 +361,12 @@ class G18Observability:
         try:
             redis = _get_redis()
             now = time.time()
+            # WS21: tenant-prefixed zset — one tenant's tool names/recency must not be
+            # visible in (or pollute pruning decisions from) another tenant's data.
+            # The admin tool-governance endpoint unions the per-tenant zsets.
+            zkey = f"{getattr(ctx, 'redis_prefix', '')}tok_opt:tool_calls"
             for name in tool_names:
-                await redis.zadd("tok_opt:tool_calls", {name: now})
+                await redis.zadd(zkey, {name: now})
         except Exception as exc:
             logger.warning("G18 tool governance recording failed: %s", exc)
 

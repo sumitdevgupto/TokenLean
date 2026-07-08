@@ -11,6 +11,43 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+# Mirrors the Terraform heredoc (infra/main.tf audit_events_schema_migration) so local /
+# self-host deployments get the table without Terraform; the ALTER back-fills `details`
+# on GCP databases created at schema_version=1. All statements are idempotent.
+AUDIT_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS audit_events (
+  id             BIGSERIAL    PRIMARY KEY,
+  tenant_id      TEXT         NOT NULL,
+  request_id     TEXT         NOT NULL,
+  timestamp      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  action         TEXT         NOT NULL DEFAULT 'proxy_request',
+  user_id        TEXT,
+  groups_applied TEXT[]       NOT NULL DEFAULT '{}',
+  tokens_saved   INT          NOT NULL DEFAULT 0,
+  otel_trace_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_id
+  ON audit_events (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp
+  ON audit_events (timestamp DESC);
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS details JSONB;
+"""
+
+
+async def ensure_audit_schema(pg_pool) -> None:
+    """Create ``audit_events`` (+ the ``details`` column) if absent. Idempotent.
+
+    Failures are logged, never raised — audit must not block startup.
+    """
+    if pg_pool is None:
+        return
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute(AUDIT_EVENTS_DDL)
+    except Exception as exc:
+        logger.warning("ensure_audit_schema failed: %s", exc)
+
+
 class AuditLogger:
     """Write one audit row per proxy request to `audit_events`.
 
@@ -42,6 +79,59 @@ class AuditLogger:
                 getattr(ctx, "request_id", "?"),
                 exc,
             )
+
+    async def log_config_change(
+        self,
+        *,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        details: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+    ) -> bool:
+        """Append one config-change audit event (portal/admin writes). Never raises.
+
+        ``actor`` goes into ``user_id`` (portal email, ``admin-key:<tenant>`` or
+        ``key:<tenant>``); ``details`` is a JSON diff/summary — callers must never put
+        secrets in it (provider keys are recorded as provider + last4 only). During the
+        rollout window where the ``details`` column doesn't exist yet (Terraform race),
+        the insert retries without it so the event is not lost.
+        """
+        if not self._db_pool:
+            return False
+        base_sql = (
+            "INSERT INTO audit_events (tenant_id, request_id, timestamp, action, user_id"
+        )
+        args = [
+            (tenant_id or "default"),
+            request_id or f"cfg-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
+            datetime.now(timezone.utc),
+            (action or "config.updated")[:200],
+            (actor or "")[:320] or None,
+        ]
+        try:
+            async with self._db_pool.acquire() as conn:
+                try:
+                    await conn.execute(
+                        base_sql + ", details) VALUES ($1,$2,$3,$4,$5,$6::jsonb)",
+                        *args, json.dumps(details or {}),
+                    )
+                except Exception as exc:
+                    if type(exc).__name__ != "UndefinedColumnError":
+                        raise
+                    await conn.execute(
+                        base_sql + ") VALUES ($1,$2,$3,$4,$5)", *args
+                    )
+            logger.info(
+                "audit: %s tenant=%s actor=%s", action, tenant_id, actor
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "AuditLogger.log_config_change failed (tenant=%s action=%s): %s",
+                tenant_id, action, exc,
+            )
+            return False
 
     async def _insert(self, ctx, response: Dict[str, Any]) -> None:
         tenant_id = getattr(ctx, "tenant_id", "default")

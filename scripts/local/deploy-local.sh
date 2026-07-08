@@ -10,7 +10,7 @@
 #   --backup-to-gcs     Backup Redis to GCS
 #   --with-grafana      Start observability stack (Prometheus + Grafana)
 #   --recreate          Force rebuild --no-cache (use after code changes)
-#   --tenants LIST      Comma-separated tenant IDs for multi-tenant seeding (e.g., nova-med,shop-bot)
+#   --tenants LIST      Comma-separated tenant IDs for multi-tenant seeding (e.g., NOVA-STG-01,SHOP-STG-01)
 #   --no-check          Skip the post-deployment health check at the end
 #
 # What this does:

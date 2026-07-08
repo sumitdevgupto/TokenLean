@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 GROUP = "G08"
 
 import os as _os
-_registry_cache: Optional[List[Dict]] = None
-_registry_loaded_at: float = 0.0
+# WS21: keyed by registry_path - a per-tenant registry_path override must never
+# be served another tenant's cached tool list. {path: (tools, loaded_at)}
+_registry_cache: Dict[str, tuple] = {}
 _REGISTRY_CACHE_TTL = int(_os.getenv("TOOL_REGISTRY_CACHE_TTL_SECONDS", "300"))
 _MCP_MANIFEST_CACHE_TTL = int(_os.getenv("MCP_MANIFEST_CACHE_TTL_SECONDS", "300"))
 _MCP_HTTP_TIMEOUT = float(_os.getenv("MCP_HTTP_TIMEOUT_SECONDS", "10.0"))
@@ -74,14 +75,14 @@ def _inactivity_threshold_days() -> int:
 
 
 def _load_registry(cfg: Dict) -> List[Dict]:
-    global _registry_cache, _registry_loaded_at
     import time
 
     now = time.monotonic()
-    if _registry_cache and (now - _registry_loaded_at) < _registry_cache_ttl():
-        return _registry_cache
-
     registry_path = cfg.get("registry_path", "")
+    cache_key = registry_path or "(default)"
+    hit = _registry_cache.get(cache_key)
+    if hit and hit[0] and (now - hit[1]) < _registry_cache_ttl():
+        return hit[0]
     tools = []
     try:
         if registry_path.startswith("gs://"):
@@ -109,8 +110,7 @@ def _load_registry(cfg: Dict) -> List[Dict]:
     # A registry file with an explicit `tools:` (null) makes `.get("tools", [])`
     # return None; coerce so callers can always iterate the result.
     tools = tools or []
-    _registry_cache = tools
-    _registry_loaded_at = now
+    _registry_cache[cache_key] = (tools, now)
     return tools
 
 
@@ -211,7 +211,7 @@ class ScheduledToolPruning:
             return
         
         try:
-            key = f"{_TOOL_USAGE_PREFIX}{tool_name}"
+            key = f"{getattr(ctx, 'redis_prefix', '')}{_TOOL_USAGE_PREFIX}{tool_name}"
             now = time.time()
             
             # Add to sorted set with timestamp
@@ -230,13 +230,13 @@ class ScheduledToolPruning:
         except Exception as exc:
             logger.debug("Tool usage recording failed: %s", exc)
     
-    async def should_prune_tool(self, tool_name: str) -> bool:
+    async def should_prune_tool(self, tool_name: str, prefix: str = "") -> bool:
         """Check if tool should be pruned due to inactivity."""
         if not self.redis:
             return False
         
         try:
-            key = f"{_TOOL_USAGE_PREFIX}{tool_name}"
+            key = f"{prefix}{_TOOL_USAGE_PREFIX}{tool_name}"
             meta = await self.redis.hgetall(f"{key}:meta")
             
             if not meta:
@@ -251,23 +251,25 @@ class ScheduledToolPruning:
             logger.debug("Pruning check failed: %s", exc)
             return False
     
-    async def get_inactive_tools(self, registry_tools: List[str]) -> List[str]:
+    async def get_inactive_tools(self, registry_tools: List[str], prefix: str = "") -> List[str]:
         """Get list of inactive tools from registry."""
         inactive = []
         for tool_name in registry_tools:
-            if await self.should_prune_tool(tool_name):
+            if await self.should_prune_tool(tool_name, prefix=prefix):
                 inactive.append(tool_name)
         return inactive
     
-    async def run_scheduled_pruning(self, dry_run: bool = False) -> Dict[str, Any]:
+    async def run_scheduled_pruning(self, dry_run: bool = False, prefix: str = "") -> Dict[str, Any]:
         """Run scheduled pruning job (call periodically via cron/scheduler)."""
         if not self.redis:
             return {"status": "no_redis", "pruned": []}
+        # WS21: prefix scopes the run to one tenant (t:<id>:); empty = legacy global.
+        lock_key = f"{prefix}{_TOOL_PRUNING_LOCK}"
         
         try:
             # Acquire lock to prevent concurrent pruning
             lock_acquired = await self.redis.set(
-                _TOOL_PRUNING_LOCK, 
+                lock_key, 
                 str(time.time()), 
                 ex=3600,  # 1 hour lock
                 nx=True
@@ -280,28 +282,28 @@ class ScheduledToolPruning:
             all_tools = [r.get("name") for r in registry if r.get("name")]
             
             # Find inactive tools
-            inactive = await self.get_inactive_tools(all_tools)
+            inactive = await self.get_inactive_tools(all_tools, prefix=prefix)
             
             if dry_run:
-                await self.redis.delete(_TOOL_PRUNING_LOCK)
+                await self.redis.delete(lock_key)
                 return {"status": "dry_run", "would_prune": inactive}
             
             # Mark tools as pruned (soft delete)
             pruned = []
             for tool_name in inactive:
                 await self.redis.hset(
-                    f"{_TOOL_MANIFEST_PREFIX}{tool_name}", 
+                    f"{prefix}{_TOOL_MANIFEST_PREFIX}{tool_name}", 
                     "status", 
                     "pruned"
                 )
                 await self.redis.hset(
-                    f"{_TOOL_MANIFEST_PREFIX}{tool_name}", 
+                    f"{prefix}{_TOOL_MANIFEST_PREFIX}{tool_name}", 
                     "pruned_at", 
                     str(time.time())
                 )
                 pruned.append(tool_name)
             
-            await self.redis.delete(_TOOL_PRUNING_LOCK)
+            await self.redis.delete(lock_key)
             
             logger.info("Scheduled pruning completed: %d tools pruned", len(pruned))
             return {"status": "completed", "pruned": pruned, "count": len(pruned)}
@@ -309,7 +311,7 @@ class ScheduledToolPruning:
         except Exception as exc:
             logger.error("Scheduled pruning failed: %s", exc)
             if self.redis:
-                await self.redis.delete(_TOOL_PRUNING_LOCK)
+                await self.redis.delete(lock_key)
             return {"status": "error", "error": str(exc), "pruned": []}
 
 
@@ -356,7 +358,7 @@ class G08ToolLoading:
         
         return all_tools
     
-    async def _apply_pruning(self, tools: List[Dict]) -> List[Dict]:
+    async def _apply_pruning(self, tools: List[Dict], prefix: str = "") -> List[Dict]:
         """Remove pruned tools from the list."""
         pruning = self._get_pruning()
         if not pruning.redis:
@@ -369,7 +371,7 @@ class G08ToolLoading:
             # Check if tool is pruned
             try:
                 status = await pruning.redis.hget(
-                    f"{_TOOL_MANIFEST_PREFIX}{tool_name}", 
+                    f"{prefix}{_TOOL_MANIFEST_PREFIX}{tool_name}", 
                     "status"
                 )
                 if status == "pruned":
@@ -424,7 +426,7 @@ class G08ToolLoading:
                 pruning = self._get_pruning()
                 if pruning.redis:
                     status = await pruning.redis.hget(
-                        f"{_TOOL_MANIFEST_PREFIX}{tool_name}", "status"
+                        f"{getattr(ctx, 'redis_prefix', '')}{_TOOL_MANIFEST_PREFIX}{tool_name}", "status"
                     )
                     if status == "pruned":
                         is_pruned = True

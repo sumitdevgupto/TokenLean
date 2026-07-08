@@ -157,7 +157,23 @@ class ZepMemoryClient:
             return []
 
 
-async def store_skill_in_qdrant(skill_id: str, skill_text: str, metadata: Dict) -> bool:
+def _tenant_skills_collection(cfg: Dict, tenant_id: str) -> str:
+    """WS21: per-tenant skills collection. The 'default' tenant keeps the legacy
+    global name (self-host back-compat); every real tenant gets <base>_<tenant> so
+    one tenant's skills are never retrieved into another tenant's prompt."""
+    base = cfg.get("skills_qdrant_collection", _SKILLS_COLLECTION)
+    if not tenant_id or tenant_id == "default":
+        return base
+    try:
+        from tenancy.context import sanitise_tenant_id
+        tenant_id = sanitise_tenant_id(tenant_id)
+    except Exception:
+        pass
+    return f"{base}_{tenant_id}"
+
+
+async def store_skill_in_qdrant(skill_id: str, skill_text: str, metadata: Dict,
+                                collection: str = _SKILLS_COLLECTION) -> bool:
     """Store an agent skill in Qdrant for semantic retrieval."""
     try:
         from qdrant_client import QdrantClient
@@ -168,10 +184,10 @@ async def store_skill_in_qdrant(skill_id: str, skill_text: str, metadata: Dict) 
         # Embed skill text
         model = get_text_embedding(_SKILLS_EMBEDDING_MODEL)
         embedding = list(model.embed([skill_text]))[0].tolist()
-        
+
         # Store in Qdrant
         client.upsert(
-            collection_name=_SKILLS_COLLECTION,
+            collection_name=collection,
             points=[{
                 "id": hashlib.md5(skill_id.encode()).hexdigest(),
                 "vector": embedding,
@@ -208,7 +224,8 @@ class SkillsManager:
             "version": "1.0"
         }
         
-        return await store_skill_in_qdrant(skill_id, skill_text, metadata)
+        return await store_skill_in_qdrant(skill_id, skill_text, metadata,
+                                           collection=self.collection)
     
     async def search_skills(self, query: str, top_k: int = 3, 
                           tag_filter: Optional[str] = None) -> List[Dict]:
@@ -252,7 +269,9 @@ class G10Memory:
     def __init__(self):
         self._mem0: Optional[Mem0MemoryClient] = None
         self._zep: Optional[ZepMemoryClient] = None
-        self._skills: Optional[SkillsManager] = None
+        # WS21: one manager per collection — the old single cached manager pinned
+        # every tenant to whichever collection the first request resolved.
+        self._skills: Dict[str, SkillsManager] = {}
         self._health_warned = False
     
     def _get_mem0(self, cfg: Dict) -> Optional[Mem0MemoryClient]:
@@ -269,13 +288,14 @@ class G10Memory:
             self._zep = ZepMemoryClient()
         return self._zep
     
-    def _get_skills_manager(self, cfg: Dict) -> Optional[SkillsManager]:
+    def _get_skills_manager(self, cfg: Dict, tenant_id: str = "default") -> Optional[SkillsManager]:
         if not cfg.get("skills_qdrant_enabled", True):
             return None
-        if self._skills is None:
-            collection = cfg.get("skills_qdrant_collection", _SKILLS_COLLECTION)
-            self._skills = SkillsManager(collection)
-        return self._skills
+        collection = _tenant_skills_collection(cfg, tenant_id)
+        mgr = self._skills.get(collection)
+        if mgr is None:
+            mgr = self._skills[collection] = SkillsManager(collection)
+        return mgr
     
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         cfg = ctx.config.get("groups", {}).get("G10_memory", {})
@@ -359,7 +379,7 @@ class G10Memory:
 
         # 3. SKILLS.md from Qdrant — retrieve relevant skills
         if cfg.get("skills_enabled", False):
-            skills_mgr = self._get_skills_manager(cfg)
+            skills_mgr = self._get_skills_manager(cfg, tenant_id)
             if skills_mgr:
                 await self._inject_skills_from_qdrant(ctx, cfg, skills_mgr)
             else:
@@ -547,7 +567,7 @@ async def _inject_relevant_skills(ctx: RequestContext, cfg: Dict) -> None:
     search and inject as a compact system message.  Replaces always-on skill blobs.
     Config keys used: skills_qdrant_collection, skills_top_k.
     """
-    collection = cfg.get("skills_qdrant_collection", "agent_skills")
+    collection = _tenant_skills_collection(cfg, getattr(ctx, "tenant_id", "default"))
     top_k: int = cfg.get("skills_top_k", 2)
     tokens_before = count_messages_tokens(ctx.messages, ctx.model)
 

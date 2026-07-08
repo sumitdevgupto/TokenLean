@@ -49,18 +49,67 @@ class G00RateLimit:
         # Per-team overrides
         self._per_team_limits = rl_cfg.get("per_team") or {}
 
-    def _get_limits_for_scope(self, user_id: str, team: str) -> Dict[str, int]:
-        """Get applicable limits for a given user/team combination."""
-        # Check per-user first (highest priority)
+    def _get_limits_for_scope(
+        self, user_id: str, team: str,
+        tenant_id: str = "default", tier: str = "",
+        rl_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
+        """Applicable limits, most specific wins (WS23):
+        per_user > per_team > per_tenant > tiers[tier] > default."""
         if user_id in self._per_user_limits:
             return self._per_user_limits[user_id]
-
-        # Check per-team
         if team in self._per_team_limits:
             return self._per_team_limits[team]
-
-        # Fall back to default
+        rl_cfg = rl_cfg or {}
+        per_tenant = rl_cfg.get("per_tenant") or {}
+        if tenant_id in per_tenant and isinstance(per_tenant[tenant_id], dict):
+            return {**self._default_limits, **per_tenant[tenant_id]}
+        tier_map = rl_cfg.get("tiers") or {}
+        if tier and tier in tier_map and isinstance(tier_map[tier], dict):
+            return {**self._default_limits, **tier_map[tier]}
         return self._default_limits
+
+    @staticmethod
+    def quota_key(redis_prefix: str, now: Optional[float] = None) -> str:
+        """Monthly billable-request counter key (tenant-prefixed; bumped by main
+        on every served 2xx, checked here before any work happens)."""
+        month = time.strftime("%Y%m", time.gmtime(now if now is not None else time.time()))
+        return f"{redis_prefix}quota:{month}"
+
+    async def _check_quota(self, ctx, redis, rl_cfg: Dict[str, Any]) -> None:
+        """WS23 monthly request-quota gate from the billing rate card.
+
+        Enforced only when ``rate_limit.quota.enabled`` — OSS/self-host default OFF.
+        Cap = included_requests × (1 + grace_pct/100); 0/absent included_requests
+        means unlimited (the enterprise custom row). Fail-open on Redis errors."""
+        qcfg = rl_cfg.get("quota") or {}
+        if not qcfg.get("enabled", False):
+            return
+        tenant_id = getattr(ctx, "tenant_id", "default")
+        if tenant_id in set(qcfg.get("exempt_tenants") or ["admin", "default"]):
+            return
+        tier = (getattr(ctx, "pricing_tier", "") or "free").lower()
+        rate_card = (ctx.config.get("billing", {}) or {}).get("rate_card", {}) or {}
+        included = ((rate_card.get(tier) or {}).get("included_requests") or 0)
+        try:
+            included = int(included)
+        except (TypeError, ValueError):
+            included = 0
+        if included <= 0:
+            return  # unlimited
+        grace = float(qcfg.get("grace_pct", 10) or 0)
+        cap = int(included * (1 + grace / 100.0))
+        try:
+            used = int(await redis.get(self.quota_key(getattr(ctx, "redis_prefix", f"t:{tenant_id}:"))) or 0)
+        except Exception as exc:
+            logger.warning("[%s] G00 quota check failed (fail-open): %s", ctx.request_id, exc)
+            return
+        if used >= cap:
+            raise RateLimitExceeded(
+                retry_after=86400,
+                limit_type="quota_exceeded",
+                scope=f"tenant={tenant_id},tier={tier},included={included},used={used}",
+            )
 
     async def _check_token_bucket(
         self,
@@ -114,6 +163,15 @@ class G00RateLimit:
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         """Check rate limits before processing the request."""
         cfg = ctx.config.get("rate_limit", {})
+        # WS23: the monthly quota gate is independent of the rps/rph limiter switch —
+        # a deployment may enforce quotas without token-bucket limiting.
+        if cfg.get("quota", {}).get("enabled", False):
+            try:
+                await self._check_quota(ctx, _get_redis(), cfg)
+            except RateLimitExceeded:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] G00 quota gate error (fail-open): %s", ctx.request_id, exc)
         if not cfg.get("enabled", False):
             return ctx
 
@@ -125,8 +183,10 @@ class G00RateLimit:
         feature = ctx.params.get("x_feature", "default")
         tenant_id = getattr(ctx, "tenant_id", "default")
 
-        # Get applicable limits
-        limits = self._get_limits_for_scope(user_id, team)
+        # Get applicable limits (per_user > per_team > per_tenant > tier > default)
+        limits = self._get_limits_for_scope(
+            user_id, team, tenant_id=tenant_id,
+            tier=(getattr(ctx, "pricing_tier", "") or "").lower(), rl_cfg=cfg)
 
         now = time.time()
         redis = _get_redis()

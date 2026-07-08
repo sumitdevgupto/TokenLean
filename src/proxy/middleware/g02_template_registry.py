@@ -140,11 +140,11 @@ class G02TemplateRegistry:
             self._redis = _get_redis()
         return self._redis
     
-    async def _load_template_meta(self, template_id: str) -> Optional[TemplateMetadata]:
-        """Load template metadata from Redis."""
+    async def _load_template_meta(self, template_id: str, prefix: str = "") -> Optional[TemplateMetadata]:
+        """Load template metadata from Redis (tenant-prefixed — WS21)."""
         try:
             redis = self._get_redis()
-            key = f"{_TEMPLATE_META_PREFIX}{template_id}"
+            key = f"{prefix}{_TEMPLATE_META_PREFIX}{template_id}"
             data = await redis.get(key)
             if data:
                 return TemplateMetadata.from_dict(json.loads(data))
@@ -152,22 +152,24 @@ class G02TemplateRegistry:
             logger.debug("Failed to load template metadata: %s", exc)
         return None
     
-    async def _save_template_meta(self, meta: TemplateMetadata) -> None:
-        """Save template metadata to Redis."""
+    async def _save_template_meta(self, meta: TemplateMetadata, prefix: str = "") -> None:
+        """Save template metadata to Redis (tenant-prefixed — WS21: one tenant's
+        deprecation/SUNSET of a template id must never block another tenant's)."""
         try:
             redis = self._get_redis()
-            key = f"{_TEMPLATE_META_PREFIX}{meta.template_id}"
+            key = f"{prefix}{_TEMPLATE_META_PREFIX}{meta.template_id}"
             await redis.set(key, json.dumps(meta.to_dict()))
         except Exception as exc:
             logger.warning("Failed to save template metadata: %s", exc)
     
     async def _record_token_history(
-        self, template_id: str, version: str, token_count: int, request_id: str
+        self, template_id: str, version: str, token_count: int, request_id: str,
+        prefix: str = "",
     ) -> None:
-        """Record per-version token count history in Redis."""
+        """Record per-version token count history in Redis (tenant-prefixed — WS21)."""
         try:
             redis = self._get_redis()
-            key = f"{_TEMPLATE_HISTORY_PREFIX}{template_id}:{version}"
+            key = f"{prefix}{_TEMPLATE_HISTORY_PREFIX}{template_id}:{version}"
             entry = {
                 "timestamp": time.time(),
                 "tokens": token_count,
@@ -183,11 +185,11 @@ class G02TemplateRegistry:
         except Exception as exc:
             logger.debug("Failed to record token history: %s", exc)
     
-    async def _get_token_history(self, template_id: str, version: str) -> List[Dict]:
-        """Get token count history for a template version."""
+    async def _get_token_history(self, template_id: str, version: str, prefix: str = "") -> List[Dict]:
+        """Get token count history for a template version (tenant-prefixed — WS21)."""
         try:
             redis = self._get_redis()
-            key = f"{_TEMPLATE_HISTORY_PREFIX}{template_id}:{version}"
+            key = f"{prefix}{_TEMPLATE_HISTORY_PREFIX}{template_id}:{version}"
             entries = await redis.zrevrange(key, 0, 99)  # Last 100 entries
             return [json.loads(e) for e in entries]
         except Exception as exc:
@@ -209,7 +211,8 @@ class G02TemplateRegistry:
             return ctx
 
         # Load or create template metadata
-        meta = await self._load_template_meta(template_id)
+        _rp = getattr(ctx, "redis_prefix", "")
+        meta = await self._load_template_meta(template_id, prefix=_rp)
         if meta is None:
             # Auto-create metadata from config if not exists
             version = budget.get("version", "1.0")
@@ -219,14 +222,14 @@ class G02TemplateRegistry:
                 author=budget.get("author", ""),
                 description=budget.get("description", ""),
             )
-            await self._save_template_meta(meta)
+            await self._save_template_meta(meta, prefix=_rp)
 
         current_tokens = ctx.current_token_count
         max_input = budget.get("total_input_max", 0)
         
         # Record token history for this version
         await self._record_token_history(
-            template_id, meta.version, current_tokens, ctx.request_id
+            template_id, meta.version, current_tokens, ctx.request_id, prefix=_rp
         )
         
         # Check deprecation status
@@ -288,7 +291,7 @@ class G02TemplateRegistry:
                 )
         else:
             # Get token history stats for insights
-            history = await self._get_token_history(template_id, meta.version)
+            history = await self._get_token_history(template_id, meta.version, prefix=_rp)
             if history:
                 avg_tokens = sum(h["tokens"] for h in history) / len(history)
                 ctx.savings.add_step(

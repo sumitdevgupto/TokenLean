@@ -123,6 +123,9 @@ services:
       # H2: gate /metrics with a bearer token. Unset by default for local dev
       # (endpoint stays open with a startup warning); set it to require auth.
       METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:-}
+      # WS25: CORS is default-deny; local dev keeps the old wildcard behaviour.
+      # Production sets CORS_ORIGINS instead and leaves this unset.
+      CORS_ALLOW_ALL: ${CORS_ALLOW_ALL:-true}
       LLM_KEY_OPENAI: ${LLM_KEY_OPENAI:-}
       LLM_KEY_ANTHROPIC: ${LLM_KEY_ANTHROPIC:-}
       LLM_KEY_GOOGLE: ${LLM_KEY_GOOGLE:-}
@@ -135,10 +138,12 @@ services:
       LLM_KEY_OPENROUTER: ${LLM_KEY_OPENROUTER:-}
       LLM_KEY_OPENCODE: ${LLM_KEY_OPENCODE:-}
       LLM_KEY_AZURE: ${LLM_KEY_AZURE:-}
-      # AWS Bedrock uses SigV4 credentials (no single key)
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      AWS_REGION_NAME: ${AWS_REGION_NAME:-}
+      # WS22 env invariant: the proxy container carries ONLY LLM_KEY_<PROVIDER>
+      # variables — never litellm-native ones (OPENAI_API_KEY, ANTHROPIC_API_KEY,
+      # AWS_ACCESS_KEY_ID, ...). Litellm-native vars bypass the BYOK key resolver,
+      # so any tenant's request could silently bill the platform account (the old
+      # AWS_* passthrough here did exactly that for Bedrock). Self-hosters who
+      # consciously want ambient Bedrock/SigV4 can re-add AWS_* themselves.
       LOG_LEVEL: INFO
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
     volumes:

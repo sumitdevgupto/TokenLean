@@ -27,7 +27,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND metadata->>'complexity_tier' = 'simple'",
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized@pitch.test' AND metadata->>'complexity_tier' = 'simple'",
           "format": "table"
         }
       ],
@@ -91,7 +91,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND metadata->>'complexity_tier' = 'medium'",
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized@pitch.test' AND metadata->>'complexity_tier' = 'medium'",
           "format": "table"
         }
       ],
@@ -155,7 +155,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized' AND metadata->>'complexity_tier' = 'complex'",
+          "rawSql": "SELECT ROUND(AVG((metadata->>'total_pct_saving')::float)::numeric,1) AS pct_reduction FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND metadata->>'user_id' = 'pitch-optimized@pitch.test' AND metadata->>'complexity_tier' = 'complex'",
           "format": "table"
         }
       ],
@@ -219,7 +219,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,6) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized'",
+          "rawSql": "SELECT ROUND(SUM((metadata->>'cost_saving_usd')::float)::numeric,6) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized@pitch.test'",
           "format": "table"
         }
       ],
@@ -266,7 +266,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT COUNT(*) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' AND (metadata->>'cache_hit')::boolean = true",
+          "rawSql": "SELECT COUNT(*) FROM traces WHERE metadata->>'user_id' = 'pitch-optimized@pitch.test' AND (metadata->>'cache_hit')::boolean = true",
           "format": "table"
         }
       ],
@@ -301,7 +301,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT metadata->>'user_id' AS run_type, ROUND(AVG((metadata->>'baseline_tokens')::float)) AS avg_baseline_tokens, ROUND(AVG((metadata->>'final_tokens_sent')::float)) AS avg_final_tokens FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') GROUP BY 1 ORDER BY 1",
+          "rawSql": "SELECT metadata->>'user_id' AS run_type, ROUND(AVG((metadata->>'baseline_tokens')::float)) AS avg_baseline_tokens, ROUND(AVG((metadata->>'final_tokens_sent')::float)) AS avg_final_tokens FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline@pitch.test','pitch-optimized@pitch.test') GROUP BY 1 ORDER BY 1",
           "format": "table"
         }
       ],
@@ -345,7 +345,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT key AS g_group, SUM((value->>'abs_saving')::int) AS tokens_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE metadata->>'user_id' = 'pitch-optimized' AND (value->>'abs_saving')::int > 0 GROUP BY 1 ORDER BY tokens_saved DESC",
+          "rawSql": "SELECT key AS g_group, SUM((value->>'abs_saving')::int) AS tokens_saved FROM traces, jsonb_each(metadata->'step_savings') WHERE metadata->>'user_id' = 'pitch-optimized@pitch.test' AND (value->>'abs_saving')::int > 0 GROUP BY 1 ORDER BY tokens_saved DESC",
           "format": "table"
         }
       ],
@@ -386,7 +386,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT id AS request_id, created_at::time(0) AS time, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline, (metadata->>'final_tokens_sent')::int AS final, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved FROM traces WHERE metadata->>'user_id' = 'pitch-optimized' ORDER BY created_at DESC LIMIT 10",
+          "rawSql": "SELECT id AS request_id, created_at::time(0) AS time, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline, (metadata->>'final_tokens_sent')::int AS final, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved FROM traces WHERE metadata->>'user_id' = 'pitch-optimized@pitch.test' ORDER BY created_at DESC LIMIT 10",
           "format": "table"
         }
       ],
@@ -409,7 +409,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT t.id AS request_id, t.metadata->>'model_requested' AS model, s.key AS g_group, (s.value->>'abs_saving')::int AS tokens_saved, ROUND((s.value->>'pct_saving_vs_baseline')::numeric,1) AS pct_of_baseline, s.value->>'description' AS description FROM traces t, jsonb_each(t.metadata->'step_savings') s WHERE t.metadata->>'user_id' = 'pitch-optimized' AND (s.value->>'abs_saving')::int > 0 ORDER BY t.created_at DESC, s.key",
+          "rawSql": "SELECT t.id AS request_id, t.metadata->>'model_requested' AS model, s.key AS g_group, (s.value->>'abs_saving')::int AS tokens_saved, ROUND((s.value->>'pct_saving_vs_baseline')::numeric,1) AS pct_of_baseline, s.value->>'description' AS description FROM traces t, jsonb_each(t.metadata->'step_savings') s WHERE t.metadata->>'user_id' = 'pitch-optimized@pitch.test' AND (s.value->>'abs_saving')::int > 0 ORDER BY t.created_at DESC, s.key",
           "format": "table"
         }
       ],
@@ -432,7 +432,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT metadata->>'user_id' AS run_type, created_at, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline_tokens, (metadata->>'final_tokens_sent')::int AS final_tokens, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved_usd, (metadata->>'cache_hit')::boolean AS cache_hit, metadata->>'routed_model' AS routed_model FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') ORDER BY created_at DESC LIMIT 6",
+          "rawSql": "SELECT metadata->>'user_id' AS run_type, created_at, metadata->>'model_requested' AS model, (metadata->>'baseline_tokens')::int AS baseline_tokens, (metadata->>'final_tokens_sent')::int AS final_tokens, ROUND((metadata->>'total_pct_saving')::numeric,1) AS pct_saving, ROUND((metadata->>'cost_saving_usd')::numeric,6) AS cost_saved_usd, (metadata->>'cache_hit')::boolean AS cache_hit, metadata->>'routed_model' AS routed_model FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline@pitch.test','pitch-optimized@pitch.test') ORDER BY created_at DESC LIMIT 6",
           "format": "table"
         }
       ],
@@ -448,7 +448,7 @@
         "datasource": {
           "uid": "langfuse-postgres"
         },
-        "rawQuery": "SELECT created_at AS time, (metadata->>'user_id') || ' - ' || metadata->>'model_requested' AS text FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline','pitch-optimized') ORDER BY created_at",
+        "rawQuery": "SELECT created_at AS time, (metadata->>'user_id') || ' - ' || metadata->>'model_requested' AS text FROM traces WHERE metadata->>'user_id' IN ('pitch-baseline@pitch.test','pitch-optimized@pitch.test') ORDER BY created_at",
         "enable": true,
         "iconColor": "blue"
       }

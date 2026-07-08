@@ -115,8 +115,7 @@ def test_load_registry_coerces_null_tools_key():
     # Regression: a registry file whose top-level `tools:` is null must yield []
     # (not None), so the merge in process_request can always iterate the result.
     from middleware import g08_tool_loading as g08
-    g08._registry_cache = None      # bypass the module-level cache
-    g08._registry_loaded_at = 0.0
+    g08._registry_cache = {}        # bypass the module-level cache (WS21: per-path dict)
     handle = MagicMock()
     handle.__enter__ = MagicMock(return_value=handle)
     handle.__exit__ = MagicMock(return_value=False)

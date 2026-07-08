@@ -12,11 +12,7 @@ proxy:
   default_provider: openai
   allow_user_id_header_override: true
   allowed_user_id_headers:
-  - pitch-baseline
-  - pitch-optimized
-  - test-*
-  - '*-pitch'
-  - '*-user'
+  - '*@*.test'
 services:
   llmlingua_url: http://llmlingua-svc:8080/compress
   qdrant_url: http://qdrant:6333
@@ -46,6 +42,31 @@ rate_limit:
     team-alpha:
       requests_per_minute: 20
       requests_per_hour: 1200
+  # WS23: per-pricing-tier defaults + per-tenant overrides (most specific wins:
+  # per_user > per_team > per_tenant > tiers > default). per_tenant entries are
+  # normally applied by the operator through tenant_configs, not edited here.
+  tiers: {}
+  #  free:
+  #    requests_per_minute: 30
+  #    requests_per_hour: 600
+  per_tenant: {}
+  # Monthly request-quota gate from the billing rate card: 429 quota_exceeded past
+  # included_requests x (1 + grace_pct/100). OFF by default — OSS/self-host never
+  # enforces a quota; the managed SaaS enables it. included_requests of 0/absent
+  # means unlimited. Exempt tenants are never gated.
+  quota:
+    enabled: false
+    grace_pct: 10
+    exempt_tenants: [admin, default]
+# WS25: periodic data-retention purge (default OFF — self-host keeps everything).
+# usage_days is clamped to a 400-day floor in code: usage_events is the billing
+# source of record and must outlive every invoice period.
+retention:
+  enabled: false
+  interval_hours: 24
+  audit_days: 0                 # 0 = keep audit_events forever
+  usage_days: 0                 # 0 = keep usage_events forever
+  cache_l2_expired_cleanup: true
 providers:
 - name: openai
   api_base: https://api.openai.com/v1

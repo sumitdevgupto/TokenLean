@@ -16,7 +16,10 @@ DO $$
 DECLARE
   t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['cache_l2', 'usage_events', 'audit_events', 'tenant_configs']
+  -- tenant_provider_keys (BYOK, WS13) + portal_users join the net; both are also
+  -- ensured app-side at commercial startup for local/self-host deployments.
+  FOREACH t IN ARRAY ARRAY['cache_l2', 'usage_events', 'audit_events', 'tenant_configs',
+                           'tenant_provider_keys', 'portal_users']
   LOOP
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = t) THEN
       EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);

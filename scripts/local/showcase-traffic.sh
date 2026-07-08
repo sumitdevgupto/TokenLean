@@ -17,7 +17,7 @@
 #   5. Prints dashboard URLs + the capture time-window
 #
 # Usage:
-#   ./scripts/local/showcase-traffic.sh [--tenant nova-med] [--distinct 6]
+#   ./scripts/local/showcase-traffic.sh [--tenant NOVA-STG-01] [--distinct 6]
 #                                       [--repeats 5] [--model gpt-4o-mini]
 #                                       [--clean-showcase] [--skip-check]
 #
@@ -115,7 +115,7 @@ _clean_showcase_data() {
   echo ""
 }
 
-TENANT="nova-med"
+TENANT="NOVA-STG-01"
 DISTINCT=6
 REPEATS=5
 MODEL="gpt-4o-mini"
@@ -251,7 +251,7 @@ for i, prompt in enumerate(PROMPTS):
             "Authorization": f"Bearer {KEY}",
             "Content-Type": "application/json",
             "X-Tenant-ID": TENANT,
-            "X-User-ID": "showcase",
+            "X-User-ID": "showcase@pitch.test",
         })
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:

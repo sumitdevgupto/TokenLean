@@ -17,9 +17,48 @@ commonly tuned keys per group, not every field.
 |---|---|
 | `proxy` | Port, log level, CORS, default model |
 | `providers` | LLM provider endpoints (keys in Secret Manager — not here) |
-| `rate_limit` | G0 request throttling (top-level, not under `groups`) |
+| `rate_limit` | G0 request throttling + per-tier/per-tenant limits + optional monthly quota gate |
+| `retention` | Optional periodic purge of aged `audit_events` / `usage_events` / expired `cache_l2` (default OFF) |
 | `groups` | Per-group enable/disable + tuning parameters |
 | `savings` | Token-savings **estimate** tuning (reporting only — never billed) |
+
+### Per-tenant configuration precedence
+
+At request time the effective config for a tenant resolves in this order (most specific wins):
+
+1. **`tenant_configs` (Postgres)** — per-tenant overrides written by the customer portal
+   (G-group knobs, default model, cascade tiers). Deep-merged into the base config;
+   propagates within ~60 s (in-process TTL cache).
+2. **`tenants.<id>` YAML block** — operator-only escape hatch in the main config.
+3. **Base config** — this file (+ `params_dir` files), the platform defaults.
+
+A tenant's default-model override sets both `proxy.default_model` and
+`proxy.fallback_request_model`; cascade-tier overrides set the head model of
+`groups.G6_routing.tiers.<simple|medium|complex>`. Provider **keys** are never part of
+config — per-tenant keys (BYOK, commercial layer) live encrypted in `tenant_provider_keys`
+and resolve per (provider, tenant) through `providers/key_resolver.py`. The OSS default
+resolver uses the global `LLM_KEY_<PROVIDER>` env / Secret Manager keys, so self-host
+behaviour is unchanged.
+
+### rate_limit extras
+
+| Parameter | Default | Description |
+|---|---|---|
+| `tiers.<tier>` | `{}` | Per-pricing-tier rps/rph defaults (`requests_per_minute`, `requests_per_hour`) |
+| `per_tenant.<id>` | `{}` | Per-tenant overrides (most specific after `per_user`/`per_team`) |
+| `quota.enabled` | `false` | Monthly request-quota gate from `billing.rate_card.<tier>.included_requests` — 429 `quota_exceeded` past the cap. OSS default OFF |
+| `quota.grace_pct` | `10` | Allowance past `included_requests` before rejecting |
+| `quota.exempt_tenants` | `[admin, default]` | Never quota-gated |
+
+### retention
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Master switch for the background purge loop |
+| `interval_hours` | `24` | How often the purge pass runs |
+| `audit_days` | `0` | Purge `audit_events` older than N days (0 = keep forever) |
+| `usage_days` | `0` | Purge `usage_events` older than N days (0 = keep forever; clamped to a 400-day billing floor) |
+| `cache_l2_expired_cleanup` | `true` | Delete `cache_l2` rows past `expires_at` |
 
 ### proxy
 | Parameter | Default | Description |

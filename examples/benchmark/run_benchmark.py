@@ -113,9 +113,9 @@ def main() -> int:
                     help="timeout for the one-time warmup request (s)")
     ap.add_argument("--no-warmup", action="store_true",
                     help="skip the warmup request (only if the proxy is already warm)")
-    ap.add_argument("--tenant", default=os.environ.get("BENCHMARK_TENANT", "bench"),
+    ap.add_argument("--tenant", default=os.environ.get("BENCHMARK_TENANT", "BENC-STG-01"),
                     help="X-Tenant-ID to run under — isolates the benchmark's cache/state "
-                         "under t:<tenant>: so cleanup deletes only its keys (default: bench)")
+                         "under t:<tenant>: so cleanup deletes only its keys (default: BENC-STG-01)")
     ap.add_argument("--quality-check", action="store_true",
                     help="Assert each answer's curated expected_facts / forbidden "
                          "(from dataset.jsonl). No extra LLM cost. Prints a PASS/FAIL line "

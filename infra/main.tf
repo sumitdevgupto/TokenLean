@@ -345,7 +345,10 @@ EOSQL
 # ─── F2: audit_events Cloud SQL table migration + INSERT-only role ───────────
 resource "null_resource" "audit_events_schema_migration" {
   triggers = {
-    schema_version = "1"
+    # v2 (WS8): + details JSONB for config-change audit events. The app also
+    # ensures this column at startup (audit.log.ensure_audit_schema) - this bump
+    # keeps GCP databases drift-free even before the first commercial boot.
+    schema_version = "2"
   }
 
   provisioner "local-exec" {
@@ -372,6 +375,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_id
   ON audit_events (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp
   ON audit_events (timestamp DESC);
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS details JSONB;
 DO $$ BEGIN
   IF NOT EXISTS (
     SELECT FROM pg_roles WHERE rolname = 'proxy_audit_role'

@@ -71,26 +71,28 @@ def _sha256_hex(text: str) -> str:
 
 # ─── Storage helpers ─────────────────────────────────────────────────────────
 
-def _store(redis_client: Optional[Any], key: str, text: str, ttl: int) -> None:
+def _store(redis_client: Optional[Any], key: str, text: str, ttl: int, prefix: str = "") -> None:
+    # WS21: prefix (t:<tenant>:) scopes both stores — without it any tenant could
+    # retrieve another tenant's stored blocks via an 8-char [CCR:...] reference.
     if redis_client is not None:
         try:
-            redis_client.setex(f"ccr:{key}", ttl, text)
+            redis_client.setex(f"{prefix}ccr:{key}", ttl, text)
             return
         except Exception as exc:
             logger.debug("G28 Redis store failed: %s — using local fallback", exc)
-    _local_store[key] = text
+    _local_store[f"{prefix}{key}"] = text
 
 
-def _retrieve_stored(redis_client: Optional[Any], key: str) -> Optional[str]:
+def _retrieve_stored(redis_client: Optional[Any], key: str, prefix: str = "") -> Optional[str]:
     if redis_client is not None:
         try:
-            val = redis_client.get(f"ccr:{key}")
+            val = redis_client.get(f"{prefix}ccr:{key}")
             if val is not None:
                 _stats["hits"] += 1
                 return val.decode() if isinstance(val, bytes) else val
         except Exception as exc:
             logger.debug("G28 Redis retrieve failed: %s — falling back to local", exc)
-    val = _local_store.get(key)
+    val = _local_store.get(f"{prefix}{key}")
     if val is not None:
         _stats["hits"] += 1
     else:
@@ -158,6 +160,7 @@ def _replace_content(
     min_tokens: int,
     model: str,
     ttl: int,
+    prefix: str = "",
 ) -> Tuple[str, bool]:
     """Return (possibly_replaced_content, was_replaced)."""
     if estimate_tokens(content, model) < min_tokens:
@@ -167,9 +170,9 @@ def _replace_content(
     ref = _make_ref(sha)
 
     # Check if it's already stored (repeat content → only one storage round-trip)
-    existing = _retrieve_stored(redis_client, sha)
+    existing = _retrieve_stored(redis_client, sha, prefix=prefix)
     if existing is None:
-        _store(redis_client, sha, content, ttl)
+        _store(redis_client, sha, content, ttl, prefix=prefix)
 
     return ref, True
 
@@ -181,6 +184,7 @@ def _process_messages(
     model: str,
     ttl: int,
     compress_system: bool = False,
+    prefix: str = "",
 ) -> Tuple[List[Dict], int, int]:
     """Walk messages and replace large text blocks with CCR references.
 
@@ -206,7 +210,8 @@ def _process_messages(
 
         if isinstance(content, str) and role in compressible_roles:
             t_before = estimate_tokens(content, model)
-            new_content, replaced = _replace_content(content, redis_client, min_tokens, model, ttl)
+            new_content, replaced = _replace_content(
+                content, redis_client, min_tokens, model, ttl, prefix=prefix)
             t_after = estimate_tokens(new_content, model)
             tokens_before += t_before
             tokens_after += t_after
@@ -229,6 +234,7 @@ def dispatch_mcp_tool(
     arguments: Dict[str, Any],
     redis_client: Optional[Any] = None,
     ttl: int = 86400,
+    prefix: str = "",
 ) -> Any:
     """Dispatch a CCR MCP tool call; return the tool result as a JSON-serialisable value."""
     if tool_name == "headroom_compress":
@@ -238,7 +244,7 @@ def dispatch_mcp_tool(
             return {"error": "text is required"}
         sha = _sha256_hex(text)
         ref = _make_ref(sha)
-        _store(redis_client, sha, text, call_ttl)
+        _store(redis_client, sha, text, call_ttl, prefix=prefix)
         return {"ref": ref, "sha256": sha, "original_len": len(text)}
 
     if tool_name == "headroom_retrieve":
@@ -246,14 +252,15 @@ def dispatch_mcp_tool(
         if not ref.startswith(_REF_PREFIX):
             return {"error": f"Invalid CCR reference: {ref!r}"}
         sha_prefix = ref[len(_REF_PREFIX):-len(_REF_SUFFIX)]
-        # Find matching key (local store linear search; Redis uses prefix scan)
+        # Find matching key — scans stay INSIDE the tenant prefix (WS21): a short
+        # 8-char reference must never resolve to another tenant's stored block.
         if redis_client is not None:
             try:
-                val = redis_client.get(f"ccr:{sha_prefix}")
+                val = redis_client.get(f"{prefix}ccr:{sha_prefix}")
                 if val is None:
                     # Try full SHA scan — sha_prefix is only 8 chars
                     for key in _local_store:
-                        if key.startswith(sha_prefix):
+                        if key.startswith(prefix) and key[len(prefix):].startswith(sha_prefix):
                             return {"text": _local_store[key]}
                     return {"error": "Reference not found"}
                 _stats["hits"] += 1
@@ -261,7 +268,7 @@ def dispatch_mcp_tool(
             except Exception:
                 pass
         for key in _local_store:
-            if key.startswith(sha_prefix):
+            if key.startswith(prefix) and key[len(prefix):].startswith(sha_prefix):
                 _stats["hits"] += 1
                 return {"text": _local_store[key]}
         _stats["misses"] += 1
@@ -330,7 +337,8 @@ class G28CCR:
         redis_client = getattr(ctx, "redis_client", None)
 
         new_messages, tokens_before, tokens_after = _process_messages(
-            ctx.messages, redis_client, min_tokens, ctx.routed_model, ttl, compress_system
+            ctx.messages, redis_client, min_tokens, ctx.routed_model, ttl, compress_system,
+            prefix=getattr(ctx, "redis_prefix", ""),
         )
 
         if tokens_after < tokens_before:
@@ -388,7 +396,8 @@ class G28CCR:
                     arguments = json.loads(fn.get("arguments", "{}"))
                 except json.JSONDecodeError:
                     arguments = {}
-                result = dispatch_mcp_tool(tool_name, arguments, redis_client, ttl)
+                result = dispatch_mcp_tool(tool_name, arguments, redis_client, ttl,
+                                           prefix=getattr(ctx, "redis_prefix", ""))
                 tc["function"]["result"] = result
                 logger.debug("[%s] G28 MCP tool %s → %r", ctx.request_id, tool_name, result)
 

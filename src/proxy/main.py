@@ -63,13 +63,20 @@ app = FastAPI(
 # CORS: Restrict to specific origins in production via CORS_ORIGINS env var
 # Format: comma-separated URLs, e.g., "https://myapp.com,https://myapp-staging.com"
 # For local development, set to "http://localhost:3000,http://localhost:8080"
-cors_origins = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins if cors_origins else ["*"],  # Fallback to wildcard only if not configured
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# WS25: DEFAULT-DENY — the old unconfigured fallback was "*", which is the wrong
+# posture for a credentialed multi-tenant API. Browser cross-origin access now
+# requires either CORS_ORIGINS or an explicit CORS_ALLOW_ALL=true (local dev only).
+# Non-browser clients (SDKs, curl) are unaffected — CORS gates browsers only.
+cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if not cors_origins and os.getenv("CORS_ALLOW_ALL", "").strip().lower() in ("1", "true", "yes"):
+    cors_origins = ["*"]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 _pipeline = OptimisationPipeline()
 
@@ -78,6 +85,20 @@ _pipeline = OptimisationPipeline()
 async def startup_event():
     load_config()
     start_hot_reload()
+    # WS22 env invariant: provider credentials must reach this process ONLY as
+    # LLM_KEY_<PROVIDER> (resolved through the BYOK seam). Litellm-native vars are
+    # picked up by litellm directly, bypassing per-tenant key resolution — under a
+    # multi-tenant deployment that silently bills the platform account.
+    _native = [v for v in (
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "AWS_ACCESS_KEY_ID", "AZURE_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY",
+    ) if os.getenv(v)]
+    if _native:
+        logger.warning(
+            "SECURITY: litellm-native credential env var(s) present in the proxy "
+            "environment: %s — these BYPASS per-tenant BYOK key resolution and can "
+            "bill the platform account. Use LLM_KEY_<PROVIDER> instead and remove "
+            "these from the container env.", ", ".join(_native))
     # Initialise shared Redis connection pool (eliminates per-request churn)
     from cache.redis_pool import init_pool, get_redis
     init_pool()
@@ -108,6 +129,9 @@ async def startup_event():
         # (model prefs + G-group knobs from the portal) are actually applied at runtime.
         _pipeline.set_db_pool(pg)
         logger.info("Billing: usage_events table ready; tenant-config loader wired")
+        # WS25: config-driven retention loop (default OFF — retention.enabled).
+        from retention import run_retention_loop
+        asyncio.create_task(run_retention_loop(lambda: pg, get_config))
     except Exception as exc:
         logger.warning("Billing: could not initialise usage_events: %s", exc)
     if not _METRICS_SCRAPE_TOKEN:
@@ -181,11 +205,17 @@ async def tool_governance(request: Request):
         now = time.time()
         cutoff = now - (days * 86400)
 
-        # Tools with recent calls
-        recent = await redis.zrangebyscore("tok_opt:tool_calls", cutoff, "+inf")
-        # All tools ever recorded
-        all_tools = await redis.zrange("tok_opt:tool_calls", 0, -1)
-        stale = sorted(set(all_tools) - set(recent))
+        # WS21: tool-call recency is recorded per tenant (t:<id>:tok_opt:tool_calls).
+        # This admin view unions all tenants' zsets (+ the legacy global key for
+        # continuity with rows recorded before the isolation fix).
+        zkeys = ["tok_opt:tool_calls"]
+        async for k in redis.scan_iter(match="t:*:tok_opt:tool_calls", count=500):
+            zkeys.append(k.decode() if isinstance(k, (bytes, bytearray)) else k)
+        recent, all_tools = set(), set()
+        for zk in zkeys:
+            recent.update(await redis.zrangebyscore(zk, cutoff, "+inf"))
+            all_tools.update(await redis.zrange(zk, 0, -1))
+        stale = sorted(all_tools - recent)
 
         return {
             "stale_tools": stale,
@@ -331,7 +361,7 @@ async def usage_export(request: Request):
     {
         "start_date": "2024-06-01",   # inclusive, UTC
         "end_date": "2024-06-08",     # inclusive, UTC
-        "tenant_id": "nova-med",      # optional filter
+        "tenant_id": "NOVA-STG-01",      # optional filter
     }
 
     Returns: application/x-ndjson stream of usage records.
@@ -512,6 +542,34 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
     # C1: one billable row per served 2xx request (best-effort, never blocks).
     if status == "200":
         _schedule_billing(ctx, response)
+        _bump_quota_counter(ctx)
+
+
+def _bump_quota_counter(ctx) -> None:
+    """WS23: fire-and-forget monthly billable-request counter (G00 quota gate reads it).
+
+    Mirrors the billable unit exactly — bumped for every served 2xx, tenant-prefixed
+    (`t:<id>:quota:<YYYYMM>`), ~40-day TTL so last month's key self-expires."""
+    if ctx is None:
+        return
+    prefix = getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
+
+    async def _bump() -> None:
+        try:
+            from cache.redis_pool import get_redis
+            from middleware.g00_rate_limit import G00RateLimit
+            key = G00RateLimit.quota_key(prefix)
+            r = get_redis()
+            n = await r.incr(key)
+            if n == 1:
+                await r.expire(key, 40 * 86400)
+        except Exception as exc:
+            logger.debug("quota counter bump failed: %s", exc)
+
+    try:
+        asyncio.create_task(_bump())
+    except RuntimeError:
+        pass
 
 
 def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, request_start):
@@ -706,9 +764,16 @@ async def chat_completions(request: Request):
             status_code=429,
             content={
                 "error": {
-                    "message": f"Rate limit exceeded: {exc.limit_type} for {exc.scope}",
+                    # quota_exceeded (monthly cap) vs rate_limit_exceeded (rps/rph)
+                    # surface distinctly so clients can react appropriately (WS23).
+                    "message": (
+                        f"Monthly request quota exceeded ({exc.scope}). "
+                        "Upgrade your plan or wait for the next billing period."
+                        if exc.limit_type == "quota_exceeded"
+                        else f"Rate limit exceeded: {exc.limit_type} for {exc.scope}"
+                    ),
                     "type": "rate_limit_exceeded",
-                    "code": "rate_limit_exceeded",
+                    "code": exc.limit_type if exc.limit_type == "quota_exceeded" else "rate_limit_exceeded",
                 }
             },
             headers={"Retry-After": str(exc.retry_after)},
@@ -930,14 +995,19 @@ async def _authenticate(request: Request) -> tuple[str, Optional[str], Optional[
             detail="API key suspended. Contact your platform team.",
         )
 
-    # Check for X-User-ID header override (for testing/tracking)
+    # Check for X-User-ID header override (per-user attribution within a tenant)
     cfg = get_config()
     header_override_enabled = cfg.get("proxy", {}).get("allow_user_id_header_override", False)
     if header_override_enabled:
         header_user_id = request.headers.get("X-User-ID") or request.headers.get("x-user-id")
         if header_user_id:
-            # Validate against allowlist (supports wildcards, e.g., "pitch-*")
-            allowed_patterns = cfg.get("proxy", {}).get("allowed_user_id_headers", [])
+            # WS25: allowlist = global config patterns + the tenant's own email domain
+            # (owner_domain stamped into the key metadata at signup → "*@acme.com").
+            # An EMPTY combined allowlist now REJECTS the override — accept-any allowed
+            # attribution spoofing (any caller could book usage under any user_id).
+            allowed_patterns = list(cfg.get("proxy", {}).get("allowed_user_id_headers", []) or [])
+            if isinstance(tenant_metadata, dict) and tenant_metadata.get("owner_domain"):
+                allowed_patterns.append(f"*@{tenant_metadata['owner_domain']}")
             if allowed_patterns:
                 from fnmatch import fnmatch
                 if any(fnmatch(header_user_id, pattern) for pattern in allowed_patterns):
@@ -946,9 +1016,9 @@ async def _authenticate(request: Request) -> tuple[str, Optional[str], Optional[
                 else:
                     logger.warning("X-User-ID header value '%s' not in allowlist, ignoring", header_user_id)
             else:
-                # If no allowlist configured, accept any header value (use with caution)
-                logger.debug("User ID overridden by X-User-ID header (no allowlist): %s", header_user_id)
-                return header_user_id, api_key, tenant_metadata
+                logger.warning(
+                    "X-User-ID override rejected: no allowlist configured "
+                    "(set proxy.allowed_user_id_headers or an owner_domain on the key)")
 
     return user_id, api_key, tenant_metadata
 

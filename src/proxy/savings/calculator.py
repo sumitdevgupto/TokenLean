@@ -1,5 +1,8 @@
+import logging
 import os
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     import tiktoken
@@ -169,8 +172,20 @@ def get_cost_per_1k(model: str) -> tuple:
     if best_costs is not None:
         return (best_costs.get("input", 0.005), best_costs.get("output", 0.015))
 
+    # WS22: pricing miss — this model silently priced at the default (gpt-4o-class)
+    # rates, skewing cost_actual/cost_saved estimates. Warn once per model so the
+    # operator seeds a pricing row (esp. for BYOK-permitted models).
+    if model_lower not in _PRICING_MISS_WARNED:
+        _PRICING_MISS_WARNED.add(model_lower)
+        logger.warning(
+            "pricing table has no row matching model '%s' — falling back to default "
+            "rates; add a pricing entry for accurate cost estimates", model)
+
     default = pricing.get("default", {})
     return (default.get("input", 0.005), default.get("output", 0.015))
+
+
+_PRICING_MISS_WARNED: set = set()
 
 
 def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:

@@ -22,9 +22,17 @@ from savings.calculator import count_messages_tokens
 logger = logging.getLogger(__name__)
 GROUP = "G17"
 
+# WS21: all three loop-state keys are tenant-prefixed at use (ctx.redis_prefix +
+# these suffixes). workflow_id is CLIENT-supplied — without the tenant prefix two
+# tenants sending the same workflow_id would share/drain one budget and trip each
+# other's loop stops (cross-tenant DoS). Same pattern as G18's turn_baseline key.
 _BUDGET_PREFIX = "tok_opt:budget:"
 _TURN_PREFIX = "tok_opt:turns:"
 _START_TIME_PREFIX = "tok_opt:start_time:"
+
+
+def _scoped(ctx, prefix: str, workflow_id: str) -> str:
+    return f"{getattr(ctx, 'redis_prefix', '')}{prefix}{workflow_id}"
 
 
 class InterAgentState(BaseModel):
@@ -99,7 +107,7 @@ class G17LoopControl:
             redis = _get_redis()
 
             # Initialize start time on first turn
-            start_time_key = f"{_START_TIME_PREFIX}{workflow_id}"
+            start_time_key = _scoped(ctx, _START_TIME_PREFIX, workflow_id)
             start_time_raw = await redis.get(start_time_key)
             if start_time_raw is None:
                 await redis.set(start_time_key, str(time.time()), ex=3600)
@@ -108,7 +116,7 @@ class G17LoopControl:
                 start_time = float(start_time_raw)
 
             # Check and increment turn counter
-            turn_key = f"{_TURN_PREFIX}{workflow_id}"
+            turn_key = _scoped(ctx, _TURN_PREFIX, workflow_id)
             turn_count = await redis.incr(turn_key)
             await redis.expire(turn_key, 3600)
 
@@ -157,7 +165,7 @@ class G17LoopControl:
                     ctx.params.setdefault("_token_opt_warnings", []).append(stop_reason)
 
             # Track and propagate token budget
-            budget_key = f"{_BUDGET_PREFIX}{workflow_id}"
+            budget_key = _scoped(ctx, _BUDGET_PREFIX, workflow_id)
             budget_raw = await redis.get(budget_key)
             if budget_raw is None:
                 remaining = starting_budget
