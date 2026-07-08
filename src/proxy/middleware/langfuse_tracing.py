@@ -248,9 +248,14 @@ def finish_trace(ctx: "RequestContext", response: Optional[Dict[str, Any]] = Non
 
         _add_scores(ctx, trace)
 
-        client = get_client()
-        if client:
-            client.flush()
+        # Do NOT flush synchronously here. `trace.generation()`/`.update()` only
+        # enqueue events in-memory; the persistent Langfuse client (module-level
+        # singleton, created once) runs its own background consumer thread that
+        # flushes on an interval and on process exit (atexit). A per-request
+        # client.flush() forces a blocking HTTP round-trip to Langfuse on the
+        # response critical path — when Langfuse is slow/backed up that surfaced
+        # as multi-second G18-observability stage latency (the SLA "Proxy only"
+        # tail). Delivery is unchanged; only the timing moves off-path.
     except Exception as exc:
         logger.warning("Langfuse finish_trace failed: %s", exc)
 

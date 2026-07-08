@@ -38,6 +38,7 @@ from middleware.g18_observability import (
     HTTP_REQUESTS,
     LLM_DURATION_MS,
     PROXY_OVERHEAD_MS,
+    STAGE_DURATION_MS,
 )
 from middleware import RequestContext
 from middleware.g00_rate_limit import RateLimitExceeded
@@ -828,6 +829,18 @@ async def chat_completions(request: Request):
         # judge/cascade fallback, G10 summary, G09 schema) is preserved alongside
         # the main call — the SLA split needs the TOTAL provider time.
         ctx.llm_elapsed_ms += _llm_ms
+        # Book the main provider completion as the 'LLM-call' pseudo-stage so the
+        # Latency Breakup dashboard shows it alongside the G-group stages and a
+        # normal request's per-step bars sum to end-to-end. G06-cascade requests
+        # short-circuit the main call (their provider time is inside G06-routing),
+        # so they simply record no LLM-call stage — no double counting.
+        try:
+            STAGE_DURATION_MS.labels(
+                stage="LLM-call",
+                tenant_id=getattr(ctx, "tenant_id", "default"),
+            ).observe(_llm_ms)
+        except Exception:  # never let metrics break the response
+            pass
         (logger.warning if _llm_ms > 10000 else logger.info)(
             "[%s] LLM call %s completed in %.0fms", request_id, ctx.routed_model, _llm_ms
         )

@@ -1,0 +1,339 @@
+{
+  "title": "Token Optimisation - Latency Breakup",
+  "uid": "token-opt-latency-breakup",
+  "tags": [
+    "token-optimisation",
+    "latency"
+  ],
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "links": [
+    {
+      "title": "SLA Monitoring",
+      "type": "dashboards",
+      "tags": [
+        "sla"
+      ],
+      "asDropdown": false,
+      "icon": "heart",
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Top-level split (end-to-end)",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "End-to-end p99 (ms)",
+      "description": "Total wall-clock the caller sees. Equals LLM time + proxy overhead on a normal request.",
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 4 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(token_opt_request_duration_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "end-to-end"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 10000 },
+              { "color": "red", "value": 30000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "LLM p99 (ms)",
+      "description": "Provider completion latency only. Cache hits and bypasses never reach the provider and are excluded.",
+      "gridPos": { "x": 6, "y": 1, "w": 6, "h": 4 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(token_opt_llm_duration_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "llm"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Proxy overhead p99 (ms)",
+      "description": "End-to-end minus total provider time. This is the latency the proxy itself adds — the number the per-step panels below explain.",
+      "gridPos": { "x": 12, "y": 1, "w": 6, "h": 4 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(token_opt_proxy_overhead_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "proxy"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 2000 },
+              { "color": "red", "value": 5000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Request rate",
+      "description": "Served requests per second (all exit paths) over the last 5m — context for how load-dependent the tail is.",
+      "gridPos": { "x": 18, "y": 1, "w": 6, "h": 4 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_proxy_overhead_ms_count{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "req/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "text", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "none",
+        "graphMode": "area",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Per-step latency — all steps (incl. LLM call)",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "bargauge",
+      "title": "Step p99 (ms) — ranked",
+      "description": "Current p99 wall-clock per pipeline step, LLM call included. The longest bars are where end-to-end time goes. 'LLM-call' is the main provider completion; on G06-cascade requests provider time is folded into 'G06-routing' instead.",
+      "gridPos": { "x": 0, "y": 6, "w": 10, "h": 11 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "{{stage}}",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [ { "field": "Value", "desc": true } ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "text"
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Step p95 over time (all steps)",
+      "description": "p95 latency per step over time. The legend table's Max/Mean columns rank steps; a rising line flags a step degrading under load (cold sidecar, slow vector DB, cascade escalation).",
+      "gridPos": { "x": 10, "y": 6, "w": 14, "h": 11 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "lineWidth": 1, "fillOpacity": 0 }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["max", "mean"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Proxy-only steps (LLM call excluded)",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 17, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "bargauge",
+      "title": "Proxy step p99 (ms) — ranked",
+      "description": "Same ranking with the LLM call removed — pure proxy-induced overhead per step. These bars should stay small; a multi-second bar (e.g. G01 LLMLingua compression on a large payload, G18 trace export) is the thing to optimise. NOTE: G06-routing still includes any in-stage cascade/judge provider calls.",
+      "gridPos": { "x": 0, "y": 18, "w": 10, "h": 11 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\",stage!=\"LLM-call\"}[5m])))",
+          "legendFormat": "{{stage}}",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [ { "field": "Value", "desc": true } ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 1000 },
+              { "color": "red", "value": 3000 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "text"
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Proxy step p95 over time (LLM excluded)",
+      "description": "p95 per proxy step over time. Use the legend Max column to find the worst offender, then the trend to see whether it is steady overhead or a load-driven tail.",
+      "gridPos": { "x": 10, "y": 18, "w": 14, "h": 11 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\",stage!=\"LLM-call\"}[5m])))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "lineWidth": 1, "fillOpacity": 0 }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["max", "mean"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": { "uid": "prometheus" },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": { "value": "$__all", "text": "All" },
+        "refresh": 2
+      }
+    ]
+  }
+}

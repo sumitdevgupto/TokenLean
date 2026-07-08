@@ -81,18 +81,35 @@ REQUESTS_TOTAL = Counter(
     "Total requests processed by the proxy",
     ["model", "team", "feature", "tenant_id"],
 )
+# Shared latency bucket ladder. Resolves the >10s tail that the old coarse
+# buckets collapsed: with only [..., 10000, 30000, 60000] a p99 anywhere between
+# 10s and 30s interpolated to the same ~12s midpoint regardless of the true
+# value. The finer rungs above 10s make percentiles in the tail meaningful.
+_LATENCY_BUCKETS_MS = [
+    10, 25, 50, 100, 250, 500, 1000, 2000, 3000, 5000, 7500,
+    10000, 15000, 20000, 30000, 45000, 60000, 120000,
+]
+# Per-stage ladder — one histogram per (stage, tenant), so it is slightly leaner
+# than the full request ladder to keep series cardinality bounded (buckets ×
+# ~30 stages × tenants), while still resolving sub-100ms stages and the
+# multi-second sidecar/cascade tail that the old [50,250,1000,5000,30000]
+# snapped into two-order-of-magnitude buckets.
+_STAGE_BUCKETS_MS = [
+    5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 30000, 60000,
+]
+
 REQUEST_DURATION_MS = Histogram(
     "token_opt_request_duration_ms",
     "End-to-end request latency in milliseconds (used by SLA dashboard)",
     ["tenant_id", "status"],
-    buckets=[50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000],
+    buckets=_LATENCY_BUCKETS_MS,
 )
 LLM_DURATION_MS = Histogram(
     "token_opt_llm_duration_ms",
     "Provider LLM call latency in milliseconds; cache hits and bypasses never "
     "reach the provider and are not observed here",
     ["tenant_id"],
-    buckets=[50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000],
+    buckets=_LATENCY_BUCKETS_MS,
 )
 PROXY_OVERHEAD_MS = Histogram(
     "token_opt_proxy_overhead_ms",
@@ -102,15 +119,18 @@ PROXY_OVERHEAD_MS = Histogram(
     "and bypasses skip the provider, so their full duration counts as proxy "
     "time (used by SLA dashboard 'Proxy only' row)",
     ["tenant_id", "status"],
-    buckets=[10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000],
+    buckets=_LATENCY_BUCKETS_MS,
 )
 STAGE_DURATION_MS = Histogram(
     "token_opt_stage_duration_ms",
     "Per-pipeline-stage wall-clock latency in milliseconds (G-group granularity); "
     "attributes proxy overhead to the stage that caused it (SLA 'Proxy time by "
-    "stage' panel). Coarse buckets keep label cardinality bounded",
+    "stage' panel + the Latency Breakup dashboard). The pseudo-stage 'LLM-call' "
+    "carries the main provider completion so a normal request's breakup sums to "
+    "end-to-end; on G06-cascade requests the provider time lives inside the "
+    "'G06-routing' stage instead (no separate main call is made)",
     ["stage", "tenant_id"],
-    buckets=[50, 250, 1000, 5000, 30000],
+    buckets=_STAGE_BUCKETS_MS,
 )
 HTTP_REQUESTS = Counter(
     "token_opt_http_requests_total",

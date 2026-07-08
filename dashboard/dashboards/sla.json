@@ -11,6 +11,19 @@
     "from": "now-24h",
     "to": "now"
   },
+  "links": [
+    {
+      "title": "Latency Breakup (per-step)",
+      "type": "dashboards",
+      "tags": [
+        "latency"
+      ],
+      "asDropdown": false,
+      "icon": "bolt",
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
   "panels": [
     {
       "id": 9,
@@ -56,11 +69,11 @@
               },
               {
                 "color": "yellow",
-                "value": 300
+                "value": 10000
               },
               {
                 "color": "red",
-                "value": 500
+                "value": 30000
               }
             ]
           }
@@ -103,7 +116,24 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 5000
+              },
+              {
+                "color": "red",
+                "value": 15000
+              }
+            ]
+          }
         }
       },
       "options": {
@@ -143,7 +173,24 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 3000
+              },
+              {
+                "color": "red",
+                "value": 8000
+              }
+            ]
+          }
         }
       },
       "options": {
@@ -264,11 +311,11 @@
               },
               {
                 "color": "yellow",
-                "value": 300
+                "value": 2000
               },
               {
                 "color": "red",
-                "value": 500
+                "value": 5000
               }
             ]
           }
@@ -312,7 +359,24 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 3000
+              }
+            ]
+          }
         }
       },
       "options": {
@@ -353,7 +417,24 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 500
+              },
+              {
+                "color": "red",
+                "value": 1500
+              }
+            ]
+          }
         }
       },
       "options": {
