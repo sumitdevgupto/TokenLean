@@ -76,6 +76,15 @@ class G00RateLimit:
         month = time.strftime("%Y%m", time.gmtime(now if now is not None else time.time()))
         return f"{redis_prefix}quota:{month}"
 
+    @staticmethod
+    def spend_key(redis_prefix: str, now: Optional[float] = None) -> str:
+        """Monthly running-USD spend counter key (tenant-prefixed; bumped by main
+        on every served 2xx by the request's real ``cost_actual_usd``, checked here
+        before any work happens). Separate from ``quota_key`` — this is the
+        denial-of-wallet ceiling, not the request-count billing gate."""
+        month = time.strftime("%Y%m", time.gmtime(now if now is not None else time.time()))
+        return f"{redis_prefix}spend:{month}"
+
     async def _check_quota(self, ctx, redis, rl_cfg: Dict[str, Any]) -> None:
         """WS23 monthly request-quota gate from the billing rate card.
 
@@ -109,6 +118,58 @@ class G00RateLimit:
                 retry_after=86400,
                 limit_type="quota_exceeded",
                 scope=f"tenant={tenant_id},tier={tier},included={included},used={used}",
+            )
+
+    @staticmethod
+    def _effective_spend_cap(ctx, scfg: Dict[str, Any]) -> Optional[float]:
+        """Resolve the effective monthly USD cap for this request, most specific wins:
+        per-tenant override (``limits.monthly_spend_cap_usd`` — written by the portal
+        into ``tenant_configs.config_overrides`` and deep-merged into ``ctx.config``)
+        > tier default (``billing.rate_card.<tier>.monthly_spend_cap_usd``). Returns
+        ``None`` when no cap is configured (unlimited) — 0/negative also means unlimited."""
+        override = (ctx.config.get("limits") or {}).get("monthly_spend_cap_usd")
+        if override is None:
+            tier = (getattr(ctx, "pricing_tier", "") or "free").lower()
+            rate_card = (ctx.config.get("billing", {}) or {}).get("rate_card", {}) or {}
+            override = (rate_card.get(tier) or {}).get("monthly_spend_cap_usd")
+        if override is None:
+            return None
+        try:
+            cap = float(override)
+        except (TypeError, ValueError):
+            return None
+        return cap if cap > 0 else None
+
+    async def _check_spend(self, ctx, redis, rl_cfg: Dict[str, Any]) -> None:
+        """Per-tenant monthly running-USD spend gate (denial-of-wallet ceiling).
+
+        Enforced only when ``rate_limit.spend_cap.enabled`` — OSS/self-host default
+        OFF. Cap = effective ``monthly_spend_cap_usd`` × (1 + grace_pct/100); absent
+        cap means unlimited. Reads the running ``t:<id>:spend:<YYYYMM>`` counter that
+        main bumps by each served request's real ``cost_actual_usd``. Fail-open on
+        Redis errors so the ceiling never takes the proxy down."""
+        scfg = rl_cfg.get("spend_cap") or {}
+        if not scfg.get("enabled", False):
+            return
+        tenant_id = getattr(ctx, "tenant_id", "default")
+        if tenant_id in set(scfg.get("exempt_tenants") or ["admin", "default"]):
+            return
+        cap = self._effective_spend_cap(ctx, scfg)
+        if cap is None:
+            return  # unlimited
+        grace = float(scfg.get("grace_pct", 0) or 0)
+        ceiling = cap * (1 + grace / 100.0)
+        try:
+            spent = float(await redis.get(
+                self.spend_key(getattr(ctx, "redis_prefix", f"t:{tenant_id}:"))) or 0.0)
+        except Exception as exc:
+            logger.warning("[%s] G00 spend check failed (fail-open): %s", ctx.request_id, exc)
+            return
+        if spent >= ceiling:
+            raise RateLimitExceeded(
+                retry_after=86400,
+                limit_type="spend_cap_exceeded",
+                scope=f"tenant={tenant_id},cap_usd={cap:.4f},spent_usd={spent:.4f}",
             )
 
     async def _check_token_bucket(
@@ -172,6 +233,15 @@ class G00RateLimit:
                 raise
             except Exception as exc:
                 logger.warning("[%s] G00 quota gate error (fail-open): %s", ctx.request_id, exc)
+        # Per-tenant USD spend cap — independent of the rps/rph limiter and the
+        # request-count quota; a deployment may enforce a dollar ceiling alone.
+        if cfg.get("spend_cap", {}).get("enabled", False):
+            try:
+                await self._check_spend(ctx, _get_redis(), cfg)
+            except RateLimitExceeded:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] G00 spend gate error (fail-open): %s", ctx.request_id, exc)
         if not cfg.get("enabled", False):
             return ctx
 

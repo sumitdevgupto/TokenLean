@@ -82,6 +82,28 @@ variable "enable_self_hosted_observability" {
   default     = true
 }
 
+# ─── BYOK provider-key security hardening (opt-in; default = current behaviour) ──
+# All three default to the pre-hardening posture so `terraform apply` is a no-op on an
+# existing project. Flip them on a STAGING project first (item 8 changes DB connectivity
+# and can break the `gcloud sql connect` migrations), validate, then promote to prod.
+variable "least_privilege_secret_iam" {
+  description = "Item 7: replace the proxy SA's project-wide secretmanager.secretAccessor with per-secret bindings (least privilege). Default false keeps the broad grant."
+  type        = bool
+  default     = false
+}
+
+variable "private_cloud_sql" {
+  description = "Item 8: put Cloud SQL on a private IP (no public IPv4) + ENCRYPTED_ONLY SSL via Private Service Access. Default false keeps public IPv4. NOTE: the `gcloud sql connect` migration steps need a public/authorized path — enable the connector or run migrations from within the VPC before turning this on."
+  type        = bool
+  default     = false
+}
+
+variable "enable_kms_master_key" {
+  description = "Item 6: provision a Cloud KMS key ring + key and grant the proxy SA cryptoKeyDecrypter, so the BYOK master key can be stored KMS-wrapped and unwrapped at startup (set TENANT_KEY_KMS_KEY on the proxy). Default false keeps the plaintext Secret Manager master key."
+  type        = bool
+  default     = false
+}
+
 variable "redis_backend" {
   description = "Redis backend: 'memorystore' (managed Memorystore) or 'docker' (redis container on a small GCE COS VM, cheaper)."
   type        = string

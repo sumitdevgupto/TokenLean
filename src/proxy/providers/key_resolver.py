@@ -33,6 +33,32 @@ class ProviderKeyError(Exception):
         super().__init__(self.public_message)
 
 
+class ProviderKeyDecryptError(ProviderKeyError):
+    """A stored tenant key was FOUND but could not be decrypted (corrupt ciphertext or a
+    master key that no longer matches). This is a **fail-closed** condition, deliberately
+    distinct from "no key configured":
+
+      * The commercial resolver raises it BEFORE any platform-key fallback, so a decrypt
+        failure never silently burns the platform account.
+      * It subclasses ``ProviderKeyError`` so every middleware ``except ProviderKeyError``
+        degrade path (G06/G09/G10/G13) still treats it as "no usable key" and fails closed
+        (no platform call) — the safe default.
+      * The main chat path catches it FIRST (before ``ProviderKeyError``) to return a
+        distinct message rather than the misleading "add a key" 402.
+    """
+
+    def __init__(self, provider: str, tenant_id: str) -> None:
+        super().__init__(
+            provider,
+            tenant_id,
+            message=(
+                f"Your stored {provider} API key could not be decrypted and cannot be "
+                f"used. Please re-enter it in the portal under Settings → Models & Keys, "
+                f"or contact support if this persists."
+            ),
+        )
+
+
 # fn(provider, tenant_id, ctx_or_None) -> Optional[str]; MAY raise ProviderKeyError
 ProviderKeyResolverFn = Callable[[str, str, Optional[Any]], Awaitable[Optional[str]]]
 

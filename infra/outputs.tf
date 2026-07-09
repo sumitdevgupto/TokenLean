@@ -23,6 +23,11 @@ output "db_password_secret_name" {
   value       = google_secret_manager_secret.db_password.secret_id
 }
 
+output "byok_master_kms_key_id" {
+  description = "Item 6: KMS crypto-key resource id for wrapping the BYOK master key (empty unless enable_kms_master_key). Set as TENANT_KEY_KMS_KEY on the proxy so it unwraps the master key at startup."
+  value       = var.enable_kms_master_key ? google_kms_crypto_key.master_key[0].id : ""
+}
+
 output "prometheus_service_url" {
   description = "Internal Cloud Run URL for the Prometheus OSS service (empty when self-hosted observability is disabled — use Cloud Monitoring)"
   value       = var.enable_self_hosted_observability ? google_cloud_run_v2_service.prometheus[0].uri : ""
