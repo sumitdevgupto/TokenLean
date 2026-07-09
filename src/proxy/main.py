@@ -14,6 +14,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 import uvicorn
@@ -56,34 +57,22 @@ logger = logging.getLogger(__name__)
 # is open (local dev); set it in production so per-tenant metrics aren't public.
 _METRICS_SCRAPE_TOKEN = os.getenv("METRICS_SCRAPE_TOKEN", "")
 
-app = FastAPI(
-    title="Token Optimisation Proxy",
-    description="LLM proxy implementing G0-G28 token optimisations (G26 reserved).",
-    version="1.0.0",
-)
-# CORS: Restrict to specific origins in production via CORS_ORIGINS env var
-# Format: comma-separated URLs, e.g., "https://myapp.com,https://myapp-staging.com"
-# For local development, set to "http://localhost:3000,http://localhost:8080"
-# WS25: DEFAULT-DENY — the old unconfigured fallback was "*", which is the wrong
-# posture for a credentialed multi-tenant API. Browser cross-origin access now
-# requires either CORS_ORIGINS or an explicit CORS_ALLOW_ALL=true (local dev only).
-# Non-browser clients (SDKs, curl) are unaffected — CORS gates browsers only.
-cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-if not cors_origins and os.getenv("CORS_ALLOW_ALL", "").strip().lower() in ("1", "true", "yes"):
-    cors_origins = ["*"]
-if cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-_pipeline = OptimisationPipeline()
+# Extension point: layers that compose on top of the core app (e.g. commercial_app)
+# register an async startup callable here instead of using @app.on_event — FastAPI
+# ignores on_event handlers once a custom lifespan is set, so the lifespan below invokes
+# these after core startup completes. Exceptions PROPAGATE (matching the old on_event
+# semantics), so a commercial startup guard that raises still refuses to boot.
+_startup_hooks: list = []
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle (replaces the deprecated @app.on_event hooks).
+
+    The startup body references module globals defined further down (``_pipeline``,
+    ``_init_openllmetry``, …) — that is fine, they are resolved when the server starts,
+    long after the module has finished importing."""
+    # ── startup ──
     load_config()
     start_hot_reload()
     # WS22 env invariant: provider credentials must reach this process ONLY as
@@ -165,12 +154,45 @@ async def startup_event():
         )
     logger.info("Token Optimisation Proxy started")
 
+    # Run registered add-on startup hooks (e.g. commercial router mounting) after core
+    # startup, so Redis/config/pipeline handles are ready. Exceptions propagate — a hook
+    # that raises (e.g. the managed BYOK boot guard) must still refuse to start the app.
+    for _hook in _startup_hooks:
+        await _hook()
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    yield
+
+    # ── shutdown ──
     from cache.redis_pool import close_pool
     await close_pool()
     logger.info("Token Optimisation Proxy shut down")
+
+
+app = FastAPI(
+    title="Token Optimisation Proxy",
+    description="LLM proxy implementing G0-G28 token optimisations (G26 reserved).",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+# CORS: Restrict to specific origins in production via CORS_ORIGINS env var
+# Format: comma-separated URLs, e.g., "https://myapp.com,https://myapp-staging.com"
+# For local development, set to "http://localhost:3000,http://localhost:8080"
+# WS25: DEFAULT-DENY — the old unconfigured fallback was "*", which is the wrong
+# posture for a credentialed multi-tenant API. Browser cross-origin access now
+# requires either CORS_ORIGINS or an explicit CORS_ALLOW_ALL=true (local dev only).
+# Non-browser clients (SDKs, curl) are unaffected — CORS gates browsers only.
+cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if not cors_origins and os.getenv("CORS_ALLOW_ALL", "").strip().lower() in ("1", "true", "yes"):
+    cors_origins = ["*"]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+_pipeline = OptimisationPipeline()
 
 
 def _init_openllmetry(cfg: Dict[str, Any]) -> None:
@@ -522,7 +544,7 @@ async def ingest_doc(request: Request):
 # Body params consumed by middleware for routing/retrieval/loop-control —
 # not recognized by the provider's completion API and must not be forwarded.
 _INTERNAL_PARAM_KEYS = {"template_id", "workflow_id", "rag_query", "batch_id", "burst_block"}
-_usage_meter = None  # initialised in startup_event once pg pool is ready
+_usage_meter = None  # initialised in the lifespan startup once pg pool is ready
 
 
 def _schedule_billing(ctx, response) -> None:

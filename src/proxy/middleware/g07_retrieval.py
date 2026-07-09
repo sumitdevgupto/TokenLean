@@ -395,7 +395,7 @@ async def _hybrid_search(
         )
 
         auth = _get_qdrant_auth_token()
-        client = AsyncQdrantClient(url=qdrant_url, api_key=auth or None)
+        client = AsyncQdrantClient(url=qdrant_url, api_key=auth or None, check_compatibility=False)
         dense_embedding = await _embed_dense(query)
         sparse_embedding = await _embed_sparse(query)  # Phase 2: may be None if fastembed unavailable
 
