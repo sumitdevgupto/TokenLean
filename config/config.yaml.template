@@ -451,12 +451,15 @@ groups:
     # Max cost DELTA (input + expected output, vs the previous tier) a single cascade
     # escalation may add. Small requests jumping into a pricey tier are blocked here.
     max_escalation_cost_usd: 0.01
-    # Over-escalation guards (execution cascade only). cap_to_classified_tier: the
+    # Over-escalation guards. cap_to_classified_tier (execution cascade only): the
     # cascade may climb at most to the tier the request itself classifies as, so a
     # plain "medium" query is never pushed to the expensive complex tier (an
     # x_complexity override bypasses the cascade entirely). allow_escalation_above_
-    # requested: when false (default), the cascade never routes to a model costlier
-    # than the one the caller requested — escalation only ever saves cost, never adds it.
+    # requested: when false (default), G06 never routes to a model costlier than the one
+    # the caller requested — enforced BOTH in the execution cascade AND on the label
+    # paths (heuristic / llm_judge / routellm), where a mis-classified "medium"/"complex"
+    # tier that outprices the requested model reverts to the requested model. Routing
+    # only ever saves cost, never adds it. Explicit x_complexity user overrides are exempt.
     cascade_cap_to_classified_tier: true
     allow_escalation_above_requested: false
     # No-judge response-adequacy scores (used when judge_model is empty), compared

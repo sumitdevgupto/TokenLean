@@ -848,6 +848,32 @@ class G06Routing:
                     getattr(ctx.savings, "routing_mode", None) or "route"
                 ) + "+tier_unreachable_fallback"
 
+        # 2c. Cost-floor guard — never route ABOVE the caller's model. The classifier can
+        # over-call a simple query as "medium"/"complex" and select a pricier tier (e.g.
+        # gpt-4o-mini requested → gpt-4o "medium" tier), turning a saving into a cost
+        # increase (denial-of-wallet by over-escalation). The execution cascade already
+        # enforces this inline via _escalation_block_reason; this covers the label paths
+        # (heuristic / llm_judge / routellm / cascade fallback). Explicit user overrides
+        # are intent and exempt. Opt out with allow_escalation_above_requested (the same
+        # flag the cascade uses). Cost is input + expected output so reasoning tiers aren't
+        # undercounted.
+        if (selected_model and selected_model != model_requested
+                and not user_override
+                and ctx.savings.routing_mode != "cascade_execution"
+                and not cfg.get("allow_escalation_above_requested", False)):
+            _out = int(ctx.params.get("max_tokens") or 512)
+            _req_cost = estimate_cost(ctx.current_token_count, _out, model_requested)
+            _sel_cost = estimate_cost(ctx.current_token_count, _out, selected_model)
+            if _sel_cost > _req_cost:
+                logger.info(
+                    "[%s] G06 cost-floor: routed %r ($%.6f) costs more than requested %r "
+                    "($%.6f) — reverting to the requested model (never route above the "
+                    "caller's model; set allow_escalation_above_requested to opt in).",
+                    ctx.request_id, selected_model, _sel_cost, model_requested, _req_cost)
+                selected_model = model_requested
+                ctx.savings.routing_mode = (
+                    getattr(ctx.savings, "routing_mode", None) or "route") + "+cost_floor"
+
         # 3. Savings logic
         if selected_model != ctx.model:
             # Input-only estimate, used ONLY for the human-readable step description below.
