@@ -135,6 +135,48 @@ class TestG06Routing:
         ctx = await G06Routing().process_request(ctx)
         assert ctx.routed_model == original
 
+    # Distinct pricing so the cost-floor guard can tell gpt-4o (pricey) from gpt-4o-mini
+    # (cheap) — mirrors the live config's pricing table (unit tests have none by default).
+    _PRICING = {
+        "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+        "gpt-4o": {"input": 0.005, "output": 0.015},
+        "gpt-4-5": {"input": 0.075, "output": 0.15},
+        "default": {"input": 0.005, "output": 0.015},
+    }
+
+    async def test_cost_floor_reverts_upward_route_to_requested(self, make_ctx):
+        # B2: a cheap-requested query mis-classified as "medium" must NOT route up to a
+        # pricier tier (denial-of-wallet by over-escalation). The medium prompt classifies
+        # medium → gpt-4o, but the caller asked for gpt-4o-mini, so the cost-floor guard
+        # reverts to gpt-4o-mini.
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o-mini")
+        ctx.config["groups"]["G6_routing"]["classifier"] = "heuristic"
+        ctx.config["groups"]["G6_routing"]["tiers"] = {
+            "simple": ["gpt-4o-mini"],
+            "medium": ["gpt-4o"],
+            "complex": ["gpt-4-5"],
+        }
+        from middleware.g06_routing import G06Routing
+        with patch("config_loader.get_pricing_table", return_value=self._PRICING):
+            ctx = await G06Routing().process_request(ctx)
+        assert ctx.routed_model == "gpt-4o-mini"
+        assert "cost_floor" in (ctx.savings.routing_mode or "")
+
+    async def test_allow_escalation_above_requested_opt_in(self, make_ctx):
+        # With the opt-in flag set, upward routing is permitted again (quality-upgrade mode).
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o-mini")
+        ctx.config["groups"]["G6_routing"]["classifier"] = "heuristic"
+        ctx.config["groups"]["G6_routing"]["allow_escalation_above_requested"] = True
+        ctx.config["groups"]["G6_routing"]["tiers"] = {
+            "simple": ["gpt-4o-mini"],
+            "medium": ["gpt-4o"],
+            "complex": ["gpt-4-5"],
+        }
+        from middleware.g06_routing import G06Routing
+        with patch("config_loader.get_pricing_table", return_value=self._PRICING):
+            ctx = await G06Routing().process_request(ctx)
+        assert ctx.routed_model == "gpt-4o"
+
     async def test_heuristic_classifier_explicit(self, make_ctx):
         ctx = make_ctx(
             [{"role": "user", "content": "Please analyse the architecture."}],
