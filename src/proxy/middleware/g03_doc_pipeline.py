@@ -226,7 +226,7 @@ class RAGFallbackOrchestrator:
             from qdrant_client import QdrantClient
             from sentence_transformers import SentenceTransformer
             
-            client = QdrantClient(url=self.qdrant_url)
+            client = QdrantClient(url=self.qdrant_url, check_compatibility=False)
             
             # Embed query
             model = SentenceTransformer("all-MiniLM-L6-v2")

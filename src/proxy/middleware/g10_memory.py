@@ -179,7 +179,7 @@ async def store_skill_in_qdrant(skill_id: str, skill_text: str, metadata: Dict,
         from qdrant_client import QdrantClient
         from ml_models import get_text_embedding
 
-        client = QdrantClient(url=_QDRANT_URL)
+        client = QdrantClient(url=_QDRANT_URL, check_compatibility=False)
 
         # Embed skill text
         model = get_text_embedding(_SKILLS_EMBEDDING_MODEL)
