@@ -148,6 +148,13 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
     volumes:
       - ./config:/app/config:ro
+      # Persist the HuggingFace / sentence-transformers cache so the G05 L2
+      # embedding model (bge-small) survives container recreates. Without this the
+      # model lives in the ephemeral container layer and is re-downloaded (~18s) on
+      # every rebuild, cold-loading on the first request burst (proxy-overhead p99
+      # spike). With the volume a recreate reloads from disk (~1-2s), and the
+      # startup warmup pays even that off the request path.
+      - hf_cache:/root/.cache/huggingface
     networks:
       - token-opt-net
     depends_on:
@@ -331,6 +338,7 @@ volumes:
   qdrant_data:
   grafana_data:
   prometheus_data:
+  hf_cache:
 
 networks:
   token-opt-net:

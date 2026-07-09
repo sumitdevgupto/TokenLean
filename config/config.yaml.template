@@ -402,6 +402,11 @@ groups:
     enabled: true
     cache_scope: tenant
     l1_ttl_seconds: 3600
+    # 384-dim local model, pre-baked into the proxy image and pinned to an immutable
+    # HF revision in the Dockerfile (ARG L2_EMBEDDING_REVISION, currently
+    # 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a). If you change this model name, bump
+    # that Dockerfile ARG to the matching revision and rebuild — the two must stay in
+    # sync, and a dimension change also requires migrating the cache_l2 pgvector table.
     l2_embedding_model: BAAI/bge-small-en-v1.5
     l2_similarity_threshold: 0.9
     l2_max_embed_chars: 2000

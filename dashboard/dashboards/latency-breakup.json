@@ -136,19 +136,20 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "Request rate",
-      "description": "Served requests per second (all exit paths) over the last 5m — context for how load-dependent the tail is.",
+      "title": "Requests (range)",
+      "description": "Total served requests (all exit paths, all statuses) over the dashboard's selected time range. Reads 0 only when there was genuinely no traffic in the window — unlike an instantaneous req/s gauge, which shows 0 whenever you are not actively sending traffic right now. Counter resets (proxy restarts) are handled by increase().",
       "gridPos": { "x": 18, "y": 1, "w": 6, "h": 4 },
       "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "expr": "sum(rate(token_opt_proxy_overhead_ms_count{tenant_id=~\"$tenant\"}[5m]))",
-          "legendFormat": "req/s"
+          "expr": "sum(increase(token_opt_proxy_overhead_ms_count{tenant_id=~\"$tenant\"}[$__range]))",
+          "legendFormat": "requests"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "short",
+          "decimals": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -175,39 +176,53 @@
     },
     {
       "id": 7,
-      "type": "bargauge",
+      "type": "table",
       "title": "Step p99 (ms) — ranked",
-      "description": "Current p99 wall-clock per pipeline step, LLM call included. The longest bars are where end-to-end time goes. 'LLM-call' is the main provider completion; on G06-cascade requests provider time is folded into 'G06-routing' instead.",
+      "description": "Current p99 wall-clock per pipeline step, LLM call included, sorted slowest-first. The top row is where end-to-end time goes. 'LLM-call' is the main provider completion; on G06-cascade requests provider time is folded into 'G06-routing' instead. (A large 'G05-cache' here right after a deploy is the bge-small embedding cold-load — see the SLA notes.)",
       "gridPos": { "x": 0, "y": 6, "w": 10, "h": 11 },
       "datasource": { "uid": "prometheus" },
       "targets": [
         {
           "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\"}[5m])))",
-          "legendFormat": "{{stage}}",
-          "instant": true
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
         }
       ],
       "transformations": [
         {
-          "id": "sortBy",
+          "id": "organize",
           "options": {
-            "fields": {},
-            "sort": [ { "field": "Value", "desc": true } ]
+            "excludeByName": { "Time": true },
+            "renameByName": { "stage": "Step", "Value": "p99 (ms)" }
           }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [ { "field": "p99 (ms)", "desc": true } ] }
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
-          "color": { "mode": "fixed", "fixedColor": "blue" }
-        }
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "gauge", "mode": "gradient" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Step" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "auto" } },
+              { "id": "custom.width", "value": 180 }
+            ]
+          }
+        ]
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "showUnfilled": true,
-        "valueMode": "text"
+        "showHeader": true,
+        "sortBy": [ { "displayName": "p99 (ms)", "desc": true } ]
       }
     },
     {
@@ -248,30 +263,39 @@
     },
     {
       "id": 10,
-      "type": "bargauge",
+      "type": "table",
       "title": "Proxy step p99 (ms) — ranked",
-      "description": "Same ranking with the LLM call removed — pure proxy-induced overhead per step. These bars should stay small; a multi-second bar (e.g. G01 LLMLingua compression on a large payload, G18 trace export) is the thing to optimise. NOTE: G06-routing still includes any in-stage cascade/judge provider calls.",
+      "description": "Same ranking with the LLM call removed — pure proxy-induced overhead per step, sorted slowest-first. Steps should stay small (green); a multi-second row (G05 embedding cold-load, G01 LLMLingua compression on a large payload, G18 trace export) is the thing to optimise. NOTE: G06-routing still includes any in-stage cascade/judge provider calls.",
       "gridPos": { "x": 0, "y": 18, "w": 10, "h": 11 },
       "datasource": { "uid": "prometheus" },
       "targets": [
         {
           "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(token_opt_stage_duration_ms_bucket{tenant_id=~\"$tenant\",stage!=\"LLM-call\"}[5m])))",
-          "legendFormat": "{{stage}}",
-          "instant": true
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
         }
       ],
       "transformations": [
         {
-          "id": "sortBy",
+          "id": "organize",
           "options": {
-            "fields": {},
-            "sort": [ { "field": "Value", "desc": true } ]
+            "excludeByName": { "Time": true },
+            "renameByName": { "stage": "Step", "Value": "p99 (ms)" }
           }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [ { "field": "p99 (ms)", "desc": true } ] }
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "gauge", "mode": "gradient" }
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -280,14 +304,20 @@
               { "color": "red", "value": 3000 }
             ]
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Step" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "auto" } },
+              { "id": "custom.width", "value": 180 }
+            ]
+          }
+        ]
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "showUnfilled": true,
-        "valueMode": "text"
+        "showHeader": true,
+        "sortBy": [ { "displayName": "p99 (ms)", "desc": true } ]
       }
     },
     {

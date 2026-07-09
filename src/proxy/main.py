@@ -110,6 +110,29 @@ async def startup_event():
     asyncio.create_task(start_batch_consumer(cfg))
     # Start G13 provider-native batch poller (no-op unless provider_native is on)
     asyncio.create_task(start_batch_poller(cfg))
+    # Warm the G05 L2 semantic-cache embedding model. On a fresh container the
+    # sentence-transformers model (bge-small) is downloaded + loaded on first use
+    # (~18s), and because the loader is lock-guarded the whole first request burst
+    # blocks behind that one cold load — spiking proxy-overhead p99 after every
+    # deploy. Warming it here (in a worker thread, as a background task so it never
+    # delays readiness) means the first real L2 lookup reuses the already-loaded,
+    # memoised instance and the cold cost is paid off the request path.
+    async def _warm_l2_embedding_model():
+        g5 = (cfg.get("groups", {}) or {}).get("G5_cache", {}) or {}
+        if not g5.get("enabled", True):
+            return
+        model_name = g5.get("l2_embedding_model", "BAAI/bge-small-en-v1.5")
+        try:
+            _t0 = time.time()
+            from ml_models import get_sentence_transformer
+            await asyncio.to_thread(get_sentence_transformer, model_name)
+            logger.info(
+                "G05 L2 embedding model warmed (%s) in %.0fms",
+                model_name, (time.time() - _t0) * 1000,
+            )
+        except Exception as exc:
+            logger.warning("G05 L2 embedding warmup failed (%s): %s", model_name, exc)
+    asyncio.create_task(_warm_l2_embedding_model())
     # Initialise OpenLLMetry (OTLP auto-instrumentation for LLM SDKs)
     _init_openllmetry(cfg)
     # Ensure billing table exists and wire UsageMeter (idempotent DDL)
