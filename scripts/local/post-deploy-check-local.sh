@@ -111,8 +111,16 @@ done
 echo ""
 
 # ─── Test 2: Proxy Health Endpoint ────────────────────────────────────────────
+# Retried: right after a deploy the container is "Up" before uvicorn finishes booting
+# (app import + bge-small embedding warm ≈ 8-9s), so a single no-retry curl false-fails
+# on a healthy stack. Poll up to ~30s so warm-up never reports a spurious error.
 info "Test 2: Checking proxy health endpoint..."
-HEALTH_RESPONSE=$(curl -s http://localhost:4000/health 2>/dev/null || echo "")
+HEALTH_RESPONSE=""
+for _ in $(seq 1 10); do
+  HEALTH_RESPONSE=$(curl -s -m 5 http://localhost:4000/health 2>/dev/null || echo "")
+  [[ "$HEALTH_RESPONSE" == *'"status":"ok"'* ]] && break
+  sleep 3
+done
 if [[ "$HEALTH_RESPONSE" == *'"status":"ok"'* ]]; then
   success "Proxy health endpoint responding"
   echo "       Response: $HEALTH_RESPONSE"
@@ -124,10 +132,15 @@ echo ""
 
 # ─── Test 3: Metrics Endpoint ─────────────────────────────────────────────────
 info "Test 3: Checking Prometheus metrics endpoint..."
-METRICS_RESPONSE=$(curl -s http://localhost:4000/metrics 2>/dev/null | head -5 || echo "")
+METRICS_RESPONSE=""
+for _ in $(seq 1 10); do
+  METRICS_RESPONSE=$(curl -s -m 5 http://localhost:4000/metrics 2>/dev/null | head -5 || echo "")
+  [[ -n "$METRICS_RESPONSE" && "$METRICS_RESPONSE" == *"# HELP"* ]] && break
+  sleep 3
+done
 if [[ -n "$METRICS_RESPONSE" && "$METRICS_RESPONSE" == *"# HELP"* ]]; then
   success "Metrics endpoint accessible"
-  COUNT=$(curl -s http://localhost:4000/metrics 2>/dev/null | grep -c "^# HELP" || echo "0")
+  COUNT=$(curl -s -m 5 http://localhost:4000/metrics 2>/dev/null | grep -c "^# HELP" || echo "0")
   echo "       Found $COUNT metric definitions"
 else
   fail "Metrics endpoint not responding correctly"
