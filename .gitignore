@@ -206,6 +206,10 @@ src/proxy/api/email_sender.py
 # Per-tenant BYOK provider-key store (Fernet-encrypted). Commercial — depends on
 # cryptography (commercial image only); imported by commercial_app.py.
 src/proxy/api/tenant_keys.py
+# Operator-console auth (email+bcrypt, own session/cookie, out-of-band provisioning, NO
+# signup) — gates the /adminconsole operator surface. Commercial; imported only by
+# commercial_app.py.
+src/proxy/api/operator_auth.py
 src/proxy/billing/tiers.py
 # Request-count invoicing (E2) — the paid product's billing calculation. Engines
 # (metering/models/audit) stay in core; the invoice generator is commercial.
@@ -246,6 +250,7 @@ tests/unit/api/test_admin.py
 tests/unit/api/test_portal_auth.py
 tests/unit/api/test_email_sender.py
 tests/unit/api/test_tenant_keys.py
+tests/unit/api/test_operator_auth.py
 tests/unit/portal/
 tests/unit/api/test_rls_scoping.py
 tests/test_gdpr_compliance.py
