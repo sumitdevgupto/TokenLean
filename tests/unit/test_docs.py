@@ -20,7 +20,7 @@ CURATED_DOCS = [
     "config-reference.md",
     "deployment-gcp.md",
     "deployment-local.md",
-    "developer-onboarding.md",
+    "client-onboarding.md",
     "langfuse-access.md",
     "oss-licenses.md",
     "request-flow-diagram.md",
