@@ -30,6 +30,10 @@ resource "google_project_service" "apis" {
     "compute.googleapis.com",
     # monitoring: Cloud Monitoring alert policies (managed observability)
     "monitoring.googleapis.com",
+    # servicenetworking: Private Service Access for private Cloud SQL (item 8, opt-in)
+    "servicenetworking.googleapis.com",
+    # cloudkms: envelope-encrypt the BYOK master key (item 6, opt-in)
+    "cloudkms.googleapis.com",
   ])
   service            = each.value
   disable_on_destroy = false
@@ -74,6 +78,30 @@ resource "random_password" "db_password" {
   special = true
 }
 
+# Item 8 (opt-in): Private Service Access so Cloud SQL can sit on a private IP.
+# Only created when var.private_cloud_sql = true, so the default public-IP deploy is
+# untouched. Uses the project's default VPC network.
+data "google_compute_network" "default" {
+  count = var.private_cloud_sql ? 1 : 0
+  name  = "default"
+}
+
+resource "google_compute_global_address" "sql_psa_range" {
+  count         = var.private_cloud_sql ? 1 : 0
+  name          = "token-opt-sql-psa"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = data.google_compute_network.default[0].id
+}
+
+resource "google_service_networking_connection" "sql_psa" {
+  count                   = var.private_cloud_sql ? 1 : 0
+  network                 = data.google_compute_network.default[0].id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.sql_psa_range[0].name]
+}
+
 resource "google_sql_database_instance" "main" {
   name             = "token-opt-pg"
   database_version = "POSTGRES_15"
@@ -85,8 +113,12 @@ resource "google_sql_database_instance" "main" {
     disk_size         = 20
     disk_autoresize   = true
 
+    # Item 8: when private_cloud_sql, drop the public IPv4, peer into the default VPC
+    # and require SSL. Otherwise keep the current public-IPv4 posture byte-identical.
     ip_configuration {
-      ipv4_enabled = true
+      ipv4_enabled    = var.private_cloud_sql ? false : true
+      private_network = var.private_cloud_sql ? data.google_compute_network.default[0].id : null
+      ssl_mode        = var.private_cloud_sql ? "ENCRYPTED_ONLY" : null
     }
 
     database_flags {
@@ -96,7 +128,10 @@ resource "google_sql_database_instance" "main" {
   }
 
   deletion_protection = true
-  depends_on          = [google_project_service.apis]
+  depends_on = [
+    google_project_service.apis,
+    google_service_networking_connection.sql_psa,
+  ]
 }
 
 resource "google_sql_database" "langfuse" {
@@ -430,16 +465,82 @@ resource "google_service_account" "proxy_sa" {
   display_name = "Token Optimisation Proxy"
 }
 
+# Item 7 (opt-in): least-privilege secret access. Default keeps the project-wide
+# secretmanager.secretAccessor grant; when var.least_privilege_secret_iam = true the
+# broad grant is dropped and the proxy SA is bound to ONLY the secrets it reads.
+locals {
+  proxy_secret_ids = var.least_privilege_secret_iam ? concat([
+    google_secret_manager_secret.db_password.secret_id,
+    google_secret_manager_secret.proxy_api_keys.secret_id,
+    google_secret_manager_secret.llm_key_openai.secret_id,
+    google_secret_manager_secret.llm_key_anthropic.secret_id,
+    google_secret_manager_secret.llm_key_google.secret_id,
+    google_secret_manager_secret.llm_key_mistral.secret_id,
+    google_secret_manager_secret.aws_access_key_id.secret_id,
+    google_secret_manager_secret.aws_secret_access_key.secret_id,
+    google_secret_manager_secret.routellm_openai_key.secret_id,
+    google_secret_manager_secret.langfuse_public_key.secret_id,
+    google_secret_manager_secret.langfuse_secret_key.secret_id,
+    google_secret_manager_secret.langfuse_nextauth_secret.secret_id,
+  ], [for s in google_secret_manager_secret.llm_key_extra : s.secret_id]) : []
+}
+
 resource "google_project_iam_member" "proxy_secret_accessor" {
+  count   = var.least_privilege_secret_iam ? 0 : 1
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "proxy_per_secret_accessor" {
+  for_each  = toset(local.proxy_secret_ids)
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Item 7 (opt-in): narrow storage from project-wide objectAdmin to the config bucket only.
 resource "google_project_iam_member" "proxy_storage_admin" {
+  count   = var.least_privilege_secret_iam ? 0 : 1
   project = var.project_id
   role    = "roles/storage.objectAdmin"
   member  = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+resource "google_storage_bucket_iam_member" "proxy_config_bucket" {
+  count  = var.least_privilege_secret_iam ? 1 : 0
+  bucket = var.config_bucket_name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# ─── Item 6 (opt-in): Cloud KMS envelope for the BYOK master key ──────────────
+# When enabled, the master key is stored KMS-wrapped in Secret Manager and unwrapped at
+# startup by the proxy (set TENANT_KEY_KMS_KEY to google_kms_crypto_key.master_key.id).
+# The decrypt grant is an independent, revocable IAM role — a proxy RCE alone no longer
+# yields the plaintext master key without also holding this KMS permission.
+resource "google_kms_key_ring" "byok" {
+  count      = var.enable_kms_master_key ? 1 : 0
+  name       = "token-opt-byok"
+  location   = var.region
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_kms_crypto_key" "master_key" {
+  count           = var.enable_kms_master_key ? 1 : 0
+  name            = "tenant-key-encryption"
+  key_ring        = google_kms_key_ring.byok[0].id
+  rotation_period = "7776000s" # 90 days
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_kms_crypto_key_iam_member" "proxy_master_key_decrypter" {
+  count         = var.enable_kms_master_key ? 1 : 0
+  crypto_key_id = google_kms_crypto_key.master_key[0].id
+  role          = "roles/cloudkms.cryptoKeyDecrypter"
+  member        = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
 resource "google_project_iam_member" "proxy_cloudsql_client" {

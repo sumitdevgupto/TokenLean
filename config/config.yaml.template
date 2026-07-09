@@ -58,6 +58,17 @@ rate_limit:
     enabled: false
     grace_pct: 10
     exempt_tenants: [admin, default]
+  # Per-tenant monthly USD spend cap — the "denial-of-wallet" ceiling. 429
+  # spend_cap_exceeded once the running t:<id>:spend:<YYYYMM> counter (summed real
+  # cost_actual_usd) crosses the effective cap x (1 + grace_pct/100). OFF by default
+  # — OSS/self-host never enforces a dollar ceiling; the managed SaaS enables it.
+  # Effective cap = per-tenant override (limits.monthly_spend_cap_usd, set via the
+  # portal into tenant_configs) > tier default (billing.rate_card.<tier>). Absent /
+  # 0 cap means unlimited. Exempt tenants are never gated. Fail-open on Redis error.
+  spend_cap:
+    enabled: false
+    grace_pct: 0
+    exempt_tenants: [admin, default]
 # WS25: periodic data-retention purge (default OFF — self-host keeps everything).
 # usage_days is clamped to a 400-day floor in code: usage_events is the billing
 # source of record and must outlive every invoice period.

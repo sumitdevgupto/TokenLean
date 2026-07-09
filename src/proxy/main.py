@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -33,7 +34,7 @@ litellm.drop_params = True
 from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
-from providers.key_resolver import resolve_provider_key, ProviderKeyError
+from providers.key_resolver import resolve_provider_key, ProviderKeyError, ProviderKeyDecryptError
 from middleware.g18_observability import (
     REQUEST_DURATION_MS,
     HTTP_REQUESTS,
@@ -537,6 +538,27 @@ def _schedule_billing(ctx, response) -> None:
         logger.debug("[%s] billing skipped: no running event loop", getattr(ctx, "request_id", "?"))
 
 
+# Item 12 — secret redaction for log lines built from upstream exceptions. A provider
+# error string can embed the Authorization header / api_key / base_url or a raw sk-/tok-
+# credential; strip those before logging, and never echo the raw exception to the client.
+_SECRET_KV_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|bearer|access[_-]?token|secret|password|base[_-]?url)\b"
+    r"\s*[=:]\s*\S+"
+)
+_SECRET_TOKEN_RE = re.compile(r"\b(sk|tok|rk|pk)-[A-Za-z0-9_\-]{6,}", re.IGNORECASE)
+
+
+def _redact_secrets(text: Any) -> str:
+    """Best-effort scrub of credentials from a string before it reaches a log sink."""
+    try:
+        s = str(text)
+    except Exception:
+        return "<unprintable>"
+    s = _SECRET_KV_RE.sub(lambda m: f"{m.group(1)}=<redacted>", s)
+    s = _SECRET_TOKEN_RE.sub(lambda m: f"{m.group(1)}-<redacted>", s)
+    return s
+
+
 def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
     """Record SLA metrics (latency histogram + status-labelled counter) for one
     request, at every exit path — success, short-circuit, and error. ``ctx`` may
@@ -566,6 +588,7 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
     if status == "200":
         _schedule_billing(ctx, response)
         _bump_quota_counter(ctx)
+        _bump_spend_counter(ctx)
 
 
 def _bump_quota_counter(ctx) -> None:
@@ -588,6 +611,42 @@ def _bump_quota_counter(ctx) -> None:
                 await r.expire(key, 40 * 86400)
         except Exception as exc:
             logger.debug("quota counter bump failed: %s", exc)
+
+    try:
+        asyncio.create_task(_bump())
+    except RuntimeError:
+        pass
+
+
+def _bump_spend_counter(ctx) -> None:
+    """Fire-and-forget monthly running-USD spend counter (G00 spend-cap gate reads it).
+
+    Bumped for every served 2xx by the request's REAL ``cost_actual_usd`` (set by
+    G18 from the provider's actual token usage), tenant-prefixed
+    (`t:<id>:spend:<YYYYMM>`), ~40-day TTL so last month's key self-expires. A
+    zero/absent cost (e.g. a bypass that never reached the LLM) is skipped."""
+    if ctx is None:
+        return
+    try:
+        cost = float(getattr(getattr(ctx, "savings", None), "cost_actual_usd", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    if cost <= 0:
+        return
+    prefix = getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
+
+    async def _bump() -> None:
+        try:
+            from cache.redis_pool import get_redis
+            from middleware.g00_rate_limit import G00RateLimit
+            key = G00RateLimit.spend_key(prefix)
+            r = get_redis()
+            total = await r.incrbyfloat(key, cost)
+            # Set the TTL once, on first accrual for the period.
+            if float(total) <= cost + 1e-9:
+                await r.expire(key, 40 * 86400)
+        except Exception as exc:
+            logger.debug("spend counter bump failed: %s", exc)
 
     try:
         asyncio.create_task(_bump())
@@ -793,10 +852,17 @@ async def chat_completions(request: Request):
                         f"Monthly request quota exceeded ({exc.scope}). "
                         "Upgrade your plan or wait for the next billing period."
                         if exc.limit_type == "quota_exceeded"
+                        else f"Monthly spend cap exceeded ({exc.scope}). "
+                        "Raise the cap in the portal or wait for the next billing period."
+                        if exc.limit_type == "spend_cap_exceeded"
                         else f"Rate limit exceeded: {exc.limit_type} for {exc.scope}"
                     ),
                     "type": "rate_limit_exceeded",
-                    "code": exc.limit_type if exc.limit_type == "quota_exceeded" else "rate_limit_exceeded",
+                    "code": (
+                        exc.limit_type
+                        if exc.limit_type in ("quota_exceeded", "spend_cap_exceeded")
+                        else "rate_limit_exceeded"
+                    ),
                 }
             },
             headers={"Retry-After": str(exc.retry_after)},
@@ -846,6 +912,22 @@ async def chat_completions(request: Request):
     provider = _resolve_provider(ctx.routed_model, eff_cfg)
     try:
         provider_key = await resolve_provider_key(provider, ctx.tenant_id, ctx)
+    except ProviderKeyDecryptError as exc:
+        # Fail closed: a stored key was found but could not be decrypted. This is a
+        # distinct condition from "no key" — surface it as a 502 so the tenant is not
+        # told to "add a key" they already added, and we never fall back to the
+        # platform key. Caught BEFORE ProviderKeyError (its subclass).
+        langfuse_tracing.finish_trace(ctx, None)
+        _record_outcome(ctx, _request_start, "502")
+        return JSONResponse(
+            status_code=502,
+            content={"error": {
+                "message": exc.public_message,
+                "type": "invalid_request_error",
+                "code": "provider_key_undecryptable",
+                "param": "model",
+            }},
+        )
     except ProviderKeyError as exc:
         langfuse_tracing.finish_trace(ctx, None)
         _record_outcome(ctx, _request_start, "402")
@@ -962,20 +1044,22 @@ async def chat_completions(request: Request):
         )
         response_dict = llm_response.model_dump() if hasattr(llm_response, "model_dump") else dict(llm_response)
     except litellm.exceptions.AuthenticationError as exc:
-        logger.error("LLM auth error: %s", exc)
+        logger.error("LLM auth error: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "401")
         raise HTTPException(status_code=401, detail="LLM provider authentication failed")
     except litellm.exceptions.RateLimitError as exc:
-        logger.warning("LLM rate limit: %s", exc)
+        logger.warning("LLM rate limit: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "429")
         raise HTTPException(status_code=429, detail="LLM provider rate limit reached")
     except Exception as exc:
-        logger.error("LLM call failed: %s", exc)
+        # Item 12: never echo the raw upstream exception to the client (it can embed the
+        # api_key/base_url) and redact secrets from the log line too.
+        logger.error("LLM call failed: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _record_outcome(ctx, _request_start, "502")
-        raise HTTPException(status_code=502, detail=f"LLM provider error: {str(exc)}")
+        raise HTTPException(status_code=502, detail="LLM provider error (upstream call failed)")
 
     # Run G14-G18 response pipeline, then finalise (savings metadata, headers,
     # SLA metrics + billing) via the shared helper.
