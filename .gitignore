@@ -125,6 +125,11 @@ config/params/*.yaml
 # benefit (multi-tenant = PAID-adjacent), not a customer artifact. OSS ships a
 # lean examples/benchmark/ reproducible proof instead. Excluded wholesale.
 pitch-test-plan/
+# The pitch-comparison Grafana dashboard is the visualisation front-end for the
+# internal harness above: every panel filters on the synthetic user_ids
+# (pitch-optimized@pitch.test / pitch-baseline@pitch.test) + complexity_tier that
+# ONLY run_roi_pitch.py emits, so it shows "No data" for any OSS self-hoster.
+dashboard/dashboards/pitch-comparison.json
 
 # ─── Publish assets ───────────────────────────────────────────────────────────
 publish/

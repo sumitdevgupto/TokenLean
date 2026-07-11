@@ -13,7 +13,10 @@
 #   3. Sends N distinct prompts, each REPEATED (first = miss/real call, repeats =
 #      cache hits) so the Cache Hit Rate tile lights up cheaply
 #   4. Verifies data actually landed: Postgres usage_events, Prometheus counters,
-#      and Langfuse traces (so you know the pitch-comparison dashboard will work)
+#      and Langfuse traces (so you know the live/per-call/trends dashboards work)
+#      NB: this traffic posts as showcase@pitch.test, so it does NOT feed the
+#      internal pitch-comparison dashboard — that one is driven only by the
+#      pitch-test-plan harness (pitch-optimized@/pitch-baseline@pitch.test).
 #   5. Prints dashboard URLs + the capture time-window
 #
 # Usage:
@@ -24,8 +27,7 @@
 #   --clean-showcase  Wipe ALL dashboard data sources first (app Postgres
 #                     usage_events/cache_l2, the SEPARATE Langfuse database's
 #                     traces/observations/scores, Redis, and the Prometheus
-#                     TSDB) so every dashboard — including pitch-comparison,
-#                     which reads Langfuse — shows ONLY this run's fresh data.
+#                     TSDB) so every dashboard shows ONLY this run's fresh data.
 #
 # Cost note: only the FIRST send of each distinct prompt hits the LLM; repeats
 # are served from cache. Default 6×5 = 30 requests but only ~6 paid calls.
@@ -44,7 +46,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # Wipe EVERY dashboard data source for a fresh slate. Yesterday's manual cleanup
 # missed Langfuse (its own `langfuse` database, separate from the app `token_opt`
-# DB) — the pitch-comparison dashboard reads Langfuse `traces`, so old trace
+# DB) — the Langfuse-backed dashboards read Langfuse `traces`, so old trace
 # history kept showing. This clears all four sources the dashboards read from.
 _clean_showcase_data() {
   warn "clean-showcase: wiping ALL dashboard data sources for a fresh slate..."
@@ -57,7 +59,7 @@ _clean_showcase_data() {
     warn "  could not truncate app tables (is token-opt-postgres up?)"
   fi
 
-  # 2. Langfuse Postgres — SEPARATE 'langfuse' DB (pitch-comparison dashboard).
+  # 2. Langfuse Postgres — SEPARATE 'langfuse' DB (Langfuse-backed dashboards).
   #    CASCADE clears observations/scores that reference a trace.
   for t in traces observations scores; do
     if docker exec token-opt-postgres psql -U token_opt -d langfuse \
@@ -302,9 +304,9 @@ if [[ "$((CACHE_AFTER - CACHE_BEFORE))" -le 0 ]]; then
 fi
 
 if [[ "$((LF_AFTER - LF_BEFORE))" -gt 0 ]]; then
-  success "Langfuse IS ingesting — the pitch-comparison dashboard will populate."
+  success "Langfuse IS ingesting — the Langfuse-backed dashboards will populate."
 else
-  warn "Langfuse traces did NOT increase — pitch-comparison dashboard won't update. Check: langfuse_enabled in config.yaml + proxy langfuse keys."
+  warn "Langfuse traces did NOT increase — Langfuse-backed dashboards won't update. Check: langfuse_enabled in config.yaml + proxy langfuse keys."
 fi
 
 # ─── 6. Capture guidance ──────────────────────────────────────────────────────
