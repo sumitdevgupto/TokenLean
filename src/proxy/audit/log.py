@@ -133,6 +133,47 @@ class AuditLogger:
             )
             return False
 
+    async def log_security_events(self, ctx) -> None:
+        """Append PII-free audit rows for G29 (PII redaction) / G30 (guardrail) activity.
+
+        Reuses the config-change insert shape (``action`` + ``details`` JSONB). The
+        details carry entity TYPES / attack CATEGORIES + counts ONLY — never the matched
+        value or prompt text — so these rows (and their GDPR export, which includes
+        ``audit_events``) are PII-free by construction. GDPR erasure nulls ``user_id`` but
+        never ``details``, which is why the no-raw-content rule is enforced here, at the
+        write. Never raises; no-op without a pool or when there is nothing to record."""
+        if not self._db_pool:
+            return
+        events = []
+        g_action = getattr(ctx, "guardrail_action", None)
+        if g_action in ("flag", "block"):
+            events.append((
+                "guardrail.flagged" if g_action == "flag" else "guardrail.blocked",
+                {"categories": list(getattr(ctx, "guardrail_categories", []) or [])},
+            ))
+        p_action = getattr(ctx, "pii_action", None)
+        if p_action and int(getattr(ctx, "pii_redactions", 0) or 0) > 0:
+            events.append((
+                "redaction.flagged" if p_action == "flag" else "redaction.applied",
+                {
+                    "entities": list(getattr(ctx, "pii_entities", []) or []),
+                    "count": int(getattr(ctx, "pii_redactions", 0) or 0),
+                    "mode": p_action,
+                },
+            ))
+        if not events:
+            return
+        tenant_id = getattr(ctx, "tenant_id", "default")
+        request_id = getattr(ctx, "request_id", "")
+        for action, details in events:
+            await self.log_config_change(
+                tenant_id=tenant_id,
+                actor=f"key:{tenant_id}",
+                action=action,
+                details=details,
+                request_id=request_id,
+            )
+
     async def _insert(self, ctx, response: Dict[str, Any]) -> None:
         tenant_id = getattr(ctx, "tenant_id", "default")
         request_id = getattr(ctx, "request_id", "unknown")

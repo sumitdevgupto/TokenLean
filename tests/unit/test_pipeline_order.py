@@ -79,6 +79,8 @@ class TestPipelineStageOrdering:
         pipeline.g25 = _make("G25")
         pipeline.g27 = _make("G27")
         pipeline.g28 = _make("G28")
+        pipeline.g29 = _make("G29")
+        pipeline.g30 = _make("G30")
         # G18 is only in process_response; stub it for completeness
         pipeline.g18 = MagicMock()
         pipeline.g15 = _make("G15")
@@ -138,6 +140,8 @@ class TestPipelineStageOrdering:
         pipeline.g25 = _make("G25")
         pipeline.g27 = _make("G27")
         pipeline.g28 = _make("G28")
+        pipeline.g29 = _make("G29")
+        pipeline.g30 = _make("G30")
         pipeline.g18 = MagicMock()
         pipeline.g15 = _make("G15")
 
@@ -184,6 +188,7 @@ class TestPipelineStageOrdering:
         # Request-path stubs (needed by process_request call below isn't invoked,
         # so we only need process_response stubs for the response path)
         pipeline.g14 = _make_resp_mock("G14")
+        pipeline.g29 = _make_resp_mock("G29")
         pipeline.g28 = _make_resp_mock("G28")
         pipeline.g23 = _make_resp_mock("G23")
         pipeline.g19 = _make_resp_mock("G19")
@@ -208,3 +213,74 @@ class TestPipelineStageOrdering:
         assert g14_pos < g23_pos, (
             f"Expected G14({g14_pos}) < G23({g23_pos}) in response path, got: {resp_log}"
         )
+
+
+def _build_stubbed_pipeline(call_log):
+    """Fully-stubbed request-path pipeline (every gXX tracks its own name)."""
+    from middleware.pipeline import OptimisationPipeline
+
+    p = OptimisationPipeline.__new__(OptimisationPipeline)
+    p._tenant_config_loader = AsyncMock()
+    p._tenant_config_loader.load = AsyncMock()
+
+    def _mk(name):
+        m = AsyncMock()
+
+        async def _side(ctx):
+            call_log.append(name)
+            return ctx
+
+        m.process_request.side_effect = _side
+        return m
+
+    for n in ["g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
+              "g11", "g12", "g13", "g15", "g16", "g17", "g19", "g20", "g21", "g22",
+              "g24", "g25", "g27", "g28", "g29", "g30"]:
+        setattr(p, n, _mk(n.upper()))
+    p.g18 = MagicMock()
+    return p
+
+
+class TestTrustSafetyStageOrdering:
+    """G30 (guardrails) → G29 (PII) run after G24 and before the G04/G05 gate, and a
+    block short-circuits the pipeline before any optimisation/cache stage."""
+
+    @pytest.mark.asyncio
+    async def test_g30_then_g29_after_g24_before_g04_g05(self):
+        call_log = []
+        pipeline = _build_stubbed_pipeline(call_log)
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(_make_ctx())
+
+        for g in ["G24", "G30", "G29", "G04", "G05"]:
+            assert g in call_log, f"{g} did not run: {call_log}"
+        assert (call_log.index("G24") < call_log.index("G30")
+                < call_log.index("G29") < call_log.index("G04")
+                < call_log.index("G05")), call_log
+
+    @pytest.mark.asyncio
+    async def test_guardrail_block_short_circuits_before_g29_and_g04(self):
+        call_log = []
+        pipeline = _build_stubbed_pipeline(call_log)
+
+        async def _blocking(ctx):
+            call_log.append("G30")
+            ctx.security_blocked = True
+            ctx.security_block_response = {"choices": []}
+            return ctx
+
+        pipeline.g30.process_request.side_effect = _blocking
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            ctx = await pipeline.process_request(_make_ctx())
+
+        assert ctx.security_blocked
+        assert "G30" in call_log
+        # A block returns immediately — G29 and the G04/G05 gate must not run.
+        assert "G29" not in call_log
+        assert "G04" not in call_log and "G05" not in call_log

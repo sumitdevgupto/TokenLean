@@ -3,6 +3,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from protocols.base import DEFAULT_PROTOCOL_NAME
+
 
 @dataclass
 class UsageEvent:
@@ -40,6 +42,9 @@ class UsageEvent:
     cost_actual_usd: float = 0.0
     cost_baseline_usd: float = 0.0
     provider: str = ""
+    # Ingress protocol the client used (#4): openai | anthropic | gemini. Observability
+    # only — billing is one row per served request regardless of protocol.
+    protocol: str = DEFAULT_PROTOCOL_NAME
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -73,7 +78,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
     bypassed        BOOLEAN     NOT NULL DEFAULT false,
     cost_actual_usd   NUMERIC(12,6) NOT NULL DEFAULT 0,
     cost_baseline_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
-    provider        TEXT        NOT NULL DEFAULT ''
+    provider        TEXT        NOT NULL DEFAULT '',
+    protocol        TEXT        NOT NULL DEFAULT '__PROTO_DEFAULT__'
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
@@ -99,5 +105,7 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS bypassed BOOLEAN NOT NULL DEFA
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_actual_usd NUMERIC(12,6) NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_baseline_usd NUMERIC(12,6) NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '';
+-- #4 multi-protocol ingress: which client protocol served this request (never billed)
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT '__PROTO_DEFAULT__';
 CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_id, user_id);
-"""
+""".replace("__PROTO_DEFAULT__", DEFAULT_PROTOCOL_NAME)

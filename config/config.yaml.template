@@ -81,6 +81,11 @@ retention:
 providers:
 - name: openai
   api_base: https://api.openai.com/v1
+  # Optional per-provider resilience override (merges over the top-level `resilience:`
+  # block). E.g. a flakier provider can trip its breaker sooner:
+  #   resilience:
+  #     failure_threshold: 3
+  #     num_retries: 2
   models:
   - gpt-4o-mini
   - gpt-4o
@@ -207,6 +212,36 @@ providers:
   - opencode/minimax-m3            # MiniMax M3 (free)
   model_prefixes:
   - opencode/
+
+# ── Provider resilience (#1 failover) ───────────────────────────────────────────────
+# Circuit breaker + retry + per-tenant cooldown + failover on the live request paths.
+# Signals are scoped so tenants can't affect each other: 429s (rate limits — a property
+# of the tenant's key) set only THAT tenant's short cooldown; 5xx/timeouts (true provider
+# health) feed the global per-provider breaker. Gates FAIL OPEN: the last viable target
+# is always attempted, so a request is never rejected without a real provider attempt.
+# `enabled: false` (or omitting this block) restores the pre-feature behaviour exactly:
+# one attempt, provider error surfaced. NOTE this template opts in (retry-only, no
+# fallbacks) — deployments keeping their existing config.yaml are unaffected.
+# Per-provider overrides live under `providers[].resilience`. Per-tenant overrides are set
+# through the tenant's config (portal / tenant_configs), which deep-merges a top-level
+# `resilience:` block over this one. Breaker/cooldown state is per worker (in-process);
+# hot-reloaded values apply immediately (no worker restart needed).
+resilience:
+  enabled: true
+  num_retries: 1              # transient-error retries on the SAME model before failover
+  failure_threshold: 5        # consecutive 5xx/timeout failures that trip a provider's breaker
+  cooldown_seconds: 30        # breaker-open duration AND per-tenant 429-cooldown TTL
+  retry_base_delay: 0.2       # exponential backoff base between retries (seconds)
+  # Failover chains: routed model → ordered list of fallback models, resolved lazily
+  # (only when the primary actually fails — no per-request cost while healthy). A
+  # fallback whose provider is gated or whose key the tenant lacks is skipped; a
+  # fallback's own auth/config error moves on to the next. Empty = retry-only.
+  fallbacks: {}
+  # Example:
+  #   gpt-4o-mini:
+  #   - claude-haiku-4-5
+  #   - gemini-2.5-flash-lite
+
 pricing:
   gpt-4o-mini:
     input: 0.00015
@@ -790,3 +825,33 @@ groups:
     effort_floor: low
     effort_ceiling: high
     extra_reasoning_prefixes: []
+  # ── Trust & Safety (G29 PII redaction, G30 injection guardrails) ─────────────
+  # Both run early and UNCONDITIONALLY — inserted after G24 and before the G04/G05
+  # gate, outside the skip_groups loops — so G24 adaptive-bypass can never disable
+  # them, bypass/cache traffic is still covered, and redaction precedes every
+  # content-persisting stage (G05 key/embedding, G07 RAG, G10 memory, G28 CCR).
+  # Defaults are NON-MUTATING (mode: flag) so the shipped config is safe and its
+  # token accounting is unchanged. Override per-tenant under
+  # tenants.<id>.groups.G29_pii_redaction / .G30_guardrails.
+  G30_guardrails:
+    enabled: true
+    mode: flag                 # allow | flag | block. flag = detect + record + pass
+                               # (default, non-mutating). block = refuse with a
+                               # content-filter 200. allow = passthrough (no scan).
+    threshold: 0.5             # minimum rule severity to fire (raise for higher confidence)
+    scan_roles: [user]         # only untrusted (user) content is scanned by default
+    metrics_enabled: true
+    extra_rules: []            # [[id, category, severity, regex], …] operator/managed additions
+    # block_message: "This request was blocked by the safety guardrails."
+  G29_pii_redaction:
+    enabled: true
+    mode: flag                 # off | flag | mask | block. flag = detect + record only
+                               # (default, non-mutating). mask = replace in place;
+                               # block = refuse a request that contains PII.
+    reversible: true           # mask mode: the model sees numbered placeholders and the
+                               # non-streaming response restores them for the data owner.
+    scan_roles: [user, assistant, tool]   # roles scanned (system prompt left untouched)
+    entities: []               # empty = all built-ins; or narrow, e.g. [EMAIL, CREDIT_CARD]
+    use_presidio: false        # optional higher-recall backend (needs presidio-analyzer)
+    metrics_enabled: true
+    # block_message: "This request was blocked because it contained personal data."

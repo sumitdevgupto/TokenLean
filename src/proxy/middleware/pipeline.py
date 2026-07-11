@@ -35,6 +35,8 @@ from middleware.g24_adaptive_bypass import G24AdaptiveBypass
 from middleware.g25_adaptive_reasoning import G25AdaptiveReasoning
 from middleware.g27_multimodal_optimizer import G27MultimodalOptimizer
 from middleware.g28_ccr import G28CCR
+from middleware.g29_pii_redaction import G29PiiRedaction
+from middleware.g30_guardrails import G30Guardrails
 from middleware import langfuse_tracing
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,8 @@ class OptimisationPipeline:
         self.g25 = G25AdaptiveReasoning()
         self.g27 = G27MultimodalOptimizer()
         self.g28 = G28CCR()
+        self.g29 = G29PiiRedaction()
+        self.g30 = G30Guardrails()
 
     def set_db_pool(self, pool) -> None:
         """Inject the asyncpg pool into the tenant-config loader after startup.
@@ -189,6 +193,23 @@ class OptimisationPipeline:
         # Stage 1b — Adaptive Bypass (loads skip_groups from rules)
         ctx = await self._run_timed("G24-adaptive-bypass", ctx, self.g24.process_request(ctx))
 
+        # Stage 1c — Trust & Safety (G30 injection guardrails → G29 PII redaction).
+        # Deliberately placed BEFORE the G04/G05 skip-loops and NOT gated by
+        # ctx.skip_groups, so: (1) G24 adaptive-bypass can never disable them,
+        # (2) bypass / cache-hit traffic is still guarded, and (3) redaction precedes
+        # every content-persisting stage (G05 key/embedding, G07 RAG, G10 memory,
+        # G28 CCR). A block short-circuits the whole pipeline like a bypass.
+        ctx = await self._run_timed("G30-guardrails", ctx, self.g30.process_request(ctx))
+        if ctx.security_blocked:
+            logger.info("[%s] G30 blocked request (injection guardrail)", ctx.request_id)
+            otel.end_span(pipeline_span)
+            return ctx
+        ctx = await self._run_timed("G29-pii-redaction", ctx, self.g29.process_request(ctx))
+        if ctx.security_blocked:
+            logger.info("[%s] G29 blocked request (PII policy)", ctx.request_id)
+            otel.end_span(pipeline_span)
+            return ctx
+
         # Stage 2 — At the Gate
         for _name, _mid in [("G04-bypass", self.g04), ("G05-cache", self.g05)]:
             ctx = await self._run_timed(_name, ctx, _mid.process_request(ctx))
@@ -254,7 +275,11 @@ class OptimisationPipeline:
     ) -> Tuple[RequestContext, Dict[str, Any]]:
         """Run response through the post-LLM optimisation pipeline."""
         # Stage 5 — After the Response
+        # G29 runs first so response-side PII masking / placeholder restore happens
+        # before observability (G18 trace/audit), format shaping, and the G05 cache
+        # store — every downstream response consumer sees the redacted content.
         for _name, _fn in [
+            ("G29-pii-redaction-resp", lambda r: self.g29.process_response(ctx, r)),
             ("G14-tool-output", lambda r: self.g14.process_response(ctx, r)),
             ("G28-ccr-resp", lambda r: self.g28.process_response(ctx, r)),
             ("G23-streaming-compression", lambda r: self.g23.process_response(ctx, r)),

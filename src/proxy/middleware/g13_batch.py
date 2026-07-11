@@ -666,8 +666,22 @@ async def _flush_batch_loop(
                 response_dict["_batch_request_id"] = request_id
                 await _store_batch_result(request_id, {"status": "completed", "response": response_dict})
                 logger.info("G13 batch item %s processed successfully", request_id)
+                _note_batch_provider_outcome(provider, None)
             except Exception as exc:
                 await _store_batch_result(request_id, {"status": "failed", "error": str(exc)})
                 logger.error("G13 batch item %s failed: %s", request_id, exc)
+                _note_batch_provider_outcome(provider, exc)
     except Exception as exc:
         logger.error("G13 batch flush failed: %s", exc)
+
+
+def _note_batch_provider_outcome(provider: str, exc) -> None:
+    """Feed a batch item's provider outcome into the circuit breaker (observation
+    only — the per-item loop keeps its own failure handling and is never gated).
+    Review K7: without this the breaker was blind to batch traffic."""
+    try:
+        from config_loader import get_config
+        from providers.resilience import note_provider_outcome
+        note_provider_outcome(provider, exc, get_config() or {})
+    except Exception:  # never let observability break the flush
+        pass

@@ -21,6 +21,31 @@ from savings.calculator import count_messages_tokens
 from middleware import RequestContext
 
 
+@pytest.fixture(autouse=True)
+def _reset_proxy_key_cache():
+    """Reset the process-wide proxy-key cache before EVERY test.
+
+    ``auth.api_key_manager`` caches validated keys in a module global with a 300s TTL.
+    A test that calls ``validate_proxy_key`` (populating that global) would otherwise make
+    a *later* test's patched ``_fetch_secret`` be ignored (warm cache → no reload) → a
+    spurious 401. Clearing it here isolates every test regardless of run order. Test-only.
+
+    Resets three module globals: the cache itself (via the public ``replace_cache`` seam,
+    which also stamps ``_CACHE_LOADED_AT``), and ``_last_forced_reload`` — the wall-clock
+    throttle gating the reload-on-miss path — which a prior test's unknown-key lookup would
+    otherwise leave set, causing a spurious 401 in a fast-following test that expects a
+    freshly-seeded key to reload.
+    """
+    try:
+        from auth import api_key_manager as _akm
+        _akm.replace_cache({})
+        _akm._CACHE_LOADED_AT = 0.0
+        _akm._last_forced_reload = 0.0
+    except Exception:
+        pass
+    yield
+
+
 # ─── Minimal config fixture ───────────────────────────────────────────────────
 
 def _minimal_config() -> Dict[str, Any]:

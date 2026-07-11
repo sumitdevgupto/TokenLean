@@ -457,7 +457,7 @@
       "id": 14,
       "type": "stat",
       "title": "Error Rate (%)",
-      "description": "Proxy-originated 5xx only — excludes 502s, which are provider-side LLM failures.",
+      "description": "Proxy-originated 5xx only \u2014 excludes 502s, which are provider-side LLM failures.",
       "gridPos": {
         "x": 15,
         "y": 5,
@@ -645,8 +645,8 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "Proxy time by stage — p95 (ms)",
-      "description": "Per-pipeline-stage p95 latency (G-group granularity) — shows which stage drives the 'Proxy only' latency above. Note: provider calls made inside a stage (G06 cascade/judge, G10 summary) appear here as stage time but are counted as LLM time in the 'Proxy only' cards, not proxy overhead.",
+      "title": "Proxy time by stage \u2014 p95 (ms)",
+      "description": "Per-pipeline-stage p95 latency (G-group granularity) \u2014 shows which stage drives the 'Proxy only' latency above. Note: provider calls made inside a stage (G06 cascade/judge, G10 summary) appear here as stage time but are counted as LLM time in the 'Proxy only' cards, not proxy overhead.",
       "gridPos": {
         "x": 0,
         "y": 24,
@@ -683,6 +683,178 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Provider Resilience (#1 failover)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Open Breakers",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(token_opt_circuit_breaker_state == 2) or vector(0)",
+          "legendFormat": "open"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Failover Events (5m)",
+      "gridPos": {
+        "x": 5,
+        "y": 35,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_failover_total{tenant_id=~\"$tenant\"}[5m])) or vector(0)",
+          "legendFormat": "failovers"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Circuit Breaker State by Provider (0=closed,1=half-open,2=open)",
+      "gridPos": {
+        "x": 10,
+        "y": 35,
+        "w": 14,
+        "h": 8
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "token_opt_circuit_breaker_state",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Failover Rate by Serving Provider",
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 10,
+        "h": 4
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (to_provider) (rate(token_opt_failover_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "\u2192 {{to_provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
         }
       }
     }

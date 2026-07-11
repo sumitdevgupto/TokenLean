@@ -296,7 +296,7 @@ resource "google_secret_manager_secret" "langfuse_nextauth_secret" {
 # provisioner so no state is kept in Cloud SQL itself.
 resource "null_resource" "billing_schema_migration" {
   triggers = {
-    schema_version = "1"
+    schema_version = "2"  # v2: +protocol column (#4 multi-protocol ingress)
   }
 
   # PGPASSWORD is required so psql (invoked by gcloud sql connect) does not
@@ -334,6 +334,9 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEF
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_level TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS complexity_tier TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS bypassed BOOLEAN NOT NULL DEFAULT false;
+-- #4 multi-protocol ingress: which client protocol served this request (never billed).
+-- Default must equal protocols.base.DEFAULT_PROTOCOL_NAME (the app-side source of truth).
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'openai';
 EOSQL
     SHELL
   }

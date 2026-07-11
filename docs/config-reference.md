@@ -90,6 +90,36 @@ configured; add more here. See [extensibility.md](extensibility.md) for the full
 `pricing:` is a flat map of `model-fragment → {input, output}` (USD per 1k tokens, reporting only —
 billing is per-request); add a row per new provider model.
 
+Optional per-provider `resilience:` sub-block overrides the top-level `resilience:` defaults
+(see below) for that provider — e.g. trip a flakier provider's breaker sooner.
+
+### resilience  *(#1 provider failover — top-level section)*
+
+Wraps the two live request paths (non-streaming and streaming `/v1/chat/completions`) with a
+circuit breaker, transient-error retry, a per-tenant connection cooldown, and failover to
+configured fallback models. Signal scoping keeps tenants isolated: **429s** (rate limits — a
+property of the tenant's key) set only that tenant's cooldown and never feed the breaker;
+**5xx/timeouts** (true provider health) feed the global per-provider breaker only. Gates
+**fail open** — the last viable target is always attempted, so a request is never rejected
+without a real provider attempt. Disabled (or omitted) → one attempt, provider error surfaced
+(behaviour-preserving). Breaker/cooldown state is per worker (in-process); hot-reloaded values
+apply immediately. The G06 tier-cascade, G13 batch, and G10 summary provider calls keep their
+own fallback behaviour and are never gated, but their outcomes **feed the breaker** so it sees
+all provider traffic.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `false` in code (`true` in the template) | Master switch. When off, exactly one attempt is made and the original provider error is returned unchanged. |
+| `num_retries` | `1` | Transient-error (429/5xx/timeout) retries on the **same** model before failing over. The whole ≥500 family (incl. Cloudflare-style 520–524) is retryable. |
+| `failure_threshold` | `5` | Consecutive 5xx/timeout failures that trip a provider's circuit breaker (skipped in favour of fallbacks until cooldown elapses, then one half-open probe). |
+| `cooldown_seconds` | `30` | Breaker-open duration **and** per-tenant 429-cooldown TTL. |
+| `retry_base_delay` | `0.2` | Exponential-backoff base (seconds) between same-model retries. |
+| `fallbacks` | `{}` | Map of routed model → ordered list of fallback models, resolved **lazily** (zero per-request cost while the primary is healthy). A fallback whose provider is gated or whose key the tenant lacks is skipped; a fallback's own auth/config error moves on to the next fallback. Empty = retry-only. On failover the winning provider is pinned to the request so cost/provider attribution stays correct; provider-scoped cache params/markers from the primary are scrubbed before a cross-provider fallback call. |
+
+Per-tenant override: set a top-level `resilience:` block in the tenant's config (portal /
+`tenant_configs`), which deep-merges over this one. The managed-tier availability SLA
+(`billing.rate_card.<tier>.sla_target_pct`, surfaced at `GET /portal/sla`) is backed by this layer.
+
 ### savings
 
 Token-savings **estimate** tuning. Reporting only — none of this affects the request-count bill.
@@ -500,6 +530,33 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `ttl_seconds` | `86400` | Redis TTL for stored content (24h) |
 | `expose_mcp_tools` | `true` | Inject `headroom_*` tools into the request |
 | `compress_system_prompt` | `false` | Allow CCR to replace the system instruction (keep false for pass-through) |
+
+### G30_guardrails
+**Trust & Safety.** Prompt-injection / jailbreak scanner over the user prompt, using a precision-biased heuristic ruleset (`guardrails/injection.py`). Runs **unconditionally right after G24** — before the G04-bypass / G05-cache stage and outside the `skip_groups` loops — so it can't be disabled by adaptive bypass, still guards bypass/cache traffic, and refuses malicious prompts before optimisation spends tokens. A `block` match short-circuits the whole pipeline with an OpenAI content-filter response (HTTP 200, `finish_reason: "content_filter"`), billed once like a bypass. Metrics: `token_opt_guardrail_events_total{category,action}`; PII-free audit rows (`guardrail.flagged` / `guardrail.blocked`). Per-tenant via `tenants.<id>.groups.G30_guardrails`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Run the guardrail scanner |
+| `mode` | `flag` | `allow` (passthrough, no scan) · `flag` (detect + record, pass) · `block` (refuse on match) |
+| `threshold` | `0.5` | Minimum rule severity to fire; raise to require higher confidence |
+| `scan_roles` | `[user]` | Message roles scanned (untrusted content only by default) |
+| `metrics_enabled` | `true` | Emit the Prometheus counter |
+| `extra_rules` | `[]` | `[[id, category, severity, regex], …]` operator/managed additions (Enterprise ships a managed red-team ruleset feed) |
+| `block_message` | *(built-in)* | Optional custom refusal text |
+
+### G29_pii_redaction
+**Trust & Safety.** PII detection + redaction (`guardrails/pii.py`): email, US SSN (separated forms only), Luhn-validated credit card, North-American phone, IPv4 — plus an optional Microsoft Presidio backend for higher recall. Runs **right after G30, before G04/G05** so cache keys/embeddings, RAG, memory, and CCR only ever see redacted content; in `mask` mode it also scrubs the raw `rag_query` snapshot and the `original_messages` copy. Reversible masking (default) shows the model numbered placeholders (`[PII:EMAIL:1]`) and the **non-streaming** response restores them for the data owner (response-side redaction is non-streaming-only in this version). Metrics: `token_opt_pii_redactions_total{entity_type,action}`; PII-free audit rows (`redaction.flagged` / `redaction.applied` — entity types + counts only, never the matched value). Per-tenant via `tenants.<id>.groups.G29_pii_redaction`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Run the detector |
+| `mode` | `flag` | `off` · `flag` (detect + record) · `mask` (replace in place) · `block` (refuse a request containing PII) |
+| `reversible` | `true` | Mask mode: numbered placeholders + response-side restore for the caller |
+| `scan_roles` | `[user, assistant, tool]` | Roles scanned (the developer's system prompt is left untouched) |
+| `entities` | `[]` | Empty = all built-ins; or narrow, e.g. `[EMAIL, CREDIT_CARD]` |
+| `use_presidio` | `false` | Optional higher-recall backend (needs `presidio-analyzer`; regex tier is the default) |
+| `metrics_enabled` | `true` | Emit the Prometheus counter |
+| `block_message` | *(built-in)* | Optional custom refusal text |
 
 ## Appendix — knob coverage caveats
 

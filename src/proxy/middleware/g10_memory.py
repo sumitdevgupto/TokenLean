@@ -661,6 +661,7 @@ async def _summarise(turns: List[Dict], summary_model: str, ctx: RequestContext)
         # This is a real provider call made inside the request pipeline; count its
         # wall-time as LLM (not proxy) time so the SLA latency split stays honest.
         _t0 = time.time()
+        _exc = None
         try:
             response = await litellm.acompletion(
                 model=_call_model,
@@ -676,9 +677,21 @@ async def _summarise(turns: List[Dict], summary_model: str, ctx: RequestContext)
                 **_call_kwargs,
                 max_tokens=150,
             )
+        except BaseException as e:
+            _exc = e
+            raise
         finally:
             try:
                 ctx.llm_elapsed_ms += (time.time() - _t0) * 1000.0
+            except Exception:
+                pass
+            # Feed the breaker (observation only; review K7 — summary calls are real
+            # provider traffic the breaker must see).
+            try:
+                from providers.resilience import note_provider_outcome
+                note_provider_outcome(
+                    getattr(summary_adapter, "name", ""), _exc, ctx.config or {}
+                )
             except Exception:
                 pass
         return response.choices[0].message.content or ""

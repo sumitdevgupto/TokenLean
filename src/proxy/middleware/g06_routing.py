@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 GROUP = "G06"
 
 
-async def _timed_llm(ctx: RequestContext, coro):
+async def _timed_llm(ctx: RequestContext, coro, model: str = ""):
     """Await an LLM-bearing coroutine and add its wall-clock time to
     ``ctx.llm_elapsed_ms``.
 
@@ -34,15 +34,30 @@ async def _timed_llm(ctx: RequestContext, coro):
     the request pipeline. Without this, that time would be booked as proxy
     overhead in the SLA split (elapsed − llm_elapsed_ms) — inflating the
     "Proxy only" latency with what is actually LLM-layer time.
+
+    When ``model`` is passed, the call's outcome also feeds the provider circuit
+    breaker via ``note_provider_outcome`` (observation only — the cascade keeps
+    its own tier-fallback behaviour and is never gated). Without this, the
+    breaker would be blind to cascade traffic and open late on a true outage.
     """
     t0 = time.time()
+    _exc = None
     try:
         return await coro
+    except BaseException as exc:
+        _exc = exc
+        raise
     finally:
         try:
             ctx.llm_elapsed_ms += (time.time() - t0) * 1000.0
         except Exception:
             pass
+        if model:
+            try:
+                from providers.resilience import note_provider_outcome
+                note_provider_outcome(_tier_provider(model) or "", _exc, ctx.config)
+            except Exception:
+                pass
 
 
 def _openai_key_available() -> bool:
@@ -393,7 +408,7 @@ async def _execute_three_tier_cascade(
             messages=ctx.messages,
             **_t1_kwargs,
             **_t1_passthrough,
-        ))
+        ), model=tier1_model)
 
         # Evaluate confidence from the RESPONSE — via judge model, or a cheap
         # response-quality heuristic when no judge is configured. (The old no-judge
@@ -444,7 +459,7 @@ async def _execute_three_tier_cascade(
                     messages=ctx.messages,
                     **_t2_kwargs,
                     **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
-                ))
+                ), model=tier2_model)
                 logger.info("G06 cascade: escalated to tier2 model %s", tier2_model)
                 # Tier2 succeeded — promote it as the best fallback before confidence check
                 best_model = tier2_model
@@ -484,7 +499,7 @@ async def _execute_three_tier_cascade(
                     messages=ctx.messages,
                     **_t3_kwargs,
                     **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
-                ))
+                ), model=tier3_model)
                 logger.info("G06 cascade: escalated to tier3 model %s", tier3_model)
                 return tier3_model, tier3_response.model_dump() if hasattr(tier3_response, "model_dump") else dict(tier3_response)
             except Exception as exc:

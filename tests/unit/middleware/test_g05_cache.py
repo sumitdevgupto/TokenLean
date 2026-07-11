@@ -23,6 +23,27 @@ class TestG05Cache:
         ctx = await G05Cache().process_request(ctx)
         assert ctx.cache_hit is False
 
+    async def test_no_cache_skips_read(self, make_ctx):
+        # G29 masked PII → lossy cache key → G05 must not read the shared cache,
+        # even when a matching entry exists (would else serve another caller's answer).
+        ctx = make_ctx()
+        ctx.no_cache = True
+        get_redis = MagicMock()
+        with patch("middleware.g05_cache._get_redis", get_redis):
+            from middleware.g05_cache import G05Cache
+            ctx = await G05Cache().process_request(ctx)
+        assert ctx.cache_hit is False
+        get_redis.assert_not_called()  # short-circuits before touching Redis
+
+    async def test_no_cache_skips_store(self, make_ctx):
+        ctx = make_ctx()
+        ctx.no_cache = True
+        get_redis = MagicMock()
+        with patch("middleware.g05_cache._get_redis", get_redis):
+            from middleware.g05_cache import G05Cache
+            await G05Cache().store_response(ctx, {"choices": [{"message": {"content": "x"}}]})
+        get_redis.assert_not_called()  # a masked request's answer is never cached
+
     async def test_l1_cache_hit(self, make_ctx):
         ctx = make_ctx()
 

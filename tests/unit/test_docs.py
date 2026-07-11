@@ -51,7 +51,7 @@ class TestREADMEGroups:
     def test_readme_exists(self):
         assert README_PATH.exists(), "README.md not found"
 
-    @pytest.mark.parametrize("group", ["G19", "G20", "G21", "G22", "G23", "G24", "G25", "G27", "G28"])
+    @pytest.mark.parametrize("group", ["G19", "G20", "G21", "G22", "G23", "G24", "G25", "G27", "G28", "G29", "G30"])
     def test_readme_mentions_group(self, group):
         content = _read(README_PATH)
         assert group in content, f"README should document {group}"

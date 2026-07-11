@@ -220,6 +220,10 @@ src/proxy/billing/payments.py
 # (audit/log.py) stays core; only this attestation tooling is commercial.
 src/proxy/audit/attestation.py
 tests/test_attestation.py
+# Managed red-team ruleset feed (#3) — commercial. The OSS G30 scanner + default
+# ruleset stay in core (guardrails/injection.py, guardrails/pii.py, guardrails/__init__.py).
+src/proxy/guardrails/ruleset_feed.py
+tests/test_ruleset_feed.py
 # Commercial app entrypoint — wires the gated GDPR/portal/billing routers (item 26).
 # Must stay out of core so verify-oss-gates Gate 7 (core barricade) stays clean.
 src/proxy/commercial_app.py

@@ -1,0 +1,150 @@
+{
+  "title": "Token Optimisation - Trust & Safety",
+  "uid": "token-opt-trust-safety",
+  "tags": [
+    "token-optimisation",
+    "trust-safety",
+    "security"
+  ],
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "type": "query",
+        "label": "Tenant",
+        "datasource": {
+          "uid": "prometheus"
+        },
+        "definition": "label_values(token_opt_requests_total, tenant_id)",
+        "query": "label_values(token_opt_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".*",
+        "current": {
+          "value": "$__all",
+          "text": "All"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "PII Redaction (G29)",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "PII spans / sec",
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 4 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_pii_redactions_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "spans/s"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "PII spans by entity type",
+      "gridPos": { "x": 6, "y": 1, "w": 10, "h": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (entity_type) (rate(token_opt_pii_redactions_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{entity_type}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "PII spans by policy action",
+      "gridPos": { "x": 16, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (action) (rate(token_opt_pii_redactions_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{action}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Injection Guardrails (G30)",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 9, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Guardrail blocks / sec",
+      "gridPos": { "x": 0, "y": 10, "w": 6, "h": 4 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(token_opt_guardrail_events_total{tenant_id=~\"$tenant\",action=\"block\"}[5m]))",
+          "legendFormat": "blocks/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Guardrail events by attack category",
+      "gridPos": { "x": 6, "y": 10, "w": 10, "h": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (category) (rate(token_opt_guardrail_events_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{category}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Guardrail events by action (flag vs block)",
+      "gridPos": { "x": 16, "y": 10, "w": 8, "h": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (action) (rate(token_opt_guardrail_events_total{tenant_id=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{action}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    }
+  ]
+}

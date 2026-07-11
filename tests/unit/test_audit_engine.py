@@ -75,3 +75,74 @@ async def test_ensure_audit_schema_noop_without_pool():
 
 def test_ddl_contains_details_alter():
     assert "ADD COLUMN IF NOT EXISTS details JSONB" in AUDIT_EVENTS_DDL
+
+
+# ── log_security_events (G29/G30 trust & safety — PII-free) ──────────────────────
+class _SecCtx:
+    def __init__(self, **kw):
+        self.tenant_id = kw.get("tenant_id", "T-1")
+        self.request_id = kw.get("request_id", "r-1")
+        self.guardrail_action = kw.get("guardrail_action")
+        self.guardrail_categories = kw.get("guardrail_categories", [])
+        self.pii_action = kw.get("pii_action")
+        self.pii_entities = kw.get("pii_entities", [])
+        self.pii_redactions = kw.get("pii_redactions", 0)
+
+
+async def test_security_events_guardrail_flag_row():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(guardrail_action="flag", guardrail_categories=["instruction_override"]))
+    assert len(conn.calls) == 1
+    _, args = conn.calls[0]
+    assert args[3] == "guardrail.flagged"
+    assert "instruction_override" in args[5]
+
+
+async def test_security_events_guardrail_block_row():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(guardrail_action="block", guardrail_categories=["system_prompt_exfil"]))
+    assert conn.calls[0][1][3] == "guardrail.blocked"
+
+
+async def test_security_events_pii_applied_is_pii_free():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(pii_action="mask", pii_entities=["EMAIL", "US_SSN"], pii_redactions=3))
+    _, args = conn.calls[0]
+    assert args[3] == "redaction.applied"
+    assert "EMAIL" in args[5] and '"count": 3' in args[5]
+    assert "@" not in args[5]  # entity TYPES only — never a raw value
+
+
+async def test_security_events_pii_flag_action_name():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(pii_action="flag", pii_entities=["PHONE"], pii_redactions=1))
+    assert conn.calls[0][1][3] == "redaction.flagged"
+
+
+async def test_security_events_writes_two_rows_when_both():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(guardrail_action="flag", guardrail_categories=["x"],
+                pii_action="mask", pii_entities=["EMAIL"], pii_redactions=1))
+    assert len(conn.calls) == 2
+
+
+async def test_security_events_noop_when_nothing_flagged():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(_SecCtx())
+    assert conn.calls == []
+
+
+async def test_security_events_pii_zero_count_skipped():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(pii_action="flag", pii_entities=[], pii_redactions=0))
+    assert conn.calls == []
+
+
+async def test_security_events_noop_without_pool():
+    await AuditLogger(None).log_security_events(_SecCtx(guardrail_action="flag"))  # no raise
