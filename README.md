@@ -416,6 +416,17 @@ main._record_outcome ───────────────────�
 
 ## Operational Scripts
 
+### Local deployment (`scripts/local/`)
+
+| Script | Purpose |
+|--------|---------|
+| `deploy-local.sh` | Deploy full stack locally via Docker Compose |
+| `start-local.sh` | Start local Docker stack |
+| `stop-local.sh` | Stop local Docker stack (zero cost) |
+| `live_run_check.sh` | Live per-provider smoke test — preflight (Docker/proxy/config/keys) → real round-trip per provider (auto-generates a proxy key if absent) → PASS/FAIL/SKIP table. `./scripts/local/live_run_check.sh [provider\|all]` |
+
+### GCP deployment (`scripts/gcp/`)
+
 | Script | Purpose |
 |--------|---------|
 | `pre-deploy-check.sh` | Pre-flight checks for all prerequisites |
@@ -423,12 +434,13 @@ main._record_outcome ───────────────────�
 | `post-deploy-check.sh` | Verify all services are running |
 | `stop-gcp.sh` | Export Redis to GCS, stop Cloud SQL (cost savings) |
 | `start-gcp.sh` | Restore Redis from GCS, start Cloud SQL |
-| `deploy-local.sh` | Deploy full stack locally via Docker Compose |
-| `live_run_check.sh` | Live per-provider smoke test — preflight (Docker/proxy/config/keys) → real round-trip per provider (auto-generates a proxy key if absent) → PASS/FAIL/SKIP table. `./scripts/local/live_run_check.sh [provider\|all]` |
-| `start-local.sh` | Start local Docker stack |
-| `stop-local.sh` | Stop local Docker stack (zero cost) |
-| `seed-data.sh` | Seed Qdrant (auto-detects GCP or local) |
 | `teardown-gcp.sh` | Delete all GCP resources |
+
+### Shared / utilities (`scripts/`)
+
+| Script | Purpose |
+|--------|---------|
+| `seed-data.sh` | Seed Qdrant (auto-detects GCP or local) |
 | `check-local-and-gcp-status.sh` | Show GCP + local Docker status |
 | `validate-cascade.py` | Ground-truth validation for G6 routing thresholds |
 | `check-stale-templates.py` | Detect and flag 30-day stale templates |
