@@ -10,7 +10,7 @@
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![Quality-gated savings](https://img.shields.io/badge/quality--gated_savings-54.1%25-brightgreen.svg)](#g0g28-optimisation-groups)
+[![Quality-gated savings](https://img.shields.io/badge/quality--gated_savings-54.1%25-brightgreen.svg)](#g0g30-optimisation-and-safety-groups)
 [![GitHub stars](https://img.shields.io/github/stars/sumitdevgupto/TokenLean?style=social)](https://github.com/sumitdevgupto/TokenLean/stargazers)
 
 **TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **22 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
@@ -158,8 +158,12 @@ See [docs/client-onboarding.md](docs/client-onboarding.md) for Python, Java, and
 
 ```mermaid
 flowchart TB
-    Req(["`Developer request
-    OpenAI-compatible client`"])
+    Req(["`Client request
+    OpenAI · Anthropic · Gemini SDK`"])
+
+    Ingress["`**0 · Native ingress** (protocols/)
+    Anthropic /v1/messages + Gemini :generateContent normalised to OpenAI shape;
+    response, streaming & errors re-serialised back to the caller's protocol`"]
 
     Gate["`**1 · Gate**
     G0 Rate-limit → G24 Adaptive-bypass (loads skip_groups) →
@@ -178,8 +182,8 @@ flowchart TB
     Align["`**4 · Final alignment**
     G21 Cache-alignment — last step before the provider call`"]
 
-    LLM{{"`LLM provider
-    any OpenAI-compatible`"}}
+    LLM{{"`LLM provider — any OpenAI-compatible
+    resilience: circuit breaker → retry → failover to a fallback provider`"}}
 
     Resp2["`**5 · Response-side**
     G29 PII-redact → G14 Tool-output → G28 CCR → G23 Stream-compress → G19 Headroom →
@@ -188,7 +192,7 @@ flowchart TB
     Out(["`Response
     + _token_opt savings breakdown`"])
 
-    Req --> Gate --> ReqOpt --> Params --> Align --> LLM --> Resp2 --> Out
+    Req --> Ingress --> Gate --> ReqOpt --> Params --> Align --> LLM --> Resp2 --> Out
 
     Gate -.->|G4 bypass or cache hit| Out
     Ingest["`G3 Knowledge ingestion
@@ -202,12 +206,46 @@ flowchart TB
 ```
 
 > Stages run in the exact order above (source of truth: `src/proxy/middleware/pipeline.py`).
-> **G24 runs first** and can skip any later stage per request; **G21** is the last step before the
-> provider call. **G4 bypass** and an **L1/L2/L3 cache hit** short-circuit straight to the response.
-> **G3** is an offline ingestion job that feeds the G7 RAG index. (G26 is a reserved slot.)
+> **Stage 0 · Native ingress** translates an Anthropic (`/v1/messages`) or Gemini
+> (`:generateContent` / `:streamGenerateContent`) request into the OpenAI shape the pipeline speaks,
+> then re-serialises the response — so the pipeline stays protocol-agnostic and the OpenAI path is
+> unchanged. **G24 runs first** and can skip any later stage per request; **G21** is the last step
+> before the provider call. **G4 bypass** and an **L1/L2/L3 cache hit** short-circuit straight to the
+> response. **G3** is an offline ingestion job that feeds the G7 RAG index. (G26 is a reserved slot.)
 > **G30 (injection guardrails) + G29 (PII redaction)** run right after G24, **unconditionally** —
 > they are never skipped by G24, cover bypass/cache traffic, and redact before any content-persisting
 > stage. A guardrail block or a PII-policy block returns an OpenAI content-filter 200.
+> The **provider call is wrapped in the resilience layer** — a circuit breaker + retry that fails over
+> to a configured fallback provider before any bytes are sent, so one upstream outage doesn't take the
+> request down.
+
+## Beyond token reduction — reliability, safety & reach
+
+Three capabilities that make the proxy production-grade for enterprise traffic — all OSS (Apache-2.0), never tier-gated:
+
+### 🔁 Provider failover & resilience
+An outage on one upstream shouldn't take your app down. Every provider call runs through a resilience layer (`providers/resilience.py`):
+- **Circuit breaker** — a provider that keeps failing is paused (*open*) and auto-probed back to health (*half-open → closed*), so you stop hammering a dead upstream.
+- **Retry + failover** — a transient error retries, then fails over to a configured **fallback provider** *before any bytes reach the client*. On swap, cost and provider attribution follow whoever actually served.
+- **Per-tenant cooldown / lockout** — a rate-limited key is skipped for a short window while other keys and providers keep serving; state is Redis-backed so it holds across workers.
+
+Configure per provider under `providers.<name>.resilience` (fallbacks, `num_retries`, `cooldown_time`, breaker thresholds). The safe default is **retry-only** — add `fallbacks` to turn on cross-provider failover. Circuit-breaker state and failover rate surface on the **SLA dashboard** and the portal SLA view.
+
+### 🛡️ Trust & safety — G29 PII · G30 injection guardrails
+Run **unconditionally right after G24** — before any optimisation spends tokens, and before any stage that persists content (cache / embeddings / memory / CCR), so they can't be bypassed and cover cache/bypass traffic too:
+- **G30 injection guardrails** — a precision-biased ruleset flags or blocks prompt-injection & jailbreak attempts (`allow | flag | block`). A block returns an OpenAI **content-filter 200**, not a 500.
+- **G29 PII redaction** — detects email / SSN / card / phone / IP (+ optional Presidio) and applies your policy (`off | flag | mask | block`) with **reversible masking** so downstream answers stay coherent.
+
+Per-tenant policy, **PII-free audit rows**, Prometheus counters, and a Trust & Safety dashboard. The managed red-team ruleset feed, portal Security tab, and compliance attestation are the commercial layer.
+
+### 🔌 Native multi-protocol ingress
+The one-line base-URL swap works from the **OpenAI**, **Anthropic** (`/v1/messages` — Claude Code included), and **Gemini** (`:generateContent` / `:streamGenerateContent`) SDKs, with each SDK's native auth (`x-api-key` / `x-goog-api-key` / `?key=`). Every request is normalised into the OpenAI-shaped pipeline and the response re-serialised — non-streaming, streaming, and error envelopes — back to your SDK's native shape. Every optimisation applies; billing is one row per served request regardless of protocol.
+
+| Client | Endpoint |
+|---|---|
+| OpenAI SDK | `POST /v1/chat/completions` |
+| Anthropic SDK / Claude Code | `POST /v1/messages` |
+| Gemini SDK | `POST /v1beta/models/{model}:generateContent` · `:streamGenerateContent` |
 
 ## Deployment Options
 
@@ -226,8 +264,11 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for complete details.
 
 ```
 src/
-├── proxy/                  # Core LiteLLM proxy + G0–G28 middleware pipeline
-│   ├── middleware/         # G0–G28 middleware files (g00_rate_limit.py … g28_ccr.py)
+├── proxy/                  # Core LiteLLM proxy + G0–G30 middleware pipeline
+│   ├── middleware/         # G0–G30 middleware files (g00_rate_limit.py … g30_guardrails.py)
+│   ├── protocols/          # Native multi-protocol ingress (OpenAI · Anthropic · Gemini translators)
+│   ├── guardrails/         # Trust & safety engines — G29 PII detector + G30 injection scanner
+│   ├── providers/          # Provider adapters + resilience.py (circuit breaker / retry / failover)
 │   ├── savings/            # Per-step savings calculator + cost models
 │   └── auth/               # Proxy key validation (GCP Secret Manager)
 ├── llmlingua-sidecar/      # G1: LLMLingua-2 HTTP compression sidecar
@@ -236,7 +277,7 @@ src/
 ├── tika-sidecar/           # Apache Tika 2.9.1 for document parsing
 └── templates/              # G16: Developer starter kits (Python / Java / Go)
 config/                     # Externalised config (hot-reloaded from GCS)
-dashboard/                  # Grafana dashboards (per-call/live/trends/quarterly)
+dashboard/                  # Grafana dashboards (per-call/live/trends/billing/sla/trust-safety/requests)
 infra/                      # Terraform (Cloud Run, Cloud SQL, Redis, Secret Manager)
 scripts/                    # Deployment, validation, and operational scripts
 ci/                         # Cloud Build + budget validation pipelines
@@ -244,7 +285,9 @@ docs/                       # Developer and operator documentation
 tests/                      # Unit and integration tests (pytest)
 ```
 
-## G0–G28 Optimisation Groups
+## G0–G30 Optimisation and Safety Groups
+
+27 token-optimisation techniques (G0–G28, G26 reserved) plus two trust & safety groups (G29 PII, G30 injection guardrails). The Savings column applies to the optimisation groups; G29/G30 are safety controls, not token-savers.
 
 | Group | Technique | Savings | Key Implementation |
 |-------|-----------|---------|-------------------|
@@ -497,9 +540,12 @@ modules (not in the default pipeline) see `g08_mcp_loader.py` and `g15_mcp_dispa
 
 | Control | Implementation |
 |---------|---------------|
-| LLM Provider Keys | GCP Secret Manager only (never exposed to developers) |
+| LLM Provider Keys | GCP Secret Manager only (never exposed to developers); per-tenant BYOK keys Fernet-encrypted at rest |
 | Developer Keys | Proxy-issued API keys with per-user rate limits |
 | Authentication | Workload Identity (no JSON credential files) |
+| **PII redaction (G29)** | Detect + `off\|flag\|mask\|block` email/SSN/card/phone/IP (+ optional Presidio) before the provider call; reversible masking; PII-free audit rows |
+| **Injection guardrails (G30)** | Precision-biased prompt-injection / jailbreak detection; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens |
+| **Provider resilience** | Circuit breaker + retry + per-tenant cooldown + failover so one upstream outage doesn't take a request down |
 | Network | VPC connector for private service communication |
 | Secrets | All secrets gitignored — see `.gitignore` |
 
@@ -519,7 +565,7 @@ pytest tests/unit/middleware/test_g01_compression.py -v
 pytest --cov=src/proxy --cov-report=html
 ```
 
-**Test Coverage:** 43 middleware files (40 G-group files + pipeline/context/tracing), integration tests for API and pipeline.
+**Test Coverage:** 45 middleware files (42 G-group files + pipeline/context/tracing), plus the `protocols/`, `guardrails/`, and `providers/resilience` engines; integration tests for API, pipeline, multi-protocol ingress, failover, and trust-safety blocking.
 
 ## Documentation
 
@@ -527,7 +573,7 @@ pytest --cov=src/proxy --cov-report=html
 |----------|---------|
 | [docs/client-onboarding.md](docs/client-onboarding.md) | Client integration guide (Python/Java/Go) |
 | [docs/config-reference.md](docs/config-reference.md) | Complete configuration parameter reference |
-| [docs/request-flow-diagram.md](docs/request-flow-diagram.md) | Full request/response pipeline (G0–G28) and per-group flow |
+| [docs/request-flow-diagram.md](docs/request-flow-diagram.md) | Full request/response pipeline (G0–G30 + native ingress) and per-group flow |
 | [docs/oss-licenses.md](docs/oss-licenses.md) | Dependency licenses (SPDX) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Complete deployment and troubleshooting guide |
 | [Token Optimisation Blog](https://sumitdevgupto.github.io/token-optimisation-blog/) | Reference article — background and walkthrough of the framework |
