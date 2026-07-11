@@ -67,7 +67,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
-          "decimals": 6
+          "decimals": 2
         }
       },
       "options": {
@@ -165,7 +165,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
-          "decimals": 6
+          "decimals": 2
         }
       }
     },
@@ -227,7 +227,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
-          "decimals": 6,
+          "decimals": 2,
           "custom": {
             "fillOpacity": 80,
             "lineWidth": 1
