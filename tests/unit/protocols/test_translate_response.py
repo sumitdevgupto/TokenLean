@@ -93,3 +93,20 @@ def test_completion_to_stream_chunk_maps_message_to_delta():
     assert "message" not in choice
     assert choice["delta"] == {"role": "assistant", "content": "x"}
     assert choice["finish_reason"] == "stop"
+
+
+def test_completion_to_stream_chunk_stamps_tool_call_indices_without_mutating():
+    """A completion's tool_calls carry no streaming `index`; the force-stream/cache-hit
+    path must stamp distinct indices so the native-stream accumulators don't collapse
+    multiple tool_calls into slot 0 — and must not mutate the (possibly cached) body."""
+    tcs = [
+        {"id": "a", "type": "function", "function": {"name": "f1", "arguments": "{}"}},
+        {"id": "b", "type": "function", "function": {"name": "f2", "arguments": "{}"}},
+    ]
+    body = {"choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": None, "tool_calls": tcs}}]}
+    chunk = main._completion_to_stream_chunk(body)
+    stamped = chunk["choices"][0]["delta"]["tool_calls"]
+    assert [tc["index"] for tc in stamped] == [0, 1]
+    # Original tool_call dicts untouched (no `index` leaked back into the cached body).
+    assert "index" not in tcs[0] and "index" not in tcs[1]

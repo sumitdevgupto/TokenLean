@@ -29,6 +29,39 @@ def sse_line(obj: Any) -> str:
     return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
 
 
+def safe_json_dumps(obj: Any) -> str:
+    """Compact JSON string for a tool-call ``arguments`` / result payload, tolerant of
+    non-serialisable input (falls back to ``{}``). Shared by the ingress adapters so the
+    two protocols serialise the same tool payload identically."""
+    try:
+        return json.dumps(obj if obj is not None else {}, separators=(",", ":"))
+    except Exception:
+        return "{}"
+
+
+def finalize_fanout(
+    role: str, collapsed: Any, tool_calls: List[Dict[str, Any]],
+    tool_msgs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Assemble one inbound message's fanned-out pieces into ordered OpenAI messages.
+
+    Shared by the Anthropic and Gemini adapters (they differ only in how they RECOGNISE
+    tool blocks/parts; the assembly is identical). ``tool_msgs`` (answers to the PRIOR
+    assistant turn) come first, then this turn's content/assistant message:
+      * assistant + tool_calls → ``content`` is the text/multimodal payload, or ``None``
+        when there is no text (OpenAI convention for a tool-call-only assistant turn);
+      * otherwise a single ``{role, content}`` message — emitted when there is residual
+        content OR there were no tool results at all, so a plain-text turn still yields
+        exactly one message (and a tool-result-only turn doesn't append an empty one).
+    """
+    out: List[Dict[str, Any]] = list(tool_msgs)
+    if role == "assistant" and tool_calls:
+        out.append({"role": "assistant", "content": collapsed or None, "tool_calls": tool_calls})
+    elif collapsed or not tool_msgs:
+        out.append({"role": role, "content": collapsed})
+    return out
+
+
 class StreamTranslator:
     """Converts the proxy's OpenAI stream chunks into a protocol's SSE frames.
 

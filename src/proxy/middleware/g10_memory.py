@@ -480,6 +480,28 @@ class G10Memory:
             logger.warning("G10 Qdrant skills retrieval failed: %s", exc)
 
 
+def _safe_window_split(turns: List[Dict], keep: int) -> int:
+    """Index at which to split ``turns`` into (summarised-old, kept-recent) so the
+    kept tail never begins with an orphaned tool result.
+
+    A blind positional cut — ``turns[-keep:]`` — can start the kept tail on a
+    ``role:"tool"`` message whose declaring ``assistant``/``tool_calls`` turn was
+    pushed into the summarised region. That leaves a ``tool_call_id`` with no
+    matching assistant ``tool_calls[].id`` in the list handed to the provider,
+    which litellm / OpenAI / Anthropic reject with a **400** — and it strikes
+    exactly on the long multi-turn agentic (tool-calling) conversation that trips
+    the window in the first place. Tool results always immediately follow their
+    assistant turn in OpenAI shape, so snap the boundary earlier over any leading
+    run of tool results: the tail then starts on the assistant turn that declared
+    them and the whole tool exchange stays intact. Returns 0 when no clean cut
+    exists (pathological all-tool history) so the caller trims nothing.
+    """
+    start = max(0, len(turns) - keep)
+    while start > 0 and turns[start].get("role") == "tool":
+        start -= 1
+    return start
+
+
 async def _apply_sliding_window(
     ctx: RequestContext, window: int, summary_model: str
 ) -> None:
@@ -493,8 +515,15 @@ async def _apply_sliding_window(
     if len(turns) <= window * 2:
         return  # Nothing to trim
 
-    old_turns = turns[: -(window * 2)]
-    recent_turns = turns[-(window * 2) :]
+    # Tool-pairing-aware cut: never orphan a role:"tool" result from the
+    # assistant/tool_calls turn that declared it (an unmatched tool_call_id
+    # 400s the provider). Snap the boundary back over a split tool exchange.
+    start = _safe_window_split(turns, window * 2)
+    if start == 0:
+        return  # No clean boundary — trimming here would orphan a tool pair
+
+    old_turns = turns[:start]
+    recent_turns = turns[start:]
 
     summary = await _summarise(old_turns, summary_model, ctx)
     summary_msg = {

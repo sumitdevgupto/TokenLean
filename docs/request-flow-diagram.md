@@ -366,9 +366,9 @@ Request → Auth → Context → G00 … G13 (batchable) → Return 202 Accepted
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/v1/chat/completions` | POST | Main proxy endpoint (OpenAI-compatible) |
-| `/v1/messages` | POST | **Native Anthropic Messages ingress** (#4) — Claude SDK / Claude Code point here one-line (`x-api-key` or Bearer). Normalised into the same pipeline; response re-serialised to Anthropic shape (streaming + non-streaming) |
-| `/v1beta/models/{model}:generateContent` | POST | **Native Gemini ingress** (#4) — Gemini SDK (`x-goog-api-key` / `?key=`). Response re-serialised to Gemini `candidates` shape |
-| `/v1beta/models/{model}:streamGenerateContent` | POST | Native Gemini **streaming** ingress (SSE) |
+| `/v1/messages` | POST | **Native Anthropic Messages ingress** (#4) — Claude SDK / Claude Code point here one-line (`x-api-key` or Bearer). Normalised into the same pipeline; response re-serialised to Anthropic shape (streaming + non-streaming). `tool_use`/`tool_result` round-trip structurally (ids preserved) — not degraded to text |
+| `/v1beta/models/{model}:generateContent` | POST | **Native Gemini ingress** (#4) — Gemini SDK (`x-goog-api-key` / `?key=`). Response re-serialised to Gemini `candidates` shape. `functionCall`/`functionResponse` round-trip structurally (id synthesised — Gemini carries none — and correlated by function name, FIFO; same-name parallel calls answered out of order can mis-bind — inherent to the id-less protocol) |
+| `/v1beta/models/{model}:streamGenerateContent` | POST | Native Gemini streaming ingress — SSE with `?alt=sse` (the Gemini wire contract); without it, a JSON array of `GenerateContentResponse`. `functionCall` deltas accumulate and emit structurally in the terminal frame |
 | `/v1/models` | GET | List available models from configured providers |
 | `/v1/batch/results/{request_id}` | GET | Poll for deferred batch results |
 | `/ingest-doc` | POST | GCS pub/sub webhook for document ingestion (G03) |
