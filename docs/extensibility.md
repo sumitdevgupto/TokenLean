@@ -63,7 +63,9 @@ pricing:
 4. Set the key: `LLM_KEY_<NAME>` locally (e.g. `LLM_KEY_KIMI`) / `llm-key-<name>` secret on GCP.
 5. *(Optional)* knobs — reasoning: add `effort_map[<tier>].<name>` under `G12_reasoning` **and**
    `supports_reasoning: true` on the provider entry; cache discount:
-   `G21_cache_alignment.providers.<name>.cache_read_multiplier`; native batch: `native_batch: true`.
+   `G21_cache_alignment.providers.<name>.cache_read_multiplier`; native batch: `native_batch: true`;
+   resilience: a per-provider `resilience:` sub-block (e.g. `failure_threshold`, `num_retries`) and
+   `resilience.fallbacks.<model>` failover chains (see [config-reference.md](config-reference.md#resilience--1-provider-failover--top-level-section)).
 6. Verify: send a test request, confirm routing in the logs and that savings/cost resolve.
 
 `providers:` changes hot-reload; a **new key** needs the secret set + container recreate.

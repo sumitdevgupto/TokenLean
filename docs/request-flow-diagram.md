@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation slots (G0–G28); G26 is reserved, so 27 groups are fully operational** across the files in `src/proxy/middleware/`.
+This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation slots (G0–G28); G26 is reserved, so 27 optimisation groups are fully operational** — plus two **trust & safety** groups, **G30 (injection guardrails)** and **G29 (PII redaction)**, that run unconditionally right after G24 (never skippable) — across the files in `src/proxy/middleware/`.
 
 The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`OptimisationPipeline`). G24 runs **first** so it can populate `ctx.skip_groups`, letting every later stage skip itself per request.
 
@@ -35,6 +35,8 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
 │  │  G00 Rate Limit       → Token bucket (Redis) → 429 if exceeded                        │       │
 │  │  G24 Adaptive Bypass  → load learned rules → populate ctx.skip_groups (runs first)  │       │
+│  │  G30 Guardrails       → prompt-injection / jailbreak scan → flag | block (non-bypass)│       │
+│  │  G29 PII Redaction    → detect PII → flag | mask | block (before cache/RAG/memory)  │       │
 │  │  ────────────────────────────────────────────────────────────────────────────────────│       │
 │  │  G04 Bypass Rules     → DB-first PostgreSQL → confidence score → zero-cost response │       │
 │  │  G05 Cache            → L1 Redis → L2 pgvector → L3 headroom SemanticCache → cached  │       │
@@ -122,10 +124,10 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 ## Pipeline Order (authoritative — `pipeline.py`)
 
 Request path:
-`G0 → G24 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
+`G0 → G24 → G30 → G29 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
 
 Response path:
-`G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → G18 → G5(store)`
+`G29(resp) → G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → G18 → G5(store)`
 
 > **G24 runs first** to populate `ctx.skip_groups`. Every Stage-2/Stage-3 group is wrapped in a
 > `if _group in ctx.skip_groups: continue` guard, so G24 can disable any of them per request.
@@ -364,6 +366,9 @@ Request → Auth → Context → G00 … G13 (batchable) → Return 202 Accepted
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/v1/chat/completions` | POST | Main proxy endpoint (OpenAI-compatible) |
+| `/v1/messages` | POST | **Native Anthropic Messages ingress** (#4) — Claude SDK / Claude Code point here one-line (`x-api-key` or Bearer). Normalised into the same pipeline; response re-serialised to Anthropic shape (streaming + non-streaming) |
+| `/v1beta/models/{model}:generateContent` | POST | **Native Gemini ingress** (#4) — Gemini SDK (`x-goog-api-key` / `?key=`). Response re-serialised to Gemini `candidates` shape |
+| `/v1beta/models/{model}:streamGenerateContent` | POST | Native Gemini **streaming** ingress (SSE) |
 | `/v1/models` | GET | List available models from configured providers |
 | `/v1/batch/results/{request_id}` | GET | Poll for deferred batch results |
 | `/ingest-doc` | POST | GCS pub/sub webhook for document ingestion (G03) |

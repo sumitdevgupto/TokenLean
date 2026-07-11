@@ -1153,7 +1153,7 @@ gcloud run services list --region=asia-south1 --format='table(metadata.name,stat
 
 - [GCP Deployment Guide](docs/deployment-gcp.md) — Focused GCP-only reference
 - [Local Deployment Guide](docs/deployment-local.md) — Docker Compose local setup
-- [Developer Onboarding Guide](docs/developer-onboarding.md)
+- [Client Onboarding Guide](docs/client-onboarding.md)
 - [Configuration Reference](docs/config-reference.md)
 - [Token Optimisation Playbook v7](token_optimization_playbook_v7.md)
 - [GCP Cloud Run Documentation](https://cloud.google.com/run/docs)

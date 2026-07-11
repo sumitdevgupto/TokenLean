@@ -32,6 +32,10 @@ REQUIRED_COLUMNS = {
     "cache_level",
     "complexity_tier",
     "bypassed",
+    "cost_actual_usd",
+    "cost_baseline_usd",
+    "provider",
+    "protocol",  # #4 multi-protocol ingress (schema_version 2)
 }
 
 
@@ -79,7 +83,11 @@ class TestUsageEventsTable:
                 cache_hit        BOOLEAN       NOT NULL DEFAULT false,
                 cache_level      TEXT          NOT NULL DEFAULT '',
                 complexity_tier  TEXT          NOT NULL DEFAULT '',
-                bypassed         BOOLEAN       NOT NULL DEFAULT false
+                bypassed         BOOLEAN       NOT NULL DEFAULT false,
+                cost_actual_usd   NUMERIC(12,8) NOT NULL DEFAULT 0,
+                cost_baseline_usd NUMERIC(12,8) NOT NULL DEFAULT 0,
+                provider         TEXT          NOT NULL DEFAULT '',
+                protocol         TEXT          NOT NULL DEFAULT 'openai'
             )
         """)
 

@@ -22,10 +22,11 @@
 > 💵 **Cost savings** run **~70%** on the same gated workloads (config-priced estimate — **directional, not invoice-grade**, and run-variable). Reported separately from the token metric on purpose: routing swaps models (a cost lever) without always cutting input tokens, and dollar figures come from a static price table, not real invoices.
 
 **Why teams use it:**
-- 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK
+- 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation
 - 📉 **Broad reduction** — 27 stacked techniques from the Token Optimisation Playbook v7, not just caching
 - 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown; per-call → quarterly Grafana dashboards
 - 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
+- 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII) run non-bypassably before any tokens are spent
 - ♻️ **Hot-reload config** — tune or A/B any technique without a redeploy
 - 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, Temporal
 
@@ -46,6 +47,9 @@ don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / u
 | Prompt compression (LLMLingua-2) | ✅ | — | — | — | — |
 | Multi-level + semantic cache (L1/L2/L3) | ✅ | basic | — | ✅ | ✅ |
 | Model routing / 3-tier cascade | ✅ (+ RouteLLM) | ✅ | — | ✅ | ✅ |
+| Provider failover / circuit breakers | ✅ | ✅ | — | ✅ | ✅ |
+| Native multi-protocol ingress (OpenAI · Anthropic · Gemini) | ✅ | partial | — | partial | — |
+| Trust & safety (PII redaction · injection guardrails) | ✅ (G29/G30) | — | — | ✅ | — |
 | Provider prefix-cache alignment | ✅ (up to ~84% on prefix) | — | — | — | — |
 | Structured/AST pruning · dedup · CCR | ✅ | — | — | — | — |
 | Drop-in OpenAI-compatible (any provider) | ✅ (10 first-class + config) | ✅ | ✅ | ✅ | ✅ |
@@ -113,20 +117,40 @@ cp infra/terraform.tfvars.template infra/terraform.tfvars
 
 ### One-Line Developer Integration
 
-**Before:**
-```python
-client = OpenAI(api_key="sk-openai-...")
-```
+Point your existing SDK's base URL at the proxy — **no prompt or code changes**. The proxy
+speaks each provider's native wire protocol (request, response, streaming, and errors) while
+applying every optimisation, so the one-line swap works whether you use the OpenAI, Anthropic,
+or Gemini SDK (including **Claude Code** via `/v1/messages`).
 
-**After:**
+**OpenAI SDK** → `/v1/chat/completions`
 ```python
 client = OpenAI(
-    api_key=os.environ["PROXY_API_KEY"],      # Proxy-issued key (not LLM key)
+    api_key=os.environ["PROXY_API_KEY"],      # Proxy-issued key (not the LLM key)
     base_url=os.environ["PROXY_ENDPOINT"] + "/v1"
 )
 ```
 
-See [docs/developer-onboarding.md](docs/developer-onboarding.md) for Python, Java, and Go examples.
+**Anthropic SDK / Claude Code** → `/v1/messages`
+```python
+client = anthropic.Anthropic(
+    api_key=os.environ["PROXY_API_KEY"],
+    base_url=os.environ["PROXY_ENDPOINT"]     # x-api-key auth handled natively
+)
+```
+
+**Gemini SDK** → `…/v1beta/models/{model}:generateContent`
+```python
+client = genai.Client(
+    api_key=os.environ["PROXY_API_KEY"],      # x-goog-api-key / ?key= handled natively
+    http_options={"base_url": os.environ["PROXY_ENDPOINT"]}
+)
+```
+
+The proxy is OpenAI-shaped internally; each request is normalised in and the response
+re-serialised back to your SDK's native shape (`ctx.ingress_protocol` records which one, for
+observability — billing is one row per served request regardless of protocol).
+
+See [docs/client-onboarding.md](docs/client-onboarding.md) for Python, Java, and Go examples.
 
 ---
 
@@ -139,6 +163,7 @@ flowchart TB
 
     Gate["`**1 · Gate**
     G0 Rate-limit → G24 Adaptive-bypass (loads skip_groups) →
+    G30 Guardrails → G29 PII-redaction (non-bypassable trust & safety) →
     G4 Rules-bypass → G5 Cache read (L1/L2/L3) → G6 Route (3-tier cascade)`"]
 
     ReqOpt["`**2 · Request-side optimisation** (each stage skippable via G24)
@@ -157,7 +182,7 @@ flowchart TB
     any OpenAI-compatible`"}}
 
     Resp2["`**5 · Response-side**
-    G14 Tool-output → G28 CCR → G23 Stream-compress → G19 Headroom →
+    G29 PII-redact → G14 Tool-output → G28 CCR → G23 Stream-compress → G19 Headroom →
     G15 Server-compute → G11 Format-feedback → G18 Observability → G5 Cache-store`"]
 
     Out(["`Response
@@ -180,6 +205,9 @@ flowchart TB
 > **G24 runs first** and can skip any later stage per request; **G21** is the last step before the
 > provider call. **G4 bypass** and an **L1/L2/L3 cache hit** short-circuit straight to the response.
 > **G3** is an offline ingestion job that feeds the G7 RAG index. (G26 is a reserved slot.)
+> **G30 (injection guardrails) + G29 (PII redaction)** run right after G24, **unconditionally** —
+> they are never skipped by G24, cover bypass/cache traffic, and redact before any content-persisting
+> stage. A guardrail block or a PII-policy block returns an OpenAI content-filter 200.
 
 ## Deployment Options
 
@@ -248,6 +276,10 @@ tests/                      # Unit and integration tests (pytest)
 | **G26** | *(reserved)* | — | Reserved slot — not implemented |
 | **G27** | Multimodal Optimizer | Variable | Compress inline base64 images (Headroom + LRU cache) |
 | **G28** | Context Compression & Reuse | 20-50% | Replace repeated blocks with `[CCR:sha256]` + headroom MCP tools |
+| **G29** | PII Redaction *(trust & safety)* | — | Detect + `off\|flag\|mask\|block` personal data (email/SSN/card/phone/IP + optional Presidio) before the provider call |
+| **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens |
+
+> **G29/G30 are trust & safety groups, not token-savings optimisations** — they don't contribute to the 54.1% headline and are kept out of the ablation harness. All 29 groups are OSS (Apache-2.0) and never tier-gated; the managed red-team ruleset feed, the portal Security tab, and the compliance attestation are the commercial layer.
 
 See [docs/request-flow-diagram.md](docs/request-flow-diagram.md) for the full pipeline order and per-group flow.
 
@@ -493,7 +525,7 @@ pytest --cov=src/proxy --cov-report=html
 
 | Document | Purpose |
 |----------|---------|
-| [docs/developer-onboarding.md](docs/developer-onboarding.md) | Developer integration guide (Python/Java/Go) |
+| [docs/client-onboarding.md](docs/client-onboarding.md) | Client integration guide (Python/Java/Go) |
 | [docs/config-reference.md](docs/config-reference.md) | Complete configuration parameter reference |
 | [docs/request-flow-diagram.md](docs/request-flow-diagram.md) | Full request/response pipeline (G0–G28) and per-group flow |
 | [docs/oss-licenses.md](docs/oss-licenses.md) | Dependency licenses (SPDX) |

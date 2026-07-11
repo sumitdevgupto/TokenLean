@@ -204,7 +204,15 @@ def finish_trace(ctx: "RequestContext", response: Optional[Dict[str, Any]] = Non
         # I1: omit raw prompt/response for tenants that opt out of content capture
         # (shared Langfuse project → no per-tenant RBAC on stored content).
         if _should_capture_content(ctx):
-            gen_input, gen_output = ctx.messages, output_text
+            gen_input = ctx.messages          # G29 already masked these in mask mode
+            gen_output = output_text
+            # G29 mask mode un-masks the response for the CLIENT (coherence), but the
+            # persisted trace must not carry the restored PII — re-apply the placeholders
+            # to the traced output only (the returned response object is untouched). F3.
+            vault = getattr(ctx, "pii_vault", None)
+            if vault:
+                from guardrails.pii import remask_with_vault
+                gen_output = remask_with_vault(gen_output, vault)
         else:
             gen_input = gen_output = "[redacted: capture_trace_content=false]"
 

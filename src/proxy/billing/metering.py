@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from billing.models import UsageEvent
+from protocols.base import DEFAULT_PROTOCOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ class UsageMeter:
             cost_actual_usd=float(getattr(savings, "cost_actual_usd", 0.0) or 0.0),
             cost_baseline_usd=float(getattr(savings, "cost_baseline_usd", 0.0) or 0.0),
             provider=(getattr(getattr(ctx, "provider_adapter", None), "name", "") or ""),
+            protocol=(getattr(ctx, "ingress_protocol", DEFAULT_PROTOCOL_NAME) or DEFAULT_PROTOCOL_NAME),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -94,9 +96,9 @@ class UsageMeter:
                  model, routed_model, otel_trace_id,
                  proxy_optimised_tokens, provider_prompt_tokens, response_tokens,
                  user_id, cache_hit, cache_level, complexity_tier, bypassed,
-                 cost_actual_usd, cost_baseline_usd, provider)
+                 cost_actual_usd, cost_baseline_usd, provider, protocol)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                    $16,$17,$18,$19,$20,$21,$22,$23)
+                    $16,$17,$18,$19,$20,$21,$22,$23,$24)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -113,6 +115,7 @@ class UsageMeter:
                     event.user_id, event.cache_hit, event.cache_level,
                     event.complexity_tier, event.bypassed,
                     event.cost_actual_usd, event.cost_baseline_usd, event.provider,
+                    event.protocol,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

@@ -17,6 +17,11 @@ class _Ctx:
         # Mirror RequestContext: the streaming path accumulates the stream's
         # wall-time into this (via +=), so it must exist as a number.
         self.llm_elapsed_ms = 0.0
+        # Fields the resilience layer (#1) reads when establishing the stream.
+        self.routed_model = "gpt-4o-mini"
+        self.provider_adapter = None
+        self.redis_prefix = ""
+        self.provider_attempts = []
 
 
 async def _collect(streaming_response):
@@ -49,7 +54,8 @@ async def test_stream_relays_chunks_and_bills_once(monkeypatch):
     monkeypatch.setattr(main.litellm, "acompletion", fake_acompletion)
     monkeypatch.setattr(main, "_record_outcome", fake_record)
 
-    resp = main._stream_response(_Ctx(), "gpt-4o-mini", {"api_key": "sk"}, {"stream": True}, "req-1", 0.0)
+    resp = main._stream_response(_Ctx(), "gpt-4o-mini", {"api_key": "sk"}, {"stream": True}, "req-1", 0.0,
+                                 provider="openai", provider_key="sk")
     body = await _collect(resp)
 
     # SSE framing + content + terminal [DONE]
@@ -62,18 +68,27 @@ async def test_stream_relays_chunks_and_bills_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_error_still_bills(monkeypatch):
+async def test_stream_failure_before_first_chunk_not_billed_as_200(monkeypatch):
+    """Review S1+S2: a stream that never produced a chunk records the REAL error
+    status (not a billable 200), and the client sees a generic redacted message —
+    never the raw upstream exception."""
     async def boom(**kwargs):
-        raise RuntimeError("provider down")
+        raise RuntimeError("provider down api_key=sk-SECRET")
 
-    billed = {}
+    recorded = {}
+
+    def fake_record(ctx, start, status, response=None):
+        recorded["status"] = status
+
     monkeypatch.setattr(main.litellm, "acompletion", boom)
-    monkeypatch.setattr(main, "_record_outcome", lambda *a, **k: billed.setdefault("called", True))
+    monkeypatch.setattr(main, "_record_outcome", fake_record)
 
-    resp = main._stream_response(_Ctx(), "gpt-4o-mini", {}, {"stream": True}, "req-2", 0.0)
+    resp = main._stream_response(_Ctx(), "gpt-4o-mini", {}, {"stream": True}, "req-2", 0.0,
+                                 provider="openai", provider_key="sk")
     body = await _collect(resp)
-    assert "error" in body  # error surfaced in the stream
-    assert billed.get("called") is True  # finally-block billing still ran
+    assert "error" in body                    # error surfaced in the stream
+    assert "SECRET" not in body               # raw exception never echoed to the client
+    assert recorded["status"] == "502"        # real status recorded — NOT a billable 200
 
 
 def test_apply_stream_g23_records_savings():

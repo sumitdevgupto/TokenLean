@@ -31,6 +31,37 @@ client = OpenAI(
 )
 ```
 
+### Anthropic SDK / Claude Code (native `/v1/messages`)
+The proxy speaks Anthropic natively — point the Claude SDK at it and keep using
+`client.messages.create(...)`. Your **proxy** key goes in `x-api-key` (the tenant's
+real provider key is resolved server-side); every optimisation still applies.
+```python
+# Before
+from anthropic import Anthropic
+client = Anthropic(api_key="sk-ant-...")
+
+# After — only these two values change
+import os
+from anthropic import Anthropic
+client = Anthropic(
+    api_key=os.environ["PROXY_API_KEY"],
+    base_url=os.environ["PROXY_ENDPOINT"],   # proxy exposes /v1/messages
+)
+```
+
+### Gemini (native `generateContent`)
+Point the Google GenAI SDK's base URL at the proxy; the proxy exposes
+`/v1beta/models/{model}:generateContent` (+ `:streamGenerateContent`) and re-serialises
+to Gemini's `candidates` shape. Send the **proxy** key via `x-goog-api-key` or `?key=`.
+```python
+import os
+from google import genai
+client = genai.Client(
+    api_key=os.environ["PROXY_API_KEY"],
+    http_options={"base_url": os.environ["PROXY_ENDPOINT"]},
+)
+```
+
 ### Java
 ```java
 // Before

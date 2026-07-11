@@ -36,13 +36,24 @@ from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_ad
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
 from providers.key_resolver import resolve_provider_key, ProviderKeyError, ProviderKeyDecryptError
+from providers.resilience import (
+    ResilienceConfig,
+    CallTarget,
+    AllTargetsFailedError,
+    BREAKER_STATE_CODE,
+    call_with_resilience,
+    get_resilience_store,
+)
 from middleware.g18_observability import (
     REQUEST_DURATION_MS,
     HTTP_REQUESTS,
     LLM_DURATION_MS,
     PROXY_OVERHEAD_MS,
     STAGE_DURATION_MS,
+    CIRCUIT_BREAKER_STATE,
+    FAILOVER_TOTAL,
 )
+from protocols import OPENAI, ANTHROPIC, GEMINI
 from middleware import RequestContext
 from middleware.g00_rate_limit import RateLimitExceeded
 from middleware.g03_doc_pipeline import trigger_doc_ingestion
@@ -126,7 +137,7 @@ async def lifespan(app: FastAPI):
     # Initialise OpenLLMetry (OTLP auto-instrumentation for LLM SDKs)
     _init_openllmetry(cfg)
     # Ensure billing table exists and wire UsageMeter (idempotent DDL)
-    global _usage_meter
+    global _usage_meter, _audit_logger
     try:
         from cache.pg_pool import get_pg_pool
         from billing.models import USAGE_EVENTS_DDL
@@ -141,6 +152,12 @@ async def lifespan(app: FastAPI):
         # D1 fix: inject the pool into the pipeline so per-tenant config_overrides
         # (model prefs + G-group knobs from the portal) are actually applied at runtime.
         _pipeline.set_db_pool(pg)
+        # Trust & Safety audit (G29/G30): core audit ENGINE writes PII-free security
+        # rows into audit_events (idempotent DDL). The commercial Security tab reads
+        # them; core just records. No commercial import — audit/log.py is a core engine.
+        from audit.log import AuditLogger, ensure_audit_schema
+        await ensure_audit_schema(pg)
+        _audit_logger = AuditLogger(db_pool=pg)
         logger.info("Billing: usage_events table ready; tenant-config loader wired")
         # WS25: config-driven retention loop (default OFF — retention.enabled).
         from retention import run_retention_loop
@@ -545,6 +562,22 @@ async def ingest_doc(request: Request):
 # not recognized by the provider's completion API and must not be forwarded.
 _INTERNAL_PARAM_KEYS = {"template_id", "workflow_id", "rag_query", "batch_id", "burst_block"}
 _usage_meter = None  # initialised in the lifespan startup once pg pool is ready
+_audit_logger = None  # core AuditLogger for G29/G30 security events (lifespan-wired)
+
+
+def _schedule_security_audit(ctx) -> None:
+    """Fire-and-forget one or two PII-free ``audit_events`` rows for any G29 redaction /
+    G30 guardrail activity on this request. No-op without ctx / a wired audit logger /
+    a running loop, and skips the task entirely when nothing was flagged. Best-effort:
+    audit must never block or break the response path."""
+    if ctx is None or _audit_logger is None:
+        return
+    if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)):
+        return
+    try:
+        asyncio.create_task(_audit_logger.log_security_events(ctx))
+    except RuntimeError:  # no running loop (not the request path) — skip
+        logger.debug("[%s] security audit skipped: no loop", getattr(ctx, "request_id", "?"))
 
 
 def _schedule_billing(ctx, response) -> None:
@@ -606,6 +639,9 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
             LLM_DURATION_MS.labels(tenant_id=tenant_id).observe(llm_ms)
     except Exception as exc:  # never let metrics break the response
         logger.debug("SLA metric record failed: %s", exc)
+    # Trust & Safety: record any G29/G30 activity at every exit path (a flagged
+    # request that later errors is still audited). PII-free; best-effort.
+    _schedule_security_audit(ctx)
     # C1: one billable row per served 2xx request (best-effort, never blocks).
     if status == "200":
         _schedule_billing(ctx, response)
@@ -676,13 +712,24 @@ def _bump_spend_counter(ctx) -> None:
         pass
 
 
-def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, request_start):
+def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, request_start,
+                     *, eff_cfg=None, provider="", routed_adapter=None, provider_key=None):
     """Pass-through SSE streaming: relay the provider's chunks unchanged.
 
     Request-side optimisations (G0–G13) are already applied before this is called. The
     response-side pipeline (G14/G18/G23) is intentionally skipped for streamed calls;
     usage is captured best-effort from the final chunk (needs provider stream-usage
     support) and billing fires once on completion (billing is per-request).
+
+    Resilience (#1): the stream is established through call_with_resilience — a transient
+    error establishing the primary stream retries then fails over to a configured fallback
+    provider BEFORE any bytes are sent. Once chunks are flowing we can't fail over (the SSE
+    response has begun), so an error mid-stream surfaces as a data:{error} event as before.
+
+    Billing/SLA truth (review S1): a stream that fails before ANY chunk was produced is
+    recorded with the real error status (429/502) — never as a served 200 — so it neither
+    bills the tenant nor pollutes success metrics. A mid-stream error after content was
+    delivered still records 200 (a partial response was served).
     """
     import json as _json
 
@@ -691,16 +738,40 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
     # for providers that don't.
     params.setdefault("stream_options", {"include_usage": True})
 
+    _rcfg = ResilienceConfig.resolve(eff_cfg or ctx.config or {}, provider)
+
+    async def _establish_primary():
+        return await litellm.acompletion(
+            model=call_model, messages=ctx.messages, **call_kwargs, **params
+        )
+
+    async def _open_stream():
+        targets = [CallTarget(
+            model=ctx.routed_model, provider=provider, invoke=_establish_primary,
+            has_key=bool(provider_key) or (routed_adapter is not None
+                                           and not routed_adapter.requires_api_key()),
+            adapter=routed_adapter,
+        )]
+        targets += _fallback_targets(
+            ctx, _rcfg, eff_cfg or ctx.config or {}, request_id, stream=True
+        )
+        return await call_with_resilience(
+            targets, get_resilience_store(), _rcfg,
+            redis_prefix=ctx.redis_prefix, attempts_sink=ctx.provider_attempts,
+            on_success=_make_pin_winner(ctx, request_id, "stream failover"),
+        )
+
     async def event_gen():
         last_usage = {}
         parts = []  # accumulated assistant text for chunk-aware G23 (measurement only)
+        served = False   # True once any chunk reached the client (billing/SLA truth)
+        fail_status = "502"
         _llm_start = time.time()
         try:
-            stream = await litellm.acompletion(
-                model=call_model, messages=ctx.messages, **call_kwargs, **params
-            )
+            stream = await _open_stream()
             async for chunk in stream:
                 cd = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
+                served = True
                 if cd.get("usage"):
                     last_usage = cd["usage"]
                 try:
@@ -712,8 +783,19 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 yield f"data: {_json.dumps(cd, separators=(',', ':'))}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:
-            logger.error("[%s] streaming LLM call failed: %s", request_id, exc)
-            yield f"data: {_json.dumps({'error': str(exc)})}\n\n"
+            # Item 12 (review S2): redact the log line and NEVER echo the raw upstream
+            # exception to the client — litellm reprs can embed base_url/key material.
+            logger.error("[%s] streaming LLM call failed: %s", request_id, _redact_secrets(exc))
+            _rl = isinstance(exc, litellm.exceptions.RateLimitError) or (
+                isinstance(exc, AllTargetsFailedError)
+                and isinstance(exc.last_error, litellm.exceptions.RateLimitError)
+            )
+            fail_status = "429" if _rl else "502"
+            _client_msg = (
+                "LLM provider rate limit reached" if _rl
+                else "LLM provider error (upstream call failed)"
+            )
+            yield f"data: {_json.dumps({'error': _client_msg})}\n\n"
         finally:
             # Chunk-aware G23: run output compression on the reassembled stream to record the
             # output-side savings the (skipped) response pipeline would have. The live chunks
@@ -734,8 +816,12 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 # preserve any provider time already booked by request-side
                 # middleware (e.g. G06 judge).
                 ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
+                _emit_resilience_metrics(ctx)
+                # Served-anything → 200 (bills; partial content counts as served).
+                # Failed before the first chunk → real error status, not billed.
                 _record_outcome(
-                    ctx, request_start, "200", {"usage": last_usage} if last_usage else None
+                    ctx, request_start, "200" if served else fail_status,
+                    {"usage": last_usage} if last_usage else None,
                 )
             except Exception as exc:
                 logger.debug("[%s] streaming _record_outcome failed: %s", request_id, exc)
@@ -799,57 +885,64 @@ async def chat_completions(request: Request):
     request_id = str(uuid.uuid4())
     user_id, api_key, tenant_metadata = await _authenticate(request)
     body = await request.json()
+    messages, model, params = OPENAI.parse_request(body, dict(request.headers))
+    return await _serve_core(
+        request, request_id, _request_start, messages, model, params,
+        user_id, api_key, tenant_metadata, OPENAI.name,
+    )
 
-    messages = body.get("messages", [])
-    _body_model = body.get("model")
-    model = _body_model or get_fallback_request_model()
-    params = {k: v for k, v in body.items() if k not in ("messages", "model")}
-    # When the client omits `model`, flag it so the pipeline can re-resolve the default
-    # from the TENANT's proxy.default_model after the per-tenant config merge (the global
-    # get_fallback_request_model() above is only a placeholder). `_`-prefix → stripped
-    # from outbound params.
-    params["_model_defaulted"] = not bool(_body_model)
 
-    # Map X-* proxy headers into ctx.params as x_ keys so middleware can read them
-    # e.g. X-Template-ID → x_template_id, X-Rag-Collection → x_rag_collection
+async def _serve_core(
+    request: Request, request_id: str, _request_start: float,
+    messages: list, model: str, params: dict, user_id: str, api_key: str,
+    tenant_metadata, ingress_protocol: str,
+):
+    """Shared request core — OpenAI-shaped in, OpenAI-shaped Response out.
+
+    The protocol routes (OpenAI / Anthropic / Gemini) parse their wire format into
+    (messages, model, params) and call this; the non-OpenAI routes then translate the
+    returned Response back to their protocol (#4). All optimisation, resilience, and
+    billing live here, protocol-agnostic; ``ctx.ingress_protocol`` flows to the usage row.
+    """
+    # Client omitted `model` → flag it so the pipeline resolves the tenant default, then
+    # apply the global placeholder so RequestContext.create has a concrete model.
+    params["_model_defaulted"] = not bool(model)
+    if not model:
+        model = get_fallback_request_model()
+
+    # Map X-* proxy headers into params (X-Template-ID → x_template_id, etc.).
+    # x-api-key / x-goog-api-key carry the native-SDK PROXY CREDENTIAL (#4) — they must
+    # never enter ctx.params (which G13 persists to the Redis batch stream), so exclude
+    # them alongside the routing headers. Auth reads them directly in _authenticate.
     for header_name, header_value in request.headers.items():
         lower = header_name.lower()
-        if lower.startswith("x-") and lower not in ("x-user-id", "x-scenario-tag"):
-            param_key = lower.replace("-", "_")  # x-rag-collection → x_rag_collection
-            params[param_key] = header_value
+        if lower.startswith("x-") and lower not in (
+            "x-user-id", "x-scenario-tag", "x-api-key", "x-goog-api-key",
+        ):
+            params[lower.replace("-", "_")] = header_value
 
     # G7 RAG: derive rag_query from the last user message when x_rag_collection is set
     if "x_rag_collection" in params and "rag_query" not in params:
         for msg in reversed(messages):
-            if msg.get("role") == "user":
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
                 params["rag_query"] = msg.get("content", "")
                 break
 
-    # Store API key hash for tenant resolution in pipeline
     api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     params["_api_key_hash"] = api_key_hash
-
-    # C1: the validated key is the authoritative tenant identity. New-format keys
-    # carry {tenant_id, tier, admin}; legacy string keys have no metadata and fall
-    # through to the "default" tenant. The pipeline reads these _auth_* params and
-    # only honours an X-Tenant-ID header for admin-scoped keys. All _-prefixed
-    # params are stripped before the LLM call.
+    # The validated key is the authoritative tenant identity (C1); the pipeline reads
+    # these _auth_* params and only honours X-Tenant-ID for admin keys.
     if isinstance(tenant_metadata, dict):
         params["_auth_tenant_id"] = tenant_metadata.get("tenant_id")
         params["_auth_tier"] = tenant_metadata.get("tier", "free")
         params["_auth_admin"] = bool(tenant_metadata.get("admin", False))
 
     cfg = get_config()
-
-    # Build request context
     ctx = RequestContext.create(
-        request_id=request_id,
-        user_id=user_id,
-        messages=messages,
-        model=model,
-        params=params,
-        config=cfg,
+        request_id=request_id, user_id=user_id, messages=messages,
+        model=model, params=params, config=cfg,
     )
+    ctx.ingress_protocol = ingress_protocol
 
     # Run G0-G17 request pipeline
     try:
@@ -889,6 +982,18 @@ async def chat_completions(request: Request):
             },
             headers={"Retry-After": str(exc.retry_after)},
         )
+
+    # Trust & Safety block (G30 injection guardrail / G29 PII policy) — a served
+    # content-filter refusal (HTTP 200, finish_reason="content_filter"). Billed once
+    # like a bypass: it is a served proxy decision, and billing it closes the
+    # free-abuse vector (spamming blocked prompts must not be free). Checked before
+    # bypass/cache because a blocked request must never be served from cache.
+    if ctx.security_blocked and ctx.security_block_response is not None:
+        response = ctx.security_block_response
+        response.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
+        langfuse_tracing.finish_trace(ctx, response)
+        _record_outcome(ctx, _request_start, "200", response)
+        return JSONResponse(content=response)
 
     # Short-circuit: bypass or cache hit
     if ctx.bypassed or ctx.cache_hit:
@@ -969,52 +1074,13 @@ async def chat_completions(request: Request):
         _record_outcome(ctx, _request_start, "503")
         raise HTTPException(status_code=503, detail=f"Provider key unavailable for {provider}")
 
-    # Build outgoing params, then strip reasoning-only params when the routed
-    # model doesn't support them. The developer may have attached reasoning_effort
-    # (valid for o4-mini), but a downgrade — G06 routing, or its disabled/no-tiers
-    # fallback to default_model — can leave those params stranded on a non-reasoning
-    # model (gpt-4o-mini), which LiteLLM rejects with UnsupportedParamsError → 502.
-    # Provider-agnostic via the adapter (Standard-3: no hardcoded provider names).
-    outgoing_params = {
-        k: v for k, v in ctx.params.items()
-        if not k.startswith("_") and not k.startswith("x_") and k not in _INTERNAL_PARAM_KEYS
-    }
-    if not routed_adapter.supports_reasoning(ctx.routed_model):
-        for rk in routed_adapter.reasoning_param_keys():
-            if outgoing_params.pop(rk, None) is not None:
-                logger.debug(
-                    "[%s] Stripped reasoning param '%s' — model %s does not support reasoning",
-                    request_id, rk, ctx.routed_model,
-                )
-
-    # Flex / priority pricing: keep `service_tier` only for providers that accept it
-    # (OpenAI). Anthropic/Gemini reject it → strip to avoid a 400. Provider-agnostic
-    # via the adapter (Standard-3: no hardcoded provider names).
-    if "service_tier" in outgoing_params and not routed_adapter.supports_service_tier():
-        outgoing_params.pop("service_tier", None)
-        logger.debug(
-            "[%s] Stripped service_tier — %s does not support it", request_id, ctx.routed_model,
-        )
-
-    # Provider param hygiene: strip params this provider rejects (e.g. parallel_tool_calls /
-    # logprobs on non-OpenAI, `thinking` on non-Anthropic). Explicit belt alongside the
-    # global litellm.drop_params safety net. Provider-agnostic via the adapter.
-    for _uk in routed_adapter.unsupported_params():
-        if outgoing_params.pop(_uk, None) is not None:
-            logger.debug(
-                "[%s] Stripped unsupported param '%s' for %s", request_id, _uk, ctx.routed_model,
-            )
-
-    # Keep an injected reasoning/thinking budget below max_tokens — Anthropic 400s when
-    # max_tokens <= thinking.budget_tokens (no-op for OpenAI's string reasoning_effort).
-    outgoing_params = routed_adapter.cap_reasoning_params(
-        outgoing_params, outgoing_params.get("max_tokens")
-    )
-
-    # Provider-native context editing (per-tenant opt-in; no-op for non-Anthropic
-    # adapters, so this is safe to call unconditionally — Standard-3 compliant).
-    outgoing_params = apply_context_management(
-        outgoing_params, routed_adapter, eff_cfg, ctx.tenant_id
+    # Provider param hygiene — reasoning-only params stripped for non-reasoning routed
+    # models, service_tier only where accepted, adapter unsupported_params, thinking-budget
+    # cap, native context editing. Single shared contract with failover targets (review
+    # K4): _outgoing_params_for is the one source of truth. Provider-agnostic via the
+    # adapter (Standard-3: no hardcoded provider names).
+    outgoing_params = _outgoing_params_for(
+        ctx, routed_adapter, ctx.routed_model, eff_cfg, request_id
     )
 
     # Resolve provider routing (model string + api_base / api_version / custom_llm_provider)
@@ -1031,57 +1097,95 @@ async def chat_completions(request: Request):
     # Previously stream=true 502-crashed (.model_dump() on an async iterator).
     if outgoing_params.get("stream"):
         return _stream_response(
-            ctx, _call_model, _call_kwargs, outgoing_params, request_id, _request_start
+            ctx, _call_model, _call_kwargs, outgoing_params, request_id, _request_start,
+            eff_cfg=eff_cfg, provider=provider, routed_adapter=routed_adapter,
+            provider_key=provider_key,
         )
 
-    # Call LLM via LiteLLM
+    # Call LLM via LiteLLM, wrapped in the resilience layer (#1): circuit breaker +
+    # retry on the routed model, then failover to any configured fallback providers.
+    # Resolve resilience config for the primary provider (per-provider override merges
+    # over the global `resilience:` block). When disabled or no fallbacks are configured
+    # this is a single target and call_with_resilience performs exactly one attempt,
+    # re-raising the provider's error unchanged — behaviour-preserving.
+    _rcfg = ResilienceConfig.resolve(eff_cfg, provider)
+
+    async def _invoke_primary():
+        resp = await litellm.acompletion(
+            model=_call_model, messages=ctx.messages, **_call_kwargs, **outgoing_params,
+        )
+        return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+
+    _targets = [CallTarget(
+        model=ctx.routed_model, provider=provider, invoke=_invoke_primary,
+        has_key=bool(provider_key) or not routed_adapter.requires_api_key(),
+        adapter=routed_adapter,
+    )]
+    _targets += _fallback_targets(ctx, _rcfg, eff_cfg, request_id)
+
     _llm_start = time.time()
     try:
         logger.info("[%s] LLM call → %s starting", request_id, ctx.routed_model)
-        llm_response = await litellm.acompletion(
-            model=_call_model,
-            messages=ctx.messages,
-            **_call_kwargs,
-            **outgoing_params,
+        response_dict = await call_with_resilience(
+            _targets, get_resilience_store(), _rcfg,
+            redis_prefix=ctx.redis_prefix, attempts_sink=ctx.provider_attempts,
+            on_success=_make_pin_winner(ctx, request_id),
         )
-        _llm_ms = (time.time() - _llm_start) * 1000
-        # += (not =) so any provider time already accumulated by middleware (G06
-        # judge/cascade fallback, G10 summary, G09 schema) is preserved alongside
-        # the main call — the SLA split needs the TOTAL provider time.
-        ctx.llm_elapsed_ms += _llm_ms
-        # Book the main provider completion as the 'LLM-call' pseudo-stage so the
-        # Latency Breakup dashboard shows it alongside the G-group stages and a
-        # normal request's per-step bars sum to end-to-end. G06-cascade requests
-        # short-circuit the main call (their provider time is inside G06-routing),
-        # so they simply record no LLM-call stage — no double counting.
-        try:
-            STAGE_DURATION_MS.labels(
-                stage="LLM-call",
-                tenant_id=getattr(ctx, "tenant_id", "default"),
-            ).observe(_llm_ms)
-        except Exception:  # never let metrics break the response
-            pass
-        (logger.warning if _llm_ms > 10000 else logger.info)(
-            "[%s] LLM call %s completed in %.0fms", request_id, ctx.routed_model, _llm_ms
-        )
-        response_dict = llm_response.model_dump() if hasattr(llm_response, "model_dump") else dict(llm_response)
     except litellm.exceptions.AuthenticationError as exc:
         logger.error("LLM auth error: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
+        _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "401")
         raise HTTPException(status_code=401, detail="LLM provider authentication failed")
     except litellm.exceptions.RateLimitError as exc:
         logger.warning("LLM rate limit: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
+        _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "429")
         raise HTTPException(status_code=429, detail="LLM provider rate limit reached")
+    except AllTargetsFailedError as exc:
+        # Every target failed or was skipped. Map to the last real error's status so
+        # the client sees a meaningful 429 vs 502, and log the (safe) attempts trail —
+        # skip reasons included — rather than a bare exception (review C6).
+        _last = exc.last_error
+        ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
+        _emit_resilience_metrics(ctx)
+        logger.error("[%s] %s", request_id, exc)  # message embeds safe attempt descriptors
+        if isinstance(_last, litellm.exceptions.RateLimitError):
+            _record_outcome(ctx, _request_start, "429")
+            raise HTTPException(status_code=429, detail="All providers rate limit reached")
+        if _last is None:
+            # No target was even attemptable (e.g. no viable key on any target) —
+            # near-unreachable thanks to fail-open, but never report it as an
+            # upstream failure that didn't happen.
+            _record_outcome(ctx, _request_start, "503")
+            raise HTTPException(status_code=503, detail="No provider available for this request")
+        _record_outcome(ctx, _request_start, "502")
+        raise HTTPException(status_code=502, detail="All providers failed (upstream error)")
     except Exception as exc:
         # Item 12: never echo the raw upstream exception to the client (it can embed the
         # api_key/base_url) and redact secrets from the log line too.
         logger.error("LLM call failed: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
+        _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "502")
         raise HTTPException(status_code=502, detail="LLM provider error (upstream call failed)")
+
+    _llm_ms = (time.time() - _llm_start) * 1000
+    # += (not =) so any provider time already accumulated by middleware (G06 judge/cascade
+    # fallback, G10 summary, G09 schema) is preserved — the SLA split needs the TOTAL
+    # provider time (including any failover retries).
+    ctx.llm_elapsed_ms += _llm_ms
+    try:
+        STAGE_DURATION_MS.labels(
+            stage="LLM-call", tenant_id=getattr(ctx, "tenant_id", "default"),
+        ).observe(_llm_ms)
+    except Exception:  # never let metrics break the response
+        pass
+    (logger.warning if _llm_ms > 10000 else logger.info)(
+        "[%s] LLM call %s completed in %.0fms", request_id, ctx.routed_model, _llm_ms
+    )
+    _emit_resilience_metrics(ctx)
 
     # Run G14-G18 response pipeline, then finalise (savings metadata, headers,
     # SLA metrics + billing) via the shared helper.
@@ -1090,23 +1194,224 @@ async def chat_completions(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Native multi-protocol ingress (#4) — Anthropic /v1/messages + Gemini generateContent.
+# Each route parses its wire format into OpenAI shape, runs the shared _serve_core, then
+# translates the OpenAI Response back to the caller's protocol. The OpenAI path above is
+# untouched (identity), so its behaviour is unchanged.
+# ---------------------------------------------------------------------------
+def _detail_str(exc: HTTPException) -> str:
+    d = getattr(exc, "detail", "")
+    return d if isinstance(d, str) else str(d)
+
+
+async def _translate_stream(translator, source_iter):
+    """Wrap the OpenAI SSE body-iterator, re-emitting each chunk in the caller's protocol.
+
+    Consuming ``source_iter`` also drives the underlying _stream_response generator to
+    completion — so its billing/usage `finally` (with ctx.ingress_protocol stamped) still
+    fires exactly once."""
+    errored = False
+    for line in translator.start():
+        yield line
+    async for raw in source_iter:
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        for frame in text.split("\n\n"):
+            frame = frame.strip()
+            if not frame.startswith("data:"):
+                continue
+            payload = frame[len("data:"):].strip()
+            if payload == "[DONE]":
+                continue  # translator.finish() owns the terminal framing
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and "error" in obj and "choices" not in obj:
+                msg = obj.get("error")
+                for out in translator.error(msg if isinstance(msg, str) else "upstream error"):
+                    yield out
+                errored = True
+                continue
+            for out in translator.chunk(obj):
+                yield out
+    # A stream that failed emits its protocol error frame and STOPS — never a synthetic
+    # success termination (finish() would fabricate a finishReason:STOP / message_stop that
+    # masks the upstream failure as a clean completion).
+    if not errored:
+        for line in translator.finish():
+            yield line
+
+
+def _completion_to_stream_chunk(openai_body: Dict) -> Dict:
+    """Reshape a full OpenAI completion into a single streaming-shaped chunk.
+
+    ``message`` → ``delta`` on each choice so a StreamTranslator can emit it as one native
+    streaming turn (finish_reason / usage stay on the choice/top level). Used when the
+    pipeline short-circuits (cache hit / bypass / block) with a whole JSON body but the
+    client asked for a stream — so the SSE contract still holds."""
+    chunk = {k: v for k, v in openai_body.items() if k != "choices"}
+    new_choices = []
+    for ch in openai_body.get("choices") or []:
+        nc = {k: v for k, v in ch.items() if k != "message"}
+        nc["delta"] = ch.get("message") or {}
+        new_choices.append(nc)
+    chunk["choices"] = new_choices
+    return chunk
+
+
+async def _one_shot_stream(translator, chunk: Dict):
+    """Drive a StreamTranslator over a single synthetic chunk (start → chunk → finish)."""
+    for line in translator.start():
+        yield line
+    for out in translator.chunk(chunk):
+        yield out
+    for line in translator.finish():
+        yield line
+
+
+async def _translate_response(protocol, resp, *, want_stream: bool = False,
+                              array_wrap: bool = False):
+    """Translate an OpenAI-shaped Response (from _serve_core) into ``protocol``'s shape.
+
+    ``want_stream`` — the client requested streaming but the pipeline may have short-
+    circuited with a plain JSON body; synthesise a one-chunk native stream so the route's
+    SSE contract holds even on a cache hit. ``array_wrap`` — Gemini non-SSE
+    streamGenerateContent returns a JSON array of GenerateContentResponse."""
+    if isinstance(resp, StreamingResponse):
+        return StreamingResponse(
+            _translate_stream(protocol.stream_translator(), resp.body_iterator),
+            media_type=protocol.stream_media_type,
+            status_code=resp.status_code,
+        )
+    # JSONResponse — re-serialise the OpenAI body. `_token_opt` (OpenAI-only) is dropped;
+    # the x-* savings headers are preserved.
+    try:
+        openai_body = json.loads(bytes(resp.body).decode("utf-8"))
+    except Exception:
+        return resp
+    if resp.status_code >= 400:
+        err = openai_body.get("error") if isinstance(openai_body.get("error"), dict) else {}
+        msg = err.get("message") or openai_body.get("detail") or "error"
+        body, status = protocol.serialise_error(resp.status_code, msg, err.get("code") or "")
+        # Preserve x-* AND Retry-After: native SDK backoff honours retry-after on 429s, so
+        # dropping it turns a graceful throttle into an aggressive retry storm.
+        err_headers = {k: v for k, v in dict(resp.headers or {}).items()
+                       if k.lower().startswith("x-") or k.lower() == "retry-after"}
+        return JSONResponse(status_code=status, content=body, headers=err_headers)
+    # Non-completion control body (batch-defer 202, etc.) has no ``choices`` — pass it
+    # through untranslated so the ``request_id`` needed to poll the result survives, rather
+    # than fabricating an empty "successful" message from it (cross-protocol batch replay is
+    # a documented follow-up).
+    if resp.status_code == 202 or "choices" not in openai_body:
+        return resp
+    passthru = {k: v for k, v in dict(resp.headers or {}).items() if k.lower().startswith("x-")}
+    if want_stream:
+        return StreamingResponse(
+            _one_shot_stream(protocol.stream_translator(),
+                             _completion_to_stream_chunk(openai_body)),
+            media_type=protocol.stream_media_type, headers=passthru,
+        )
+    body = protocol.serialise_response(openai_body)
+    if array_wrap:
+        body = [body]
+    return JSONResponse(status_code=resp.status_code, content=body, headers=passthru)
+
+
+async def _serve_protocol(request: Request, proto, *, path_model: str = "",
+                          force_stream: bool = False, array_wrap: bool = False):
+    """Shared entry for a non-OpenAI ingress route: authenticate → parse → _serve_core →
+    translate. ``proto`` is the ingress adapter (its ``.name`` is the ingress protocol).
+    Auth/parse/pipeline errors are serialised into the caller's protocol."""
+    _request_start = time.time()
+    request_id = str(uuid.uuid4())
+    try:
+        user_id, api_key, tenant_metadata = await _authenticate(request, proto)
+        body = await request.json()
+        messages, model, params = proto.parse_request(body, dict(request.headers), path_model)
+        if force_stream:
+            params["stream"] = True
+    except HTTPException as exc:
+        eb, st = proto.serialise_error(exc.status_code, _detail_str(exc))
+        return JSONResponse(status_code=st, content=eb)
+    except Exception as exc:
+        logger.warning("[%s] %s ingress: bad request: %s", request_id, proto.name, _redact_secrets(exc))
+        eb, st = proto.serialise_error(400, "Invalid request body")
+        return JSONResponse(status_code=st, content=eb)
+    # array_wrap serves non-streaming and boxes the result in a JSON array, so it never
+    # wants a synthesised stream.
+    want_stream = bool(params.get("stream")) and not array_wrap
+    try:
+        resp = await _serve_core(request, request_id, _request_start, messages, model, params,
+                                 user_id, api_key, tenant_metadata, proto.name)
+    except HTTPException as exc:
+        eb, st = proto.serialise_error(exc.status_code, _detail_str(exc))
+        return JSONResponse(status_code=st, content=eb)
+    return await _translate_response(proto, resp, want_stream=want_stream, array_wrap=array_wrap)
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API ingress (Claude SDK / Claude Code point here one-line)."""
+    return await _serve_protocol(request, ANTHROPIC)
+
+
+@app.post("/v1beta/models/{model}:generateContent")
+async def gemini_generate_content(request: Request, model: str):
+    """Google Gemini generateContent ingress (non-streaming)."""
+    return await _serve_protocol(request, GEMINI, path_model=model)
+
+
+@app.post("/v1beta/models/{model}:streamGenerateContent")
+async def gemini_stream_generate_content(request: Request, model: str):
+    """Google Gemini streamGenerateContent ingress.
+
+    Honours Gemini's wire contract: ``?alt=sse`` streams SSE frames; the default (no
+    ``alt``) returns a JSON array of GenerateContentResponse objects (which non-SSE REST
+    clients parse), served as a single-element array from the aggregated response."""
+    if request.query_params.get("alt") == "sse":
+        return await _serve_protocol(request, GEMINI, path_model=model, force_stream=True)
+    return await _serve_protocol(request, GEMINI, path_model=model, array_wrap=True)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _authenticate(request: Request) -> tuple[str, Optional[str], Optional[dict]]:
+async def _authenticate(
+    request: Request, proto=OPENAI,
+) -> tuple[str, Optional[str], Optional[dict]]:
     """
     Validate proxy API key, return (user_id, api_key, tenant_metadata). Raises 401 on failure.
+
+    Native-SDK credential channels are scoped to the ingress protocol that needs them (#4):
+    ``proto`` declares its own ``credential_headers`` / ``credential_query_param``, so
+    ``x-api-key`` (Anthropic) and ``?key=`` (Gemini — appears in URL logs) are accepted
+    ONLY on those protocols' routes. Every other route defaults to ``OPENAI`` = Bearer-only.
 
     Optional: Accept X-User-ID header to override user_id for testing/tracking.
     Header is only accepted if the value matches the allowlist in config.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+    if auth_header.startswith("Bearer "):
+        api_key = auth_header.removeprefix("Bearer ").strip()
+    else:
+        # The proxy key rides in the protocol's native field (the tenant's BYOK provider
+        # key is resolved server-side), so no provider secret ever transits the client.
+        api_key = ""
+        for hdr in getattr(proto, "credential_headers", ()):
+            val = request.headers.get(hdr)
+            if val:
+                api_key = val.strip()
+                break
+        query_param = getattr(proto, "credential_query_param", "")
+        if not api_key and query_param:
+            api_key = (request.query_params.get(query_param) or "").strip()
+    if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or malformed Authorization header. Use: Bearer <proxy-key>",
+            detail=("Missing proxy key. Use 'Authorization: Bearer <proxy-key>' "
+                    "(or x-api-key / x-goog-api-key / ?key= for native Anthropic/Gemini SDKs)."),
         )
-    api_key = auth_header.removeprefix("Bearer ").strip()
     is_valid, user_id, tenant_metadata = validate_proxy_key(api_key)
     if not is_valid:
         raise HTTPException(
@@ -1186,6 +1491,176 @@ def _resolve_provider(model: str, cfg: Dict[str, Any]) -> str:
         return providers[0].get("name", "")
     logger.error("No providers configured and no prefix match for model '%s'", model)
     return ""
+
+
+def _outgoing_params_for(ctx, adapter, model: str, eff_cfg: Dict[str, Any],
+                         request_id: str = "") -> Dict[str, Any]:
+    """Build provider-hygienic outgoing params for `model` under `adapter`.
+
+    THE single source of the provider param-hygiene contract — used by the primary
+    path and every failover target alike (review K4: no divergent copies). Steps:
+    strip internal keys, strip reasoning-only params on non-reasoning models, strip
+    service_tier / unsupported params, cap the thinking budget, apply native context
+    editing.
+    """
+    outgoing = {
+        k: v for k, v in ctx.params.items()
+        if not k.startswith("_") and not k.startswith("x_") and k not in _INTERNAL_PARAM_KEYS
+    }
+    if not adapter.supports_reasoning(model):
+        for rk in adapter.reasoning_param_keys():
+            if outgoing.pop(rk, None) is not None and request_id:
+                logger.debug(
+                    "[%s] Stripped reasoning param '%s' — model %s does not support reasoning",
+                    request_id, rk, model,
+                )
+    if "service_tier" in outgoing and not adapter.supports_service_tier():
+        outgoing.pop("service_tier", None)
+        if request_id:
+            logger.debug("[%s] Stripped service_tier — %s does not support it", request_id, model)
+    for _uk in adapter.unsupported_params():
+        if outgoing.pop(_uk, None) is not None and request_id:
+            logger.debug("[%s] Stripped unsupported param '%s' for %s", request_id, _uk, model)
+    outgoing = adapter.cap_reasoning_params(outgoing, outgoing.get("max_tokens"))
+    outgoing = apply_context_management(outgoing, adapter, eff_cfg, ctx.tenant_id)
+    return outgoing
+
+
+# Provider-scoped request params injected by G21 for the PRIMARY provider — they must
+# never leak onto a failover target routed to a different provider (review P1).
+_PRIMARY_SCOPED_PARAMS = ("prompt_cache_key", "prompt_cache_retention")
+
+
+def _sanitized_failover_messages(messages):
+    """Copy `messages` with provider-specific annotations removed (review P2).
+
+    G21's Anthropic marker opt-in writes ``cache_control`` INTO message dicts; a
+    fallback routed to another provider must not carry them (OpenAI/Gemini 400 on
+    unknown message fields, and a fallback 400 would abort the chain). Shallow-copies
+    each message dict; content is shared (read-only downstream).
+    """
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and "cache_control" in m:
+            m = {k: v for k, v in m.items() if k != "cache_control"}
+        out.append(m)
+    return out
+
+
+def _sanitized_failover_tools(tools):
+    """Same scrub for tool definitions (G21 annotates tools[-1] with cache_control)."""
+    if not isinstance(tools, list):
+        return tools
+    out = []
+    for t in tools:
+        if isinstance(t, dict) and "cache_control" in t:
+            t = {k: v for k, v in t.items() if k != "cache_control"}
+        out.append(t)
+    return out
+
+
+def _lazy_fallback_target(ctx, model: str, eff_cfg: Dict[str, Any], request_id: str,
+                          *, stream: bool = False) -> CallTarget:
+    """Build a LAZY failover target: nothing is resolved until it is actually attempted.
+
+    Review P3: eager building cost a key resolution (potentially a blocking Secret
+    Manager RPC, or a BYOK decrypt + `provider_key.used` audit row) per fallback on
+    EVERY request even when the primary succeeded. Here resolution happens inside
+    ``invoke`` — i.e. only after the primary has already failed. A missing/undecryptable
+    tenant key raises ProviderKeyError inside invoke, which call_with_resilience treats
+    as a non-retryable fallback error and simply moves to the next target (the
+    'never spend another tenant's key' guarantee, enforced at resolution time).
+    """
+    provider = _resolve_provider(model, eff_cfg)
+    target = CallTarget(model=model, provider=provider, invoke=None, has_key=True)
+
+    async def _invoke():
+        providers_cfg = eff_cfg.get("providers", [])
+        adapter = get_adapter(model, providers_cfg)
+        key = await resolve_provider_key(provider, ctx.tenant_id, ctx)  # may raise → next target
+        if not key and adapter.requires_api_key():
+            raise ProviderKeyError(provider, ctx.tenant_id)
+        target.adapter = adapter  # pinned onto ctx by on_success for cost/provider attribution
+        outgoing = _outgoing_params_for(ctx, adapter, model, eff_cfg, request_id)
+        for pk in _PRIMARY_SCOPED_PARAMS:
+            outgoing.pop(pk, None)
+        if stream:
+            outgoing.setdefault("stream_options", {"include_usage": True})
+        call_model, call_kwargs = adapter.build_call(
+            model, get_provider_entry(model, providers_cfg) or {}, key
+        )
+        resp = await litellm.acompletion(
+            model=call_model,
+            messages=_sanitized_failover_messages(ctx.messages),
+            **call_kwargs,
+            **{**outgoing, **({"tools": _sanitized_failover_tools(outgoing.get("tools"))}
+                              if outgoing.get("tools") is not None else {})},
+        )
+        if stream:
+            return resp  # the stream iterator; caller relays it
+        return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+
+    target.invoke = _invoke
+    return target
+
+
+def _fallback_targets(ctx, rcfg, eff_cfg, request_id: str, *, stream: bool = False):
+    """The (lazy) failover targets for ctx.routed_model per config — [] when disabled."""
+    if not rcfg.enabled:
+        return []
+    targets = []
+    for fb_model in rcfg.fallbacks.get(ctx.routed_model, []):
+        if fb_model == ctx.routed_model:
+            continue
+        targets.append(_lazy_fallback_target(ctx, fb_model, eff_cfg, request_id, stream=stream))
+    return targets
+
+
+def _make_pin_winner(ctx, request_id: str, label: str = "failover"):
+    """on_success callback: pin the winning target's model + adapter onto ctx so
+    pricing (model-keyed), the usage_events.provider column, and the cache-discount
+    multiplier all attribute to the provider that actually served."""
+    def _pin(t):
+        if t.model != ctx.routed_model:
+            logger.info("[%s] %s: %s → %s", request_id, label, ctx.routed_model, t.model)
+        ctx.routed_model = t.model
+        if t.adapter is not None:
+            ctx.provider_adapter = t.adapter
+    return _pin
+
+
+def _emit_resilience_metrics(ctx) -> None:
+    """Emit the breaker-state gauge + failover counter from ctx.provider_attempts.
+
+    Gauge is labelled by provider ONLY (the breaker is global — a tenant label would
+    just fan identical state into tenants×providers stale series; review S4) and uses
+    peek_provider_state so display never creates breakers nor fabricates probes.
+    The failover counter fires whenever a non-first target served — including
+    same-provider model fallbacks (review S5). Never raises.
+    """
+    attempts = getattr(ctx, "provider_attempts", None) or []
+    if not attempts:
+        return
+    try:
+        store = get_resilience_store()
+        seen = set()
+        for a in attempts:
+            if a.provider and a.provider not in seen:
+                seen.add(a.provider)
+                CIRCUIT_BREAKER_STATE.labels(provider=a.provider).set(
+                    BREAKER_STATE_CODE.get(store.peek_provider_state(a.provider), 0)
+                )
+        winner = next((a for a in attempts if a.outcome == "success"), None)
+        first = attempts[0]
+        if winner is not None and winner is not first:
+            FAILOVER_TOTAL.labels(
+                from_provider=first.provider or "unknown",
+                to_provider=winner.provider or "unknown",
+                reason=first.outcome or "unknown",
+                tenant_id=getattr(ctx, "tenant_id", "default"),
+            ).inc()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("resilience metrics emit failed: %s", exc)
 
 
 if __name__ == "__main__":

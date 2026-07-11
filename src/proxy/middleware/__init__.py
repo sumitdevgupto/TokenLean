@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from savings.models import SavingsRecord
 from savings.calculator import count_messages_tokens, count_request_tokens
+from protocols.base import DEFAULT_PROTOCOL_NAME
 
 
 @dataclass
@@ -63,6 +64,51 @@ class RequestContext:
     # MUST NOT call the LLM again (avoids a duplicate provider call). None =
     # normal path (main.py makes the call).
     cascade_response: Optional[Dict] = None
+    # Provider failover trail (#1 resilience). Each element is a
+    # providers.resilience.Attempt recording one provider/model try and its
+    # outcome (success | error | skipped_*). Populated by call_with_resilience;
+    # empty on cache hit / bypass / non-resilient paths. Used by G18 (failover
+    # metric) and the SLA surface. List[Any] to avoid importing providers here.
+    provider_attempts: List[Any] = field(default_factory=list)
+
+    # ── Trust & Safety (#2 PII redaction G29 / #3 guardrails G30) ────────────
+    # Short-circuit pair (mirrors bypassed/cache_response): set by G30 on a hard
+    # guardrail block OR by G29 when the tenant's PII policy is `block`. When
+    # security_blocked is True the pipeline returns immediately (no optimisation,
+    # cache, or LLM call) and main.py serves security_block_response — an
+    # OpenAI-shaped completion with finish_reason "content_filter". A blocked
+    # request is a served proxy decision → billed like a bypass (one usage row).
+    security_blocked: bool = False
+    security_block_response: Optional[Dict] = None
+    # G30 verdict for the request. action ∈ {None,"allow","flag","block"} (None =
+    # guardrails did not run); categories are PII-free rule categories
+    # (e.g. "instruction_override","system_prompt_exfil"). Consumed by the G18
+    # metric + the PII-free security audit row + the commercial Security tab.
+    guardrail_action: Optional[str] = None
+    guardrail_categories: List[str] = field(default_factory=list)
+    # G29 redaction summary. action ∈ {None,"flag","mask","block"}; entities are
+    # PII-free entity TYPES only (e.g. "EMAIL","US_SSN") — never the matched text;
+    # count is the number of spans redacted across request (+ non-stream response).
+    pii_action: Optional[str] = None
+    pii_entities: List[str] = field(default_factory=list)
+    pii_redactions: int = 0
+    # Ingress protocol the client used (default = the OpenAI identity protocol;
+    # "anthropic" for /v1/messages, "gemini" for …:generateContent). The pipeline is
+    # protocol-agnostic (OpenAI-shaped internally) — this only flows into
+    # usage_events.protocol so per-protocol volume is filterable. (#4 ingress.)
+    ingress_protocol: str = DEFAULT_PROTOCOL_NAME
+    # Reversible-mask vault: placeholder token → original PII span, populated by G29
+    # when mode=mask + reversible so the non-streaming response can restore the
+    # caller's own data. IN-MEMORY ONLY for the request lifetime — the one field
+    # that holds raw PII; it is never logged, audited, billed, or persisted.
+    pii_vault: Dict[str, str] = field(default_factory=dict)
+    # Set by G29 when it MASKS PII: masking makes the G05 cache key lossy (two
+    # different PII values collapse to the same placeholder → the same key), so a
+    # PII-bearing masked request must NOT read or write the shared cache — otherwise
+    # one caller's answer could be served to another's look-alike query. G05 honours
+    # this on both read and store. (flag mode leaves content unmasked → keys stay
+    # unique → caching is safe and this stays False.)
+    no_cache: bool = False
 
     @property
     def current_token_count(self) -> int:

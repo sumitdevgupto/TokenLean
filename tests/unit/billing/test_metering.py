@@ -88,6 +88,14 @@ class TestUsageMeterBuildsEvent:
         ctx2 = _make_ctx()
         assert meter._build_event(ctx2, {}).response_tokens == 0
 
+    def test_build_event_carries_ingress_protocol(self):
+        # #4: the protocol column mirrors ctx.ingress_protocol (defaults to openai).
+        meter = UsageMeter()
+        ctx = _make_ctx()
+        ctx.ingress_protocol = "anthropic"
+        assert meter._build_event(ctx, {}).protocol == "anthropic"
+        assert meter._build_event(_make_ctx(), {}).protocol == "openai"
+
     def test_build_event_carries_user_and_flags(self):
         # Requests Explorer filter columns mirror the request-context flags;
         # complexity_tier comes from params.x_complexity_tier (X-Complexity-Tier header).

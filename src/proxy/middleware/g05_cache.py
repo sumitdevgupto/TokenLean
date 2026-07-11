@@ -343,6 +343,11 @@ class G05Cache:
         cfg = ctx.config.get("groups", {}).get("G5_cache", {})
         if not cfg.get("enabled", False):
             return ctx
+        # G29 sets no_cache when it masks PII: the masked cache key is lossy, so reading
+        # (or later writing) the shared cache could serve one caller's PII-derived answer
+        # to another's look-alike masked query. Skip the cache entirely for such requests.
+        if getattr(ctx, "no_cache", False):
+            return ctx
 
         tokens_before = ctx.current_token_count
         normalised = _normalise(ctx.messages)
@@ -524,7 +529,7 @@ class G05Cache:
         self, ctx: "RequestContext", response: Dict[str, Any]
     ) -> None:
         """Store the LLM response in L1, L2, L3, and step caches after a successful call."""
-        if ctx.cache_hit or ctx.bypassed:
+        if ctx.cache_hit or ctx.bypassed or getattr(ctx, "no_cache", False):
             return
 
         cfg = ctx.config.get("groups", {}).get("G5_cache", {})

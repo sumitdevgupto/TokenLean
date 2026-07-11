@@ -156,6 +156,41 @@ OUTPUT_HOLDOUT_COMPLETION_TOKENS = Histogram(
     ["cohort", "tenant_id"],
     buckets=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
 )
+# ── Provider resilience (#1 failover) ─────────────────────────────────────────
+CIRCUIT_BREAKER_STATE = Gauge(
+    "token_opt_circuit_breaker_state",
+    "Provider circuit-breaker state (0=closed, 1=half-open, 2=open). The breaker is "
+    "GLOBAL per provider (fed by 5xx/timeout health signals only — never by tenant "
+    "rate limits), so the gauge is labelled by provider alone. Open means the proxy "
+    "prefers failing over past that provider until its cooldown elapses "
+    "(SLA dashboard resilience panel)",
+    ["provider"],
+)
+FAILOVER_TOTAL = Counter(
+    "token_opt_failover_total",
+    "Provider failover events — one per request whose answer came from a fallback "
+    "provider after the primary was skipped or errored. Labelled by the provider that "
+    "ultimately served (to_provider) and the reason the primary was abandoned",
+    ["from_provider", "to_provider", "reason", "tenant_id"],
+)
+# ── Trust & Safety (#2 PII redaction G29 / #3 injection guardrails G30) ────────
+# Emitted directly by the G29/G30 middleware (not here) so the count is recorded even
+# on the block short-circuit, which never reaches G18.record(). Labels carry entity
+# TYPE / attack CATEGORY only — never the matched value (no PII/prompt content).
+PII_REDACTIONS_TOTAL = Counter(
+    "token_opt_pii_redactions_total",
+    "PII spans handled by G29, one increment per detected span. `action` is the policy "
+    "that applied (flag = detected only, mask = replaced in place, block = request "
+    "refused); `entity_type` is the detector class (EMAIL, US_SSN, …)",
+    ["tenant_id", "entity_type", "action"],
+)
+GUARDRAIL_EVENTS_TOTAL = Counter(
+    "token_opt_guardrail_events_total",
+    "Prompt-injection / jailbreak events from G30, one increment per flagged or blocked "
+    "request per matched category. `action` is flag or block; `category` is the PII-free "
+    "attack class (instruction_override, system_prompt_exfil, …)",
+    ["tenant_id", "category", "action"],
+)
 
 
 class G18Observability:
