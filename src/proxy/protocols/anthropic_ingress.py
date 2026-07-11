@@ -2,15 +2,29 @@
 
 Covers the common surface fully: system prompt, text + image content, core sampling
 params, tools, usage, and stop-reason mapping, plus streaming (message_start →
-content_block_delta → message_stop). Tool *result* round-tripping is best-effort
-(rendered as text) — full agentic tool replay across protocols is a follow-up.
+content_block_delta → message_stop). ``tool_use``/``tool_result`` round-trip
+structurally in both directions (non-streaming and streaming): inbound ``tool_use``
+blocks become the assistant's own OpenAI ``tool_calls`` (ids preserved) and
+``tool_result`` blocks become ``role:"tool"`` messages matched to the prior call;
+outbound ``tool_calls`` become ``tool_use`` blocks.
+
+Malformed tool history (by design): an orphaned ``tool_result`` — one whose
+``tool_use_id`` matches no prior ``tool_use`` — degrades to text rather than emit a
+dangling ``role:"tool"``. In the other direction we do **not** fabricate a result for
+an unanswered ``tool_use``; it passes through structurally as-is, so a genuinely
+malformed conversation (a *non-trailing* call the client never answered) may be
+rejected by the provider with a 400 — the same outcome the provider returns for that
+input, surfaced honestly rather than hidden by silently reshaping tool structure into
+prose. A valid *trailing* "awaiting execution" call passes through unchanged.
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List
 
-from protocols.base import IngressProtocol, StreamTranslator
+from protocols.base import (
+    IngressProtocol, StreamTranslator, finalize_fanout, safe_json_dumps,
+)
 
 # OpenAI finish_reason → Anthropic stop_reason.
 _STOP_REASON = {
@@ -28,10 +42,12 @@ _ERROR_TYPE = {
 
 
 def _content_to_openai(content: Any) -> Any:
-    """Anthropic message content (string or block list) → OpenAI content.
+    """Anthropic text/image content (string or block list) → OpenAI content.
 
     All-text block lists collapse to a plain string; a list containing images is kept
-    as OpenAI multimodal parts; tool_use / tool_result blocks degrade to text."""
+    as OpenAI multimodal parts. Tool blocks are extracted and fanned out separately by
+    ``_message_to_openai`` before this is called — by the time a block list reaches
+    here it never contains ``tool_use``/``tool_result`` entries."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -53,14 +69,6 @@ def _content_to_openai(content: Any) -> Any:
             elif src.get("type") == "url":
                 parts.append({"type": "image_url", "image_url": {"url": src.get("url", "")}})
                 has_image = True
-        elif btype == "tool_result":  # best-effort: render as text
-            parts.append({"type": "text",
-                          "text": f"[tool_result {block.get('tool_use_id', '')}]: "
-                                  f"{_flatten_text(block.get('content'))}"})
-        elif btype == "tool_use":
-            parts.append({"type": "text",
-                          "text": f"[tool_use {block.get('name', '')}]: "
-                                  f"{json.dumps(block.get('input', {}))}"})
     if not has_image:
         return "".join(p["text"] for p in parts if p.get("type") == "text")
     return parts
@@ -83,6 +91,71 @@ def _tool_to_openai(tool: Dict[str, Any]) -> Dict[str, Any]:
     }}
 
 
+class _ToolState:
+    """Cross-message state for the inbound fan-out (``parse_request``'s message loop).
+
+    Tracks the ``tool_use`` ids seen so far, so a later ``tool_result`` block can be
+    matched to its call. An unmatched ``tool_result`` degrades to text instead of
+    emitting an orphaned OpenAI ``role:"tool"`` message — litellm/providers reject a
+    ``tool_call_id`` with no matching assistant ``tool_calls[].id`` (400)."""
+
+    __slots__ = ("seen_tool_ids",)
+
+    def __init__(self) -> None:
+        self.seen_tool_ids: set = set()
+
+
+def _message_to_openai(role: str, content: Any, state: "_ToolState") -> List[Dict[str, Any]]:
+    """Anthropic message (role + content) → one or more OpenAI messages.
+
+    A single Anthropic turn can carry text, ``tool_use`` (assistant call), and
+    ``tool_result`` (a prior call's answer) blocks together. OpenAI/litellm need these
+    as separate, well-formed messages: results as ``role:"tool"`` matching a PRIOR
+    assistant ``tool_calls[].id``, and calls as the assistant's own ``tool_calls[]`` —
+    never a dangling ``role:"tool"`` with no matching call. Plain text/image content —
+    the common case — still collapses to exactly one message, byte-identical to before.
+    """
+    if not isinstance(content, list):
+        return [{"role": role, "content": _content_to_openai(content)}]
+
+    residual: List[Dict[str, Any]] = []  # text / image / degraded-tool blocks
+    tool_calls: List[Dict[str, Any]] = []
+    tool_msgs: List[Dict[str, Any]] = []
+    new_ids: List[str] = []  # this message's tool_use ids — committed to state AFTER the loop
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "tool_use":
+            name, tool_id = block.get("name", ""), block.get("id", "")
+            if role == "assistant" and name and tool_id:
+                tool_calls.append({"id": tool_id, "type": "function", "function": {
+                    "name": name, "arguments": safe_json_dumps(block.get("input", {}))}})
+                new_ids.append(tool_id)
+            else:
+                # Malformed (no name/id) or a tool_use outside an assistant turn — Anthropic
+                # never sends the latter, but degrade defensively rather than drop silently.
+                residual.append({"type": "text",
+                                 "text": f"[tool_use {name}]: {safe_json_dumps(block.get('input', {}))}"})
+        elif btype == "tool_result":
+            tool_use_id = block.get("tool_use_id", "")
+            result_text = _flatten_text(block.get("content"))
+            # Match only ids from PRIOR messages (already emitted as an assistant tool_calls
+            # message). A tool_result sharing a turn with its tool_use is malformed — matching
+            # it would emit a role:"tool" BEFORE the assistant message that declares the id
+            # (an ordering violation providers reject), so degrade it to text instead.
+            if tool_use_id and tool_use_id in state.seen_tool_ids:
+                tool_msgs.append({"role": "tool", "tool_call_id": tool_use_id, "content": result_text})
+            else:
+                residual.append({"type": "text", "text": f"[tool_result {tool_use_id}]: {result_text}"})
+        else:
+            residual.append(block)  # text / image — let _content_to_openai collapse it
+
+    state.seen_tool_ids.update(new_ids)
+    return finalize_fanout(role, _content_to_openai(residual), tool_calls, tool_msgs)
+
+
 class AnthropicProtocol(IngressProtocol):
     name = "anthropic"
     # Anthropic SDK authenticates with the x-api-key header (proxy key rides here; the
@@ -95,11 +168,11 @@ class AnthropicProtocol(IngressProtocol):
         sys_text = system if isinstance(system, str) else _flatten_text(system)
         if sys_text:
             messages.append({"role": "system", "content": sys_text})
+        state = _ToolState()
         for m in body.get("messages", []) or []:
             if not isinstance(m, dict):
                 continue
-            messages.append({"role": m.get("role", "user"),
-                             "content": _content_to_openai(m.get("content"))})
+            messages.extend(_message_to_openai(m.get("role", "user"), m.get("content"), state))
 
         model = body.get("model") or path_model or ""
         params: Dict[str, Any] = {}
@@ -229,7 +302,7 @@ class _AnthropicStream(StreamTranslator):
         for tc in delta.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
-            idx = tc.get("index", 0)
+            idx = tc.get("index") or 0  # `or 0` (not default) so an explicit null can't key the dict
             slot = self._tool_calls.setdefault(idx, {"id": "", "name": "", "args": ""})
             if tc.get("id"):
                 slot["id"] = tc["id"]

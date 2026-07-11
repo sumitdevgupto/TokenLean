@@ -1253,7 +1253,15 @@ def _completion_to_stream_chunk(openai_body: Dict) -> Dict:
     new_choices = []
     for ch in openai_body.get("choices") or []:
         nc = {k: v for k, v in ch.items() if k != "message"}
-        nc["delta"] = ch.get("message") or {}
+        delta = dict(ch.get("message") or {})
+        # A completion's tool_calls carry no streaming `index`; the native-stream
+        # translators accumulate tool-call fragments keyed by index, so stamp a distinct
+        # one per call (without this, multiple cached tool_calls collapse into slot 0 on
+        # the force-stream / cache-hit path). Copy each entry so the cached body is not mutated.
+        tcs = delta.get("tool_calls")
+        if tcs:
+            delta["tool_calls"] = [{**tc, "index": tc.get("index", i)} for i, tc in enumerate(tcs)]
+        nc["delta"] = delta
         new_choices.append(nc)
     chunk["choices"] = new_choices
     return chunk

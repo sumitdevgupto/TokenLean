@@ -44,12 +44,16 @@ def _config():
     }
 
 
-def _resp(content="hello-from-llm", model="claude-3-5-haiku"):
+def _resp(content="hello-from-llm", model="claude-3-5-haiku", tool_calls=None):
     m = MagicMock()
+    msg = {"role": "assistant", "content": content}
+    if tool_calls:
+        msg["content"] = None
+        msg["tool_calls"] = tool_calls
     m.model_dump.return_value = {
         "id": "chatcmpl-x", "object": "chat.completion", "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                     "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": "tool_calls" if tool_calls else "stop"}],
         "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
     }
     return m
@@ -222,3 +226,141 @@ def test_gemini_stream_error_not_masked_as_success_F4():
     assert resp.status_code == 200  # stream already opened
     assert '"finishReason":"STOP"' not in resp.text
     assert "UNAVAILABLE" in resp.text  # the error frame is present
+
+
+# ── Structural tool round-tripping (Branch 4, 2026-07-11) ─────────────────────
+# End-to-end through the real app: a prior tool_use/tool_result (Anthropic) or
+# functionCall/functionResponse (Gemini) turn in the conversation history must reach
+# litellm.acompletion as well-formed OpenAI tool_calls/role:"tool" messages — the
+# litellm/provider 400-on-orphan constraint, verified against the ACTUAL call.
+
+def _sent_messages(mock):
+    return mock.call_args.kwargs["messages"]
+
+
+def _assert_well_formed_and_json_args(messages):
+    # Each tool_call id → index of the assistant message that declares it.
+    declared_at = {tc["id"]: i for i, m in enumerate(messages)
+                   for tc in (m.get("tool_calls") or [])}
+    tool_msgs = [(i, m) for i, m in enumerate(messages) if m.get("role") == "tool"]
+    assert tool_msgs, "expected at least one role:tool message in the sent conversation"
+    for i, tm in tool_msgs:
+        tcid = tm["tool_call_id"]
+        assert tcid in declared_at, f"orphaned tool message sent to litellm: {tm}"
+        # litellm/providers also 400 if a tool message precedes its declaring tool_calls.
+        assert declared_at[tcid] < i, f"tool message precedes its declaring tool_calls: {tm}"
+    for m in messages:
+        for tc in (m.get("tool_calls") or []):
+            args = tc["function"]["arguments"]
+            assert isinstance(args, str), f"arguments must be a JSON string, got {type(args)}"
+            json.loads(args)  # must parse
+
+
+def test_anthropic_multiturn_tool_history_reaches_litellm_well_formed():
+    mock = AsyncMock(return_value=_resp("The weather is sunny."))
+    body = {
+        "model": "claude-3-5-haiku", "max_tokens": 100,
+        "tools": [{"name": "get_weather", "description": "Get weather",
+                   "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+        "messages": [
+            {"role": "user", "content": "What's the weather in SF?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Sunny, 72F"}]},
+        ],
+    }
+    resp = _drive(mock, "/v1/messages", {"x-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    _assert_well_formed_and_json_args(_sent_messages(mock))
+
+
+def test_gemini_multiturn_tool_history_reaches_litellm_well_formed():
+    mock = AsyncMock(return_value=_resp("It's sunny.", model="gemini-2.5-flash"))
+    body = {
+        "tools": [{"functionDeclarations": [
+            {"name": "get_weather", "description": "Get weather",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]}],
+        "contents": [
+            {"role": "user", "parts": [{"text": "What's the weather in SF?"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "get_weather",
+                                                              "response": {"temp": "72F"}}}]},
+        ],
+    }
+    resp = _drive(mock, "/v1beta/models/gemini-2.5-flash:generateContent",
+                  {"x-goog-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    _assert_well_formed_and_json_args(_sent_messages(mock))
+
+
+# ── Structural tool round-tripping — outbound (assistant call → client) ────────
+
+def test_anthropic_non_streaming_outbound_tool_call_end_to_end():
+    tc = [{"id": "toolu_out", "type": "function",
+           "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]
+    mock = AsyncMock(return_value=_resp(tool_calls=tc))
+    body = {"model": "claude-3-5-haiku", "max_tokens": 50,
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "weather in SF?"}]}
+    resp = _drive(mock, "/v1/messages", {"x-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    data = resp.json()
+    blk = [b for b in data["content"] if b["type"] == "tool_use"][0]
+    assert blk["id"] == "toolu_out" and blk["name"] == "get_weather"
+    assert blk["input"] == {"city": "SF"}
+    assert data["stop_reason"] == "tool_use"
+
+
+def test_gemini_non_streaming_outbound_tool_call_end_to_end():
+    tc = [{"id": "ignored", "type": "function",
+           "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]
+    mock = AsyncMock(return_value=_resp(model="gemini-2.5-flash", tool_calls=tc))
+    body = {"contents": [{"role": "user", "parts": [{"text": "weather in SF?"}]}]}
+    resp = _drive(mock, "/v1beta/models/gemini-2.5-flash:generateContent",
+                  {"x-goog-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    data = resp.json()
+    part = data["candidates"][0]["content"]["parts"][0]
+    assert part["functionCall"]["name"] == "get_weather"
+    assert part["functionCall"]["args"] == {"city": "SF"}
+
+
+# ── Structural tool round-tripping — streaming outbound ────────────────────────
+
+def _tool_stream_chunks(name="get_weather", tool_id="", args_json='{"city":"SF"}'):
+    async def gen():
+        delta = {"function": {"name": name, "arguments": args_json}}
+        if tool_id:
+            delta["id"] = tool_id
+        yield {"model": "claude-3-5-haiku", "id": "msg_e2e",
+               "choices": [{"delta": {"tool_calls": [{"index": 0, **delta}]}}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+               "usage": {"prompt_tokens": 5, "completion_tokens": 8}}
+    return gen()
+
+
+def test_gemini_streaming_tool_calls_emit_functioncall():
+    async def acompletion(**kwargs):
+        return _tool_stream_chunks()
+    body = {"contents": [{"role": "user", "parts": [{"text": "weather in SF?"}]}]}
+    resp = _drive(acompletion, "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                  {"x-goog-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    assert '"functionCall"' in resp.text
+    assert "get_weather" in resp.text
+    assert '"SF"' in resp.text
+
+
+def test_anthropic_streaming_tool_calls_emit_tool_use():
+    async def acompletion(**kwargs):
+        return _tool_stream_chunks(tool_id="toolu_stream_e2e")
+    body = {"model": "claude-3-5-haiku", "max_tokens": 50, "stream": True,
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "weather in SF?"}]}
+    resp = _drive(acompletion, "/v1/messages", {"x-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    assert '"type":"tool_use"' in resp.text
+    assert '"id":"toolu_stream_e2e"' in resp.text
+    assert "get_weather" in resp.text
+    assert '"stop_reason":"tool_use"' in resp.text

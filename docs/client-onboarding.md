@@ -35,6 +35,9 @@ client = OpenAI(
 The proxy speaks Anthropic natively — point the Claude SDK at it and keep using
 `client.messages.create(...)`. Your **proxy** key goes in `x-api-key` (the tenant's
 real provider key is resolved server-side); every optimisation still applies.
+Multi-turn tool use round-trips structurally (not as text): `tool_use`/`tool_result`
+blocks map to well-formed tool calls on the way in and out, both streaming and
+non-streaming, so an agentic Claude Code session keeps full tool-call fidelity.
 ```python
 # Before
 from anthropic import Anthropic
@@ -53,6 +56,12 @@ client = Anthropic(
 Point the Google GenAI SDK's base URL at the proxy; the proxy exposes
 `/v1beta/models/{model}:generateContent` (+ `:streamGenerateContent`) and re-serialises
 to Gemini's `candidates` shape. Send the **proxy** key via `x-goog-api-key` or `?key=`.
+Multi-turn tool use round-trips structurally: `functionCall`/`functionResponse` parts
+map to well-formed tool calls on the way in and out, both streaming and non-streaming.
+Gemini parts carry no call id, so a `functionResponse` is matched to its `functionCall`
+FIFO by function name — correct for distinct functions and for same-name calls answered
+in order; two *parallel* calls to the **same** function answered out of order are the one
+case that can bind to the wrong call.
 ```python
 import os
 from google import genai
