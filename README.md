@@ -118,9 +118,10 @@ cp infra/terraform.tfvars.template infra/terraform.tfvars
 ### One-Line Developer Integration
 
 Point your existing SDK's base URL at the proxy — **no prompt or code changes**. The proxy
-speaks each provider's native wire protocol (request, response, streaming, and errors) while
-applying every optimisation, so the one-line swap works whether you use the OpenAI, Anthropic,
-or Gemini SDK (including **Claude Code** via `/v1/messages`).
+speaks each provider's native wire protocol (request, response, streaming, errors, and tool
+calls) while applying every optimisation, so the one-line swap works whether you use the
+OpenAI, Anthropic, or Gemini SDK (including **Claude Code** via `/v1/messages`) — multi-turn
+agentic tool use round-trips structurally too.
 
 **OpenAI SDK** → `/v1/chat/completions`
 ```python
@@ -238,8 +239,13 @@ Run **unconditionally right after G24** — before any optimisation spends token
 
 Per-tenant policy, **PII-free audit rows**, Prometheus counters, and a Trust & Safety dashboard. The managed red-team ruleset feed, portal Security tab, and compliance attestation are the commercial layer.
 
+<p align="center">
+  <img src="assets/screenshots/trust-safety.png" width="900" alt="Trust & Safety dashboard — G29 PII redaction and G30 injection guardrails"><br>
+  <em>Trust &amp; Safety dashboard — PII spans redacted and injection attempts blocked, broken out by entity type (<code>EMAIL</code>, <code>CREDIT_CARD</code>, <code>US_SSN</code>) and attack category (<code>instruction_override</code>, <code>role_play_jailbreak</code>, <code>system_prompt_exfil</code>).</em>
+</p>
+
 ### 🔌 Native multi-protocol ingress
-The one-line base-URL swap works from the **OpenAI**, **Anthropic** (`/v1/messages` — Claude Code included), and **Gemini** (`:generateContent` / `:streamGenerateContent`) SDKs, with each SDK's native auth (`x-api-key` / `x-goog-api-key` / `?key=`). Every request is normalised into the OpenAI-shaped pipeline and the response re-serialised — non-streaming, streaming, and error envelopes — back to your SDK's native shape. Every optimisation applies; billing is one row per served request regardless of protocol.
+The one-line base-URL swap works from the **OpenAI**, **Anthropic** (`/v1/messages` — Claude Code included), and **Gemini** (`:generateContent` / `:streamGenerateContent`) SDKs, with each SDK's native auth (`x-api-key` / `x-goog-api-key` / `?key=`). Every request is normalised into the OpenAI-shaped pipeline and the response re-serialised — non-streaming, streaming, error envelopes, **and tool/function calls** — back to your SDK's native shape. Multi-turn agentic tool use round-trips **structurally** (not as text): Anthropic `tool_use`/`tool_result` and Gemini `functionCall`/`functionResponse` map to well-formed OpenAI `tool_calls`/`tool` messages both ways, so an agentic loop through `/v1/messages` (Claude Code) or `generateContent` keeps full tool-call fidelity across turns. Every optimisation applies; billing is one row per served request regardless of protocol.
 
 | Client | Endpoint |
 |---|---|
@@ -400,6 +406,16 @@ Every LLM response includes detailed savings metadata:
 > billing is a separate, non-OSS concern.
 
 **Dashboards:** Access Grafana at `https://grafana-<hash>-uc.a.run.app` for per-call, live, trends (switch bucket via the `Granularity` variable: hour/day/week/month/quarter), and all-time quarterly aggregations. (Dollar panels use the same config-priced estimate — see the caveat above.)
+
+<p align="center">
+  <img src="assets/screenshots/trends-savings.png" width="520" alt="Savings attributed per optimisation group — G16, G05, G19 lead"><br>
+  <em>Savings attributed per optimisation group — here G16 (agent architecture), G05 (semantic cache) and G19 (headroom pruning) lead.</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/live-calls.png" width="760" alt="Live requests per minute flowing through the proxy"><br>
+  <em>Live request volume through the proxy — the telemetry behind the per-call → quarterly savings views.</em>
+</p>
 
 **How dashboard values are calculated.** Grafana never reads `config.yaml` directly — it queries Postgres. The data flow is:
 
