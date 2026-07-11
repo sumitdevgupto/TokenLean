@@ -134,6 +134,19 @@ dashboard/dashboards/pitch-comparison.json
 # ─── Publish assets ───────────────────────────────────────────────────────────
 publish/
 
+# ─── Images (only curated README assets under assets/ are tracked) ────────────
+# Screenshots, captures, and photos anywhere else stay out of the repo. The
+# README's dashboard shots + logo live under assets/ and are kept via the negation.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.ico
+*.tiff
+!assets/**
+
 # ─── Local development files ────────────────────────────────────────────────
 .envrc
 .direnv/
