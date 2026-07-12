@@ -10,6 +10,15 @@ terraform {
       version = "~> 3.0"
     }
   }
+
+  # Remote state (GCS). Bucket + prefix are supplied at init time via
+  # -backend-config (see scripts/gcp/gcp-deploy.sh), keeping this file
+  # generic/portable. Locally:
+  #   terraform init -migrate-state \
+  #     -backend-config="bucket=${PROJECT_ID}-tf-state" \
+  #     -backend-config="prefix=token-opt"
+  # The bucket is versioned so a corrupted/deleted state can be recovered.
+  backend "gcs" {}
 }
 
 provider "google" {
