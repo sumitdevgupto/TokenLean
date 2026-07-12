@@ -20,6 +20,21 @@ _OPENMETER_API_KEY = os.getenv("OPENMETER_API_KEY", "")
 _RECORD_TIMEOUT = 5.0  # seconds
 
 
+def _group_savings_enabled() -> bool:
+    """C1 config gate — persist the per-G-group JSONB blob on the hot insert path.
+
+    Default true; operators can drop the extra JSONB write via
+    ``billing.metering.group_savings_enabled: false``. Tolerant of a missing/partial
+    config (returns true) so the metering engine never hard-fails on config shape."""
+    try:
+        from config_loader import get_config
+        cfg = get_config() or {}
+        billing = (cfg.get("billing") or {}).get("metering") or {}
+        return bool(billing.get("group_savings_enabled", True))
+    except Exception:
+        return True
+
+
 class UsageMeter:
     """Records usage events to Postgres and OpenMeter."""
 
@@ -35,9 +50,26 @@ class UsageMeter:
         self._om_url = openmeter_url or _OPENMETER_URL
         self._om_key = openmeter_api_key or _OPENMETER_API_KEY
 
-    def _build_event(self, ctx: Any, response: Dict) -> UsageEvent:
+    def _build_event(
+        self,
+        ctx: Any,
+        response: Dict,
+        *,
+        status_code: int = 200,
+        billable: bool = True,
+        total_duration_ms: int = 0,
+        llm_duration_ms: int = 0,
+    ) -> UsageEvent:
         savings = ctx.savings
         groups = [s.group for s in savings.step_savings]
+        # C1: per-G-group realised token savings {group: tokens}, non-zero steps only.
+        # Gated by config so operators can drop the JSONB write on the hot path if desired.
+        group_savings: Dict[str, int] = {}
+        if _group_savings_enabled():
+            for s in savings.step_savings:
+                amt = int(getattr(s, "absolute_saving", 0) or 0)
+                if amt > 0:
+                    group_savings[s.group] = group_savings.get(s.group, 0) + amt
         trace_id = ""
         if ctx.otel_span:
             from tracing.otel import get_trace_id
@@ -84,6 +116,12 @@ class UsageMeter:
             cost_baseline_usd=float(getattr(savings, "cost_baseline_usd", 0.0) or 0.0),
             provider=(getattr(getattr(ctx, "provider_adapter", None), "name", "") or ""),
             protocol=(getattr(ctx, "ingress_protocol", DEFAULT_PROTOCOL_NAME) or DEFAULT_PROTOCOL_NAME),
+            group_savings=group_savings,
+            # C2 — reliability/latency observability.
+            status_code=int(status_code or 0),
+            billable=bool(billable),
+            total_duration_ms=max(0, int(total_duration_ms or 0)),
+            llm_duration_ms=max(0, int(llm_duration_ms or 0)),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -96,9 +134,11 @@ class UsageMeter:
                  model, routed_model, otel_trace_id,
                  proxy_optimised_tokens, provider_prompt_tokens, response_tokens,
                  user_id, cache_hit, cache_level, complexity_tier, bypassed,
-                 cost_actual_usd, cost_baseline_usd, provider, protocol)
+                 cost_actual_usd, cost_baseline_usd, provider, protocol,
+                 group_savings, status_code, billable, total_duration_ms, llm_duration_ms)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                    $16,$17,$18,$19,$20,$21,$22,$23,$24)
+                    $16,$17,$18,$19,$20,$21,$22,$23,$24,
+                    $25::jsonb,$26,$27,$28,$29)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -116,6 +156,9 @@ class UsageMeter:
                     event.complexity_tier, event.bypassed,
                     event.cost_actual_usd, event.cost_baseline_usd, event.provider,
                     event.protocol,
+                    json.dumps(event.group_savings or {}),
+                    event.status_code, event.billable,
+                    event.total_duration_ms, event.llm_duration_ms,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)
@@ -151,15 +194,30 @@ class UsageMeter:
         except Exception as exc:
             logger.warning("UsageMeter: OpenMeter POST failed: %s", exc)
 
-    async def record(self, ctx: Any, response: Dict) -> None:
-        """Fire-and-forget: build event and write to Postgres + OpenMeter."""
+    async def record(
+        self,
+        ctx: Any,
+        response: Dict,
+        *,
+        status_code: int = 200,
+        billable: bool = True,
+        total_duration_ms: int = 0,
+        llm_duration_ms: int = 0,
+    ) -> None:
+        """Fire-and-forget: build event and write to Postgres (+ OpenMeter for billable
+        rows). C2: ``billable`` distinguishes a billable 2xx unit from an observability-only
+        error/latency row — non-billable rows are persisted for reliability analytics but
+        never pushed to OpenMeter (which is a billing sink)."""
         try:
-            event = self._build_event(ctx, response)
+            event = self._build_event(
+                ctx, response,
+                status_code=status_code, billable=billable,
+                total_duration_ms=total_duration_ms, llm_duration_ms=llm_duration_ms,
+            )
         except Exception as exc:
             logger.warning("UsageMeter: failed to build event: %s", exc)
             return
-        await asyncio.gather(
-            self._persist_postgres(event),
-            self._post_openmeter(event),
-            return_exceptions=True,
-        )
+        tasks = [self._persist_postgres(event)]
+        if event.billable:
+            tasks.append(self._post_openmeter(event))
+        await asyncio.gather(*tasks, return_exceptions=True)

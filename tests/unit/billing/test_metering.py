@@ -135,6 +135,63 @@ class TestUsageMeterBuildsEvent:
         assert event.cost_saved_usd > 0    # estimated avoided input cost, not 0
 
 
+class TestUsageMeterC1GroupSavings:
+    """C1 — per-G-group realised savings JSONB blob."""
+
+    def test_build_event_group_savings_nonzero_only(self):
+        meter = UsageMeter()
+        ctx = _make_ctx()  # one G01 step, 500→300 = 200 saved
+        ctx.savings.step_savings.append(StepSaving("G05", "cache", 300, 300))  # 0 saved
+        event = meter._build_event(ctx, {})
+        assert event.group_savings == {"G01": 200}  # G05 (0) omitted
+
+    def test_build_event_group_savings_sums_repeated_group(self):
+        meter = UsageMeter()
+        ctx = _make_ctx()
+        ctx.savings.step_savings.append(StepSaving("G01", "more", 100, 40))  # +60
+        event = meter._build_event(ctx, {})
+        assert event.group_savings == {"G01": 260}
+
+    def test_group_savings_disabled_yields_empty(self, monkeypatch):
+        import billing.metering as m
+        monkeypatch.setattr(m, "_group_savings_enabled", lambda: False)
+        event = UsageMeter()._build_event(_make_ctx(), {})
+        assert event.group_savings == {}
+
+
+class TestUsageMeterC2Reliability:
+    """C2 — status_code / latency / billable observability fields."""
+
+    def test_build_event_defaults_are_billable_200(self):
+        event = UsageMeter()._build_event(_make_ctx(), {})
+        assert event.status_code == 200
+        assert event.billable is True
+        assert event.total_duration_ms == 0
+
+    def test_build_event_carries_status_and_latency(self):
+        event = UsageMeter()._build_event(
+            _make_ctx(), {}, status_code=502, billable=False,
+            total_duration_ms=1234, llm_duration_ms=900,
+        )
+        assert event.status_code == 502
+        assert event.billable is False
+        assert event.total_duration_ms == 1234
+        assert event.llm_duration_ms == 900
+
+    @pytest.mark.asyncio
+    async def test_non_billable_row_skips_openmeter(self):
+        mock_conn = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_http = MagicMock()
+        meter = UsageMeter(db_pool=mock_pool, http_session=mock_http,
+                           openmeter_url="http://openmeter:8888")
+        await meter.record(_make_ctx(), {}, status_code=502, billable=False)
+        mock_conn.execute.assert_called_once()   # persisted for analytics
+        mock_http.post.assert_not_called()        # but NOT pushed to the billing sink
+
+
 class TestUsageMeterRecord:
     @pytest.mark.asyncio
     async def test_postgres_insert_called_with_correct_values(self):
@@ -152,6 +209,11 @@ class TestUsageMeterRecord:
         # First arg is the SQL, remaining are positional params
         assert "acme" in call_args  # tenant_id
         assert "req-meter" in call_args  # request_id
+        # C1/C2: SQL + 29 bound params (24 legacy + group_savings + status_code +
+        # billable + total_duration_ms + llm_duration_ms).
+        assert len(call_args) == 1 + 29
+        # group_savings is serialised to a JSON string for the ::jsonb bind.
+        assert '"G01": 200' in call_args or '{"G01": 200}' in call_args
 
     @pytest.mark.asyncio
     async def test_openmeter_post_called_with_correct_payload(self):

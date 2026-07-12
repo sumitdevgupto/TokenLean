@@ -132,8 +132,25 @@ Token-savings **estimate** tuning. Reporting only — none of this affects the r
 
 - `proxy_optimised_tokens` — the proxy's post-optimisation token estimate (`y`).
 - `provider_prompt_tokens` — provider-reported prompt tokens from the response `usage` (`z`), when the provider returns them.
+- `group_savings` — per-G-group realised token savings as JSONB (`{"G05": 3400, ...}`), non-zero steps only. Powers the portal's "savings by optimisation" view without querying the Langfuse traces blob.
+- `status_code`, `total_duration_ms`, `llm_duration_ms`, `billable` — reliability/latency observability. A non-2xx outcome is persisted as a `billable=false` row so the in-dashboard latency-percentile + error-rate panels have data; **`billable=false` rows are excluded from the request-count invoice** (invoice/quota SQL filters `COALESCE(billable, true)`).
 
 (`x` = `baseline_tokens`. Billing is the request **count**, not tokens — see the two-track model in [request-flow-diagram.md](request-flow-diagram.md).)
+
+**Metering toggles** (`billing.metering.*`, both default `true`):
+
+| Parameter | Default | Description |
+|---|---|---|
+| `group_savings_enabled` | `true` | Persist the per-group `group_savings` JSONB on each row (C1). Set `false` to drop the extra write. |
+| `persist_all_outcomes` | `true` | Persist an observability-only row for non-2xx outcomes (C2). Set `false` to restore the pre-C2 2xx-only write. Never affects billed request counts either way. |
+
+**Observability / FinOps** (`portal.finops.*`) — tunes the Observability tab's spend forecast + anomaly detector:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `forecast_method` | `linear` | Month-end spend projection method (burn-rate × days in month). |
+| `anomaly_ratio` | `2.0` | Flag a day when its cost ≥ ratio × the trailing-median daily cost. Shared by `/portal/finops/anomalies` and the operator `/admin/finops/anomalies`. |
+| `anomaly_baseline_days` | `28` | Trailing window the anomaly baseline median is computed over. |
 
 ### rate_limit  *(G0 — top-level section)*
 

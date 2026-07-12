@@ -8,3 +8,12 @@ billing:
   # commercial-only config/params/tiers.yaml.template, merged back under `billing:`
   # in private builds and simply absent in OSS. OpenMeter was removed (2026-07-02):
   # its push in metering.py is a dormant no-op configured via env vars, never here.
+  metering:
+    # C1 — persist the per-G-group realised savings JSONB on each usage_events row so
+    # the "savings by optimisation" panel works from the indexed table (not Langfuse).
+    # Set false to drop the extra JSONB write on the hot insert path.
+    group_savings_enabled: true
+    # C2 — persist an observability-only row for non-2xx outcomes (billable=false) so the
+    # in-dashboard latency-percentile + error-rate panels have data. These rows are
+    # EXCLUDED from the request-count invoice. Set false to restore the old 2xx-only write.
+    persist_all_outcomes: true

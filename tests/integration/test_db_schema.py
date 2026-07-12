@@ -36,6 +36,11 @@ REQUIRED_COLUMNS = {
     "cost_baseline_usd",
     "provider",
     "protocol",  # #4 multi-protocol ingress (schema_version 2)
+    "group_savings",       # C1 — per-G-group realised savings
+    "status_code",         # C2 — reliability/latency observability
+    "billable",
+    "total_duration_ms",
+    "llm_duration_ms",
 }
 
 

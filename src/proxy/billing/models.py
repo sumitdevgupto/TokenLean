@@ -1,7 +1,7 @@
 """Billing domain models and Postgres DDL."""
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from protocols.base import DEFAULT_PROTOCOL_NAME
 
@@ -45,6 +45,18 @@ class UsageEvent:
     # Ingress protocol the client used (#4): openai | anthropic | gemini. Observability
     # only — billing is one row per served request regardless of protocol.
     protocol: str = DEFAULT_PROTOCOL_NAME
+    # C1 — per-G-group realised token savings {group: tokens_saved}, non-zero steps only.
+    # Lets the indexed usage_events table answer "savings by optimisation" without parsing
+    # the unindexed Langfuse traces blob. Compact (~2–8 keys). Observability; never billed.
+    group_savings: Dict[str, int] = field(default_factory=dict)
+    # C2 — reliability/latency observability (never billed). status_code is the served HTTP
+    # status; billable marks whether this row counts as a billable unit (2xx only) so
+    # error/latency rows can exist without inflating the request-count invoice. Latencies
+    # in ms: total = end-to-end, llm = provider-call only (proxy overhead = total - llm).
+    status_code: int = 0
+    billable: bool = True
+    total_duration_ms: int = 0
+    llm_duration_ms: int = 0
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -79,7 +91,12 @@ CREATE TABLE IF NOT EXISTS usage_events (
     cost_actual_usd   NUMERIC(12,6) NOT NULL DEFAULT 0,
     cost_baseline_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
     provider        TEXT        NOT NULL DEFAULT '',
-    protocol        TEXT        NOT NULL DEFAULT '__PROTO_DEFAULT__'
+    protocol        TEXT        NOT NULL DEFAULT '__PROTO_DEFAULT__',
+    group_savings   JSONB       NOT NULL DEFAULT '{}',
+    status_code     SMALLINT    NOT NULL DEFAULT 0,
+    billable        BOOLEAN     NOT NULL DEFAULT true,
+    total_duration_ms INTEGER   NOT NULL DEFAULT 0,
+    llm_duration_ms INTEGER     NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
@@ -107,5 +124,16 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_baseline_usd NUMERIC(12,6
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '';
 -- #4 multi-protocol ingress: which client protocol served this request (never billed)
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT '__PROTO_DEFAULT__';
+-- C1: per-G-group realised token savings (observability; never billed)
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS group_savings JSONB NOT NULL DEFAULT '{}';
+-- C2: reliability/latency observability + billable flag (error/latency rows exist without
+-- inflating the request-count invoice; invoice/quota queries filter WHERE billable)
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS status_code SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS billable BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_duration_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS llm_duration_ms INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_id, user_id);
+-- C2: keep the error-rate / latency-percentile queries index-only over the hot window.
+CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_status_idx
+    ON usage_events (tenant_id, timestamp DESC) INCLUDE (status_code, total_duration_ms, billable);
 """.replace("__PROTO_DEFAULT__", DEFAULT_PROTOCOL_NAME)

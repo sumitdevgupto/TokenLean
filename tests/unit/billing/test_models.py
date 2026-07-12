@@ -85,6 +85,28 @@ class TestUsageEvent:
         assert e2.complexity_tier == "complex"
         assert e2.bypassed is True
 
+    def test_c1_group_savings_default_and_settable(self):
+        # C1 — per-G-group realised savings blob; empty dict by default.
+        e = self._make_event()
+        assert e.group_savings == {}
+        e2 = self._make_event(group_savings={"G01": 200, "G05": 3400})
+        assert e2.group_savings == {"G01": 200, "G05": 3400}
+        assert e2.to_dict()["group_savings"] == {"G01": 200, "G05": 3400}
+
+    def test_c2_reliability_fields_default_and_settable(self):
+        # C2 — status_code / latency / billable observability.
+        e = self._make_event()
+        assert e.status_code == 0
+        assert e.billable is True
+        assert e.total_duration_ms == 0
+        assert e.llm_duration_ms == 0
+        e2 = self._make_event(status_code=502, billable=False,
+                              total_duration_ms=1200, llm_duration_ms=800)
+        assert e2.status_code == 502
+        assert e2.billable is False
+        assert e2.total_duration_ms == 1200
+        assert e2.llm_duration_ms == 800
+
 
 class TestUsageEventsDDL:
     def test_ddl_is_string(self):
@@ -98,8 +120,19 @@ class TestUsageEventsDDL:
         for col in ["tenant_id", "request_id", "tokens_saved", "cost_saved_usd",
                     "groups_applied", "pricing_tier", "otel_trace_id",
                     "response_tokens", "user_id", "cache_hit", "cache_level",
-                    "complexity_tier", "bypassed"]:
+                    "complexity_tier", "bypassed",
+                    # C1/C2
+                    "group_savings", "status_code", "billable",
+                    "total_duration_ms", "llm_duration_ms"]:
             assert col in USAGE_EVENTS_DDL, f"DDL missing column: {col}"
+
+    def test_ddl_c1c2_columns_have_idempotent_migration(self):
+        # New columns must ALSO appear in the ADD COLUMN IF NOT EXISTS block so existing
+        # tables get them non-destructively.
+        for col in ["group_savings", "status_code", "billable",
+                    "total_duration_ms", "llm_duration_ms"]:
+            assert f"ADD COLUMN IF NOT EXISTS {col}" in USAGE_EVENTS_DDL, (
+                f"DDL missing idempotent migration for: {col}")
 
     def test_ddl_has_create_index(self):
         assert "CREATE INDEX" in USAGE_EVENTS_DDL
