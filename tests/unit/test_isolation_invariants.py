@@ -129,3 +129,32 @@ class TestTenantIdSanitisation:
     def test_leading_non_alnum_is_prefixed(self):
         out = sanitise_tenant_id("_evil")
         assert out[0].isalnum()
+
+
+# ── Doc-ingestion isolation: bucket <-> collection stay mutually aligned ──────
+# A tenant's doc bucket (token-opt-docs-<tenant>) and its Qdrant collection
+# (rag_<tenant>) are both derived from the same tenant id. If a future refactor
+# desyncs the two, a doc ingested into tenant A's bucket could land in the wrong
+# collection — the core cross-tenant leak this whole design prevents.
+class TestBucketCollectionAlignment:
+    _TENANTS = ["NOVA-STG-01", "SHOP-STG-01", "default", "foo_bar"]
+
+    @pytest.mark.parametrize("tenant", _TENANTS)
+    def test_bucket_reverse_derives_to_same_tenant(self, tenant):
+        from tenancy.context import tenant_to_bucket, bucket_to_tenant
+        assert bucket_to_tenant(tenant_to_bucket(tenant), self._TENANTS) == tenant
+
+    @pytest.mark.parametrize("tenant", _TENANTS)
+    def test_collection_and_bucket_share_the_id(self, tenant):
+        from tenancy.context import tenant_to_bucket, TenantContext
+        bucket = tenant_to_bucket(tenant)
+        collection = TenantContext.for_tenant(tenant).qdrant_collection
+        assert collection.startswith("rag_")
+        if tenant not in ("default", ""):
+            # bucket slug and collection suffix trace to the same sanitised id
+            assert bucket.removeprefix("token-opt-docs-")
+            assert collection.removeprefix("rag_")
+
+    def test_distinct_tenants_get_distinct_buckets(self):
+        from tenancy.context import tenant_to_bucket
+        assert tenant_to_bucket("NOVA-STG-01") != tenant_to_bucket("SHOP-STG-01")

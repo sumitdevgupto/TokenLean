@@ -542,16 +542,114 @@ async def list_models(request: Request):
 # Document ingestion webhook (G03)
 # ---------------------------------------------------------------------------
 
+# Registry of tenants that own doc buckets. The webhook caller is GCS/Pub-Sub (not the
+# tenant), so tenant identity is reverse-derived from the bucket name via this registry.
+# Cached briefly to avoid a DB hit per notification.
+_INGEST_REGISTRY_CACHE: dict = {"tenants": [], "ts": 0.0}
+_INGEST_REGISTRY_TTL = 60.0
+
+
+async def _ingest_tenant_registry() -> list:
+    """Return the distinct set of tenant ids that own doc buckets (60s cached)."""
+    now = time.monotonic()
+    if _INGEST_REGISTRY_CACHE["tenants"] and (now - _INGEST_REGISTRY_CACHE["ts"]) < _INGEST_REGISTRY_TTL:
+        return _INGEST_REGISTRY_CACHE["tenants"]
+    db_url = os.getenv("DATABASE_URL", "")
+    if not db_url:
+        return []  # single-tenant / local: no registry (caller falls back to derived slug)
+    from cache.pg_pool import get_pg_pool
+    pool = await get_pg_pool(db_url)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT DISTINCT tenant_id FROM portal_users WHERE tenant_id IS NOT NULL")
+    tenants = [r["tenant_id"] for r in rows]
+    _INGEST_REGISTRY_CACHE.update(tenants=tenants, ts=now)
+    return tenants
+
+
+def _verify_ingest_oidc(request: Request) -> None:
+    """Verify the Pub/Sub push OIDC token, gated by INGEST_REQUIRE_OIDC.
+
+    Local/self-host (INGEST_REQUIRE_OIDC=false, default) skips this so the existing
+    flat-payload curl flow and tests keep working. Managed GCP sets it true so only the
+    push SA can drive ingestion. 401 on any failure.
+    """
+    if os.getenv("INGEST_REQUIRE_OIDC", "false").lower() != "true":
+        return
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing OIDC token")
+    token = auth.removeprefix("Bearer ").strip()
+    expected_sa = os.getenv("INGEST_PUSH_SA_EMAIL", "")
+    audience = os.getenv("INGEST_OIDC_AUDIENCE", "")
+    try:
+        from google.oauth2 import id_token as _id_token
+        from google.auth.transport import requests as _ga_requests
+        claims = _id_token.verify_oauth2_token(
+            token, _ga_requests.Request(), audience=audience or None
+        )
+    except Exception as exc:
+        logger.warning("Rejected /ingest-doc: OIDC verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid OIDC token")
+    if expected_sa and claims.get("email") != expected_sa:
+        logger.warning("Rejected /ingest-doc: OIDC email %r != expected push SA", claims.get("email"))
+        raise HTTPException(status_code=401, detail="OIDC token not from the ingest push SA")
+
+
+def _parse_ingest_payload(payload: dict) -> tuple[str, str]:
+    """Extract (bucket, object) from either a Pub/Sub push envelope or a flat body.
+
+    Real GCS notifications arrive as {"message": {"data": "<base64 GCS resource>",
+    "attributes": {...}}}; local/tests may post a flat {"bucket","name"}. Prefer the
+    message attributes (bucketId/objectId) when present.
+    """
+    msg = payload.get("message")
+    if isinstance(msg, dict):
+        attrs = msg.get("attributes") or {}
+        bucket = attrs.get("bucketId", "")
+        obj = attrs.get("objectId", "")
+        if not (bucket and obj):
+            data = msg.get("data")
+            if data:
+                try:
+                    import base64
+                    resource = json.loads(base64.b64decode(data).decode("utf-8"))
+                    bucket = bucket or resource.get("bucket", "")
+                    obj = obj or resource.get("name", "")
+                except Exception as exc:
+                    logger.warning("/ingest-doc: could not decode Pub/Sub message.data: %s", exc)
+        return bucket, obj
+    return payload.get("bucket", ""), payload.get("name", "")
+
+
 @app.post("/ingest-doc")
 async def ingest_doc(request: Request):
-    """GCS pub/sub push notification → triggers G03 doc pipeline job."""
+    """GCS pub/sub push notification → triggers G03 doc pipeline job.
+
+    Hardened (data-safety): verifies the push OIDC token, parses the Pub/Sub envelope,
+    and reverse-derives the tenant from the (per-tenant) bucket name via the registry.
+    An unregistered bucket is refused with 403 so a doc can never be ingested into a
+    tenant it doesn't belong to.
+    """
+    _verify_ingest_oidc(request)
     payload = await request.json()
-    bucket = payload.get("bucket", "")
-    obj = payload.get("name", "")
-    if bucket and obj:
-        success = await trigger_doc_ingestion(bucket, obj)
-        return {"triggered": success, "object": obj}
-    raise HTTPException(status_code=400, detail="Missing bucket or name in payload")
+    bucket, obj = _parse_ingest_payload(payload)
+    if not (bucket and obj):
+        raise HTTPException(status_code=400, detail="Missing bucket or name in payload")
+
+    from tenancy.context import bucket_to_tenant, sanitise_tenant_id
+    registry = await _ingest_tenant_registry()
+    if registry:
+        tenant_id = bucket_to_tenant(bucket, registry)
+        if tenant_id is None:
+            logger.warning("Rejected /ingest-doc: bucket %r not registered to any tenant", bucket)
+            raise HTTPException(status_code=403, detail="Bucket not registered to any tenant")
+    else:
+        # Single-tenant / local (no registry): fall back to the derived slug so the
+        # existing flat-payload flow keeps working. Never fail-open in multi-tenant mode.
+        tenant_id = "default"
+
+    success = await trigger_doc_ingestion(bucket, obj, tenant_id=tenant_id)
+    return {"triggered": success, "object": obj, "tenant_id": sanitise_tenant_id(tenant_id)}
 
 
 # ---------------------------------------------------------------------------
@@ -580,15 +678,37 @@ def _schedule_security_audit(ctx) -> None:
         logger.debug("[%s] security audit skipped: no loop", getattr(ctx, "request_id", "?"))
 
 
-def _schedule_billing(ctx, response) -> None:
-    """Fire-and-forget exactly one ``usage_events`` row for a billable served
-    request (C1 normal/cache/bypass, C1b batch-deferred). Idempotent at the DB
-    (request_id UNIQUE + ON CONFLICT DO NOTHING). No-op when billing isn't wired
-    (no UsageMeter / no DB pool) or there is no running event loop."""
+def _persist_all_outcomes() -> bool:
+    """C2 config gate — persist observability-only rows for non-2xx outcomes so the
+    in-dashboard error-rate / latency panels have data. Default true; disable via
+    ``billing.metering.persist_all_outcomes: false`` to restore the old 2xx-only write."""
+    try:
+        billing = (get_config().get("billing") or {}).get("metering") or {}
+        return bool(billing.get("persist_all_outcomes", True))
+    except Exception:
+        return True
+
+
+def _schedule_billing(
+    ctx, response, *, status_code: int = 200, billable: bool = True,
+    total_duration_ms: int = 0, llm_duration_ms: int = 0,
+) -> None:
+    """Fire-and-forget exactly one ``usage_events`` row for a served request.
+    Idempotent at the DB (request_id UNIQUE + ON CONFLICT DO NOTHING). No-op when
+    billing isn't wired (no UsageMeter / no DB pool) or there is no running event loop.
+
+    C2: ``billable`` marks a billable 2xx unit; non-billable rows (errors) are still
+    persisted so the reliability/latency analytics have data, but are excluded from the
+    request-count invoice (invoice/quota SQL filters ``WHERE billable``) and from the
+    OpenMeter push. ``status_code`` + latencies feed the in-dashboard SLA panels."""
     if ctx is None or response is None or _usage_meter is None:
         return
     try:
-        asyncio.create_task(_usage_meter.record(ctx, response))
+        asyncio.create_task(_usage_meter.record(
+            ctx, response,
+            status_code=status_code, billable=billable,
+            total_duration_ms=total_duration_ms, llm_duration_ms=llm_duration_ms,
+        ))
     except RuntimeError:  # no running loop (not the request path) — skip billing
         logger.debug("[%s] billing skipped: no running event loop", getattr(ctx, "request_id", "?"))
 
@@ -642,11 +762,31 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
     # Trust & Safety: record any G29/G30 activity at every exit path (a flagged
     # request that later errors is still audited). PII-free; best-effort.
     _schedule_security_audit(ctx)
-    # C1: one billable row per served 2xx request (best-effort, never blocks).
-    if status == "200":
-        _schedule_billing(ctx, response)
+    # C1/C2: persist exactly one usage_events row per outcome. 2xx = billable unit
+    # (billed + quota/spend bumped); non-2xx = observability-only row (billable=false,
+    # excluded from invoices) so the reliability/latency panels have error data. The 202
+    # batch-defer path bills separately at defer, so skip its row here to avoid a
+    # non-billable row racing the billable one (ON CONFLICT would drop the billable insert).
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError):
+        status_code = 0
+    billable = status == "200"
+    if billable:
+        _schedule_billing(
+            ctx, response if response is not None else {},
+            status_code=status_code, billable=True,
+            total_duration_ms=int(elapsed_ms), llm_duration_ms=int(llm_ms),
+        )
         _bump_quota_counter(ctx)
         _bump_spend_counter(ctx)
+    elif status_code != 202 and _persist_all_outcomes():
+        # Observability-only error row. ctx may be None for very-early failures — skip then.
+        _schedule_billing(
+            ctx, {},
+            status_code=status_code, billable=False,
+            total_duration_ms=int(elapsed_ms), llm_duration_ms=int(llm_ms),
+        )
 
 
 def _bump_quota_counter(ctx) -> None:
@@ -1009,7 +1149,7 @@ async def _serve_core(
         # C1b: a batched request is billable at defer — it was accepted and will be
         # served async. ctx/savings exist here; the result-serve endpoint has no ctx.
         # request_id UNIQUE keeps it single even if the client polls the result.
-        _schedule_billing(ctx, ctx.cache_response or {})
+        _schedule_billing(ctx, ctx.cache_response or {}, status_code=202, billable=True)
         _record_outcome(ctx, _request_start, "202")
         return JSONResponse(
             status_code=202,

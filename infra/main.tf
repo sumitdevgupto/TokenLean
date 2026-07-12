@@ -296,7 +296,7 @@ resource "google_secret_manager_secret" "langfuse_nextauth_secret" {
 # provisioner so no state is kept in Cloud SQL itself.
 resource "null_resource" "billing_schema_migration" {
   triggers = {
-    schema_version = "2"  # v2: +protocol column (#4 multi-protocol ingress)
+    schema_version = "2" # v2: +protocol column (#4 multi-protocol ingress)
   }
 
   # PGPASSWORD is required so psql (invoked by gcloud sql connect) does not
@@ -515,6 +515,61 @@ resource "google_storage_bucket_iam_member" "proxy_config_bucket" {
   bucket = var.config_bucket_name
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# ─── Per-tenant document ingestion — SHARED scaffolding ──────────────────────
+# Per-tenant doc BUCKETS are NOT provisioned here — they are created at customer
+# onboarding time (api/tenant_provisioning.py) so a new tenant can ingest immediately
+# without a terraform apply. Terraform provisions only the shared prerequisites every
+# tenant bucket plugs into: the signBlob grant, one ingest topic, one push subscription
+# to /ingest-doc, and the GCS→topic publish grant. Bucket naming (token-opt-docs-<tenant>)
+# is kept in sync with tenancy/context.py::tenant_to_bucket via var.doc_bucket_prefix.
+data "google_project" "this" {
+  project_id = var.project_id
+}
+
+# signBlob so the proxy SA can mint V4 signed upload URLs (api/upload.py) without a key file.
+resource "google_service_account_iam_member" "proxy_sign_blob" {
+  service_account_id = google_service_account.proxy_sa.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Dedicated identity for the Pub/Sub push → /ingest-doc (OIDC-verified by the webhook).
+resource "google_service_account" "ingest_push_sa" {
+  account_id   = "token-opt-ingest-push-sa"
+  display_name = "Token Optimisation doc-ingest push"
+}
+
+# One shared topic; every tenant bucket's OBJECT_FINALIZE notification targets it.
+resource "google_pubsub_topic" "doc_ingest" {
+  name = "token-opt-doc-ingest"
+}
+
+# Allow the GCS service agent to publish object notifications onto the shared topic.
+resource "google_pubsub_topic_iam_member" "gcs_publish" {
+  topic  = google_pubsub_topic.doc_ingest.id
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:service-${data.google_project.this.number}@gs-project-accounts.iam.gserviceaccount.com"
+}
+
+# Push subscription → the hardened /ingest-doc webhook, authenticated by an OIDC token
+# minted for the push SA (the webhook checks INGEST_PUSH_SA_EMAIL + audience).
+resource "google_pubsub_subscription" "doc_ingest_push" {
+  count = var.proxy_service_url != "" ? 1 : 0
+  name  = "token-opt-doc-ingest-push"
+  topic = google_pubsub_topic.doc_ingest.id
+
+  push_config {
+    push_endpoint = "${var.proxy_service_url}/ingest-doc"
+    oidc_token {
+      service_account_email = google_service_account.ingest_push_sa.email
+      audience              = "${var.proxy_service_url}/ingest-doc"
+    }
+  }
+
+  ack_deadline_seconds       = 60
+  message_retention_duration = "86400s"
 }
 
 # ─── Item 6 (opt-in): Cloud KMS envelope for the BYOK master key ──────────────

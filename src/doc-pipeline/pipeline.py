@@ -5,10 +5,11 @@ Steps: download → extract text (Unstructured) → strip boilerplate
        → chunk (256-512 tokens) → embed dense + sparse (SPLADE/BM25)
        → upsert to Qdrant named vectors.
 """
-import hashlib
 import logging
 import os
+import re
 import sys
+import uuid
 from typing import List
 
 logger = logging.getLogger(__name__)
@@ -18,9 +19,25 @@ _GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _GCS_OBJECT = os.getenv("GCS_OBJECT", "")
 _QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 _QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "rag_docs")
+# Tenant scoping: injected per-run as a container override alongside QDRANT_COLLECTION
+# (see g03_doc_pipeline.trigger_doc_ingestion). Every upserted point is stamped with it
+# for defense-in-depth even though the collection already segregates by tenant.
+_TENANT_ID = os.getenv("TENANT_ID", "default")
 _CHUNK_SIZE = int(os.getenv("CHUNK_SIZE_TOKENS", "400"))
 _CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 _SPARSE_MODEL = os.getenv("SPARSE_EMBEDDING_MODEL", "Qdrant/bm25")
+
+# Collection allowlist: refuse to create/write a collection whose name isn't a safe
+# identifier, so a malformed TENANT_ID can't spray a garbage collection or inject. This
+# matches what TenantContext.for_tenant actually produces — rag_<sanitised>, where the
+# sanitised id may contain uppercase and hyphens (sanitise_tenant_id allows [A-Za-z0-9_-]).
+# Kept deliberately broad enough to accept every real rag_<tenant> yet reject whitespace,
+# ';', quotes, and other injection characters.
+_VALID_COLLECTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
+
+# Fixed namespace for deterministic, tenant-scoped point ids (uuid5). Replaces the old
+# 32-bit md5-truncation which could silently overwrite another doc's/tenant's chunk.
+_POINT_ID_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
 
 
 def download_from_gcs(bucket: str, obj: str) -> bytes:
@@ -238,6 +255,14 @@ def upsert_to_qdrant(
         SparseVectorParams, SparseIndexParams,
     )
 
+    if not _VALID_COLLECTION_RE.match(_QDRANT_COLLECTION):
+        logger.error(
+            "Refusing to upsert: QDRANT_COLLECTION %r is not a valid identifier "
+            "(^[a-z][a-z0-9_]{0,62}$). Check the TENANT_ID override.",
+            _QDRANT_COLLECTION,
+        )
+        sys.exit(1)
+
     client = QdrantClient(url=_QDRANT_URL)
 
     # Collection management: ensure named vectors (dense + sparse)
@@ -271,12 +296,19 @@ def upsert_to_qdrant(
 
     points = [
         PointStruct(
-            id=int(hashlib.md5(f"{source}:{i}".encode()).hexdigest()[:8], 16),
+            # Deterministic + tenant-namespaced: re-ingesting the same doc updates in
+            # place; two tenants (or two docs) can never collide onto one id.
+            id=str(uuid.uuid5(_POINT_ID_NAMESPACE, f"{_TENANT_ID}:{source}:{i}")),
             vector={
                 "dense": dense_embeddings[i],
                 "sparse": _to_sparse_vector(sparse_embeddings[i]),
             },
-            payload={"text": chunks[i], "source": source, "chunk_index": i},
+            payload={
+                "text": chunks[i],
+                "source": source,
+                "chunk_index": i,
+                "tenant_id": _TENANT_ID,
+            },
         )
         for i in range(len(chunks))
     ]

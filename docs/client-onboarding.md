@@ -145,22 +145,33 @@ If your team uses RAG (the `rag_query` hint above), your reference documents nee
 into the vector store first. Ingestion is handled by the **G03 doc pipeline** — a background Cloud
 Run Job, not part of the request path.
 
-**How ingestion is triggered today:** the proxy does **not** accept a file directly. A document is
-ingested when it lands in the configured **GCS bucket** and the resulting object notification reaches
-the proxy's `POST /ingest-doc` webhook (wired via GCS → Pub/Sub push). The Job then downloads,
-extracts (Apache Tika / Unstructured), strips boilerplate, chunks, embeds (dense + sparse), and
-upserts into Qdrant for retrieval.
+**Per-tenant isolation.** Each tenant has its **own** GCS document bucket
+(`token-opt-docs-<your-tenant>`), created automatically when you sign up — documents never mix
+between tenants. Ingested chunks land in your own Qdrant collection (`rag_<your-tenant>`), and
+retrieval only ever reads from it. You never need to know or manage the bucket name.
+
+**How ingestion works:** you upload a document with your existing tenant API key via a short-lived
+signed URL — no GCS credentials are ever handed to you. The upload triggers a background Job that
+downloads, extracts (Apache Tika / Unstructured), strips boilerplate, chunks, embeds (dense +
+sparse), and upserts into your collection for retrieval.
 
 Typical flow:
 
 ```bash
-# 1. Drop your document into the ingestion bucket (ask your platform team for the bucket name)
-gsutil cp handbook.pdf gs://<your-ingest-bucket>/docs/handbook.pdf
+# 1. Ask the proxy for a signed upload URL (authenticated with your tenant key).
+curl -s -X POST https://<proxy>/portal/upload-url \
+  -H "Authorization: Bearer $YOUR_TENANT_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"filename": "handbook.pdf"}'
+# → {"signed_url": "https://storage.googleapis.com/...", "object": "docs/handbook.pdf", "expires_in": 900}
 
-# 2. The GCS object notification fires POST /ingest-doc automatically → the Job runs.
-#    (No further action needed. Supported inputs: PDF, DOCX, HTML, TXT, and other Tika/Unstructured types.)
+# 2. PUT the file bytes to the signed URL (scoped to YOUR bucket only).
+curl -X PUT --upload-file handbook.pdf "<signed_url>"
 
-# 3. Once ingested, retrieval works via the rag_query hint:
+# 3. Ingestion fires automatically (object notification → the Job runs).
+#    Supported inputs: PDF, DOCX, HTML, TXT, and other Tika/Unstructured types.
+
+# 4. Once ingested, retrieval works via the rag_query hint:
 ```
 ```python
 resp = client.chat.completions.create(
@@ -170,10 +181,11 @@ resp = client.chat.completions.create(
 )
 ```
 
-> **What's not available:** there is currently **no direct HTTP upload endpoint** on the proxy
-> (you cannot `POST` file bytes and have them ingested). Documents must be placed in GCS first.
-> Contact your platform team for the ingestion bucket name and write access. Full flow, Job steps,
-> and env vars are documented in [request-flow-diagram.md](request-flow-diagram.md#document-ingestion-pipeline-g03).
+> **How isolation is enforced:** the signed URL is derived from your authenticated tenant — you can
+> only ever obtain a URL for your own bucket. The ingestion webhook reverse-derives the tenant from
+> the bucket name and refuses any bucket not registered to a tenant, so a document can never be
+> ingested into a tenant it doesn't belong to. Full flow, Job steps, and env vars are documented in
+> [request-flow-diagram.md](request-flow-diagram.md#document-ingestion-pipeline-g03).
 
 ## Dashboard
 

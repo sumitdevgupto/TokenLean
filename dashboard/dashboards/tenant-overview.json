@@ -323,6 +323,36 @@
           }
         }
       }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Fine-tune Jobs by Tenant",
+      "description": "Per-tenant fine-tuning triggers (token_opt_finetune_jobs_total). status = submitted / refused_byok / trigger_error.",
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (tenant_id, status) (increase(token_opt_finetune_jobs_total{tenant_id=~\"$tenant\"}[$__range]))",
+          "legendFormat": "{{tenant_id}} — {{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "drawStyle": "bars"
+          }
+        }
+      }
     }
   ],
   "templating": {

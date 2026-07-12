@@ -536,6 +536,12 @@ CONFIG_GCS_BLOB=config/config.yaml,\
 REDIS_URL=${REDIS_URL},\
 QDRANT_URL=${QDRANT_URL},\
 GCP_REGION=${REGION},\
+DOC_PIPELINE_JOB_NAME=doc-pipeline-job,\
+FINETUNE_PIPELINE_JOB_NAME=finetune-pipeline-job,\
+INGEST_REQUIRE_OIDC=true,\
+INGEST_PUSH_SA_EMAIL=token-opt-ingest-push-sa@${PROJECT_ID}.iam.gserviceaccount.com,\
+INGEST_OIDC_AUDIENCE=${PROXY_URL:-}/ingest-doc,\
+DOC_PIPELINE_SA_EMAIL=${PROXY_SA},\
 LANGFUSE_HOST=${LANGFUSE_URL},\
 AWS_REGION_NAME=${AWS_REGION_NAME:-us-east-1},\
 LOG_LEVEL=INFO" \
@@ -547,6 +553,15 @@ LOG_LEVEL=INFO" \
 
   PROXY_URL=$(gcloud run services describe token-proxy \
     --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
+
+  # Patch the ingest OIDC audience now that the proxy URL is known (must equal the audience
+  # Terraform sets on the Pub/Sub push subscription: <proxy_url>/ingest-doc).
+  if [[ -n "$PROXY_URL" ]]; then
+    gcloud run services update token-proxy \
+      --region="$REGION" --project="$PROJECT_ID" \
+      --update-env-vars="INGEST_OIDC_AUDIENCE=${PROXY_URL}/ingest-doc" \
+      --quiet || warn "Could not patch INGEST_OIDC_AUDIENCE"
+  fi
 
   # Patch Langfuse NEXTAUTH_URL to Langfuse's own public URL (required for OAuth session callbacks)
   gcloud run services update langfuse-svc \
@@ -701,12 +716,15 @@ deploy_jobs() {
     --quiet
   success "doc-pipeline-job deployed"
 
+  # REDIS_URL + GCS_BUCKET are required for a real finetune run (job-tracking + training
+  # export); per-run TENANT_ID/QDRANT_COLLECTION/DOMAIN/TENANT_PROVIDER_KEY come as container
+  # overrides from the trigger. Job name matches FINETUNE_PIPELINE_JOB_NAME on the proxy.
   gcloud run jobs deploy finetune-pipeline-job \
     --image="${REGISTRY_URL}/finetune-pipeline:latest" \
     --region="$REGION" \
     --project="$PROJECT_ID" \
     --service-account="$PROXY_SA" \
-    --set-env-vars="QDRANT_URL=${QDRANT_URL},GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
+    --set-env-vars="QDRANT_URL=${QDRANT_URL},REDIS_URL=${REDIS_URL},GCS_BUCKET=${CONFIG_BUCKET},GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
     --max-retries=1 \
     --task-timeout=1800 \
     --quiet

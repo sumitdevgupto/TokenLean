@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# seed-data.sh — Seed Qdrant with pitch_docs (works for GCP and Local)
+# seed-data.sh — Seed Qdrant with a per-tenant RAG collection (GCP and Local)
 # =============================================================================
 # Usage:
-#   ./scripts/seed-data.sh [--qdrant-url URL] [--gcp-project ID]
+#   ./scripts/seed-data.sh [--tenant ID] [--qdrant-url URL] [--gcp-project ID]
 #
-# Auto-detects environment:
+#   --tenant       → Tenant ID; seeds collection rag_<tenant> (default: "default"
+#                    → rag_docs). Matches tenancy/context.py + the ingest pipeline.
 #   --qdrant-url   → Use explicit Qdrant URL
 #   --gcp-project  → Discover Cloud Run Qdrant URL from GCP
 #   (none)         → Default to http://localhost:6333 (local Docker)
+#
+# The collection uses NAMED dense+sparse vectors and stamps tenant_id into every
+# payload, so seeded data is byte-compatible with what the G03 doc pipeline upserts
+# (the old pitch_docs / unnamed-384-dim scheme did NOT match retrieval and is gone).
 # =============================================================================
 set -euo pipefail
 
@@ -16,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 QDRANT_URL="${QDRANT_URL:-}"
 PROJECT_ID=""
-COLLECTION="pitch_docs"
+TENANT="${SEED_TENANT:-default}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -27,6 +32,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --tenant)      TENANT="$2"; shift 2 ;;
     --qdrant-url)  QDRANT_URL="$2"; shift 2 ;;
     --gcp-project) PROJECT_ID="$2"; shift 2 ;;
     --help)
@@ -35,6 +41,13 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown option: $1" ;;
   esac
 done
+
+# Collection follows tenancy/context.py: default → rag_docs, else rag_<tenant>.
+if [[ "$TENANT" == "default" || -z "$TENANT" ]]; then
+  COLLECTION="rag_docs"
+else
+  COLLECTION="rag_${TENANT}"
+fi
 
 # ─── Auto-detect Qdrant URL ───────────────────────────────────────────────────
 if [[ -z "$QDRANT_URL" && -n "$PROJECT_ID" ]]; then
@@ -69,51 +82,21 @@ else
   info "Collection not found — creating and seeding..."
 fi
 
-# ─── Create collection ────────────────────────────────────────────────────────
-info "Creating collection ${COLLECTION}..."
-curl -s -X PUT "${QDRANT_URL}/collections/${COLLECTION}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "vectors": {
-      "size": 384,
-      "distance": "Cosine"
-    }
-  }' > /dev/null || error "Failed to create collection"
-success "Collection created"
+# ─── Seed data (named dense+sparse, tenant_id-stamped) ────────────────────────
+# Delegates to the canonical per-tenant seeder so the collection schema (named
+# dense/sparse vectors) and payload (tenant_id) match exactly what the G03 doc
+# pipeline upserts — the old inline 384-dim unnamed-vector seed did NOT.
+info "Seeding tenant '${TENANT}' → collection ${COLLECTION}..."
 
-# ─── Seed data ────────────────────────────────────────────────────────────────
-info "Seeding documents..."
-
-# Check if seed script exists
-SEED_SCRIPT="${REPO_ROOT}/pitch-test-plan/src/seed_direct.py"
-SEED_OK=false
-if [[ -f "$SEED_SCRIPT" ]]; then
-  python3 "$SEED_SCRIPT" \
-    --qdrant-url "${QDRANT_URL}" \
-    --collection "${COLLECTION}" \
-    && SEED_OK=true \
-    || warn "Python seed script failed, falling back to inline seed"
-else
-  warn "seed_direct.py not found, using inline seed data"
+SEED_SCRIPT="${REPO_ROOT}/pitch-test-plan/src/seed_qdrant_tenants.py"
+if [[ ! -f "$SEED_SCRIPT" ]]; then
+  error "Canonical seeder not found: ${SEED_SCRIPT}"
 fi
 
-# Inline fallback: generate 384-dim vectors matching collection config
-if [[ "$SEED_OK" != true ]]; then
-  python3 -c "
-import json, random, urllib.request
-random.seed(42)
-points = [
-    {'id': i+1, 'vector': [random.gauss(0,0.1) for _ in range(384)],
-     'payload': {'text': f'Sample document {i+1}', 'source': 'seed-fallback'}}
-    for i in range(2)
-]
-data = json.dumps({'points': points}).encode()
-req = urllib.request.Request('${QDRANT_URL}/collections/${COLLECTION}/points',
-    data=data, headers={'Content-Type': 'application/json'}, method='PUT')
-urllib.request.urlopen(req, timeout=10)
-print('Inline fallback seed complete')
-" 2>/dev/null || warn "Inline fallback seed failed"
-fi
+QDRANT_URL="${QDRANT_URL}" python3 "$SEED_SCRIPT" \
+  --tenants "${TENANT}" \
+  --qdrant-url "${QDRANT_URL}" \
+  || error "Seeding failed — ensure qdrant-client, sentence-transformers, fastembed are installed"
 
 # ─── Verify ───────────────────────────────────────────────────────────────────
 POINTS_COUNT=$(curl -s "${QDRANT_URL}/collections/${COLLECTION}" 2>/dev/null | \

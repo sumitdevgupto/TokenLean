@@ -228,6 +228,12 @@ src/proxy/api/tenant_keys.py
 # signup) — gates the /adminconsole operator surface. Commercial; imported only by
 # commercial_app.py.
 src/proxy/api/operator_auth.py
+# Per-tenant GCS doc-bucket provisioner (create bucket + OBJECT_FINALIZE notification +
+# objectViewer grant) invoked at onboarding, and the signed-upload-URL router. Commercial —
+# depend on google-cloud-storage (commercial image only); imported by commercial_app.py /
+# api/portal_auth.py. The bucket<->tenant naming helpers stay in core (tenancy/context.py).
+src/proxy/api/tenant_provisioning.py
+src/proxy/api/upload.py
 src/proxy/billing/tiers.py
 # Request-count invoicing (E2) — the paid product's billing calculation. Engines
 # (metering/models/audit) stay in core; the invoice generator is commercial.
@@ -273,6 +279,8 @@ tests/unit/api/test_portal_auth.py
 tests/unit/api/test_email_sender.py
 tests/unit/api/test_tenant_keys.py
 tests/unit/api/test_operator_auth.py
+tests/unit/api/test_tenant_provisioning.py
+tests/unit/api/test_upload.py
 tests/unit/portal/
 tests/unit/api/test_rls_scoping.py
 tests/test_gdpr_compliance.py

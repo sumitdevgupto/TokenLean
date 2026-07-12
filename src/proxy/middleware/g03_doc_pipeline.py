@@ -29,6 +29,9 @@ _TIKA_SIDECAR_URL = os.getenv("TIKA_SIDECAR_URL", "http://tika-svc:9998")
 # Fine-tuning configuration
 _FINETUNE_MIN_DOCS = int(os.getenv("FINETUNE_MIN_DOCS", "100"))  # Min docs to trigger FT
 _FINETUNE_STABILITY_DAYS = int(os.getenv("FINETUNE_STABILITY_DAYS", "30"))  # Domain stability
+# Cloud Run Job name — env-configurable so the trigger and the deploy agree (mirrors
+# DOC_PIPELINE_JOB_NAME). Default matches the name gcp-deploy.sh actually creates.
+_FINETUNE_JOB = os.getenv("FINETUNE_PIPELINE_JOB_NAME", "finetune-pipeline-job")
 _RAG_FALLBACK_ENABLED = os.getenv("RAG_FALLBACK_ENABLED", "true").lower() == "true"
 
 # OOD Detection thresholds
@@ -37,13 +40,25 @@ _OOD_MAX_RETRIES = int(os.getenv("OOD_MAX_RETRIES", "3"))
 _RAG_FALLBACK_INDEX = os.getenv("RAG_FALLBACK_INDEX", "broad-domain-index")
 
 
-async def trigger_doc_ingestion(gcs_bucket: str, gcs_object: str) -> bool:
+async def trigger_doc_ingestion(
+    gcs_bucket: str, gcs_object: str, tenant_id: str = "default"
+) -> bool:
     """
     Trigger the document ingestion Cloud Run Job for a newly uploaded file.
     Called from the /ingest-doc webhook endpoint in main.py.
+
+    The tenant's Qdrant collection is derived via TenantContext — the SAME code the
+    read path (G07 _resolve_collection → ctx.qdrant_collection) uses — so ingest writes
+    land in exactly the collection retrieval reads from (rag_<tenant>, or rag_docs for
+    the default/single-tenant deploy). This closes the old read/write asymmetry where
+    writes always went to the shared rag_docs.
     """
     try:
         from google.cloud import run_v2
+        from tenancy.context import TenantContext
+
+        tctx = TenantContext.for_tenant(tenant_id)
+        collection = tctx.qdrant_collection
 
         client = run_v2.JobsAsyncClient()
         job_name = (
@@ -58,70 +73,152 @@ async def trigger_doc_ingestion(gcs_bucket: str, gcs_object: str) -> bool:
                         env=[
                             run_v2.EnvVar(name="GCS_BUCKET", value=gcs_bucket),
                             run_v2.EnvVar(name="GCS_OBJECT", value=gcs_object),
+                            run_v2.EnvVar(name="QDRANT_COLLECTION", value=collection),
+                            run_v2.EnvVar(name="TENANT_ID", value=tctx.tenant_id),
                         ]
                     )
                 ]
             ),
         )
         await client.run_job(request=request)
-        logger.info("G03 triggered doc-pipeline job for gs://%s/%s", gcs_bucket, gcs_object)
+        logger.info(
+            "G03 triggered doc-pipeline job for gs://%s/%s → tenant=%s collection=%s",
+            gcs_bucket, gcs_object, tctx.tenant_id, collection,
+        )
         return True
     except Exception as exc:
         logger.error("G03 failed to trigger doc-pipeline job: %s", exc)
         return False
 
 
-async def trigger_fine_tuning_pipeline(domain: str, doc_count: int) -> bool:
+class FineTuneByokError(Exception):
+    """Raised when strict-BYOK is on and the tenant has no provider key for training.
+
+    The admin/trigger caller maps this to HTTP 402 — a tenant fine-tune must never fall
+    back to the platform provider key (that would train the tenant's model on the
+    platform account and cross the isolation boundary)."""
+
+    def __init__(self, tenant_id: str, provider: str):
+        self.tenant_id = tenant_id
+        self.provider = provider
+        super().__init__(f"No provider key for tenant {tenant_id!r} / provider {provider!r} (strict BYOK)")
+
+
+async def trigger_fine_tuning_pipeline(
+    tenant_id: str,
+    domain: str,
+    doc_count: int,
+    *,
+    provider: str = "openai",
+    get_config=None,
+) -> bool:
     """
-    Trigger fine-tuning pipeline when domain has sufficient stable documents.
-    Break-even: Fine-tuning is cost-effective when >100 docs in stable domain.
+    Trigger the fine-tuning Cloud Run Job for one tenant's domain corpus.
+
+    Tenant-isolated: the Job reads ONLY the tenant's collection (rag_<tenant>) filtered by
+    tenant_id, exports under finetune-training/<tenant>/<domain>/, and tenant-prefixes its
+    Redis keys. Because the Job is a separate process with no key resolver, the tenant's
+    BYOK provider key is resolved HERE (in-proxy, where the resolver lives) and passed as a
+    Job secret. Under strict-BYOK with no tenant key, this raises FineTuneByokError (→ 402)
+    rather than leaking the platform key.
     """
+    from tenancy.context import TenantContext
+
+    tctx = TenantContext.for_tenant(tenant_id)
+
     if doc_count < _FINETUNE_MIN_DOCS:
-        logger.debug("Fine-tuning skipped: only %d docs for domain '%s' (min: %d)", 
-                    doc_count, domain, _FINETUNE_MIN_DOCS)
+        logger.debug("Fine-tuning skipped: only %d docs for tenant '%s' domain '%s' (min: %d)",
+                    doc_count, tctx.tenant_id, domain, _FINETUNE_MIN_DOCS)
         return False
-    
+
+    # Resolve the tenant's BYOK provider key at trigger time (the Job has no resolver).
+    tenant_key = ""
+    byok_enforce = False
+    try:
+        from providers.key_resolver import resolve_provider_key, ProviderKeyError
+        try:
+            tenant_key = await resolve_provider_key(provider, tctx.tenant_id, ctx=None) or ""
+        except ProviderKeyError:
+            # Strict-BYOK denial — do NOT fall back to the platform key for a tenant train.
+            byok_enforce = True
+            _emit_finetune_metric(tctx.tenant_id, "refused_byok", provider)
+            raise FineTuneByokError(tctx.tenant_id, provider)
+        # If a resolver returned a key, enforce it in the Job too (defense-in-depth).
+        byok_enforce = bool(tenant_key)
+    except FineTuneByokError:
+        raise
+    except Exception as exc:
+        # No resolver installed (OSS/local) → platform-key path, no enforcement.
+        logger.debug("Fine-tune BYOK resolve skipped (no resolver): %s", exc)
+
     try:
         from google.cloud import run_v2
-        
+
         client = run_v2.JobsAsyncClient()
         job_name = (
             f"projects/{_GCP_PROJECT}/locations/{_DOC_PIPELINE_REGION}"
-            f"/jobs/token-opt-finetune-pipeline"
+            f"/jobs/{_FINETUNE_JOB}"
         )
+        env = [
+            run_v2.EnvVar(name="TENANT_ID", value=tctx.tenant_id),
+            run_v2.EnvVar(name="QDRANT_COLLECTION", value=tctx.qdrant_collection),
+            run_v2.EnvVar(name="DOMAIN", value=domain),
+            run_v2.EnvVar(name="DOC_COUNT", value=str(doc_count)),
+            run_v2.EnvVar(name="STABILITY_DAYS", value=str(_FINETUNE_STABILITY_DAYS)),
+            run_v2.EnvVar(name="PROVIDER", value=provider),
+            run_v2.EnvVar(name="BYOK_ENFORCE", value="true" if byok_enforce else "false"),
+        ]
+        if tenant_key:
+            env.append(run_v2.EnvVar(name="TENANT_PROVIDER_KEY", value=tenant_key))
         request = run_v2.RunJobRequest(
             name=job_name,
             overrides=run_v2.RunJobRequest.Overrides(
                 container_overrides=[
-                    run_v2.RunJobRequest.Overrides.ContainerOverride(
-                        env=[
-                            run_v2.EnvVar(name="DOMAIN", value=domain),
-                            run_v2.EnvVar(name="DOC_COUNT", value=str(doc_count)),
-                            run_v2.EnvVar(name="STABILITY_DAYS", value=str(_FINETUNE_STABILITY_DAYS)),
-                        ]
-                    )
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(env=env)
                 ]
             ),
         )
         await client.run_job(request=request)
-        logger.info("G03 triggered fine-tuning pipeline for domain '%s' (%d docs)", domain, doc_count)
+        logger.info(
+            "G03 triggered fine-tuning for tenant '%s' domain '%s' (%d docs) → collection %s",
+            tctx.tenant_id, domain, doc_count, tctx.qdrant_collection,
+        )
+        _emit_finetune_metric(tctx.tenant_id, "submitted", provider)
         return True
     except Exception as exc:
         logger.error("G03 failed to trigger fine-tuning pipeline: %s", exc)
+        _emit_finetune_metric(tctx.tenant_id, "trigger_error", provider)
         return False
 
 
-async def check_domain_stability(domain: str) -> Dict[str, Any]:
+def _emit_finetune_metric(tenant_id: str, status: str, provider: str) -> None:
+    """Increment the finetune-jobs counter. The Job runs out-of-process and can't push to
+    the proxy registry, so submissions are counted here at trigger time."""
+    try:
+        from middleware.g18_observability import FINETUNE_JOBS_TOTAL
+        FINETUNE_JOBS_TOTAL.labels(tenant_id=tenant_id, status=status, provider=provider).inc()
+    except Exception:
+        pass  # metrics are best-effort; never block a trigger on them
+
+
+def _domain_stats_key(tenant_id: str, domain: str) -> str:
+    """Tenant-prefixed domain-stats key (t:<tenant>:tok_opt:domain:<domain>), matching the
+    TenantContext.redis_prefix convention used across the pipeline (G18 etc.)."""
+    from tenancy.context import TenantContext
+    return f"{TenantContext.for_tenant(tenant_id).redis_prefix}tok_opt:domain:{domain}"
+
+
+async def check_domain_stability(domain: str, tenant_id: str = "default") -> Dict[str, Any]:
     """
-    Check if a domain has been stable enough to trigger fine-tuning.
+    Check if a tenant's domain has been stable enough to trigger fine-tuning.
     Returns: {stable: bool, doc_count: int, days_active: int}
     """
     try:
         # Query metadata store (PostgreSQL) for domain statistics
         from cache.redis_pool import get_redis
         redis = get_redis()
-        
-        domain_key = f"tok_opt:domain:{domain}"
+
+        domain_key = _domain_stats_key(tenant_id, domain)
         stats = await redis.hgetall(domain_key)
         
         if not stats:
@@ -146,13 +243,13 @@ async def check_domain_stability(domain: str) -> Dict[str, Any]:
         return {"stable": False, "doc_count": 0, "days_active": 0}
 
 
-async def update_domain_stats(domain: str, doc_added: bool = True) -> None:
-    """Update domain statistics in Redis for fine-tuning eligibility."""
+async def update_domain_stats(domain: str, doc_added: bool = True, tenant_id: str = "default") -> None:
+    """Update a tenant's domain statistics in Redis for fine-tuning eligibility."""
     try:
         from cache.redis_pool import get_redis
         redis = get_redis()
-        
-        domain_key = f"tok_opt:domain:{domain}"
+
+        domain_key = _domain_stats_key(tenant_id, domain)
         now = time.time()
         
         # Initialize first_seen if new domain

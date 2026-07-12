@@ -391,26 +391,34 @@ as a Cloud Run **Job** triggered by a GCS object notification.
 
 ### End-to-end flow
 
+Per-tenant isolation: each tenant has its OWN bucket (`token-opt-docs-<tenant>`, created at
+onboarding) and its OWN Qdrant collection (`rag_<tenant>`). The webhook reverse-derives the tenant
+from the bucket name and refuses unregistered buckets, so documents never mix between tenants.
+
 ```
+   1. POST /portal/upload-url (tenant key) → signed PUT URL for gs://token-opt-docs-<tenant>/…
+                                        │
+   2. Client PUTs bytes ──────────────►│  (no GCS creds handed to the client)
                         ┌──────────────────────────────┐
-   1. Upload doc  ────► │  GCS bucket (docs/…)          │
+                        │  gs://token-opt-docs-<tenant> │
                         └───────────────┬──────────────┘
-                                        │ 2. Object-finalize notification
-                                        ▼  (Pub/Sub push)
-                        ┌──────────────────────────────┐
-                        │  Proxy  POST /ingest-doc      │  main.py:442
-                        │  body: { bucket, name }       │
-                        └───────────────┬──────────────┘
-                                        │ 3. trigger_doc_ingestion(bucket, name)
-                                        ▼   (g03_doc_pipeline.py:40 → run_v2 JobsAsyncClient)
-                        ┌──────────────────────────────┐
-                        │  Cloud Run Job                │  src/doc-pipeline/pipeline.py
-                        │  env: GCS_BUCKET, GCS_OBJECT  │
-                        └───────────────┬──────────────┘
-                                        │ 4. download → extract → chunk → embed → upsert
+                                        │ 3. OBJECT_FINALIZE → shared Pub/Sub topic → push (OIDC)
                                         ▼
                         ┌──────────────────────────────┐
-                        │  Qdrant collection            │  read later by G07 retrieval
+                        │  Proxy  POST /ingest-doc      │  main.py (OIDC-verified;
+                        │  → bucket_to_tenant(bucket)   │   unknown bucket → 403)
+                        └───────────────┬──────────────┘
+                                        │ 4. trigger_doc_ingestion(bucket, name, tenant_id)
+                                        ▼   (g03_doc_pipeline.py → run_v2 JobsAsyncClient)
+                        ┌──────────────────────────────────────────────┐
+                        │  Cloud Run Job   src/doc-pipeline/pipeline.py │
+                        │  env: GCS_BUCKET, GCS_OBJECT,                 │
+                        │       QDRANT_COLLECTION=rag_<tenant>, TENANT_ID│
+                        └───────────────┬──────────────────────────────┘
+                                        │ 5. download → extract → chunk → embed → upsert
+                                        ▼   (points stamped payload{tenant_id})
+                        ┌──────────────────────────────┐
+                        │  Qdrant collection rag_<tenant│  read later by G07 (pinned per tenant)
                         └──────────────────────────────┘
 ```
 
@@ -430,17 +438,48 @@ as a Cloud Run **Job** triggered by a GCS object notification.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `GCS_BUCKET` / `GCS_OBJECT` | — | The object to ingest (injected per-run as container overrides) |
-| `QDRANT_URL` / `QDRANT_COLLECTION` | `…:6333` / `rag_docs` | Target vector store + collection |
+| `QDRANT_COLLECTION` / `TENANT_ID` | `rag_docs` / `default` | Per-tenant target collection + tenant stamp (injected per-run; `rag_<tenant>` for multi-tenant, `rag_docs` for single-tenant) |
+| `QDRANT_URL` | `…:6333` | Target vector store |
 | `USE_TIKA` / `TIKA_SIDECAR_URL` | `false` / `http://tika-svc:9998` | Prefer Tika extraction |
 | `CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS` | `400` / `50` | Chunk sizing |
 | `MAX_CHUNK_TOKENS` | `4000` | Oversized-chunk summarisation threshold |
 | `DOC_PIPELINE_JOB_NAME` / `GCP_REGION` | `token-opt-doc-pipeline` / `us-central1` | Which Cloud Run Job the webhook launches |
 
-> **Scope of what's implemented.** The proxy does **not** expose a raw file-upload API — a document
-> must already be in GCS; ingestion is triggered by the object-finalize notification hitting
-> `POST /ingest-doc`. The webhook has no auth/tenant guard, and the Job's `QDRANT_COLLECTION`
-> defaults to a shared `rag_docs` collection (not the per-tenant `ctx.qdrant_collection` used on the
-> read path). Multi-tenant deployments must set `QDRANT_COLLECTION` per ingestion run accordingly.
+> **Scope of what's implemented.** Clients upload via a signed URL (`POST /portal/upload-url` →
+> V4 signed PUT), so no raw file bytes transit the proxy and no GCS credentials are handed out.
+> `POST /ingest-doc` is OIDC-verified (Pub/Sub push) and reverse-derives the tenant from the bucket
+> name, refusing any unregistered bucket (403). The Job receives `QDRANT_COLLECTION=rag_<tenant>` +
+> `TENANT_ID` per run — the SAME collection the read path (`ctx.qdrant_collection`) uses — and stamps
+> `tenant_id` into every point. Single-tenant/self-host deploys with no registry fall back to the
+> shared `rag_docs` collection, byte-identical to before.
+
+### Fine-tuning (tenant-isolated, operator-invoked)
+
+Fine-tuning is a **companion Cloud Run Job** (`src/finetune-pipeline/pipeline.py`), not part of the
+request path. It is **operator-invoked** — an admin triggers it for one `(tenant, domain)` via
+`POST /api/v1/admin/tenants/{id}/finetune` — and fully tenant-isolated:
+
+```
+Operator ─ POST /api/v1/admin/tenants/NOVA-STG-01/finetune {domain}
+   → trigger_fine_tuning_pipeline(tenant_id, domain, doc_count)   [g03_doc_pipeline.py]
+       ├─ resolve tenant BYOK key (in-proxy) ─ strict-BYOK & none ▶ 402
+       ├─ metric token_opt_finetune_jobs_total{tenant_id,status,provider}
+       └─ RunJob env: TENANT_ID, QDRANT_COLLECTION=rag_<tenant>, DOMAIN, TENANT_PROVIDER_KEY, BYOK_ENFORCE
+   → finetune-pipeline Job  [src/finetune-pipeline/pipeline.py]
+       ├─ read rag_<tenant> WITH tenant_id filter   (only this tenant's chunks)
+       ├─ BYOK guard: strict-BYOK & no key ▶ exit 2 (never the platform key)
+       ├─ export → finetune-training/<tenant>/<domain>/<ts>/training.jsonl
+       └─ track → t:<tenant>:tok_opt:finetune:<job_id>   (tenant-prefixed Redis)
+```
+
+**Isolation layers:** per-tenant read collection (`rag_<tenant>`) + a `tenant_id` payload filter +
+tenant+domain-nested GCS export path + tenant-prefixed Redis keys + BYOK training key (a tenant's
+model is never trained on the platform account). A tenant sees only its own jobs via the read-only
+`GET /portal/finetune`.
+
+> **Not yet auto-routed.** Trained models are **inert** — nothing routes a tenant's requests to its
+> fine-tuned model yet; wiring the model ID into per-tenant routing is a separate follow-up. Default/
+> single-tenant deploys use `rag_docs`, no Redis prefix, and no BYOK enforcement (unchanged).
 
 ## Key Data Structures
 

@@ -191,6 +191,17 @@ GUARDRAIL_EVENTS_TOTAL = Counter(
     "attack class (instruction_override, system_prompt_exfil, …)",
     ["tenant_id", "category", "action"],
 )
+# G03 fine-tuning: one increment per trigger, labelled by tenant. Emitted from the trigger
+# (g03_doc_pipeline.trigger_fine_tuning_pipeline) since the Cloud Run Job runs out-of-process
+# and can't push to the proxy registry — so this counts SUBMISSIONS, not completions.
+# `status` ∈ {submitted, refused_byok, trigger_error}; `provider` ∈ {openai, vertex_ai}.
+FINETUNE_JOBS_TOTAL = Counter(
+    "token_opt_finetune_jobs_total",
+    "Per-tenant fine-tuning job triggers, one increment per submission attempt. `status` is "
+    "submitted / refused_byok (strict-BYOK, no tenant key) / trigger_error; `provider` is the "
+    "training backend.",
+    ["tenant_id", "status", "provider"],
+)
 
 
 class G18Observability:

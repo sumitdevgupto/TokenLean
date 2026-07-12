@@ -33,6 +33,12 @@ variable "proxy_service_url" {
   default     = ""
 }
 
+variable "doc_bucket_prefix" {
+  description = "Prefix for per-tenant document buckets (token-opt-docs-<tenant>). MUST match tenancy/context.py::tenant_to_bucket / the DOC_BUCKET_PREFIX env so IaC and code agree."
+  type        = string
+  default     = "token-opt-docs-"
+}
+
 variable "alertmanager_url" {
   description = "Full HTTPS URL of the deployed Alertmanager Cloud Run service (used in prometheus.yml alerting config)"
   type        = string

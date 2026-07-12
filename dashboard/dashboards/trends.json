@@ -347,7 +347,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT metadata->>'routed_model' AS model, COUNT(*) AS calls FROM traces WHERE $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY calls DESC",
+          "rawSql": "SELECT metadata->>'routed_model' AS model, COUNT(*) AS calls FROM traces WHERE ('${tenant}' = '.*' OR metadata->>'tenant_id' = '${tenant}') AND $__timeFilter(created_at) AND ('${user_id}' = 'All' OR metadata->>'user_id' = '${user_id}') GROUP BY 1 ORDER BY calls DESC",
           "format": "table"
         }
       ],

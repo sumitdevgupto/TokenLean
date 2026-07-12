@@ -104,6 +104,19 @@ class TestG03UpdateDomainStats:
             from middleware.g03_doc_pipeline import update_domain_stats
             await update_domain_stats("acme-corp")  # should not raise
 
+    async def test_domain_stats_key_is_tenant_prefixed(self):
+        mock_redis = AsyncMock()
+        mock_redis.exists = AsyncMock(return_value=False)
+        mock_redis.hset = AsyncMock(return_value=True)
+        mock_redis.hincrby = AsyncMock(return_value=1)
+        mock_redis.expire = AsyncMock(return_value=True)
+        with patch("cache.redis_pool.get_redis", return_value=mock_redis):
+            from middleware.g03_doc_pipeline import update_domain_stats
+            await update_domain_stats("acme", doc_added=True, tenant_id="NOVA-STG-01")
+        # Every key touched must carry the tenant prefix — no cross-tenant domain stats.
+        for call in mock_redis.hincrby.call_args_list + mock_redis.hset.call_args_list:
+            assert call.args[0] == "t:NOVA-STG-01:tok_opt:domain:acme"
+
 
 @pytest.mark.asyncio
 class TestG03TriggerPipelines:
@@ -131,28 +144,12 @@ class TestG03TriggerPipelines:
         assert result is True
         mock_client.run_job.assert_awaited_once()
 
-    async def test_trigger_doc_ingestion_failure_returns_false(self):
-        # google.cloud.run_v2 is not installed in the test environment, so the
-        # import inside trigger_doc_ingestion raises and is caught.
-        from middleware.g03_doc_pipeline import trigger_doc_ingestion
-        result = await trigger_doc_ingestion("my-bucket", "docs/file.pdf")
-        assert result is False
-
-    async def test_trigger_fine_tuning_below_min_docs_skipped(self):
-        from middleware.g03_doc_pipeline import trigger_fine_tuning_pipeline, _FINETUNE_MIN_DOCS
-        result = await trigger_fine_tuning_pipeline("acme-corp", _FINETUNE_MIN_DOCS - 1)
-        assert result is False
-
-    async def test_trigger_fine_tuning_at_min_docs_attempts_trigger(self):
-        # google.cloud.run_v2 unavailable → caught exception → False, but
-        # confirms the doc_count gate itself does not block at the threshold.
-        from middleware.g03_doc_pipeline import trigger_fine_tuning_pipeline, _FINETUNE_MIN_DOCS
-        result = await trigger_fine_tuning_pipeline("acme-corp", _FINETUNE_MIN_DOCS)
-        assert result is False  # ImportError path, not the doc-count gate
-
-    async def test_trigger_fine_tuning_success(self):
+    async def test_trigger_doc_ingestion_threads_tenant_collection(self):
+        """The Job env must carry QDRANT_COLLECTION derived via TenantContext (the same
+        code the read path uses) + TENANT_ID — closing the read/write asymmetry."""
         import contextlib
         from middleware import g03_doc_pipeline
+        from tenancy.context import TenantContext
 
         mock_client = MagicMock()
         mock_client.run_job = AsyncMock(return_value=MagicMock())
@@ -169,24 +166,141 @@ class TestG03TriggerPipelines:
             if not attr.startswith("_"):
                 setattr(fake_module, attr, getattr(fake_run_v2, attr))
 
-        # Force `from google.cloud import run_v2` to resolve to the fake in EVERY
-        # environment. Patching sys.modules alone is not enough when google-cloud-run
-        # is installed (as in CI): the `google.cloud` package already carries a real
-        # `run_v2` attribute that shadows sys.modules, so the real JobsAsyncClient()
-        # gets built and hits GCP Application Default Credentials — which fails in CI
-        # (no creds) while passing on a dev box that has gcloud auth. Patch the
-        # package attribute too so the mock is used regardless.
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict(sys.modules, {"google.cloud.run_v2": fake_module}))
             try:
                 import google.cloud as _gc
                 stack.enter_context(patch.object(_gc, "run_v2", fake_module, create=True))
             except Exception:
-                pass  # google.cloud not importable → sys.modules patch suffices
-            result = await g03_doc_pipeline.trigger_fine_tuning_pipeline("acme-corp", 150)
+                pass
+            ok = await g03_doc_pipeline.trigger_doc_ingestion(
+                "token-opt-docs-nova-stg-01", "docs/f.pdf", tenant_id="NOVA-STG-01"
+            )
+
+        assert ok is True
+        # Inspect the captured RunJobRequest → env list (EnvVar side-effect returns dicts).
+        req = mock_client.run_job.call_args.kwargs["request"]
+        env = {e["name"]: e["value"] for e in req["overrides"]["container_overrides"][0]["env"]}
+        expected = TenantContext.for_tenant("NOVA-STG-01").qdrant_collection
+        assert env["QDRANT_COLLECTION"] == expected  # rag_nova-stg-01, no hardcoding
+        assert env["TENANT_ID"] == "NOVA-STG-01"
+        assert env["GCS_BUCKET"] == "token-opt-docs-nova-stg-01"
+
+    async def test_trigger_doc_ingestion_default_tenant_uses_rag_docs(self):
+        import contextlib
+        from middleware import g03_doc_pipeline
+
+        mock_client = MagicMock()
+        mock_client.run_job = AsyncMock(return_value=MagicMock())
+        fake_run_v2 = MagicMock()
+        fake_run_v2.JobsAsyncClient.return_value = mock_client
+        fake_run_v2.RunJobRequest = MagicMock(side_effect=lambda **kw: kw)
+        fake_run_v2.RunJobRequest.Overrides = MagicMock(side_effect=lambda **kw: kw)
+        fake_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock(side_effect=lambda **kw: kw)
+        fake_run_v2.EnvVar = MagicMock(side_effect=lambda **kw: kw)
+        fake_module = types.ModuleType("google.cloud.run_v2")
+        for attr in dir(fake_run_v2):
+            if not attr.startswith("_"):
+                setattr(fake_module, attr, getattr(fake_run_v2, attr))
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"google.cloud.run_v2": fake_module}))
+            try:
+                import google.cloud as _gc
+                stack.enter_context(patch.object(_gc, "run_v2", fake_module, create=True))
+            except Exception:
+                pass
+            await g03_doc_pipeline.trigger_doc_ingestion("b", "o")  # default tenant
+
+        req = mock_client.run_job.call_args.kwargs["request"]
+        env = {e["name"]: e["value"] for e in req["overrides"]["container_overrides"][0]["env"]}
+        assert env["QDRANT_COLLECTION"] == "rag_docs"
+        assert env["TENANT_ID"] == "default"
+
+    async def test_trigger_doc_ingestion_failure_returns_false(self):
+        # google.cloud.run_v2 is not installed in the test environment, so the
+        # import inside trigger_doc_ingestion raises and is caught.
+        from middleware.g03_doc_pipeline import trigger_doc_ingestion
+        result = await trigger_doc_ingestion("my-bucket", "docs/file.pdf")
+        assert result is False
+
+    async def test_trigger_fine_tuning_below_min_docs_skipped(self):
+        from middleware.g03_doc_pipeline import trigger_fine_tuning_pipeline, _FINETUNE_MIN_DOCS
+        result = await trigger_fine_tuning_pipeline("default", "acme", _FINETUNE_MIN_DOCS - 1)
+        assert result is False
+
+    async def test_trigger_fine_tuning_at_min_docs_attempts_trigger(self):
+        # google.cloud.run_v2 unavailable → caught exception → False, but
+        # confirms the doc_count gate itself does not block at the threshold.
+        from middleware.g03_doc_pipeline import trigger_fine_tuning_pipeline, _FINETUNE_MIN_DOCS
+        result = await trigger_fine_tuning_pipeline("default", "acme", _FINETUNE_MIN_DOCS)
+        assert result is False  # ImportError path, not the doc-count gate
+
+    async def test_trigger_fine_tuning_threads_tenant_and_collection(self):
+        import contextlib
+        from middleware import g03_doc_pipeline
+        from tenancy.context import TenantContext
+
+        mock_client = MagicMock()
+        mock_client.run_job = AsyncMock(return_value=MagicMock())
+
+        fake_run_v2 = MagicMock()
+        fake_run_v2.JobsAsyncClient.return_value = mock_client
+        fake_run_v2.RunJobRequest = MagicMock(side_effect=lambda **kw: kw)
+        fake_run_v2.RunJobRequest.Overrides = MagicMock(side_effect=lambda **kw: kw)
+        fake_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock(side_effect=lambda **kw: kw)
+        fake_run_v2.EnvVar = MagicMock(side_effect=lambda **kw: kw)
+
+        fake_module = types.ModuleType("google.cloud.run_v2")
+        for attr in dir(fake_run_v2):
+            if not attr.startswith("_"):
+                setattr(fake_module, attr, getattr(fake_run_v2, attr))
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"google.cloud.run_v2": fake_module}))
+            try:
+                import google.cloud as _gc
+                stack.enter_context(patch.object(_gc, "run_v2", fake_module, create=True))
+            except Exception:
+                pass
+            result = await g03_doc_pipeline.trigger_fine_tuning_pipeline("NOVA-STG-01", "support", 150)
 
         assert result is True
-        mock_client.run_job.assert_awaited_once()
+        req = mock_client.run_job.call_args.kwargs["request"]
+        env = {e["name"]: e["value"] for e in req["overrides"]["container_overrides"][0]["env"]}
+        assert env["TENANT_ID"] == "NOVA-STG-01"
+        assert env["QDRANT_COLLECTION"] == TenantContext.for_tenant("NOVA-STG-01").qdrant_collection
+        assert env["DOMAIN"] == "support"
+        # No resolver installed in this test env → not enforced, no platform-key leak asserted elsewhere.
+        assert env["BYOK_ENFORCE"] == "false"
+
+    async def test_trigger_fine_tuning_refuses_on_strict_byok(self):
+        """When the resolver raises ProviderKeyError (strict-BYOK, no tenant key), the trigger
+        raises FineTuneByokError (→ 402) rather than falling back to the platform key."""
+        from middleware import g03_doc_pipeline
+        from middleware.g03_doc_pipeline import FineTuneByokError
+        from providers.key_resolver import ProviderKeyError
+
+        async def _raise(provider, tenant_id, ctx=None):
+            raise ProviderKeyError(provider, tenant_id)
+
+        with patch("providers.key_resolver.resolve_provider_key", _raise):
+            with pytest.raises(FineTuneByokError):
+                await g03_doc_pipeline.trigger_fine_tuning_pipeline("NOVA-STG-01", "support", 150)
+
+    async def test_trigger_fine_tuning_emits_metric(self):
+        from middleware import g03_doc_pipeline
+        from middleware.g18_observability import FINETUNE_JOBS_TOTAL
+
+        before = FINETUNE_JOBS_TOTAL.labels(
+            tenant_id="NOVA-STG-01", status="trigger_error", provider="openai"
+        )._value.get()
+        # run_v2 unavailable → trigger_error path → metric increments.
+        await g03_doc_pipeline.trigger_fine_tuning_pipeline("NOVA-STG-01", "support", 150)
+        after = FINETUNE_JOBS_TOTAL.labels(
+            tenant_id="NOVA-STG-01", status="trigger_error", provider="openai"
+        )._value.get()
+        assert after >= before + 1
 
 
 @pytest.mark.asyncio
