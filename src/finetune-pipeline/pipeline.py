@@ -331,7 +331,10 @@ class FineTunePipeline:
         self.project_id = os.getenv("GCP_PROJECT_ID", "")
         self.region = os.getenv("GCP_REGION", "us-central1")
         # BYOK: the tenant's own training key (passed by the trigger) + strict-BYOK flag.
-        # The platform OPENAI_API_KEY is used ONLY for the default/single-tenant case.
+        # BYOK_ENFORCE is the trigger's AUTHORITATIVE decision (single source of truth): the
+        # trigger already refused (402) if strict BYOK was on with no tenant key, so if the
+        # Job runs with BYOK_ENFORCE=false it means the operator intentionally allows the
+        # platform key. The platform OPENAI_API_KEY is used ONLY when BYOK_ENFORCE is false.
         self.tenant_provider_key = os.getenv("TENANT_PROVIDER_KEY", "")
         self.byok_enforce = os.getenv("BYOK_ENFORCE", "false").lower() == "true"
         self.openai_key = os.getenv("OPENAI_API_KEY", "")
@@ -339,20 +342,24 @@ class FineTunePipeline:
     def _resolve_training_key(self) -> str:
         """Return the provider key to train with, fail-closed under strict BYOK.
 
-        A tenant fine-tune must use the TENANT's key — never the platform key. If strict-BYOK
-        is on and no tenant key was passed, refuse (exit 2) instead of silently falling back to
-        the platform account. For the default/single-tenant case, the platform key is fine.
+        A tenant fine-tune must use the TENANT's key — never the platform key. BYOK_ENFORCE is
+        the trigger's authoritative decision (it already 402'd if strict-BYOK had no tenant
+        key), so this guard trusts it rather than re-deriving policy from tenant_id: if
+        enforce is on and no tenant key was passed, refuse (exit 2) instead of silently
+        falling back to the platform account. When enforce is off, the platform key is used
+        (single-tenant, or an operator who intentionally allows platform fallback).
         """
         if self.tenant_provider_key:
             return self.tenant_provider_key
-        if self.byok_enforce or self.tenant_id != "default":
+        if self.byok_enforce:
             logger.error(
-                "BYOK: no tenant provider key for tenant '%s' — refusing to train on the "
-                "platform key (strict isolation). Seed the tenant's key and retry.",
+                "BYOK: no tenant provider key for tenant '%s' but BYOK_ENFORCE is on — "
+                "refusing to train on the platform key (strict isolation). Seed the tenant's "
+                "key and retry.",
                 self.tenant_id,
             )
             sys.exit(2)
-        return self.openai_key  # default/single-tenant only
+        return self.openai_key  # BYOK not enforced → platform key (single-tenant / opt-in)
 
     def _track_job(self, job_id: str, status: str, metadata: Dict):
         """Track fine-tuning job in Redis under the tenant's key namespace."""

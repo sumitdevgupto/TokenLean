@@ -94,7 +94,7 @@ This will:
 2. Start infrastructure containers (redis, postgres, qdrant)
 3. Start application containers (proxy, sidecars, langfuse)
 4. Wait for health checks
-5. Seed Qdrant with pitch_docs
+5. Seed Qdrant with rag_docs
 
 ### Step 3: Verify Services
 

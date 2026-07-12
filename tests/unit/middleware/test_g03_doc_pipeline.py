@@ -274,17 +274,98 @@ class TestG03TriggerPipelines:
         # No resolver installed in this test env → not enforced, no platform-key leak asserted elsewhere.
         assert env["BYOK_ENFORCE"] == "false"
 
-    async def test_trigger_fine_tuning_refuses_on_strict_byok(self):
-        """When the resolver raises ProviderKeyError (strict-BYOK, no tenant key), the trigger
-        raises FineTuneByokError (→ 402) rather than falling back to the platform key."""
+    @staticmethod
+    def _fake_run_v2(mock_client):
+        """Build a fake google.cloud.run_v2 whose builders record kwargs as dicts."""
+        fake = MagicMock()
+        fake.JobsAsyncClient.return_value = mock_client
+        fake.RunJobRequest = MagicMock(side_effect=lambda **kw: kw)
+        fake.RunJobRequest.Overrides = MagicMock(side_effect=lambda **kw: kw)
+        fake.RunJobRequest.Overrides.ContainerOverride = MagicMock(side_effect=lambda **kw: kw)
+        fake.EnvVar = MagicMock(side_effect=lambda **kw: kw)
+        mod = types.ModuleType("google.cloud.run_v2")
+        for attr in dir(fake):
+            if not attr.startswith("_"):
+                setattr(mod, attr, getattr(fake, attr))
+        return mod
+
+    async def _run_trigger(self, tenant_id, domain, doc_count, **kw):
+        """Invoke trigger_fine_tuning_pipeline with a mocked run_v2; return the captured env."""
+        import contextlib
+        from middleware import g03_doc_pipeline
+        mock_client = MagicMock()
+        mock_client.run_job = AsyncMock(return_value=MagicMock())
+        mod = self._fake_run_v2(mock_client)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"google.cloud.run_v2": mod}))
+            try:
+                import google.cloud as _gc
+                stack.enter_context(patch.object(_gc, "run_v2", mod, create=True))
+            except Exception:
+                pass
+            ok = await g03_doc_pipeline.trigger_fine_tuning_pipeline(tenant_id, domain, doc_count, **kw)
+        env = {}
+        if mock_client.run_job.call_args is not None:
+            req = mock_client.run_job.call_args.kwargs["request"]
+            env = {e["name"]: e["value"] for e in req["overrides"]["container_overrides"][0]["env"]}
+        return ok, env
+
+    async def test_trigger_fine_tuning_refuses_on_strict_byok_no_tenant_key(self):
+        """Strict BYOK on + no tenant-OWNED key → FineTuneByokError (402), never platform key."""
         from middleware import g03_doc_pipeline
         from middleware.g03_doc_pipeline import FineTuneByokError
-        from providers.key_resolver import ProviderKeyError
 
-        async def _raise(provider, tenant_id, ctx=None):
-            raise ProviderKeyError(provider, tenant_id)
+        async def _no_key(provider, tenant_id):
+            return None  # tenant has no key of its own
 
-        with patch("providers.key_resolver.resolve_provider_key", _raise):
+        with patch("providers.key_resolver.resolve_tenant_owned_key", _no_key), \
+             patch.object(g03_doc_pipeline, "_finetune_byok_enforced", lambda gc=None: True):
+            with pytest.raises(FineTuneByokError):
+                await g03_doc_pipeline.trigger_fine_tuning_pipeline("NOVA-STG-01", "support", 150)
+
+    async def test_trigger_fine_tuning_never_ships_platform_key(self):
+        """THE isolation fix: with strict BYOK OFF (default) and no tenant-owned key, the job
+        is triggered WITHOUT any TENANT_PROVIDER_KEY and BYOK_ENFORCE=false — the platform key
+        is NEVER passed as if it were the tenant's. (resolve_tenant_owned_key never returns the
+        platform key, so there is nothing to leak.)"""
+        from middleware import g03_doc_pipeline
+
+        async def _no_key(provider, tenant_id):
+            return None
+
+        with patch("providers.key_resolver.resolve_tenant_owned_key", _no_key), \
+             patch.object(g03_doc_pipeline, "_finetune_byok_enforced", lambda gc=None: False):
+            ok, env = await self._run_trigger("NOVA-STG-01", "support", 150)
+
+        assert ok is True
+        assert "TENANT_PROVIDER_KEY" not in env  # no key shipped at all — no platform-key leak
+        assert env["BYOK_ENFORCE"] == "false"
+
+    async def test_trigger_fine_tuning_ships_genuine_tenant_key(self):
+        """When the tenant OWNS a key, it is shipped as TENANT_PROVIDER_KEY with enforcement."""
+        from middleware import g03_doc_pipeline
+
+        async def _tenant_key(provider, tenant_id):
+            return "sk-genuinely-the-tenants-own-key"
+
+        with patch("providers.key_resolver.resolve_tenant_owned_key", _tenant_key), \
+             patch.object(g03_doc_pipeline, "_finetune_byok_enforced", lambda gc=None: False):
+            ok, env = await self._run_trigger("NOVA-STG-01", "support", 150)
+
+        assert ok is True
+        assert env["TENANT_PROVIDER_KEY"] == "sk-genuinely-the-tenants-own-key"
+        assert env["BYOK_ENFORCE"] == "true"  # enforce in the Job whenever we have a real key
+
+    async def test_trigger_fine_tuning_refuses_on_undecryptable_key(self):
+        """A stored-but-undecryptable tenant key fails closed (402), never platform fallback."""
+        from middleware import g03_doc_pipeline
+        from middleware.g03_doc_pipeline import FineTuneByokError
+        from providers.key_resolver import ProviderKeyDecryptError
+
+        async def _corrupt(provider, tenant_id):
+            raise ProviderKeyDecryptError(provider, tenant_id)
+
+        with patch("providers.key_resolver.resolve_tenant_owned_key", _corrupt):
             with pytest.raises(FineTuneByokError):
                 await g03_doc_pipeline.trigger_fine_tuning_pipeline("NOVA-STG-01", "support", 150)
 
@@ -608,3 +689,78 @@ class TestG03DocPipelineMiddleware:
         mw.rag_orchestrator.search_with_fallback.assert_awaited_once_with(
             "What is our refund policy?", collection="rag_docs", top_k=3
         )
+
+
+@pytest.mark.asyncio
+class TestListTenantFinetuneJobs:
+    """The shared finetune-status reader: tenant-prefixed keys + pipelined (not N+1) fetch."""
+
+    class _PipelineFake:
+        """Redis fake that records whether .pipeline() batching was used."""
+        def __init__(self, hashes):
+            self._h = hashes
+            self.hgetall_calls = 0
+            self.pipeline_used = False
+
+        async def zrevrange(self, key, a, b):
+            return list(self._h.keys())
+
+        async def scan_iter(self, match=None):
+            for j in self._h:
+                yield f"t:NOVA-STG-01:tok_opt:finetune:{j}"
+            # also emit a domain-index key that must be skipped
+            yield "t:NOVA-STG-01:tok_opt:finetune:domain:support"
+
+        async def hgetall(self, key):
+            self.hgetall_calls += 1
+            jid = key.rsplit("tok_opt:finetune:", 1)[-1]
+            return self._h.get(jid, {})
+
+        def pipeline(self):
+            outer = self
+
+            class _Pipe:
+                def __init__(self):
+                    self._keys = []
+                def hgetall(self, key):
+                    self._keys.append(key)
+                async def execute(self):
+                    outer.pipeline_used = True
+                    return [outer._h.get(k.rsplit("tok_opt:finetune:", 1)[-1], {}) for k in self._keys]
+            return _Pipe()
+
+    async def test_uses_pipeline_not_n_plus_1(self):
+        from middleware.g03_doc_pipeline import list_tenant_finetune_jobs
+        redis = self._PipelineFake({"j1": {"status": "RUNNING"}, "j2": {"status": "DONE"}})
+        jobs = await list_tenant_finetune_jobs(redis, "NOVA-STG-01")
+        assert len(jobs) == 2
+        assert redis.pipeline_used is True         # batched, not sequential
+        assert redis.hgetall_calls == 0            # no per-id sequential hgetall
+        # the domain-index key was skipped (not treated as a job id)
+        assert all("domain" not in (j.get("status") or "") for j in jobs)
+
+    async def test_falls_back_to_sequential_without_pipeline(self):
+        from middleware.g03_doc_pipeline import list_tenant_finetune_jobs
+
+        class _NoPipe:
+            def __init__(self, h): self._h = h
+            async def scan_iter(self, match=None):
+                for j in self._h:
+                    yield f"t:NOVA-STG-01:tok_opt:finetune:{j}"
+            async def hgetall(self, key):
+                return self._h.get(key.rsplit("tok_opt:finetune:", 1)[-1], {})
+            # no .pipeline() attribute at all
+
+        redis = _NoPipe({"j1": {"status": "RUNNING"}})
+        jobs = await list_tenant_finetune_jobs(redis, "NOVA-STG-01")
+        assert jobs == [{"status": "RUNNING"}]
+
+    async def test_empty_returns_empty_list(self):
+        from middleware.g03_doc_pipeline import list_tenant_finetune_jobs
+
+        class _Empty:
+            async def scan_iter(self, match=None):
+                return
+                yield  # pragma: no cover
+        jobs = await list_tenant_finetune_jobs(_Empty(), "NOVA-STG-01")
+        assert jobs == []

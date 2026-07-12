@@ -70,7 +70,7 @@ class TestWebhookIsolation:
 
     async def test_unknown_bucket_rejected_403(self, monkeypatch):
         monkeypatch.delenv("INGEST_REQUIRE_OIDC", raising=False)
-        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=["NOVA-STG-01"])), \
+        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=(True, ["NOVA-STG-01"]))), \
              patch.object(main, "trigger_doc_ingestion", AsyncMock(return_value=True)) as trig:
             resp = await self._post({"bucket": "token-opt-docs-evil", "name": "x.pdf"})
         assert resp.status_code == 403
@@ -78,7 +78,7 @@ class TestWebhookIsolation:
 
     async def test_known_bucket_threads_derived_tenant(self, monkeypatch):
         monkeypatch.delenv("INGEST_REQUIRE_OIDC", raising=False)
-        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=["NOVA-STG-01"])), \
+        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=(True, ["NOVA-STG-01"]))), \
              patch.object(main, "trigger_doc_ingestion", AsyncMock(return_value=True)) as trig:
             resp = await self._post({"bucket": "token-opt-docs-nova-stg-01", "name": "docs/a.pdf"})
         assert resp.status_code == 200
@@ -86,8 +86,52 @@ class TestWebhookIsolation:
         trig.assert_awaited_once()
         assert trig.await_args.kwargs.get("tenant_id") == "NOVA-STG-01"
 
+    async def test_empty_but_configured_registry_fails_closed_403(self, monkeypatch):
+        """THE fail-open fix: multi-tenant mode (registry configured) with an empty tenant
+        list (fresh deploy, no signups yet) must 403 any bucket, NOT fall open to default."""
+        monkeypatch.delenv("INGEST_REQUIRE_OIDC", raising=False)
+        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=(True, []))), \
+             patch.object(main, "trigger_doc_ingestion", AsyncMock(return_value=True)) as trig:
+            resp = await self._post({"bucket": "token-opt-docs-nova-stg-01", "name": "docs/a.pdf"})
+        assert resp.status_code == 403
+        trig.assert_not_awaited()  # never ingested as "default"
+
+    async def test_unconfigured_registry_uses_default(self, monkeypatch):
+        """Single-tenant/local (registry NOT configured, DATABASE_URL unset) keeps working:
+        the doc is ingested as tenant_id='default'."""
+        monkeypatch.delenv("INGEST_REQUIRE_OIDC", raising=False)
+        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=(False, []))), \
+             patch.object(main, "trigger_doc_ingestion", AsyncMock(return_value=True)) as trig:
+            resp = await self._post({"bucket": "some-bucket", "name": "docs/a.pdf"})
+        assert resp.status_code == 200
+        trig.assert_awaited_once()
+        assert trig.await_args.kwargs.get("tenant_id") == "default"
+
     async def test_missing_fields_400(self, monkeypatch):
         monkeypatch.delenv("INGEST_REQUIRE_OIDC", raising=False)
-        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=[])):
+        with patch.object(main, "_ingest_tenant_registry", AsyncMock(return_value=(False, []))):
             resp = await self._post({"bucket": "", "name": ""})
         assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+class TestIngestRegistryResolution:
+    """_ingest_tenant_registry must distinguish 'not configured' from 'configured-but-empty'."""
+
+    def _reset_cache(self):
+        main._INGEST_REGISTRY_CACHE.update(configured=False, tenants=[], ts=0.0, valid=False)
+
+    async def test_no_database_url_is_unconfigured(self, monkeypatch):
+        self._reset_cache()
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        configured, tenants = await main._ingest_tenant_registry()
+        assert configured is False and tenants == []
+
+    async def test_db_error_stays_configured_and_empty(self, monkeypatch):
+        """DATABASE_URL set but the query fails (e.g. portal_users missing) → configured=True,
+        empty list → caller fails closed instead of the webhook 500ing."""
+        self._reset_cache()
+        monkeypatch.setenv("DATABASE_URL", "postgres://x")
+        with patch("cache.pg_pool.get_pg_pool", AsyncMock(side_effect=Exception("relation portal_users does not exist"))):
+            configured, tenants = await main._ingest_tenant_registry()
+        assert configured is True and tenants == []

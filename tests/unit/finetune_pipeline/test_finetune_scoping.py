@@ -165,3 +165,27 @@ def test_default_tenant_uses_platform_key(monkeypatch):
     })
     pipe = mod.FineTunePipeline()
     assert pipe._resolve_training_key() == "sk-platform"  # single-tenant backward-compat
+
+
+def test_nondefault_tenant_nonstrict_byok_allows_platform_key(monkeypatch):
+    # Finding #9 reconciliation: BYOK_ENFORCE is the trigger's authoritative decision. A
+    # non-default tenant with enforce=false (operator intentionally opted into platform
+    # fallback) must NOT be force-refused just because tenant_id != "default".
+    mod = _load(monkeypatch, {
+        "TENANT_ID": "NOVA-STG-01", "BYOK_ENFORCE": "false",
+        "TENANT_PROVIDER_KEY": "", "OPENAI_API_KEY": "sk-platform",
+    })
+    pipe = mod.FineTunePipeline()
+    assert pipe._resolve_training_key() == "sk-platform"
+
+
+def test_nondefault_tenant_strict_byok_no_key_refuses(monkeypatch):
+    # The backstop: enforce=true + no tenant key → exit 2 (never the platform key).
+    mod = _load(monkeypatch, {
+        "TENANT_ID": "NOVA-STG-01", "BYOK_ENFORCE": "true",
+        "TENANT_PROVIDER_KEY": "", "OPENAI_API_KEY": "sk-platform",
+    })
+    pipe = mod.FineTunePipeline()
+    with pytest.raises(SystemExit) as exc:
+        pipe._resolve_training_key()
+    assert exc.value.code == 2

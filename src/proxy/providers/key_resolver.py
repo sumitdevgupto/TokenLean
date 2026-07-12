@@ -94,3 +94,44 @@ async def resolve_provider_key(
 ) -> Optional[str]:
     """Resolve the LLM key for (provider, tenant). See module docstring for the contract."""
     return await _resolver(provider, tenant_id, ctx)
+
+
+# ── Tenant-OWNED key seam (never the platform fallback) ───────────────────────
+# Distinct from resolve_provider_key: that seam intentionally falls back to the platform
+# key when BYOK isn't enforced (correct for the chat path). The fine-tune path must NOT
+# train a tenant's model on the platform account, so it needs a resolver that returns a key
+# ONLY when it is genuinely the tenant's own — never the platform key. The default (OSS, no
+# per-tenant key store) returns None; the commercial layer installs a real one that reads the
+# encrypted tenant_provider_keys store. A None return means "this tenant has no own key" and
+# the caller decides (strict BYOK → refuse; non-strict → platform key is acceptable).
+
+
+async def _default_tenant_owned_resolver(provider: str, tenant_id: str) -> Optional[str]:
+    """OSS default: there is no per-tenant key store, so no tenant ever OWNS a key here."""
+    return None
+
+
+_tenant_owned_resolver: Callable[[str, str], Awaitable[Optional[str]]] = _default_tenant_owned_resolver
+
+
+def set_tenant_owned_key_resolver(fn: Callable[[str, str], Awaitable[Optional[str]]]) -> None:
+    """Install the tenant-owned-key resolver (commercial layer, at startup)."""
+    global _tenant_owned_resolver
+    _tenant_owned_resolver = fn
+    logger.info("tenant-owned key resolver installed: %s", getattr(fn, "__qualname__", repr(fn)))
+
+
+def reset_tenant_owned_key_resolver() -> None:
+    """Restore the OSS default (used by tests)."""
+    global _tenant_owned_resolver
+    _tenant_owned_resolver = _default_tenant_owned_resolver
+
+
+async def resolve_tenant_owned_key(provider: str, tenant_id: str) -> Optional[str]:
+    """Return the tenant's OWN provider key, or None — NEVER the platform key.
+
+    Used by the fine-tune trigger: a non-None result is safe to train a tenant's model with;
+    a None result means the tenant has no key of its own (the caller enforces strict-BYOK
+    policy). May raise ProviderKeyDecryptError (fail-closed) if a stored key is undecryptable.
+    """
+    return await _tenant_owned_resolver(provider, tenant_id)

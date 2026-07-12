@@ -6,7 +6,7 @@
 #   ./scripts/local/deploy-local.sh [--seed] [--backup-to-gcs] [--with-grafana] [--recreate] [--tenants TENANT_LIST] [--no-check]
 #
 # Options:
-#   --seed              Seed Qdrant with pitch_docs collection
+#   --seed              Seed Qdrant with the rag_docs collection
 #   --backup-to-gcs     Backup Redis to GCS
 #   --with-grafana      Start observability stack (Prometheus + Grafana)
 #   --recreate          Force rebuild --no-cache (use after code changes)
@@ -18,7 +18,7 @@
 #   2. Builds all images locally (no Cloud Build, zero GCP cost)
 #   3. Starts infrastructure + application containers
 #   4. Waits for health checks
-#   5. Seeds Qdrant with pitch_docs (if --seed)
+#   5. Seeds Qdrant with rag_docs (if --seed)
 #   6. Optionally backs up to GCS
 #
 # All G1-G18 optimisations are available via Docker networking.
@@ -169,7 +169,7 @@ fi
 
 # ─── Seed Qdrant ──────────────────────────────────────────────────────────────
 if [[ "$SEED" == true ]]; then
-  info "Seeding Qdrant with pitch_docs..."
+  info "Seeding Qdrant with rag_docs..."
   "${SCRIPT_DIR}/../seed-data.sh" --qdrant-url http://localhost:6333 || warn "Seeding failed"
 fi
 

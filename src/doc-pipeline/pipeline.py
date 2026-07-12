@@ -258,7 +258,7 @@ def upsert_to_qdrant(
     if not _VALID_COLLECTION_RE.match(_QDRANT_COLLECTION):
         logger.error(
             "Refusing to upsert: QDRANT_COLLECTION %r is not a valid identifier "
-            "(^[a-z][a-z0-9_]{0,62}$). Check the TENANT_ID override.",
+            "(^[A-Za-z][A-Za-z0-9_-]{0,62}$). Check the TENANT_ID override.",
             _QDRANT_COLLECTION,
         )
         sys.exit(1)

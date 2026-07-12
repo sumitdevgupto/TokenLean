@@ -131,25 +131,34 @@ async def trigger_fine_tuning_pipeline(
                     doc_count, tctx.tenant_id, domain, _FINETUNE_MIN_DOCS)
         return False
 
-    # Resolve the tenant's BYOK provider key at trigger time (the Job has no resolver).
+    # Resolve the tenant's OWN provider key at trigger time (the Job has no resolver). Using
+    # the tenant-owned seam — NOT resolve_provider_key — is what prevents the platform-key
+    # leak: resolve_provider_key falls back to the platform key when strict BYOK is off, and
+    # the fine-tune path can't tell that fallback apart from a genuine tenant key. The
+    # tenant-owned resolver returns a key ONLY when it is genuinely the tenant's; None means
+    # the tenant has no key of its own, and strict-BYOK config decides refuse-vs-allow.
     tenant_key = ""
-    byok_enforce = False
+    byok_enforce = _finetune_byok_enforced(get_config)
+    from providers.key_resolver import ProviderKeyDecryptError, resolve_tenant_owned_key
     try:
-        from providers.key_resolver import resolve_provider_key, ProviderKeyError
-        try:
-            tenant_key = await resolve_provider_key(provider, tctx.tenant_id, ctx=None) or ""
-        except ProviderKeyError:
-            # Strict-BYOK denial — do NOT fall back to the platform key for a tenant train.
-            byok_enforce = True
-            _emit_finetune_metric(tctx.tenant_id, "refused_byok", provider)
-            raise FineTuneByokError(tctx.tenant_id, provider)
-        # If a resolver returned a key, enforce it in the Job too (defense-in-depth).
-        byok_enforce = bool(tenant_key)
-    except FineTuneByokError:
-        raise
+        tenant_key = await resolve_tenant_owned_key(provider, tctx.tenant_id) or ""
+    except ProviderKeyDecryptError:
+        # A stored key exists but is undecryptable → fail closed, never the platform key.
+        _emit_finetune_metric(tctx.tenant_id, "refused_byok", provider)
+        raise FineTuneByokError(tctx.tenant_id, provider)
     except Exception as exc:
-        # No resolver installed (OSS/local) → platform-key path, no enforcement.
-        logger.debug("Fine-tune BYOK resolve skipped (no resolver): %s", exc)
+        # Transient resolver error (e.g. DB blip) → treat as "no tenant key" and let the
+        # strict-BYOK gate below decide, rather than silently proceeding on a platform key.
+        logger.warning("Fine-tune tenant-key resolve failed for %s: %s", tctx.tenant_id, exc)
+
+    if not tenant_key and byok_enforce:
+        # Strict BYOK is on and the tenant has no key of its own — refuse (→ 402). NEVER
+        # fall back to the platform key for a tenant fine-tune.
+        _emit_finetune_metric(tctx.tenant_id, "refused_byok", provider)
+        raise FineTuneByokError(tctx.tenant_id, provider)
+    # Enforce in the Job whenever we actually have a tenant key (defense-in-depth), so a
+    # direct `gcloud run jobs execute` can't silently train on the platform key either.
+    byok_enforce = byok_enforce or bool(tenant_key)
 
     try:
         from google.cloud import run_v2
@@ -199,6 +208,71 @@ def _emit_finetune_metric(tenant_id: str, status: str, provider: str) -> None:
         FINETUNE_JOBS_TOTAL.labels(tenant_id=tenant_id, status=status, provider=provider).inc()
     except Exception:
         pass  # metrics are best-effort; never block a trigger on them
+
+
+def _finetune_byok_enforced(get_config=None) -> bool:
+    """Is strict BYOK enforced (byok.enforce)? Same config knob commercial_app + the chat
+    path read, resolved once here so the fine-tune trigger's refuse-vs-allow decision is a
+    single source of truth (not re-derived inside the Job). Defaults False (OSS/self-host)."""
+    try:
+        if get_config is None:
+            from config_loader import get_config as _gc
+            cfg = _gc() or {}
+        else:
+            cfg = get_config() or {}
+        byok = (cfg.get("byok", {}) or {})
+        return str(byok.get("enforce", False)).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _decode(v):
+    return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
+
+async def list_tenant_finetune_jobs(redis, tenant_id: str, domain=None, limit: int = 20) -> list:
+    """Return a tenant's fine-tune jobs (status + model id) from its tenant-prefixed Redis
+    keys, newest-first. Shared by the portal (self-serve) and admin (operator) status views so
+    the key layout + decode logic live in ONE place.
+
+    The per-job hashes are fetched with a single pipelined round trip (not N sequential
+    hgetall calls) so a tenant with many jobs doesn't cost N Redis RTTs per page load.
+    """
+    from tenancy.context import TenantContext
+    prefix = TenantContext.for_tenant(tenant_id).redis_prefix
+    limit = max(1, min(int(limit), 100))
+
+    if domain:
+        ids = await redis.zrevrange(f"{prefix}tok_opt:finetune:domain:{domain}", 0, limit - 1)
+        ids = [_decode(i) for i in ids]
+    else:
+        ids = []
+        async for key in redis.scan_iter(match=f"{prefix}tok_opt:finetune:*"):
+            k = _decode(key)
+            if ":domain:" in k:
+                continue  # skip the per-domain zset index keys
+            ids.append(k.rsplit("tok_opt:finetune:", 1)[-1])
+            if len(ids) >= limit:
+                break
+
+    if not ids:
+        return []
+
+    # Batch the hash fetches into ONE pipelined round trip instead of N sequential calls.
+    try:
+        pipe = redis.pipeline()
+        for jid in ids:
+            pipe.hgetall(f"{prefix}tok_opt:finetune:{jid}")
+        results = await pipe.execute()
+    except Exception:
+        # Fallback for a redis client/mock without pipeline support — sequential fetch.
+        results = [await redis.hgetall(f"{prefix}tok_opt:finetune:{jid}") for jid in ids]
+
+    jobs = []
+    for data in results:
+        if data:
+            jobs.append({_decode(k): _decode(v) for k, v in data.items()})
+    return jobs
 
 
 def _domain_stats_key(tenant_id: str, domain: str) -> str:

@@ -115,13 +115,29 @@ class ChunkGuard:
 
 # I3: the pgvector fallback interpolates the collection name straight into the
 # SQL `FROM {collection}` (asyncpg cannot parameterise an identifier), so the
-# name MUST be validated against a strict allowlist pattern first — both to stop
-# SQL injection and to keep retrieval inside the rag_* / tenant namespace.
-_VALID_COLLECTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+# name MUST be validated against a strict allowlist first — both to stop SQL
+# injection and to keep retrieval inside the rag_* / tenant namespace.
+#
+# The allowlist matches EXACTLY what TenantContext.for_tenant produces (rag_<sanitised>,
+# where sanitise_tenant_id allows [A-Za-z0-9_-], so real tenant ids like NOVA-STG-01 yield
+# rag_NOVA-STG-01 — uppercase + hyphens). The old lowercase-only-no-hyphen pattern silently
+# rejected every standard {CODE4}-{ENV}-{NN} tenant's collection, breaking pgvector RAG for
+# them. Uppercase/hyphenated names are not valid UNQUOTED SQL identifiers, so the name is
+# double-quoted at interpolation (_quote_collection); the allowlist forbids '"' so the quote
+# cannot be broken out of.
+_VALID_COLLECTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 
 
 def _is_valid_collection_name(name: str) -> bool:
     return bool(name and _VALID_COLLECTION_RE.match(name))
+
+
+def _quote_collection(name: str) -> str:
+    """Double-quote a validated collection name for safe use as a SQL identifier.
+
+    Only call on a name that passed _is_valid_collection_name (which forbids '"'), so no
+    quote-escaping is possible — this just makes uppercase/hyphenated identifiers valid."""
+    return '"' + name + '"'
 
 
 async def _pgvector_search(
@@ -145,11 +161,13 @@ async def _pgvector_search(
 
         pool = await get_pg_pool(db_url)
         async with pool.acquire() as conn:
-            # Cosine similarity search in pgvector
+            # Cosine similarity search in pgvector. The collection is double-quoted so
+            # uppercase/hyphenated tenant collection names (rag_NOVA-STG-01) are valid
+            # identifiers; safe because it passed the _VALID_COLLECTION_RE allowlist (no '"').
             rows = await conn.fetch(
                 f"""
                 SELECT text, source, 1 - (embedding <=> $1::vector) as score
-                FROM {collection}
+                FROM {_quote_collection(collection)}
                 WHERE 1 - (embedding <=> $1::vector) >= $2
                 ORDER BY score DESC
                 LIMIT $3

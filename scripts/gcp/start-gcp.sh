@@ -143,8 +143,8 @@ done
 echo ""
 success "Cloud SQL is RUNNABLE"
 
-# ─── Step 3: Verify Qdrant pitch_docs collection ─────────────────────────────
-info "Checking Qdrant pitch_docs collection..."
+# ─── Step 3: Verify Qdrant rag_docs collection ───────────────────────────────
+info "Checking Qdrant rag_docs collection..."
 QDRANT_URL=$(gcloud run services describe token-opt-qdrant \
   --region="$REGION" --project="$PROJECT_ID" \
   --format="value(status.url)" 2>/dev/null || echo "")
@@ -163,7 +163,7 @@ if [[ -n "$QDRANT_URL" ]]; then
   POINTS_COUNT=$(python3 -c "
 import urllib.request, json, sys
 try:
-    r = urllib.request.urlopen('${QDRANT_URL}/collections/pitch_docs', timeout=10)
+    r = urllib.request.urlopen('${QDRANT_URL}/collections/rag_docs', timeout=10)
     d = json.loads(r.read())
     print(d.get('result',{}).get('points_count', 0))
 except Exception as e:
@@ -172,21 +172,20 @@ except Exception as e:
 
   if [[ "$POINTS_COUNT" -gt 0 ]] 2>/dev/null; then
     QDRANT_STATUS="seeded (${POINTS_COUNT} docs)"
-    success "Qdrant pitch_docs has ${POINTS_COUNT} documents"
+    success "Qdrant rag_docs has ${POINTS_COUNT} documents"
   else
     QDRANT_STATUS="EMPTY — needs seeding"
-    warn "Qdrant pitch_docs collection is empty or missing"
+    warn "Qdrant rag_docs collection is empty or missing"
     if command -v python3 &>/dev/null && python3 -c "import sentence_transformers" &>/dev/null; then
-      echo -en "${YELLOW}Re-seed pitch_docs now? (y/yes/no): ${NC}"
+      echo -en "${YELLOW}Re-seed rag_docs now? (y/yes/no): ${NC}"
       read -r do_seed
       if [[ "$do_seed" == "y" || "$do_seed" == "yes" ]]; then
-        python3 "${REPO_ROOT}/pitch-test-plan/src/seed_direct.py" \
-          --qdrant-url "$QDRANT_URL" --collection pitch_docs \
+        "${REPO_ROOT}/scripts/seed-data.sh" --qdrant-url "$QDRANT_URL" \
           && { QDRANT_STATUS="seeded"; success "Qdrant seeded"; } \
-          || warn "Seeding failed — run manually: python3 pitch-test-plan/src/seed_direct.py"
+          || warn "Seeding failed — run manually: ./scripts/seed-data.sh --qdrant-url ${QDRANT_URL}"
       fi
     else
-      warn "python3/sentence-transformers not available — run manually: python3 pitch-test-plan/src/seed_direct.py --qdrant-url ${QDRANT_URL}"
+      warn "python3/sentence-transformers not available — run manually: ./scripts/seed-data.sh --qdrant-url ${QDRANT_URL}"
     fi
   fi
 

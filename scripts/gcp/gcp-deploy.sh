@@ -732,8 +732,9 @@ deploy_jobs() {
 }
 
 # ─── Step 6: Seed Qdrant with demo documents ────────────────────────────────
-# Temporarily opens Qdrant ingress to all, seeds pitch_docs collection,
-# then reverts to internal-only ingress. Requires sentence-transformers locally.
+# Temporarily opens Qdrant ingress to all, seeds the rag_docs collection (named
+# dense+sparse vectors, matching the doc-pipeline/G07 read path), then reverts to
+# internal-only ingress. Requires sentence-transformers locally.
 seed_qdrant() {
   if [[ "${ENABLE_QDRANT:-true}" != "true" ]]; then
     info "Qdrant disabled (ENABLE_QDRANT) — using pgvector; skipping Qdrant seed"
@@ -746,11 +747,11 @@ seed_qdrant() {
   # We check first — if docs are already present (e.g. --skip-infra config-only run
   # with no image change), we skip the expensive open/close ingress cycle.
 
-  info "Checking Qdrant pitch_docs collection..."
+  info "Checking Qdrant rag_docs collection..."
 
   # Check python3 and sentence-transformers available
   if ! command -v python3 &>/dev/null; then
-    warn "python3 not found — skipping Qdrant seeding. Run manually: python3 pitch-test-plan/src/seed_direct.py --qdrant-url <QDRANT_URL>"
+    warn "python3 not found — skipping Qdrant seeding. Run manually: ./scripts/seed-data.sh --qdrant-url <QDRANT_URL>"
     return 0
   fi
   if ! python3 -c "import sentence_transformers" &>/dev/null; then
@@ -779,12 +780,12 @@ seed_qdrant() {
     --member=allUsers --role=roles/run.invoker &>/dev/null || true
   sleep 10
 
-  # Check if already seeded
+  # Check if already seeded (rag_docs is the default/single-tenant collection the proxy reads)
   local points_count
   points_count=$(python3 -c "
 import urllib.request, json
 try:
-    r = urllib.request.urlopen('${qdrant_public_url}/collections/pitch_docs', timeout=10)
+    r = urllib.request.urlopen('${qdrant_public_url}/collections/rag_docs', timeout=10)
     d = json.loads(r.read())
     print(d.get('result', {}).get('points_count', 0))
 except:
@@ -792,13 +793,12 @@ except:
 " 2>/dev/null || echo "0")
 
   if [[ "$points_count" -gt 0 ]] 2>/dev/null; then
-    success "Qdrant pitch_docs already has ${points_count} docs — skipping seed (no image change detected)"
+    success "Qdrant rag_docs already has ${points_count} docs — skipping seed (no image change detected)"
   else
-    info "Qdrant pitch_docs is empty (new revision wipes storage) — seeding now..."
-    python3 "${REPO_ROOT}/pitch-test-plan/src/seed_direct.py" \
-      --qdrant-url "$qdrant_public_url" --collection pitch_docs \
+    info "Qdrant rag_docs is empty (new revision wipes storage) — seeding now..."
+    "${REPO_ROOT}/scripts/seed-data.sh" --qdrant-url "$qdrant_public_url" \
       && success "Qdrant seeded successfully" \
-      || warn "Qdrant seeding failed — run manually: python3 pitch-test-plan/src/seed_direct.py --qdrant-url ${qdrant_public_url}"
+      || warn "Qdrant seeding failed — run manually: ./scripts/seed-data.sh --qdrant-url ${qdrant_public_url}"
   fi
 
   # Always revert ingress to internal-only

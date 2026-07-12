@@ -95,22 +95,46 @@ class TestRagCollectionConstraint:
 
 # ── I3: pgvector collection-name validation ──────────────────────────────────
 class TestCollectionNameValidation:
-    @pytest.mark.parametrize("name", ["rag_acme", "rag_docs", "pitch_docs"])
+    @pytest.mark.parametrize("name", [
+        "rag_acme", "rag_docs", "pitch_docs",
+        # The fix: collection names TenantContext actually produces for standard
+        # {CODE4}-{ENV}-{NN} tenants (uppercase + hyphens) must be ACCEPTED — the old
+        # lowercase-only pattern silently broke pgvector RAG for every real tenant.
+        "rag_NOVA-STG-01", "rag_SHOP-STG-01", "rag_ACME-PRD-01",
+    ])
     def test_valid_names_accepted(self, name):
         from middleware.g07_retrieval import _is_valid_collection_name
         assert _is_valid_collection_name(name)
 
+    def test_tenant_collection_names_are_valid(self):
+        """Every collection TenantContext.for_tenant produces must pass G07's validator."""
+        from middleware.g07_retrieval import _is_valid_collection_name
+        for t in ["NOVA-STG-01", "SHOP-STG-01", "default", "foo_bar", "ACME-PRD-01"]:
+            col = TenantContext.for_tenant(t).qdrant_collection
+            assert _is_valid_collection_name(col), f"{col} rejected"
+
     @pytest.mark.parametrize("name", [
-        "rag_acme; DROP TABLE cache_l2",
-        "rag acme",
-        "rag-acme",          # hyphen not allowed in a SQL identifier here
-        "1rag",              # must start with a letter
+        "rag_acme; DROP TABLE cache_l2",  # semicolon + space
+        "rag acme",                       # space
+        'rag_"acme"',                     # embedded quote — must never pass (quoting safety)
+        "1rag",                           # must start with a letter
         "",
-        "RAG_ACME",          # uppercase not in the allowlist
+        "rag_acme'evil",                  # single quote
+        "rag_acme/*x*/",                  # comment chars
+        "rag_acme)",                      # paren
     ])
     def test_injection_or_invalid_names_rejected(self, name):
         from middleware.g07_retrieval import _is_valid_collection_name
         assert not _is_valid_collection_name(name)
+
+    def test_quote_collection_wraps_safely(self):
+        """The double-quote wrapper makes hyphenated names valid identifiers; the allowlist
+        guarantees the name contains no '"', so the quote can't be broken out of."""
+        from middleware.g07_retrieval import _quote_collection, _is_valid_collection_name
+        name = "rag_NOVA-STG-01"
+        assert _is_valid_collection_name(name)
+        assert _quote_collection(name) == '"rag_NOVA-STG-01"'
+        assert '"' not in name  # nothing to escape
 
 
 # ── I5: tenant_id sanitisation ───────────────────────────────────────────────

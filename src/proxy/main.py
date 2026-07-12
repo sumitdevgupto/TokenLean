@@ -544,26 +544,47 @@ async def list_models(request: Request):
 
 # Registry of tenants that own doc buckets. The webhook caller is GCS/Pub-Sub (not the
 # tenant), so tenant identity is reverse-derived from the bucket name via this registry.
-# Cached briefly to avoid a DB hit per notification.
-_INGEST_REGISTRY_CACHE: dict = {"tenants": [], "ts": 0.0}
-_INGEST_REGISTRY_TTL = 60.0
+# Cached briefly to avoid a DB hit per notification. `configured` distinguishes "no registry
+# (single-tenant/local, DATABASE_URL unset)" from "registry configured but currently empty"
+# — the caller MUST fail closed in the latter (multi-tenant mode) instead of defaulting.
+_INGEST_REGISTRY_CACHE: dict = {"configured": False, "tenants": [], "ts": 0.0, "valid": False}
+_INGEST_REGISTRY_TTL = float(os.getenv("INGEST_REGISTRY_TTL_SECONDS", "60"))
 
 
-async def _ingest_tenant_registry() -> list:
-    """Return the distinct set of tenant ids that own doc buckets (60s cached)."""
+async def _ingest_tenant_registry() -> tuple[bool, list]:
+    """Return (registry_configured, tenant_ids). Cached for INGEST_REGISTRY_TTL_SECONDS.
+
+    ``registry_configured`` is True whenever DATABASE_URL is set (multi-tenant mode), even if
+    the tenant list is momentarily empty — so the caller can fail closed rather than fall open
+    to tenant_id="default". A transient DB error keeps the mode as configured with an empty
+    list (still fail-closed) rather than crashing the webhook.
+    """
     now = time.monotonic()
-    if _INGEST_REGISTRY_CACHE["tenants"] and (now - _INGEST_REGISTRY_CACHE["ts"]) < _INGEST_REGISTRY_TTL:
-        return _INGEST_REGISTRY_CACHE["tenants"]
+    # Serve from cache when a prior successful load is still fresh — including an empty result
+    # (avoids re-querying every request in the empty-but-configured window / thundering herd).
+    if _INGEST_REGISTRY_CACHE["valid"] and (now - _INGEST_REGISTRY_CACHE["ts"]) < _INGEST_REGISTRY_TTL:
+        return _INGEST_REGISTRY_CACHE["configured"], _INGEST_REGISTRY_CACHE["tenants"]
     db_url = os.getenv("DATABASE_URL", "")
     if not db_url:
-        return []  # single-tenant / local: no registry (caller falls back to derived slug)
-    from cache.pg_pool import get_pg_pool
-    pool = await get_pg_pool(db_url)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT DISTINCT tenant_id FROM portal_users WHERE tenant_id IS NOT NULL")
-    tenants = [r["tenant_id"] for r in rows]
-    _INGEST_REGISTRY_CACHE.update(tenants=tenants, ts=now)
-    return tenants
+        # Single-tenant / local: no registry at all → caller uses the derived slug/default.
+        _INGEST_REGISTRY_CACHE.update(configured=False, tenants=[], ts=now, valid=True)
+        return False, []
+    try:
+        from cache.pg_pool import get_pg_pool
+        pool = await get_pg_pool(db_url)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT tenant_id FROM portal_users WHERE tenant_id IS NOT NULL")
+        tenants = [r["tenant_id"] for r in rows]
+        _INGEST_REGISTRY_CACHE.update(configured=True, tenants=tenants, ts=now, valid=True)
+        return True, tenants
+    except Exception as exc:
+        # DATABASE_URL is set (multi-tenant intent) but the query failed (e.g. portal_users
+        # not created in an OSS-only deploy, or a transient DB error). Stay CONFIGURED with an
+        # empty list so the caller fails closed (403) rather than falling open to "default".
+        # Do NOT cache a failure — recover on the next call.
+        logger.warning("ingest registry query failed (failing closed): %s", exc)
+        return True, []
 
 
 def _verify_ingest_oidc(request: Request) -> None:
@@ -637,15 +658,19 @@ async def ingest_doc(request: Request):
         raise HTTPException(status_code=400, detail="Missing bucket or name in payload")
 
     from tenancy.context import bucket_to_tenant, sanitise_tenant_id
-    registry = await _ingest_tenant_registry()
-    if registry:
+    registry_configured, registry = await _ingest_tenant_registry()
+    if registry_configured:
+        # Multi-tenant mode: the bucket MUST reverse-derive to a registered tenant. This is
+        # fail-closed even when the registry is momentarily empty (fresh deploy before the
+        # first signup) — never fall open to "default", which would ingest into the shared
+        # collection or misattribute a doc to the wrong tenant.
         tenant_id = bucket_to_tenant(bucket, registry)
         if tenant_id is None:
             logger.warning("Rejected /ingest-doc: bucket %r not registered to any tenant", bucket)
             raise HTTPException(status_code=403, detail="Bucket not registered to any tenant")
     else:
-        # Single-tenant / local (no registry): fall back to the derived slug so the
-        # existing flat-payload flow keeps working. Never fail-open in multi-tenant mode.
+        # Single-tenant / local (no registry configured at all): fall back to the default so
+        # the existing flat-payload / self-host flow keeps working.
         tenant_id = "default"
 
     success = await trigger_doc_ingestion(bucket, obj, tenant_id=tenant_id)
