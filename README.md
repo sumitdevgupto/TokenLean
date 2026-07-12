@@ -7,6 +7,11 @@
   Cut your LLM token bill 30–70% with a one-line code change and zero quality loss.
 </p>
 
+<p align="center">
+  ☁️ <strong>Don't want to self-host?</strong> Get it as a fully-managed SaaS —
+  <a href="https://cbeyond.cloud/tokenlean/"><strong>cbeyond.cloud/tokenlean</strong></a>
+</p>
+
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
@@ -605,6 +610,17 @@ pytest --cov=src/proxy --cov-report=html
 | [docs/oss-licenses.md](docs/oss-licenses.md) | Dependency licenses (SPDX) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Complete deployment and troubleshooting guide |
 | [Token Optimisation Blog](https://sumitdevgupto.github.io/token-optimisation-blog/) | Reference article — background and walkthrough of the framework |
+
+## ☁️ Prefer it fully managed? TokenLean as a Service
+
+Don't want to run, scale and operate the infrastructure yourself? **Cbeyond** offers
+TokenLean as a **fully-managed SaaS** — hosted, auto-scaling, SLA-backed, with enterprise
+security and zero ops on your side. Everything in this open-source core, run and operated
+for you, so your team captures the savings on day one.
+
+→ **[Explore the managed &amp; Enterprise offering at cbeyond.cloud/tokenlean](https://cbeyond.cloud/tokenlean/)**
+
+---
 
 ## License
 

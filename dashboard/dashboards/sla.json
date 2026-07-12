@@ -625,7 +625,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT date_trunc('hour', timestamp) AS time, ROUND(AVG(CASE WHEN baseline_tokens > 0 THEN 100.0 * tokens_saved / baseline_tokens ELSE 0 END)::numeric, 1) AS avg_saving_pct FROM usage_events WHERE timestamp >= NOW() - INTERVAL '24 hours' AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
+          "rawSql": "SELECT date_trunc('hour', timestamp) AS time, ROUND(AVG(CASE WHEN baseline_tokens > 0 THEN 100.0 * tokens_saved / baseline_tokens ELSE 0 END)::numeric, 1) AS avg_saving_pct FROM usage_events WHERE timestamp >= NOW() - INTERVAL '24 hours' AND COALESCE(billable, true) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
           "format": "time_series",
           "datasource": {
             "type": "postgres",
