@@ -9,7 +9,7 @@
 
 <p align="center">
   ☁️ <strong>Don't want to self-host?</strong> Get it as a fully-managed SaaS —
-  <a href="https://cbeyond.cloud/tokenlean/"><strong>cbeyond.cloud/tokenlean</strong></a>
+  <a href="https://cbeyond.cloud/tokenlean/" target="_blank" rel="noopener"><strong>cbeyond.cloud/tokenlean</strong></a>
 </p>
 
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
@@ -618,7 +618,7 @@ TokenLean as a **fully-managed SaaS** — hosted, auto-scaling, SLA-backed, with
 security and zero ops on your side. Everything in this open-source core, run and operated
 for you, so your team captures the savings on day one.
 
-→ **[Explore the managed &amp; Enterprise offering at cbeyond.cloud/tokenlean](https://cbeyond.cloud/tokenlean/)**
+→ <strong><a href="https://cbeyond.cloud/tokenlean/" target="_blank" rel="noopener">Explore the managed &amp; Enterprise offering at cbeyond.cloud/tokenlean</a></strong>
 
 ---
 
