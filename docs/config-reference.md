@@ -152,6 +152,12 @@ Token-savings **estimate** tuning. Reporting only — none of this affects the r
 | `anomaly_ratio` | `2.0` | Flag a day when its cost ≥ ratio × the trailing-median daily cost. Shared by `/portal/finops/anomalies` and the operator `/admin/finops/anomalies`. |
 | `anomaly_baseline_days` | `28` | Trailing window the anomaly baseline median is computed over. |
 
+**Invoice history** (`portal.invoices.*`):
+
+| Parameter | Default | Description |
+|---|---|---|
+| `history_months` | `12` | Max trailing months `GET /portal/invoices/history` recomputes (read-only, no persistence). Caps the `?months=` query param. |
+
 ### rate_limit  *(G0 — top-level section)*
 
 Request throttling at the gate (token bucket). Lives at the top level, not under `groups`.
