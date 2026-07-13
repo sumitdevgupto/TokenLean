@@ -1,0 +1,59 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE_100 — $100 hard cap execution profile (OpenAI-only)
+# ─────────────────────────────────────────────────────────────────────────────
+# A cost-bounded profile of the pitch-test-plan harness. Same code, same
+# datasets, same full G-step coverage as the other modes — only the SIZING
+# (sample counts, repeats, dataset subset, and gpt-4.5 exposure) changes so the
+# run stays under the $100 LLM-spend ceiling.
+#
+# Purpose: publishable spend-weighted headline + confidence intervals — every
+# dataset at full samples with N=3 median and the widest gpt-4.5 exposure.
+#
+# The cap is LLM API spend only (identical across all four deployment targets:
+# OSS/commercial x local/GCP). GCP infra cost, if any, is separate/out-of-band.
+#
+# gpt-4.5 is the dominant budget lever (its output is 250x gpt-4o-mini), so the
+# `complex`-tier (gpt-4.5) call count is the primary dial. A ~22% reserve is kept
+# below the cap to absorb gpt-4.5 output-length variance.
+# See pitch-test-plan/README.md § "Execution modes".
+
+mode: "100"
+spend_cap_usd: 100.0
+
+# ── Ablation sizing (Phase A — per-group attribution) ────────────────────────
+sample_size: 18
+repeats: 3              # N=3 median — the publishable configuration
+
+# ── Dataset selection ────────────────────────────────────────────────────────
+dataset_subset: all
+max_datasets: 0
+
+# ── G06 cascade exposure — PLANNING TARGETS (not yet enforced) ───────────────
+# NOT read/enforced by the harness today; the only live spend guard is the
+# cumulative `spend_cap_usd` abort. Per-tier rationing ships with the Phase-B
+# load replayer (plan items 6-7, 13). See mode_5.yaml for the full note.
+routing:
+  medium_call_budget: 100   # gpt-4o   (planning target)
+  complex_call_budget: 115  # gpt-4-5  (planning target; ~$65 at ~1K in/500 out x3 repeats)
+
+# ── Multimodal (G27) — PLANNING TARGET (not yet enforced) ────────────────────
+vision_requests: 20
+
+# ── Phase B (concurrent organic blended load) — NOT YET IMPLEMENTED ──────────
+blended_load_requests: 6000   # placeholder; drives volume once the load replayer lands
+
+# ── Proxy-config overrides deep-merged into the base ROI config ───────────────
+config_overrides:
+  groups:
+    G6_routing:
+      enabled: true
+      classifier: cascade
+      cascade_execution: true
+      tiers:
+        simple:  ["gpt-4o-mini"]
+        medium:  ["gpt-4o"]
+        complex: ["gpt-4-5"]
+
+# ── Estimated spend (calibrate against --dry-run-cost before committing) ──────
+# ~$77.94 (78% of the $100 cap); ~$22.06 reserve.
+est_spend_usd: 77.94

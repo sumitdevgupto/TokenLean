@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE_5 — $5 hard cap execution profile (OpenAI-only)
+# ─────────────────────────────────────────────────────────────────────────────
+# A cost-bounded profile of the pitch-test-plan harness. Same code, same
+# datasets, same full G-step coverage as the other modes — only the SIZING
+# (sample counts, repeats, dataset subset, and gpt-4.5 exposure) changes so the
+# run stays under the $5 LLM-spend ceiling.
+#
+# Purpose: fast smoke of the WHOLE pipeline — "is it alive, does every group
+# fire, does G06 route across all three tiers" — for a few dollars.
+#
+# The cap is LLM API spend only (identical across all four deployment targets:
+# OSS/commercial x local/GCP). GCP infra cost, if any, is separate/out-of-band.
+#
+# gpt-4.5 is the dominant budget lever (its output is 250x gpt-4o-mini), so the
+# `complex`-tier (gpt-4.5) call count is the primary dial. A ~30% reserve is kept
+# below the cap to absorb gpt-4.5 output-length variance.
+# See pitch-test-plan/README.md § "Execution modes".
+
+mode: "5"
+spend_cap_usd: 5.0
+
+# ── Ablation sizing (Phase A — per-group attribution) ────────────────────────
+sample_size: 6          # requests per config (all-off / only-Gx / all-on)
+repeats: 1              # no median at this budget — one pass
+
+# ── Dataset selection ────────────────────────────────────────────────────────
+# A rotating slice keeps a single $5 run cheap; run repeatedly (or bump to
+# MODE_25) to cover the rest. `datasets: all` would still fit but leaves little
+# gpt-4.5 headroom, so we cap the vertical/DS subset here.
+dataset_subset:
+  - DS1     # support (simple)  — G01/G02/G11
+  - DS2     # RAG KB (medium)   — G03/G06/G07/G09/G10
+  - DS7     # DevOps agent      — G08/G14/G15/G16/G19
+  - DS5     # reasoning/cascade — G06/G12 (drives gpt-4.5 HIGH tier)
+  - DS9     # dedup             — G22
+max_datasets: 5
+
+# ── G06 cascade exposure — PLANNING TARGETS (not yet enforced) ───────────────
+# NOTE: these are the intended per-tier call counts this mode was budget-sized
+# around. They are NOT read or enforced by the harness today — the ONLY live
+# spend guard is the cumulative `spend_cap_usd` abort. Per-tier call rationing
+# ships with the Phase-B load replayer (see plan tracker items 6-7, 13). Until
+# then, treat these as documentation of the cost model, not runtime limits.
+routing:
+  medium_call_budget: 12    # gpt-4o   (planning target)
+  complex_call_budget: 15   # gpt-4-5  (planning target; dominant cost ~$2.85 at ~1K in/500 out)
+
+# ── Multimodal (G27) — PLANNING TARGET (not yet enforced) ────────────────────
+vision_requests: 3          # planning target; excluded from the token headline (image-byte)
+
+# ── Phase B (concurrent organic blended load) — NOT YET IMPLEMENTED ──────────
+# The concurrent load replayer (plan items 6-7) is not built yet; this field is
+# a placeholder for the request volume it will drive once it lands.
+blended_load_requests: 0
+
+# ── Proxy-config overrides deep-merged into the base ROI config ───────────────
+# Sets the 3-tier OpenAI cascade for G06 (replaces the base `complex: o4-mini`).
+config_overrides:
+  groups:
+    G6_routing:
+      enabled: true
+      classifier: cascade
+      cascade_execution: true
+      tiers:
+        simple:  ["gpt-4o-mini"]
+        medium:  ["gpt-4o"]
+        complex: ["gpt-4-5"]
+
+# ── Estimated spend (calibrate against --dry-run-cost before committing) ──────
+# ~$3.42 (68% of the $5 cap); ~$1.58 reserve. Figure assumes ~1K-in / 300-500-out
+# per request; gpt-4.5 output length is the volatile term.
+est_spend_usd: 3.42
