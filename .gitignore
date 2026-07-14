@@ -291,6 +291,8 @@ tests/unit/api/test_upload.py
 # Enterprise Docs RAG-chat endpoint + shared answer cache (commercial).
 tests/unit/api/test_docs_chat.py
 tests/unit/api/test_docs_cache.py
+# Docs seeder Phase-3 (--sync/--generate) tests — the seeder itself is commercial.
+tests/unit/scripts/test_seed_product_docs.py
 tests/unit/portal/
 tests/unit/api/test_rls_scoping.py
 tests/test_gdpr_compliance.py
