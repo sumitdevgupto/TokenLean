@@ -10,6 +10,12 @@ api/tenant_keys.py
 api/operator_auth.py
 api/gdpr.py
 api/admin.py
+api/docs.py
+api/docs_cache.py
+# Docs-seeder + docs snapshot staged for the COMMERCIAL image only — the OSS image must not
+# carry enterprise docs. (Dockerfile.commercial.dockerignore does NOT strip this, so the paid
+# image keeps it.)
+_docs_seed/
 commercial_app.py
 billing/tiers.py
 billing/invoicing.py

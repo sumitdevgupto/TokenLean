@@ -16,6 +16,38 @@ from typing import Any, Dict, Tuple
 _lock = threading.Lock()
 _instances: Dict[Tuple[str, str], Any] = {}
 
+# Whether the installed qdrant-client accepts the `check_compatibility` kwarg. It was added
+# in qdrant-client 1.14; on older clients (e.g. 1.12.x) passing it raises
+# "unexpected keyword argument 'check_compatibility'", which silently breaks EVERY Qdrant
+# path (G07 retrieval, G03 ingest, G10 memory, docs-chat). Detected once via the ctor
+# signature so call sites stay version-agnostic. Suppresses the client's version-skew warning
+# where supported, and is simply omitted where not.
+_qdrant_supports_check_compat: Any = None
+_qdrant_compat_lock = threading.Lock()
+
+
+def qdrant_client_kwargs(**extra: Any) -> Dict[str, Any]:
+    """Return kwargs for QdrantClient/AsyncQdrantClient, adding `check_compatibility=False`
+    only when the installed client supports it. Pass through `url`, `api_key`, etc. via
+    ``extra``. Use everywhere a Qdrant client is constructed so a client-version bump/downgrade
+    can't break connectivity."""
+    global _qdrant_supports_check_compat
+    if _qdrant_supports_check_compat is None:
+        with _qdrant_compat_lock:
+            if _qdrant_supports_check_compat is None:
+                try:
+                    import inspect
+                    from qdrant_client import QdrantClient
+                    _qdrant_supports_check_compat = (
+                        "check_compatibility" in inspect.signature(QdrantClient.__init__).parameters
+                    )
+                except Exception:
+                    _qdrant_supports_check_compat = False
+    kwargs = {k: v for k, v in extra.items() if v is not None or k == "api_key"}
+    if _qdrant_supports_check_compat:
+        kwargs["check_compatibility"] = False
+    return kwargs
+
 
 def _get_or_create(cache_key: Tuple[str, str], factory) -> Any:
     instance = _instances.get(cache_key)

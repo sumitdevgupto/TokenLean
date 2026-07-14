@@ -177,9 +177,9 @@ async def store_skill_in_qdrant(skill_id: str, skill_text: str, metadata: Dict,
     """Store an agent skill in Qdrant for semantic retrieval."""
     try:
         from qdrant_client import QdrantClient
-        from ml_models import get_text_embedding
+        from ml_models import get_text_embedding, qdrant_client_kwargs
 
-        client = QdrantClient(url=_QDRANT_URL, check_compatibility=False)
+        client = QdrantClient(**qdrant_client_kwargs(url=_QDRANT_URL))
 
         # Embed skill text
         model = get_text_embedding(_SKILLS_EMBEDDING_MODEL)

@@ -234,6 +234,13 @@ src/proxy/api/operator_auth.py
 # api/portal_auth.py. The bucket<->tenant naming helpers stay in core (tenancy/context.py).
 src/proxy/api/tenant_provisioning.py
 src/proxy/api/upload.py
+# Enterprise Docs RAG-chat endpoint + its shared cross-tenant answer cache (commercial).
+src/proxy/api/docs.py
+src/proxy/api/docs_cache.py
+# Transient build-staging dir: the deploy scripts copy the docs-seeder + docs snapshot here
+# right before the commercial image build (Dockerfile.commercial COPYs it to /app/seed). Never
+# committed — it's regenerated each build.
+src/proxy/_docs_seed/
 src/proxy/billing/tiers.py
 # Request-count invoicing (E2) — the paid product's billing calculation. Engines
 # (metering/models/audit) stay in core; the invoice generator is commercial.
@@ -281,6 +288,9 @@ tests/unit/api/test_tenant_keys.py
 tests/unit/api/test_operator_auth.py
 tests/unit/api/test_tenant_provisioning.py
 tests/unit/api/test_upload.py
+# Enterprise Docs RAG-chat endpoint + shared answer cache (commercial).
+tests/unit/api/test_docs_chat.py
+tests/unit/api/test_docs_cache.py
 tests/unit/portal/
 tests/unit/api/test_rls_scoping.py
 tests/test_gdpr_compliance.py

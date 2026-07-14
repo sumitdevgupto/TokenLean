@@ -409,19 +409,21 @@ async def _hybrid_search(
     try:
         from qdrant_client import AsyncQdrantClient
         from qdrant_client.models import (
-            Prefetch, Fusion,
+            Prefetch, Fusion, FusionQuery,
         )
+        from ml_models import qdrant_client_kwargs
 
         auth = _get_qdrant_auth_token()
-        client = AsyncQdrantClient(url=qdrant_url, api_key=auth or None, check_compatibility=False)
+        client = AsyncQdrantClient(**qdrant_client_kwargs(url=qdrant_url, api_key=auth or None))
         dense_embedding = await _embed_dense(query)
         sparse_embedding = await _embed_sparse(query)  # Phase 2: may be None if fastembed unavailable
 
         # Phase 2 fix: Build prefetch list dynamically based on sparse availability.
-        # qdrant-client 1.18.x query_points API: pass the raw query value and
-        # select the named vector via `using=` — do NOT wrap in NamedVector /
-        # NamedSparseVector (those are rejected by the Prefetch.query union and
-        # were the source of the float_type/model_type validation errors).
+        # qdrant-client query_points API (verified on 1.12.x): pass the raw query value in each
+        # Prefetch and select the named vector via `using=` — do NOT wrap in NamedVector /
+        # NamedSparseVector (those are rejected by the Prefetch.query union and were the source of
+        # the float_type/model_type validation errors). The fusion query itself, however, DOES need
+        # the FusionQuery wrapper (see below) — the bare Fusion enum is not a valid top-level query.
         prefetches = [
             Prefetch(
                 query=dense_embedding,
@@ -440,11 +442,15 @@ async def _hybrid_search(
 
         try:
             if sparse_embedding is not None:
-                # Hybrid search with RRF fusion
+                # Hybrid search with RRF fusion. The top-level fusion query MUST be wrapped in
+                # FusionQuery(fusion=Fusion.RRF) — passing the bare `Fusion.RRF` enum serialises
+                # to an invalid request body on qdrant-client 1.12.x / server 1.12.x (the server
+                # 400s with "Expected some form of vector, id, or a type of query"), which silently
+                # dropped every hybrid search to the dense-only except-fallback below.
                 results = await client.query_points(
                     collection_name=collection,
                     prefetch=prefetches,
-                    query=Fusion.RRF,
+                    query=FusionQuery(fusion=Fusion.RRF),
                     limit=top_k_final,
                     with_payload=True,
                 )
@@ -475,8 +481,12 @@ async def _hybrid_search(
             )
 
         await client.close()
+        # `source` is carried through (seeded + ingested points both stamp it) so callers
+        # that need provenance — e.g. the docs-chat citations via retrieve() — can use it.
+        # The request-path caller ignores it, so this is a no-op for existing behaviour.
         return [
-            {"text": r.payload.get("text", ""), "score": r.score}
+            {"text": r.payload.get("text", ""), "score": r.score,
+             "source": (r.payload or {}).get("source", "")}
             for r in results.points
         ]
     except Exception as exc:
@@ -512,3 +522,51 @@ async def _rerank(
     except Exception as exc:
         logger.warning("G07 reranker failed: %s — using original order", exc)
         return chunks[:top_k]
+
+
+async def retrieve(
+    query: str,
+    collection: str,
+    *,
+    top_k: int = 5,
+    top_k_final: int = 3,
+    similarity_threshold: float = 0.3,
+    max_chunk_tokens: int = 1000,
+    max_total_tokens: int = 4000,
+    use_pgvector: Optional[bool] = None,
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+) -> List[Dict]:
+    """Context-free retrieval helper — the reusable core of G07, decoupled from
+    ``RequestContext`` so non-pipeline callers (e.g. the commercial docs-chat endpoint)
+    can retrieve against an arbitrary collection.
+
+    Runs the same hybrid dense+sparse Qdrant search + ChunkGuard + cross-encoder rerank as
+    ``G07Retrieval.process_request``, and returns ``[{text, score, source}]`` (rerank score
+    preserved, ``source`` carried for citations). ``use_pgvector`` defaults to auto:
+    pgvector when Qdrant is unset but ``DATABASE_URL`` is present, else Qdrant.
+
+    ``similarity_threshold`` here gates the CROSS-ENCODER rerank score (typically wider-range
+    than the cosine gate on the request path), so it defaults lower; tune per caller.
+    """
+    if not query or not collection:
+        return []
+    if not _is_valid_collection_name(collection):
+        logger.warning("retrieve(): rejected invalid collection name %r", collection)
+        return []
+
+    cfg = {"similarity_threshold": similarity_threshold}
+    if use_pgvector is None:
+        use_pgvector = not _QDRANT_URL and bool(_PGVECTOR_URL)
+
+    try:
+        if use_pgvector and _PGVECTOR_URL:
+            chunks = await _pgvector_search(query, top_k, _PGVECTOR_URL, collection, cfg)
+            guarded = ChunkGuard(max_chunk_tokens, max_total_tokens).validate_chunks(chunks)
+            return guarded[:top_k_final]
+
+        chunks = await _hybrid_search(query, top_k, top_k_final, _QDRANT_URL, collection, cfg)
+        guarded = ChunkGuard(max_chunk_tokens, max_total_tokens).validate_chunks(chunks)
+        return await _rerank(query, guarded, top_k_final, similarity_threshold, reranker_model)
+    except Exception as exc:
+        logger.warning("retrieve() failed for collection %s: %s", collection, exc)
+        return []

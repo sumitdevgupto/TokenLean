@@ -31,7 +31,8 @@ class Mem0MemoryStore:
         """Lazy-init Qdrant client."""
         if self._client is None:
             from qdrant_client import QdrantClient
-            self._client = QdrantClient(url=self.qdrant_url, check_compatibility=False)
+            from ml_models import qdrant_client_kwargs
+            self._client = QdrantClient(**qdrant_client_kwargs(url=self.qdrant_url))
         return self._client
     
     async def ensure_collection(self):

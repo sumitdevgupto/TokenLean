@@ -346,6 +346,17 @@ class G05Cache:
         # G29 sets no_cache when it masks PII: the masked cache key is lossy, so reading
         # (or later writing) the shared cache could serve one caller's PII-derived answer
         # to another's look-alike masked query. Skip the cache entirely for such requests.
+        #
+        # x_no_cache is the per-request opt-out for an internal/self-call whose own caller
+        # already applies its OWN caching layer (e.g. the commercial docs-chat endpoint caches
+        # {answer, citations} keyed by docs_version in api/docs_cache.py) — for such a caller,
+        # G05's semantic (L2) match on the INTERNAL prompt text is actively wrong: two
+        # differently-grounded internal calls (different retrieved chunks, hence different
+        # correct answers) can still land within the L2 similarity threshold of each other
+        # purely because their SYSTEM instructions are similar, silently serving one grounded
+        # answer in place of another regardless of what was actually retrieved this time.
+        if str(ctx.params.get("x_no_cache", "")).lower() in ("true", "1", "yes"):
+            ctx.no_cache = True
         if getattr(ctx, "no_cache", False):
             return ctx
 

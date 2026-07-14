@@ -44,6 +44,23 @@ class TestG05Cache:
             await G05Cache().store_response(ctx, {"choices": [{"message": {"content": "x"}}]})
         get_redis.assert_not_called()  # a masked request's answer is never cached
 
+    async def test_x_no_cache_param_skips_read_and_store(self, make_ctx):
+        """An internal self-call (e.g. commercial docs-chat) that already applies its OWN
+        caching layer opts OUT of G05 via the x_no_cache request param — G05's semantic L2
+        match on the internal prompt text would otherwise serve one differently-grounded
+        call's answer in place of another's. Regression for the docs-chat cache-pollution bug."""
+        ctx = make_ctx()
+        ctx.params["x_no_cache"] = "true"
+        get_redis = MagicMock()
+        with patch("middleware.g05_cache._get_redis", get_redis):
+            from middleware.g05_cache import G05Cache
+            g05 = G05Cache()
+            ctx = await g05.process_request(ctx)
+            assert ctx.no_cache is True  # param → ctx flag, so BOTH read and write guards trip
+            await g05.store_response(ctx, {"choices": [{"message": {"content": "x"}}]})
+        assert ctx.cache_hit is False
+        get_redis.assert_not_called()  # short-circuits before touching Redis on read AND write
+
     async def test_l1_cache_hit(self, make_ctx):
         ctx = make_ctx()
 

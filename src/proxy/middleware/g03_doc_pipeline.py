@@ -396,8 +396,9 @@ class RAGFallbackOrchestrator:
         try:
             from qdrant_client import QdrantClient
             from sentence_transformers import SentenceTransformer
-            
-            client = QdrantClient(url=self.qdrant_url, check_compatibility=False)
+            from ml_models import qdrant_client_kwargs
+
+            client = QdrantClient(**qdrant_client_kwargs(url=self.qdrant_url))
             
             # Embed query
             model = SentenceTransformer("all-MiniLM-L6-v2")
