@@ -439,6 +439,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
       --region="$REGION" \
       --project="$PROJECT_ID" \
       --service-account="routellm-sidecar-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+      --ingress=internal \
       --allow-unauthenticated \
       --memory=2Gi --cpu=2 \
       --max-instances=1 \
@@ -944,16 +945,14 @@ main() {
   # Always upload config — ensures GCS stays in sync whether or not Terraform ran
   upload_config
 
-  # SKIP_PLATFORM_KEYS=true → do NOT seed any platform LLM provider key into Secret
-  # Manager. Set by the commercial deploy under strict BYOK (BYOK_ENFORCE=true): every
-  # tenant supplies its own key, so a platform key must not exist in the project at all.
-  # Default (unset/false) preserves OSS/self-host behaviour — a default-provider key is
-  # required and seeded.
-  if [[ "${SKIP_PLATFORM_KEYS:-false}" == "true" ]]; then
-    info "SKIP_PLATFORM_KEYS=true — strict-BYOK deploy: NOT seeding any platform LLM provider key (tenants BYOK)."
-  else
-    provision_llm_keys
-  fi
+  # Always call provision_llm_keys — it internally gates the TENANT-SERVING platform
+  # provider keys (llm-key-*) on SKIP_PLATFORM_KEYS (set by the commercial deploy under
+  # strict BYOK: every tenant supplies its own key, so no platform key that could answer
+  # a tenant request may exist in the project) but unconditionally seeds the RouteLLM
+  # embeddings key + Langfuse keys, which are INFRA credentials, not a tenant-answer path.
+  # A prior version skipped this whole call under SKIP_PLATFORM_KEYS=true, which also
+  # silently skipped those two infra-only seedings on every strict-BYOK GCP deploy.
+  provision_llm_keys
 
   prepare_config_yaml
   if [[ "$SKIP_BUILD" != "true" ]]; then

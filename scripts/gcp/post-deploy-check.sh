@@ -125,34 +125,39 @@ else
   ((UNHEALTHY++))
 fi
 
-# ─── Check 2: Memorystore Redis ──────────────────────────────────────────────
-info "Checking Memorystore Redis..."
+# ─── Check 2: Redis (Memorystore OR the docker-Redis GCE VM) ─────────────────
+# The commercial deploy defaults to `--redis docker` (a GCE COS VM, token-opt-redis-vm);
+# `--redis memorystore` provisions Memorystore (token-opt-redis) instead. Only ONE exists per
+# deploy — accept either, and only FAIL when NEITHER is present.
+info "Checking Redis (Memorystore or docker-Redis VM)..."
 REDIS_EXISTS=$(gcloud redis instances list \
   --project="$PROJECT_ID" \
   --region="$REGION" \
   --filter="name:${REDIS_INSTANCE}" \
   --format="value(name)" 2>/dev/null || echo "")
 
-if [[ -z "$REDIS_EXISTS" ]]; then
-  error "Memorystore Redis: NOT FOUND (must restore from backup)"
-  ((UNHEALTHY++))
-else
+if [[ -n "$REDIS_EXISTS" ]]; then
   REDIS_STATE=$(gcloud redis instances describe "${REDIS_INSTANCE}" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format="value(state)" 2>/dev/null || echo "UNKNOWN")
-  
+    --project="$PROJECT_ID" --region="$REGION" --format="value(state)" 2>/dev/null || echo "UNKNOWN")
   REDIS_HOST=$(gcloud redis instances describe "${REDIS_INSTANCE}" \
-    --project="$PROJECT_ID" \
-    --region="$REGION" \
-    --format="value(host)" 2>/dev/null || echo "")
-  
+    --project="$PROJECT_ID" --region="$REGION" --format="value(host)" 2>/dev/null || echo "")
   if [[ "$REDIS_STATE" == "READY" ]]; then
-    success "Memorystore Redis: ${REDIS_STATE} (${REDIS_HOST})"
-    ((HEALTHY++))
+    success "Memorystore Redis: ${REDIS_STATE} (${REDIS_HOST})"; ((HEALTHY++))
   else
-    warn "Memorystore Redis: ${REDIS_STATE} (not READY yet)"
-    ((WARNINGS++))
+    warn "Memorystore Redis: ${REDIS_STATE} (not READY yet)"; ((WARNINGS++))
+  fi
+else
+  # No Memorystore → check the docker-Redis GCE VM (the commercial default, redis_backend=docker).
+  REDIS_VM="token-opt-redis-vm"; REDIS_VM_ZONE="${REGION}-a"
+  VM_STATE=$(gcloud compute instances describe "${REDIS_VM}" \
+    --project="$PROJECT_ID" --zone="${REDIS_VM_ZONE}" --format="value(status)" 2>/dev/null || echo "")
+  if [[ -z "$VM_STATE" ]]; then
+    error "Redis: NEITHER Memorystore (${REDIS_INSTANCE}) NOR the docker-Redis VM (${REDIS_VM}) found"
+    ((UNHEALTHY++))
+  elif [[ "$VM_STATE" == "RUNNING" ]]; then
+    success "docker-Redis VM: ${VM_STATE} (${REDIS_VM} @ ${REDIS_VM_ZONE})"; ((HEALTHY++))
+  else
+    warn "docker-Redis VM: ${VM_STATE} (not RUNNING yet — ${REDIS_VM})"; ((WARNINGS++))
   fi
 fi
 
@@ -245,8 +250,11 @@ ROUTELLM_URL=$(gcloud run services describe routellm-svc \
 
 if [[ -n "$ROUTELLM_URL" ]]; then
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${ROUTELLM_URL}/health" 2>/dev/null || echo "000")
-  if [[ "$HTTP_STATUS" == "200" ]]; then
-    success "routellm-svc: HTTP ${HTTP_STATUS}"
+  # routellm-svc is deployed --ingress=internal (denial-of-wallet defense: it holds an OpenAI key),
+  # so an EXTERNAL operator curl gets 403 — that's the service up AND correctly locked down. The
+  # proxy reaches it internally (same-project Cloud Run, like Qdrant). Accept 200 or 403.
+  if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "403" ]]; then
+    success "routellm-svc: Reachable (HTTP ${HTTP_STATUS}; 403 = internal-only blocking external, OK)"
     ((HEALTHY++))
   else
     warn "routellm-svc: HTTP ${HTTP_STATUS}"
@@ -333,7 +341,9 @@ info "Checking BYOK hardening posture..."
 KMS_ENV=$(gcloud run services describe token-proxy --region="$REGION" --project="$PROJECT_ID" \
   --format='value(spec.template.spec.containers[0].env)' 2>/dev/null | grep -c TENANT_KEY_KMS_KEY || true)
 if [[ "${KMS_ENV:-0}" -ge 1 ]]; then
-  success "BYOK master key: KMS-wrapped (TENANT_KEY_KMS_KEY set on token-proxy)"
+  # Env-var presence proves KMS unwrap is CONFIGURED, not that the stored secret is actually
+  # ciphertext — the behavioural proof (decrypt round-trip) is key-security-harness.sh --gcp stage 11.
+  success "BYOK master key: TENANT_KEY_KMS_KEY set (KMS unwrap configured; wrap not behaviourally verified here — see key-security-harness.sh --gcp stage 11)"
   ((HEALTHY++))
 else
   warn "BYOK master key: plaintext (TENANT_KEY_KMS_KEY not set — enable_kms_master_key=false / HARDEN_KMS=false)"
