@@ -152,12 +152,24 @@ provision_infra() {
 
 # ─── Step 2: Provision LLM keys to Secret Manager from config/keys.yaml ──
 provision_llm_keys() {
+  # SKIP_PLATFORM_KEYS=true (strict-BYOK commercial deploy) → skip the TENANT-SERVING
+  # platform provider keys (llm-key-<provider>) so no platform key that could answer a
+  # tenant request ever exists in the project. It deliberately does NOT skip the RouteLLM
+  # embeddings key or Langfuse keys below — those are INFRA credentials (routellm-sidecar
+  # embeddings / observability), never a tenant-answer path. Default (unset) = OSS behaviour.
+  local skip_platform="${SKIP_PLATFORM_KEYS:-false}"
   info "Provisioning LLM API keys from ${REPO_ROOT}/config/keys.yaml..."
   local keys_file="${REPO_ROOT}/config/keys.yaml"
-  [[ ! -f "$keys_file" ]] && error "Keys file not found: ${keys_file}\nCopy config/keys.yaml.template → config/keys.yaml and fill in real values."
+  # Under strict BYOK the file may legitimately have no provider keys — only require it to
+  # exist when we actually need to read provider keys from it.
+  if [[ "$skip_platform" != "true" && ! -f "$keys_file" ]]; then
+    error "Keys file not found: ${keys_file}\nCopy config/keys.yaml.template → config/keys.yaml and fill in real values."
+  fi
 
   parse_yaml_value() {
     local field="$1"
+    # Tolerate a missing keys_file (strict-BYOK deploy may have none) — yield empty, not an error.
+    [[ -f "$keys_file" ]] || return 0
     grep -E "^\s+${field}:" "$keys_file" | sed -E 's/.*:\s*\"?([^\"#]+)\"?.*/\1/' | tr -d '[:space:]'
   }
 
@@ -185,31 +197,37 @@ provision_llm_keys() {
     fi
   }
 
-  # Mandatory key — the configured default provider (proxy.default_provider). No longer
-  # hardcoded to OpenAI: set DEFAULT_PROVIDER to match your config so e.g. an Anthropic- or
-  # Gemini-first deployment isn't forced to supply an OpenAI key.
-  local default_provider="${DEFAULT_PROVIDER:-openai}"
-  if ! store_key "llm-key-${default_provider}" "${default_provider}"; then
-    error "Mandatory key missing in ${keys_file}: '${default_provider}' (your proxy.default_provider) is required.\nFill it in, or set DEFAULT_PROVIDER to a provider you have a key for."
+  if [[ "$skip_platform" == "true" ]]; then
+    info "SKIP_PLATFORM_KEYS=true — strict BYOK: NOT seeding any tenant-serving platform provider key (llm-key-*). Tenants supply their own."
+  else
+    # Mandatory key — the configured default provider (proxy.default_provider). No longer
+    # hardcoded to OpenAI: set DEFAULT_PROVIDER to match your config so e.g. an Anthropic- or
+    # Gemini-first deployment isn't forced to supply an OpenAI key.
+    local default_provider="${DEFAULT_PROVIDER:-openai}"
+    if ! store_key "llm-key-${default_provider}" "${default_provider}"; then
+      error "Mandatory key missing in ${keys_file}: '${default_provider}' (your proxy.default_provider) is required.\nFill it in, or set DEFAULT_PROVIDER to a provider you have a key for."
+    fi
+
+    # Optional LLM provider keys — skip if not set. (Bedrock uses AWS SigV4 creds, not a key.)
+    store_key "llm-key-anthropic"   "anthropic" || true
+    store_key "llm-key-google"      "google"    || true
+    store_key "llm-key-gemini"      "gemini"    || true
+    store_key "llm-key-mistral"     "mistral"   || true
+    store_key "llm-key-cohere"      "cohere"    || true
+    store_key "llm-key-deepseek"    "deepseek"  || true
+    store_key "llm-key-xai"         "xai"       || true
+    store_key "llm-key-groq"        "groq"      || true
+    store_key "llm-key-azure"       "azure"     || true
+    store_key "llm-key-openrouter"  "openrouter" || true
+    store_key "llm-key-opencode"    "opencode"  || true
   fi
 
-  # RouteLLM key — needed only when G06 routing uses the mf/sw_ranking routers (which call
-  # OpenAI embeddings). Provisioned when present; a warning (not a hard failure) otherwise.
+  # RouteLLM embeddings key — INFRA credential for the routellm-sidecar (G06 mf/sw_ranking
+  # routers call OpenAI embeddings). NOT a tenant-answer path, so it is seeded even under
+  # strict BYOK. Provisioned when present in keys.yaml; a warning otherwise. `store_key`
+  # tolerates a missing keys_file (parse yields empty → skip), so this is safe under BYOK.
   store_key "routellm-openai-key" "routellm" \
     || warn "routellm key not set — G06 mf/sw_ranking routers need an OpenAI key for embeddings; G06 routing will degrade. Disable G06 or use the causal_llm router if you don't use OpenAI."
-
-  # Optional LLM provider keys — skip if not set. (Bedrock uses AWS SigV4 creds, not a key.)
-  store_key "llm-key-anthropic"   "anthropic" || true
-  store_key "llm-key-google"      "google"    || true
-  store_key "llm-key-gemini"      "gemini"    || true
-  store_key "llm-key-mistral"     "mistral"   || true
-  store_key "llm-key-cohere"      "cohere"    || true
-  store_key "llm-key-deepseek"    "deepseek"  || true
-  store_key "llm-key-xai"         "xai"       || true
-  store_key "llm-key-groq"        "groq"      || true
-  store_key "llm-key-azure"       "azure"     || true
-  store_key "llm-key-openrouter"  "openrouter" || true
-  store_key "llm-key-opencode"    "opencode"  || true
 
   # Langfuse keys — only available after first deploy + manual UI step
   # These live under langfuse_keys: in keys.yaml (not llm_keys:)
@@ -926,7 +944,16 @@ main() {
   # Always upload config — ensures GCS stays in sync whether or not Terraform ran
   upload_config
 
-  provision_llm_keys
+  # SKIP_PLATFORM_KEYS=true → do NOT seed any platform LLM provider key into Secret
+  # Manager. Set by the commercial deploy under strict BYOK (BYOK_ENFORCE=true): every
+  # tenant supplies its own key, so a platform key must not exist in the project at all.
+  # Default (unset/false) preserves OSS/self-host behaviour — a default-provider key is
+  # required and seeded.
+  if [[ "${SKIP_PLATFORM_KEYS:-false}" == "true" ]]; then
+    info "SKIP_PLATFORM_KEYS=true — strict-BYOK deploy: NOT seeding any platform LLM provider key (tenants BYOK)."
+  else
+    provision_llm_keys
+  fi
 
   prepare_config_yaml
   if [[ "$SKIP_BUILD" != "true" ]]; then

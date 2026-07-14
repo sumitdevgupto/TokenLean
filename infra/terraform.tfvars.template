@@ -18,6 +18,18 @@ alertmanager_url       = ""                  # e.g. https://alertmanager-xxxx-uc
 # When set, overrides the auto-derived proxy_service_url/admin/alert-webhook endpoint.
 alert_webhook_url      = ""
 
+# ── BYOK provider-key security hardening (opt-in; default = current behaviour) ──
+# Customer BYOK provider keys are the crown jewels: master key + a Postgres dump =
+# every tenant's plaintext key. These three flags separate those halves. They default
+# to `false` in variables.tf so an OSS/self-host apply is a no-op. The MANAGED commercial
+# deploy (scripts/commercial/deploy-commercial-gcp.sh) sets them true AUTOMATICALLY via
+# TF_VAR_* (override with HARDEN_KMS / HARDEN_SECRET_IAM / HARDEN_PRIVATE_SQL=false in
+# .env.gcp). To harden an OSS deploy, uncomment below. Flip on a STAGING project first,
+# validate, then promote — see internal-docs/proxy-key-security.md.
+# enable_kms_master_key       = true   # master key stored KMS-wrapped (separate cryptoKeyDecrypter grant)
+# least_privilege_secret_iam  = true   # drop project-wide secretAccessor; bind proxy SA per-secret
+# private_cloud_sql           = true   # no public IPv4 on Cloud SQL + ENCRYPTED_ONLY SSL
+
 # ── Observability tuning ───────────────────────────────────────────────────────
 prometheus_retention              = "15d"   # e.g. 30d for production
 alertmanager_resolve_timeout      = "5m"

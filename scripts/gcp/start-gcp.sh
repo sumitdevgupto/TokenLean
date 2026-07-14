@@ -5,8 +5,14 @@
 # Usage:
 #   ./scripts/gcp/start-gcp.sh [--project PROJECT_ID] [--region REGION]
 #
-# What this does:
-#   1. Recreates Memorystore Redis from backup if needed
+# What this does (Redis backend auto-detected — see stop-gcp.sh):
+#   1. Redis:
+#        - docker VM (commercial DEFAULT): `gcloud compute instances start` if
+#          stopped, or recreate via terraform apply if stop-gcp.sh never ran /
+#          the VM was deleted out-of-band. Cold container, no data to restore
+#          (the redis:7-alpine container runs with --save "").
+#        - memorystore: recreate via terraform apply if missing (stop-gcp.sh
+#          deletes it — Memorystore has no stop/start, only delete/create).
 #   2. Starts Cloud SQL instance
 #   3. Waits for all services to be healthy
 # =============================================================================
@@ -15,9 +21,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PROJECT_ID=""
-REGION="asia-south1"
+REGION=""   # resolved below: --region flag > GCP_REGION (.env.gcp) > asia-south1
 SQL_INSTANCE="token-opt-pg"
-REDIS_INSTANCE="token-opt-redis"
+REDIS_INSTANCE="token-opt-redis"        # Memorystore instance name (redis_backend=memorystore)
+REDIS_VM="token-opt-redis-vm"           # GCE VM name (redis_backend=docker, THE DEFAULT)
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -68,60 +75,68 @@ echo "║   START INFRA                                        ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-# ─── Step 1: Check/Recreate Memorystore Redis ─────────────────────────────────
-info "Checking Memorystore Redis..."
-
-REDIS_EXISTS=$(timeout 30 gcloud redis instances list \
+# ─── Step 1: Check/Start Redis (docker VM default, or Memorystore) ────────────
+VM_ZONE="${REGION}-a"
+info "Checking docker-Redis GCE VM (${REDIS_VM}) — the commercial default..."
+VM_STATUS=$(timeout 30 gcloud compute instances describe "${REDIS_VM}" \
   --project="$PROJECT_ID" \
-  --region="$REGION" \
-  --filter="name:${REDIS_INSTANCE}" \
-  --format="value(name)" 2>/dev/null || echo "")
+  --zone="$VM_ZONE" \
+  --format="value(status)" 2>/dev/null || echo "")
 
-if [[ -z "$REDIS_EXISTS" ]]; then
-  warn "Redis instance not found — needs to be recreated from backup"
-  
-  # Find latest backup
-  CONFIG_BUCKET=$(timeout 30 gcloud storage buckets list \
-    --project="$PROJECT_ID" \
-    --filter="name~token-opt-config" \
-    --format="value(name)" 2>/dev/null | head -1 || echo "")
-  
-  if [[ -n "$CONFIG_BUCKET" ]]; then
-    LATEST_BACKUP=$(timeout 30 gsutil ls "gs://${CONFIG_BUCKET}/backups/redis-backup-*.rdb" 2>/dev/null | sort -r | head -1 || echo "")
-    if [[ -n "$LATEST_BACKUP" ]]; then
-      info "Found backup: ${LATEST_BACKUP}"
-      warn "Note: You'll need to restore this backup manually after Redis is created"
-      warn "Or run: gcloud redis instances import --source-uri=${LATEST_BACKUP}"
-    fi
-  fi
-  
-  warn "Redis must be recreated via Terraform or gcloud"
-  warn "Run: cd infra && terraform apply (to recreate Redis)"
-  warn "OR: Continue without Redis (proxy will use in-memory fallback)"
-  
-  echo -en "${YELLOW}Continue without Redis for now? (y/yes/no): ${NC}"
-  read -r continue_no_redis
-  if [[ "$continue_no_redis" != "yes" && "$continue_no_redis" != "y" ]]; then
-    info "Exiting. Please restore Redis first."
-    exit 0
+if [[ -n "$VM_STATUS" ]]; then
+  # VM exists (stop-gcp.sh stops it, never deletes it) — just start it back up.
+  if [[ "$VM_STATUS" == "RUNNING" ]]; then
+    success "Redis VM already RUNNING"
+  else
+    info "Starting Redis VM (state: ${VM_STATUS})..."
+    timeout 120 gcloud compute instances start "${REDIS_VM}" \
+      --project="$PROJECT_ID" \
+      --zone="$VM_ZONE" \
+      --quiet || warn "Redis VM start failed"
+    success "Redis VM started (container runs with --save \"\" — no data to restore, self-heals cold)"
   fi
 else
-  info "Redis instance exists — checking status..."
-  for i in $(seq 1 30); do
-    REDIS_STATE=$(timeout 15 gcloud redis instances describe "${REDIS_INSTANCE}" \
-      --project="$PROJECT_ID" \
-      --region="$REGION" \
-      --format="value(state)" 2>/dev/null || echo "")
-    [[ "$REDIS_STATE" == "READY" ]] && break
-    [[ "$REDIS_STATE" == "STATE_UNSPECIFIED" ]] && break
-    sleep 10
-    echo -n "."
-  done
-  echo ""
-  if [[ "$REDIS_STATE" == "READY" ]]; then
-    success "Memorystore Redis is READY"
+  info "No docker-Redis VM found — checking Memorystore..."
+  REDIS_EXISTS=$(timeout 30 gcloud redis instances list \
+    --project="$PROJECT_ID" \
+    --region="$REGION" \
+    --filter="name:${REDIS_INSTANCE}" \
+    --format="value(name)" 2>/dev/null || echo "")
+
+  if [[ -z "$REDIS_EXISTS" ]]; then
+    # Neither backend found. Two cases: (a) redis_backend=memorystore and stop-gcp.sh
+    # deleted it (Memorystore has no stop/start — delete/create only), or (b) infra was
+    # never applied / the VM was removed out-of-band. Recreate whichever this project's
+    # terraform.tfvars actually specifies (no -var override — respect the real config).
+    info "No Redis found on either backend — recreating via terraform apply (cold cache, self-heals; nothing durable lives in Redis)..."
+    if [[ -d "${REPO_ROOT}/infra" ]]; then
+      ( cd "${REPO_ROOT}/infra" \
+        && terraform init -upgrade >/dev/null 2>&1 \
+        && terraform apply -target='google_redis_instance.cache' \
+             -target='google_compute_instance.redis' -auto-approve ) \
+        && success "Redis recreated via Terraform (backend per terraform.tfvars)" \
+        || warn "terraform apply for Redis failed — recreate manually (cd infra && terraform apply). Proxy falls back to in-memory rate-limit meanwhile."
+    else
+      warn "infra/ not found — cannot auto-recreate Redis. Run 'terraform apply' where your infra lives."
+    fi
   else
-    warn "Redis state: ${REDIS_STATE} — may still be initializing"
+    info "Memorystore Redis instance exists — checking status..."
+    for i in $(seq 1 30); do
+      REDIS_STATE=$(timeout 15 gcloud redis instances describe "${REDIS_INSTANCE}" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --format="value(state)" 2>/dev/null || echo "")
+      [[ "$REDIS_STATE" == "READY" ]] && break
+      [[ "$REDIS_STATE" == "STATE_UNSPECIFIED" ]] && break
+      sleep 10
+      echo -n "."
+    done
+    echo ""
+    if [[ "$REDIS_STATE" == "READY" ]]; then
+      success "Memorystore Redis is READY"
+    else
+      warn "Redis state: ${REDIS_STATE} — may still be initializing"
+    fi
   fi
 fi
 

@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# stop-gcp.sh — ZERO-COST pause: backup Redis to GCS, delete Memorystore
+# stop-gcp.sh — ZERO-COST pause: stop/delete Redis (either backend), stop Cloud SQL
 # =============================================================================
 # Usage:
 #   ./scripts/gcp/stop-gcp.sh [--project PROJECT_ID] [--region REGION]
 #
 # What this does:
-#   1. Exports Redis data to GCS (backup)
-#   2. Deletes Memorystore Redis instance (stops all billing)
-#   3. Stops Cloud SQL instance (stops compute; ~$2/month storage remains)
-#   4. Cloud Run (proxy, Qdrant, sidecars): already scales to zero — no action needed
+#   1. Redis — backend auto-detected, no backup (ephemeral cache/counters only;
+#      durable data lives in Cloud SQL, see Step 2):
+#        - memorystore: DELETE the instance (Memorystore cannot be paused).
+#        - docker (GCE VM, the commercial DEFAULT — deploy-commercial-gcp.sh
+#          defaults --redis docker): STOP the VM (`gcloud compute instances stop`).
+#          Cheaper + simpler than Memorystore: stopped compute is ~free, the boot
+#          disk persists, and start-gcp.sh just restarts it — but the container
+#          itself already runs with --save "" (non-persistent), so there was never
+#          any Redis *data* to preserve on the VM either way.
+#   2. Stops Cloud SQL instance (stops compute; ~$2/month storage remains)
+#   3. Cloud Run (proxy, Qdrant, sidecars): already scales to zero — no action needed
 #      Qdrant data persists on Cloud Run storage between scale-to-zero cycles.
 #
 # To resume: run scripts/gcp/start-gcp.sh
@@ -19,9 +26,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PROJECT_ID=""
-REGION="asia-south1"
+REGION=""   # resolved below: --region flag > GCP_REGION (.env.gcp) > asia-south1
 SQL_INSTANCE="token-opt-pg"
-REDIS_INSTANCE="token-opt-redis"
+REDIS_INSTANCE="token-opt-redis"        # Memorystore instance name (redis_backend=memorystore)
+REDIS_VM="token-opt-redis-vm"           # GCE VM name (redis_backend=docker, THE DEFAULT)
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -70,8 +78,8 @@ echo "╔═══════════════════════�
 echo "║   TokenLean — Token Optimisation Framework           ║"
 echo "║   STOP INFRA                                         ║"
 echo "╠══════════════════════════════════════════════════════╣"
-echo "║  This will backup and delete Redis, stop Cloud SQL   ║"
-echo "║  to achieve zero compute billing.                    ║"
+echo "║  This will delete Redis and stop Cloud SQL to        ║"
+echo "║  achieve zero compute billing.                       ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -79,48 +87,47 @@ echo -en "${YELLOW}Are you sure? (y/yes/no): ${NC}"
 read -r confirm
 [[ "$confirm" != "yes" && "$confirm" != "y" ]] && { info "Aborted."; exit 0; }
 
-# ─── Step 1: Backup Redis to GCS ─────────────────────────────────────────────
-info "Backing up Redis data to GCS..."
-
-# Get Redis connection info (30s timeout to avoid hanging if GCP API is slow)
-REDIS_HOST=$(timeout 30 gcloud redis instances describe "${REDIS_INSTANCE}" \
+# ─── Step 1: Delete Memorystore Redis (stops all billing) ────────────────────
+# No backup: Redis holds ONLY ephemeral cache + rate-limit counters + transient
+# G10-G13-G18 state — never a system of record. Durable data (billing usage_events,
+# tenant_configs, audit_events, pgvector RAG) lives in Cloud SQL, which we only STOP
+# (data preserved). start-gcp.sh recreates Redis via terraform apply; the cache is
+# cold and self-heals. So a stop→start cycle is lossless for anything that matters.
+info "Checking Memorystore Redis..."
+REDIS_EXISTS=$(timeout 30 gcloud redis instances describe "${REDIS_INSTANCE}" \
   --project="$PROJECT_ID" \
   --region="$REGION" \
-  --format="value(host)" 2>/dev/null || echo "")
+  --format="value(name)" 2>/dev/null || echo "")
 
-if [[ -n "$REDIS_HOST" ]]; then
-  # Get GCS bucket for config (created by Terraform)
-  CONFIG_BUCKET=$(timeout 30 gcloud storage buckets list \
-    --project="$PROJECT_ID" \
-    --filter="name~token-opt-config" \
-    --format="value(name)" 2>/dev/null | head -1 || echo "")
-  
-  if [[ -n "$CONFIG_BUCKET" ]]; then
-    # Export Redis data using redis-cli if available, or warning
-    if command -v redis-cli &>/dev/null; then
-      BACKUP_FILE="redis-backup-$(date +%Y%m%d-%H%M%S).rdb"
-      info "Exporting Redis data..."
-      timeout 60 redis-cli -h "$REDIS_HOST" --rdb "/tmp/${BACKUP_FILE}" 2>/dev/null || warn "Redis backup failed - continuing anyway"
-      if [[ -f "/tmp/${BACKUP_FILE}" ]]; then
-        timeout 120 gsutil cp "/tmp/${BACKUP_FILE}" "gs://${CONFIG_BUCKET}/backups/" && success "Redis backup saved to GCS"
-        rm -f "/tmp/${BACKUP_FILE}"
-      fi
-    else
-      warn "redis-cli not installed - skipping Redis backup (data will be lost)"
-    fi
-  else
-    warn "Config bucket not found - skipping Redis backup"
-  fi
-  
-  # ─── Step 2: Delete Memorystore Redis (stops all billing) ────────────────────
-  warn "Deleting Memorystore Redis instance to stop billing..."
+if [[ -n "$REDIS_EXISTS" ]]; then
+  warn "Deleting Memorystore Redis instance to stop billing (ephemeral cache — no backup needed)..."
   timeout 300 gcloud redis instances delete "${REDIS_INSTANCE}" \
     --project="$PROJECT_ID" \
     --region="$REGION" \
     --quiet || warn "Redis deletion failed or already deleted"
   success "Memorystore Redis deleted — billing stopped"
 else
-  info "Redis instance not found - may already be deleted"
+  info "No Memorystore instance found — checking docker-Redis GCE VM (commercial default)..."
+  VM_ZONE="${REGION}-a"
+  VM_STATUS=$(timeout 30 gcloud compute instances describe "${REDIS_VM}" \
+    --project="$PROJECT_ID" \
+    --zone="$VM_ZONE" \
+    --format="value(status)" 2>/dev/null || echo "")
+
+  if [[ -n "$VM_STATUS" ]]; then
+    if [[ "$VM_STATUS" == "TERMINATED" ]]; then
+      info "Redis VM (${REDIS_VM}) already stopped"
+    else
+      warn "Stopping Redis VM ${REDIS_VM} (state: ${VM_STATUS})..."
+      timeout 180 gcloud compute instances stop "${REDIS_VM}" \
+        --project="$PROJECT_ID" \
+        --zone="$VM_ZONE" \
+        --quiet || warn "Redis VM stop failed"
+      success "Redis VM stopped — compute billing stopped (boot disk persists, ~pennies/month)"
+    fi
+  else
+    info "No Redis found on either backend (Memorystore or docker VM) — nothing to stop"
+  fi
 fi
 
 # ─── Step 3: Stop Cloud SQL instance ──────────────────────────────────────────

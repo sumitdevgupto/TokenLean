@@ -480,6 +480,14 @@ resource "google_service_account" "proxy_sa" {
 # Item 7 (opt-in): least-privilege secret access. Default keeps the project-wide
 # secretmanager.secretAccessor grant; when var.least_privilege_secret_iam = true the
 # broad grant is dropped and the proxy SA is bound to ONLY the secrets it reads.
+#
+# NOTE: three commercial secrets are created by scripts/commercial/deploy-commercial-gcp.sh
+# (gcloud secrets create), NOT by Terraform, so they cannot be referenced here by resource
+# attribute: `tenant-key-encryption-key` (the BYOK master key), `database-url`, and
+# `sendgrid-api-key`. That script binds the proxy SA to each at creation time via
+# `grant_secret_access` (gated on least_privilege_secret_iam). If you add another
+# script-created secret the proxy must read, bind it there too — this list is Terraform-owned
+# secrets only.
 locals {
   proxy_secret_ids = var.least_privilege_secret_iam ? concat([
     google_secret_manager_secret.db_password.secret_id,

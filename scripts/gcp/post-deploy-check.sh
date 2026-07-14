@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_ID=""
-REGION="asia-south1"
+REGION=""   # resolved below: --region flag > GCP_REGION (.env.gcp) > asia-south1
 
 # Service names
 SQL_INSTANCE="token-opt-pg"
@@ -31,6 +31,8 @@ SERVICES=(
   "llmlingua-svc"
   "routellm-svc"
   "langfuse-svc"
+  "tika-svc"
+  "portal-svc"
 )
 
 # Colors
@@ -309,8 +311,10 @@ else
   ((WARNINGS++))
 fi
 
-# Check critical secrets exist
-CRITICAL_SECRETS=("token-opt-db-password" "llm-key-openai")
+# Check critical secrets exist. Includes the commercial BYOK secrets:
+# tenant-key-encryption-key = the BYOK master key (Fernet); database-url = the DB DSN
+# stored as a secret (item 9) rather than a plaintext env var.
+CRITICAL_SECRETS=("token-opt-db-password" "llm-key-openai" "tenant-key-encryption-key" "database-url")
 for secret in "${CRITICAL_SECRETS[@]}"; do
   if gcloud secrets versions access latest --secret="$secret" --project="$PROJECT_ID" &>/dev/null; then
     success "Secret ${secret}: Has active version"
@@ -320,6 +324,28 @@ for secret in "${CRITICAL_SECRETS[@]}"; do
     ((WARNINGS++))
   fi
 done
+
+# ─── BYOK hardening posture (commercial) ─────────────────────────────────────
+# Confirms the master key is KMS-wrapped and the KMS key ring exists — i.e. reading
+# the Secret Manager value alone does not yield plaintext (decrypt is a separable
+# IAM grant). Absent/plaintext is a WARN (a valid OSS/unhardened deploy), not fatal.
+info "Checking BYOK hardening posture..."
+KMS_ENV=$(gcloud run services describe token-proxy --region="$REGION" --project="$PROJECT_ID" \
+  --format='value(spec.template.spec.containers[0].env)' 2>/dev/null | grep -c TENANT_KEY_KMS_KEY || true)
+if [[ "${KMS_ENV:-0}" -ge 1 ]]; then
+  success "BYOK master key: KMS-wrapped (TENANT_KEY_KMS_KEY set on token-proxy)"
+  ((HEALTHY++))
+else
+  warn "BYOK master key: plaintext (TENANT_KEY_KMS_KEY not set — enable_kms_master_key=false / HARDEN_KMS=false)"
+  ((WARNINGS++))
+fi
+if gcloud kms keys list --location="$REGION" --keyring=token-opt-byok --project="$PROJECT_ID" &>/dev/null; then
+  success "KMS key ring token-opt-byok: present (decrypt is a separable grant)"
+  ((HEALTHY++))
+else
+  warn "KMS key ring token-opt-byok: absent (KMS envelope not enabled)"
+  ((WARNINGS++))
+fi
 
 # ─── Check 6: GCS Bucket ─────────────────────────────────────────────────────
 info "Checking GCS bucket..."
