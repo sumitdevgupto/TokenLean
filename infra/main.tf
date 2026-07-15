@@ -763,6 +763,14 @@ resource "google_cloud_run_v2_service" "qdrant" {
       ports {
         container_port = 6333
       }
+
+      # Startup CPU boost: give the container extra CPU during cold start so it
+      # loads its collections faster (no idle-cost impact — boost applies only
+      # during startup). Matches the --cpu-boost flag on the gcloud-deployed
+      # request-serving services (proxy, sidecars, portal, langfuse, grafana, tika).
+      resources {
+        startup_cpu_boost = true
+      }
     }
   }
 

@@ -405,6 +405,7 @@ deploy_services() {
     --service-account="$PROXY_SA" \
     --allow-unauthenticated \
     --memory=2Gi --cpu=2 \
+    --cpu-boost \
     --max-instances=1 \
     --timeout=60 \
     --set-env-vars="LOG_LEVEL=INFO" \
@@ -442,6 +443,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
       --ingress=internal \
       --allow-unauthenticated \
       --memory=2Gi --cpu=2 \
+      --cpu-boost \
       --max-instances=1 \
       --timeout=60 \
       --set-env-vars="LOG_LEVEL=INFO,ROUTELLM_STRONG_MODEL=${ROUTELLM_STRONG},ROUTELLM_WEAK_MODEL=${ROUTELLM_WEAK}" \
@@ -504,6 +506,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --add-cloudsql-instances="${DB_CONNECTION}" \
     ${LF_AUTH_FLAG} \
     --memory=1Gi --cpu=1 \
+    --cpu-boost \
     --max-instances=1 \
     --port=3000 \
     --set-env-vars="DATABASE_URL=${DB_URL},NEXTAUTH_URL=https://placeholder.invalid" \
@@ -547,6 +550,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --add-cloudsql-instances="${DB_CONNECTION}" \
     --allow-unauthenticated \
     --memory=4Gi --cpu=2 \
+    --cpu-boost \
     --min-instances=0 --max-instances="${PROXY_MAX_INSTANCES:-1}" \
     --timeout=120 \
     --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},\
@@ -601,6 +605,7 @@ LOG_LEVEL=INFO" \
     --add-cloudsql-instances="${DB_CONNECTION}" \
     --allow-unauthenticated \
     --memory=512Mi --cpu=1 \
+    --cpu-boost \
     --max-instances=1 \
     --set-env-vars="GF_SERVER_HTTP_PORT=8080,\
 GF_PATHS_PROVISIONING=//etc/grafana/provisioning,\
@@ -632,6 +637,7 @@ LANGFUSE_DB_USER=token_opt_app" \
       --service-account="$PROXY_SA" \
       --allow-unauthenticated \
       --memory=1Gi --cpu=1 \
+      --cpu-boost \
       --max-instances=1 \
       --timeout=60 \
       --port=9998 \
