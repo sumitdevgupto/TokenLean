@@ -25,7 +25,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # cache's 384-dim vector space and poisoning stored cache_l2 rows. Bump deliberately.
 ARG L2_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ARG L2_EMBEDDING_REVISION=5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${L2_EMBEDDING_MODEL}', revision='${L2_EMBEDDING_REVISION}')"
+# The revision-pinned download creates ONLY snapshots/<sha> — huggingface_hub writes a
+# refs/<name> file for branch/tag revisions, NOT for commit SHAs. Runtime loads the model
+# WITHOUT a revision (resolves "main" → needs refs/main), so an offline/egress-restricted
+# host cache-MISSES the baked model. Write refs/main → pinned SHA ourselves (the bare SHA,
+# no trailing newline — exactly what hf_hub writes for a branch) so the offline lookup
+# resolves while the build stays immutably pinned.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${L2_EMBEDDING_MODEL}', revision='${L2_EMBEDDING_REVISION}')" && \
+    REF_DIR="/root/.cache/huggingface/hub/models--$(echo "${L2_EMBEDDING_MODEL}" | sed 's|/|--|g')/refs" && \
+    mkdir -p "$REF_DIR" && printf '%s' "${L2_EMBEDDING_REVISION}" > "$REF_DIR/main"
 
 COPY . .
 

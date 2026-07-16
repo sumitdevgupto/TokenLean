@@ -1,0 +1,23 @@
+# Purpose-built key-sync image for the in-VPC Cloud Run Job.
+#
+# WHY a dedicated image (not the proxy-commercial image): the sync must run from a
+# minimal, app-free container over the private-IP Cloud SQL socket. sync_proxy_keys.py
+# is standalone (asyncpg only — no proxy package), so the image carries just Python +
+# asyncpg + the script + the freshly-minted local-keys.json (COPYed into the build
+# context by scripts/gcp/sync-proxy-keys-job.sh, then removed from the repo right after).
+#
+# The job reaches the (public OR private) Cloud SQL instance over the Cloud SQL Auth
+# Proxy Unix socket mounted at /cloudsql/<conn> by --set-cloudsql-instances, so no
+# private IP address is ever needed and the SAME image works for both connectivity modes.
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir asyncpg
+
+WORKDIR /app
+
+COPY sync_proxy_keys.py /app/sync_proxy_keys.py
+# local-keys.json is copied into infra/migrations/ by sync-proxy-keys-job.sh right
+# before `docker build` and removed immediately after (it holds key hashes — never lingers).
+COPY local-keys.json /app/local-keys.json
+
+CMD ["python", "/app/sync_proxy_keys.py"]

@@ -73,13 +73,12 @@ MIGRATE_SA=$(terraform output -raw proxy_service_account_email 2>/dev/null) \
   || error "could not read proxy_service_account_email from Terraform."
 cd "${REPO_ROOT}"
 
-# pgvector.sql only when Qdrant is disabled (G07 pgvector fallback) — mirrors the
-# Terraform `count = var.enable_qdrant ? 0 : 1` gate on null_resource.pgvector_extension.
-# Fall back to TF_VAR_enable_qdrant so a standalone run inside the deploy env (which
-# exports both) or a Terraform-var-only env still picks the right backend.
-ENABLE_QDRANT="${ENABLE_QDRANT:-${TF_VAR_enable_qdrant:-true}}"
-RUN_PGVECTOR="false"
-[[ "$ENABLE_QDRANT" != "true" ]] && RUN_PGVECTOR="true"
+# pgvector.sql ALWAYS runs: it was originally gated on Qdrant being disabled (G07
+# pgvector fallback), but the G05 L2 semantic cache stores its embeddings in pgvector
+# REGARDLESS of the G07 backend — on a Qdrant-enabled stack the missing extension
+# surfaced as `G05 L2 pgvector error: type "vector" does not exist` on every request
+# (L2 cache silently dead). CREATE EXTENSION IF NOT EXISTS is idempotent and free.
+RUN_PGVECTOR="true"
 
 MIGRATE_IMAGE="${REGISTRY_URL}/schema-migrate:latest"
 JOB_NAME="schema-migrate-job"

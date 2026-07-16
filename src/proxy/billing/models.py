@@ -109,6 +109,12 @@ CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx
 -- FREE/ENTERPRISE tier collapse: default new rows to the $0 self-host floor. Existing
 -- legacy-tier rows (e.g. 'basic') are left as-is and invoice at $0 via the invoicing fallback.
 ALTER TABLE usage_events ALTER COLUMN pricing_tier SET DEFAULT 'free';
+-- model/routed_model/otel_trace_id are in the CREATE TABLE above, but that is a no-op when
+-- the table already exists from an earlier (minimal) migration — so self-heal them here too,
+-- else metering's INSERT fails with 'column "model" does not exist'.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS routed_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS otel_trace_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_optimised_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider_prompt_tokens INTEGER;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS response_tokens INTEGER NOT NULL DEFAULT 0;

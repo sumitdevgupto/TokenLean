@@ -101,6 +101,39 @@ async def replace_all(pg_pool, store: dict) -> None:
                 )
 
 
+async def upsert_keys(pg_pool, store: dict) -> int:
+    """Idempotently UPSERT {key_hash: metadata} into proxy_keys WITHOUT deleting rows.
+
+    Unlike ``replace_all`` (transactional replace, incl. deletions), this only inserts
+    new hashes and refreshes existing ones — used by the in-VPC key-sync job so harness
+    keys minted after the first deploy reach the table (``import_blob_store_once`` is
+    guarded on an empty table and never re-runs). Returns the count upserted.
+    """
+    count = 0
+    async with pg_pool.acquire() as conn:
+        for key_hash, entry in store.items():
+            if not isinstance(entry, dict):
+                # Legacy string-format rows: keep them round-trippable.
+                entry = {"tenant_id": str(entry), "tier": "legacy"}
+            extra = {k: v for k, v in entry.items() if k not in _CORE_FIELDS}
+            await conn.execute(
+                "INSERT INTO proxy_keys (key_hash, tenant_id, tier, admin, suspended, created_at, extra) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) "
+                "ON CONFLICT (key_hash) DO UPDATE SET "
+                "tenant_id=EXCLUDED.tenant_id, tier=EXCLUDED.tier, admin=EXCLUDED.admin, "
+                "suspended=EXCLUDED.suspended, created_at=EXCLUDED.created_at, extra=EXCLUDED.extra",
+                key_hash,
+                entry.get("tenant_id", "default"),
+                entry.get("tier", "free"),
+                bool(entry.get("admin")),
+                bool(entry.get("suspended")),
+                entry.get("created_at"),
+                json.dumps(extra),
+            )
+            count += 1
+    return count
+
+
 async def import_blob_store_once(pg_pool) -> int:
     """One-time idempotent migration: if the table is empty and the active blob store
     has keys, copy them in (existing hashes keep validating unchanged). Returns count."""

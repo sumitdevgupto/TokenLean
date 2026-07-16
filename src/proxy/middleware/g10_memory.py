@@ -232,9 +232,10 @@ class SkillsManager:
         """Search for relevant skills."""
         try:
             from qdrant_client import QdrantClient
-            from ml_models import get_text_embedding
+            from ml_models import get_text_embedding, qdrant_client_kwargs
 
-            client = QdrantClient(url=self._qdrant_url)
+            # qdrant_client_kwargs: version-compat + app-layer api-key + GCP IAM bearer.
+            client = QdrantClient(**qdrant_client_kwargs(url=self._qdrant_url))
             model = get_text_embedding(_SKILLS_EMBEDDING_MODEL)
             embedding = list(model.embed([query]))[0].tolist()
 

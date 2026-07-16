@@ -163,9 +163,10 @@ class PGVectorRAG:
             return False
         
         try:
-            # Generate embedding
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            # Generate embedding — shared loader (cached singleton + HF_HUB_OFFLINE guard so
+            # the baked model loads without an HF-CDN metadata call that hangs under VPC egress).
+            from ml_models import get_sentence_transformer
+            model = get_sentence_transformer("all-MiniLM-L6-v2")
             embedding = model.encode(text).tolist()
             
             async with pool.acquire() as conn:

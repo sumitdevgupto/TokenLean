@@ -72,8 +72,10 @@ def _similarity(text_a: str, text_b: str, model: Optional[Any]) -> float:
 def _get_model(cfg: Dict) -> Optional[Any]:
     model_name = cfg.get("embedding_model", "BAAI/bge-small-en-v1.5")
     try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-        return SentenceTransformer(model_name)
+        # Shared loader: cached singleton + HF_HUB_OFFLINE guard (local_files_only so the
+        # baked model loads without an HF-CDN metadata call that hangs under VPC egress).
+        from ml_models import get_sentence_transformer
+        return get_sentence_transformer(model_name)
     except Exception:
         return None
 

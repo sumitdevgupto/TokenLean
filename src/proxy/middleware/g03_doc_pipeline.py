@@ -395,13 +395,14 @@ class RAGFallbackOrchestrator:
         """Execute search with specified strategy."""
         try:
             from qdrant_client import QdrantClient
-            from sentence_transformers import SentenceTransformer
             from ml_models import qdrant_client_kwargs
 
             client = QdrantClient(**qdrant_client_kwargs(url=self.qdrant_url))
             
-            # Embed query
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            # Embed query — shared loader (cached singleton + HF_HUB_OFFLINE guard so the
+            # baked model loads without an HF-CDN metadata call that hangs under VPC egress).
+            from ml_models import get_sentence_transformer
+            model = get_sentence_transformer("all-MiniLM-L6-v2")
             query_embedding = model.encode(query).tolist()
             
             if strategy == "strict_hybrid":

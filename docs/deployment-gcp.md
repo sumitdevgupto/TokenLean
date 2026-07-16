@@ -188,6 +188,11 @@ cd infra && terraform apply
 | `keys.yaml not found` | Copy from template: `cp config/keys.yaml.template config/keys.yaml` and fill in real keys |
 | Redis backup fails | Install redis-cli: `brew install redis` (macOS) or `apt-get install redis-tools` (Linux) |
 | Cloud Run service not found | Check with `gcloud run services list --region=asia-south1` |
+| Requests hang ~120s then **504** (pipeline stalls) | Almost always a **Redis dead-connection hang**: Cloud Run Direct VPC egress silently drops idle TCP connections, so a stale pooled connection blocks until the kernel gives up (~240s). The proxy's Redis pool ships with `socket_timeout`/`health_check_interval` set (`cache/redis_pool.py`), which bounds this — tune via `REDIS_SOCKET_TIMEOUT` / `REDIS_HEALTH_CHECK_INTERVAL`. Look for `STAGE GXX SLOW: <ms>` in the proxy logs to confirm the stalling stage. |
+| `couldn't connect to huggingface.co ... couldn't find them in the cached files` on GCP | The embedding model was baked **revision-pinned** but its `refs/main` was missing, so an offline/egress-restricted runtime cache-misses. Fixed in `src/proxy/Dockerfile` (writes `refs/main` after the pinned bake) — **rebuild the proxy image** if you see this after a Dockerfile bump. |
+| G07 retrieval slow / Qdrant unreachable on GCP | If Qdrant is `ingress=internal`, Cloud Run→Cloud Run calls to its `run.app` URL are rejected unless the caller uses `--vpc-egress=all-traffic`. Either set the proxy to full VPC egress (needs Cloud NAT for LLM egress) or run Qdrant `ingress=all` + IAM (`run.invoker`) so the proxy's identity token authenticates. |
+| Qdrant calls time out (`ConnectTimeout`, empty error strings) despite the service being reachable via curl | **qdrant-client dials port 6333 by default even for `https://` URLs without an explicit port** — Cloud Run serves 443 only, so every request hits a closed port. The shared `ml_models.qdrant_client_kwargs()` pins `port=443` for portless https URLs; if you construct a Qdrant client directly, pass `port=443` (or put the port in the URL). |
+| `G05 L2 pgvector error: type "vector" does not exist` | The pgvector extension is required for the G05 L2 semantic cache **even when Qdrant serves G07**. Re-run the schema migrations (`scripts/gcp/run-migrations-job.sh` on the private-IP path) — `pgvector.sql` now applies unconditionally. |
 
 ---
 

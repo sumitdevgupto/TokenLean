@@ -67,11 +67,16 @@ fi
 # ─── Check if collection exists ───────────────────────────────────────────────
 info "Checking Qdrant collection: ${COLLECTION}..."
 
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+# App-layer auth: the GCP-managed Qdrant enforces an api-key (qdrant-api-key secret,
+# exported as QDRANT_API_KEY by the calling deploy script). Empty locally → no header.
+CURL_AUTH=()
+[[ -n "${QDRANT_API_KEY:-}" ]] && CURL_AUTH=(-H "api-key: ${QDRANT_API_KEY}")
+
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${CURL_AUTH[@]}" \
   "${QDRANT_URL}/collections/${COLLECTION}" 2>/dev/null || echo "000")
 
 if [[ "$HTTP_STATUS" == "200" ]]; then
-  POINTS_COUNT=$(curl -s "${QDRANT_URL}/collections/${COLLECTION}" 2>/dev/null | \
+  POINTS_COUNT=$(curl -s "${CURL_AUTH[@]}" "${QDRANT_URL}/collections/${COLLECTION}" 2>/dev/null | \
     python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('result', {}).get('points_count', 0))" 2>/dev/null || echo "0")
   if [[ "$POINTS_COUNT" -gt 0 ]]; then
     success "Collection ${COLLECTION} already has ${POINTS_COUNT} documents — skipping seed"
@@ -99,7 +104,7 @@ QDRANT_URL="${QDRANT_URL}" python3 "$SEED_SCRIPT" \
   || error "Seeding failed — ensure qdrant-client, sentence-transformers, fastembed are installed"
 
 # ─── Verify ───────────────────────────────────────────────────────────────────
-POINTS_COUNT=$(curl -s "${QDRANT_URL}/collections/${COLLECTION}" 2>/dev/null | \
+POINTS_COUNT=$(curl -s "${CURL_AUTH[@]}" "${QDRANT_URL}/collections/${COLLECTION}" 2>/dev/null | \
   python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('result', {}).get('points_count', 0))" 2>/dev/null || echo "0")
 
 if [[ "$POINTS_COUNT" -gt 0 ]]; then

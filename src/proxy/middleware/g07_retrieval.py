@@ -32,44 +32,11 @@ _DENSE_MODEL = os.getenv("DENSE_EMBEDDING_MODEL", "sentence-transformers/all-Min
 _SPARSE_MODEL = os.getenv("SPARSE_EMBEDDING_MODEL", "Qdrant/bm25")
 _PGVECTOR_URL = os.getenv("DATABASE_URL", "")  # PostgreSQL connection for pgvector fallback
 
-# Cached GCP identity token for authenticating to internal Cloud Run services
-_token_cache: dict = {"token": "", "expires_at": 0.0}
-
-def _get_qdrant_auth_token() -> str:
-    """Return a valid GCP identity token for Qdrant, refreshing if near expiry.
-    
-    Phase 2 fix: Gracefully handles non-GCP local deployments without raising.
-    """
-    import time, urllib.request, socket
-    if _QDRANT_API_KEY:
-        return _QDRANT_API_KEY  # Static override (e.g. non-GCP deployments)
-    
-    # Phase 2: Skip GCP metadata fetch on local/non-GCP environments
-    if os.getenv("QDRANT_LOCAL_NOAUTH") == "1":
-        logger.debug("G07 QDRANT_LOCAL_NOAUTH=1, skipping GCP token fetch")
-        return ""
-    
-    now = time.time()
-    if _token_cache["token"] and now < _token_cache["expires_at"]:
-        return _token_cache["token"]
-    try:
-        url = (
-            "http://metadata.google.internal/computeMetadata/v1/instance/"
-            f"service-accounts/default/identity?audience={_QDRANT_URL}"
-        )
-        req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
-        token = urllib.request.urlopen(req, timeout=5).read().decode().strip()
-        _token_cache["token"] = token
-        _token_cache["expires_at"] = now + 3000  # refresh 10 min before 1h expiry
-        logger.debug("G07 Qdrant identity token refreshed")
-        return token
-    except (socket.gaierror, urllib.error.URLError) as e:
-        # Phase 2: DNS/connection errors on local dev — silent fallback to no-auth
-        logger.debug("G07 GCP metadata unavailable (local env): %s", e)
-        return ""
-    except Exception as e:
-        logger.warning("G07 could not fetch Qdrant identity token: %s", e)
-        return ""
+# GCP Cloud Run IAM auth (identity-token Bearer) is attached centrally by
+# ml_models.qdrant_client_kwargs — the old per-module token fetch lived here but sent
+# the token via the WRONG header (qdrant-client's api_key → `api-key`, which Cloud Run
+# IAM ignores; the Bearer needs auth_token_provider). _QDRANT_API_KEY remains the
+# Qdrant APP-LAYER key (defense-in-depth behind IAM), passed as api_key below.
 
 
 class ChunkGuard:
@@ -413,8 +380,9 @@ async def _hybrid_search(
         )
         from ml_models import qdrant_client_kwargs
 
-        auth = _get_qdrant_auth_token()
-        client = AsyncQdrantClient(**qdrant_client_kwargs(url=qdrant_url, api_key=auth or None))
+        # api_key = the Qdrant app-layer key (`api-key` header); the Cloud Run IAM
+        # Bearer token is attached automatically by qdrant_client_kwargs on GCP.
+        client = AsyncQdrantClient(**qdrant_client_kwargs(url=qdrant_url, api_key=_QDRANT_API_KEY or None))
         dense_embedding = await _embed_dense(query)
         sparse_embedding = await _embed_sparse(query)  # Phase 2: may be None if fastembed unavailable
 

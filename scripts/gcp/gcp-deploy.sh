@@ -499,7 +499,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
       --project="$PROJECT_ID" \
       --service-account="routellm-sidecar-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
       --ingress=internal \
-      --allow-unauthenticated \
+      --no-allow-unauthenticated \
       --memory=2Gi --cpu=2 \
       --cpu-boost \
       --max-instances=1 \
@@ -507,6 +507,13 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
       --set-env-vars="LOG_LEVEL=INFO,ROUTELLM_STRONG_MODEL=${ROUTELLM_STRONG},ROUTELLM_WEAK_MODEL=${ROUTELLM_WEAK}" \
       --set-secrets="OPENAI_API_KEY=routellm-openai-key:latest" \
       --quiet
+
+    # Scrub the legacy allUsers invoker binding left by earlier deploys that used
+    # --allow-unauthenticated. Harmless behind internal ingress today, but a landmine:
+    # if anyone ever flips this service's ingress, allUsers would make it fully public.
+    gcloud run services remove-iam-policy-binding routellm-svc \
+      --region="$REGION" --project="$PROJECT_ID" \
+      --member="allUsers" --role="roles/run.invoker" --quiet &>/dev/null || true
 
     ROUTELLM_URL=$(gcloud run services describe routellm-svc \
       --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
@@ -615,6 +622,16 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     AWS_SECRETS_FLAG="--set-secrets=AWS_ACCESS_KEY_ID=aws-access-key-id:latest,AWS_SECRET_ACCESS_KEY=aws-secret-access-key:latest"
   fi
 
+  # Qdrant app-layer API key (Terraform-generated `qdrant-api-key`): layer 2 behind
+  # Cloud Run IAM. The proxy sends it as the `api-key` header on every Qdrant call
+  # (plus a GCP identity token as `Authorization: Bearer` for the IAM layer — see
+  # ml_models.qdrant_client_kwargs). Mounted only if the secret exists so older
+  # provisions without the Terraform resource still deploy.
+  QDRANT_KEY_SECRET_FLAG=""
+  if timeout 30 gcloud secrets versions access latest --secret="qdrant-api-key" --project="$PROJECT_ID" &>/dev/null; then
+    QDRANT_KEY_SECRET_FLAG="--set-secrets=QDRANT_API_KEY=qdrant-api-key:latest"
+  fi
+
   # Deploy main proxy — LANGFUSE_URL now available
   gcloud run deploy token-proxy \
     --image="${REGISTRY_URL}/proxy:latest" \
@@ -648,6 +665,7 @@ LOG_LEVEL=INFO" \
     ${LANGFUSE_SECRETS_FLAG} \
     ${METRICS_SECRET_FLAG} \
     ${AWS_SECRETS_FLAG} \
+    ${QDRANT_KEY_SECRET_FLAG} \
     --quiet
 
   PROXY_URL=$(gcloud run services describe token-proxy \
@@ -871,23 +889,32 @@ seed_qdrant() {
     return 0
   fi
 
-  # Open ingress temporarily so we can check + seed from outside GCP VPC
-  info "Opening Qdrant ingress temporarily..."
-  gcloud run services update token-opt-qdrant \
-    --region="$REGION" --project="$PROJECT_ID" \
-    --ingress=all --quiet \
-    || { warn "Could not open Qdrant ingress — skipping seed"; return 0; }
+  # Qdrant steady state is ingress=ALL + IAM (run.invoker) + an app-layer api-key —
+  # NOT internal-only (internal ingress rejected even in-VPC Cloud Run callers using the
+  # run.app URL under private-ranges-only egress, silently breaking G07/docs-chat).
+  # For this off-VPC seeding window we add a TEMPORARY allUsers invoker (removed below);
+  # during the window the app-layer api-key still gates every request.
+  info "Opening Qdrant IAM temporarily for off-VPC seeding..."
   gcloud run services add-iam-policy-binding token-opt-qdrant \
     --region="$REGION" --project="$PROJECT_ID" \
     --member=allUsers --role=roles/run.invoker &>/dev/null || true
   sleep 10
 
+  # App-layer key: required on every request once QDRANT__SERVICE__API_KEY is set.
+  local qdrant_api_key
+  qdrant_api_key=$(timeout 30 gcloud secrets versions access latest --secret="qdrant-api-key" \
+    --project="$PROJECT_ID" 2>/dev/null || echo "")
+
   # Check if already seeded (rag_docs is the default/single-tenant collection the proxy reads)
   local points_count
-  points_count=$(python3 -c "
-import urllib.request, json
+  points_count=$(QDRANT_API_KEY="$qdrant_api_key" python3 -c "
+import os, urllib.request, json
 try:
-    r = urllib.request.urlopen('${qdrant_public_url}/collections/rag_docs', timeout=10)
+    req = urllib.request.Request('${qdrant_public_url}/collections/rag_docs')
+    key = os.getenv('QDRANT_API_KEY', '')
+    if key:
+        req.add_header('api-key', key)
+    r = urllib.request.urlopen(req, timeout=10)
     d = json.loads(r.read())
     print(d.get('result', {}).get('points_count', 0))
 except:
@@ -898,21 +925,19 @@ except:
     success "Qdrant rag_docs already has ${points_count} docs — skipping seed (no image change detected)"
   else
     info "Qdrant rag_docs is empty (new revision wipes storage) — seeding now..."
-    "${REPO_ROOT}/scripts/seed-data.sh" --qdrant-url "$qdrant_public_url" \
+    QDRANT_API_KEY="$qdrant_api_key" "${REPO_ROOT}/scripts/seed-data.sh" --qdrant-url "$qdrant_public_url" \
       && success "Qdrant seeded successfully" \
-      || warn "Qdrant seeding failed — run manually: ./scripts/seed-data.sh --qdrant-url ${qdrant_public_url}"
+      || warn "Qdrant seeding failed — run manually: QDRANT_API_KEY=<qdrant-api-key secret> ./scripts/seed-data.sh --qdrant-url ${qdrant_public_url}"
   fi
 
-  # Always revert ingress to internal-only
-  info "Reverting Qdrant ingress to internal-only..."
+  # Always remove the temporary allUsers grant (ingress stays ALL — the steady state;
+  # IAM + the app-layer key are the two standing gates).
+  info "Removing temporary Qdrant allUsers IAM grant..."
   gcloud run services remove-iam-policy-binding token-opt-qdrant \
     --region="$REGION" --project="$PROJECT_ID" \
-    --member=allUsers --role=roles/run.invoker &>/dev/null || true
-  gcloud run services update token-opt-qdrant \
-    --region="$REGION" --project="$PROJECT_ID" \
-    --ingress=internal --quiet \
-    || warn "Could not revert Qdrant ingress — run manually: gcloud run services update token-opt-qdrant --ingress=internal --region=${REGION}"
-  success "Qdrant ingress reverted to internal-only"
+    --member=allUsers --role=roles/run.invoker &>/dev/null \
+    || warn "Could not remove Qdrant allUsers grant — run manually: gcloud run services remove-iam-policy-binding token-opt-qdrant --member=allUsers --role=roles/run.invoker --region=${REGION}"
+  success "Qdrant IAM restored (invoker-only, ingress stays ALL + api-key)"
 }
 
 # ─── Step 7: Patch Prometheus/Alertmanager with real service URLs ────────────

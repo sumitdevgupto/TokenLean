@@ -575,6 +575,9 @@ locals {
     # them the Cloud Run deploy fails with "Permission denied on secret".
     google_secret_manager_secret.grafana_admin_password.secret_id,
     google_secret_manager_secret.metrics_scrape_token.secret_id,
+    # qdrant-svc + token-proxy + docs-seed-job all run as the proxy SA and mount
+    # the Qdrant app-layer key (QDRANT__SERVICE__API_KEY resp. QDRANT_API_KEY).
+    google_secret_manager_secret.qdrant_api_key.secret_id,
   ], [for s in google_secret_manager_secret.llm_key_extra : s.secret_id]) : []
 }
 
@@ -707,15 +710,16 @@ resource "google_project_iam_member" "proxy_run_invoker" {
   member  = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
-# ─── pgvector extension (G07 pgvector fallback — enable_qdrant = false) ───────
-# When Qdrant is disabled, G07 uses PostgreSQL/pgvector on Cloud SQL. Enable the
-# `vector` extension on the token_opt DB so PGVectorRAG can create its table.
+# ─── pgvector extension (G05 L2 cache + G07 pgvector fallback) ────────────────
+# The `vector` extension is needed REGARDLESS of the G07 backend: the G05 L2 semantic
+# cache stores its embeddings in pgvector on Cloud SQL even when Qdrant serves G07
+# (missing it → `G05 L2 pgvector error: type "vector" does not exist` on every request,
+# L2 cache silently dead). G07's PGVectorRAG fallback additionally needs it when
+# enable_qdrant=false.
 resource "null_resource" "pgvector_extension" {
-  # Only needed when Qdrant is disabled (G07 pgvector fallback). AND only via the
-  # local-exec path on the public-IP deploy — on the private-IP path the in-VPC
-  # migration job applies pgvector.sql instead (gated identically in that script on
-  # ENABLE_QDRANT=false). Both conditions must hold for the local-exec to run.
-  count = (var.enable_qdrant || var.private_cloud_sql) ? 0 : 1
+  # local-exec path applies only on the public-IP deploy — on the private-IP path the
+  # in-VPC migration job (run-migrations-job.sh) applies pgvector.sql unconditionally.
+  count = var.private_cloud_sql ? 0 : 1
   triggers = {
     schema_version = "1"
   }
@@ -840,11 +844,43 @@ resource "google_compute_firewall" "redis_internal" {
 }
 
 # ─── Qdrant (G03 doc-pipeline ingestion, G07 hybrid search) ──────────────────
+# Qdrant app-layer API key (defense-in-depth, generated once at provision time —
+# never in .env/git). Layer 1 is Cloud Run IAM (ingress ALL + run.invoker required:
+# unauthenticated hits are rejected at Google's front end and never reach the
+# container). Layer 2 is this key, enforced by Qdrant itself — so even a
+# misconfigured IAM grant (e.g. a lingering allUsers from a seeding window)
+# exposes nothing. Created unconditionally (a secret is ~free) so the proxy's
+# QDRANT_API_KEY mount never dangles when enable_qdrant is toggled.
+resource "random_password" "qdrant_api_key" {
+  length  = 48
+  special = false # header-safe (sent as the `api-key` HTTP header)
+}
+
+resource "google_secret_manager_secret" "qdrant_api_key" {
+  secret_id = "qdrant-api-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "qdrant_api_key" {
+  secret      = google_secret_manager_secret.qdrant_api_key.id
+  secret_data = random_password.qdrant_api_key.result
+}
+
 resource "google_cloud_run_v2_service" "qdrant" {
   count    = var.enable_qdrant ? 1 : 0
   name     = "token-opt-qdrant"
   location = var.region
-  ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  # INGRESS_TRAFFIC_ALL + IAM (no allUsers binding anywhere): callers must present a
+  # Google-signed identity token for a run.invoker principal (the proxy SA holds a
+  # project-level grant). INTERNAL_ONLY is NOT usable here: Cloud Run→Cloud Run calls
+  # to a run.app URL only count as "internal" with --vpc-egress=all-traffic, which
+  # would force ALL proxy egress (incl. OpenAI) through the VPC and require Cloud NAT.
+  # Verified empirically 2026-07-16: with private-ranges-only egress + INTERNAL_ONLY,
+  # ZERO proxy/job requests ever reached this service (rejected at the GFE).
+  ingress = "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = google_service_account.proxy_sa.email
@@ -854,6 +890,18 @@ resource "google_cloud_run_v2_service" "qdrant" {
 
       ports {
         container_port = 6333
+      }
+
+      # App-layer auth (layer 2 behind Cloud Run IAM) — Qdrant rejects requests
+      # without this key even if an IAM misconfiguration lets them through.
+      env {
+        name = "QDRANT__SERVICE__API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.qdrant_api_key.secret_id
+            version = "latest"
+          }
+        }
       }
 
       # Startup CPU boost: give the container extra CPU during cold start so it
@@ -866,7 +914,7 @@ resource "google_cloud_run_v2_service" "qdrant" {
     }
   }
 
-  depends_on = [google_project_service.apis]
+  depends_on = [google_project_service.apis, google_secret_manager_secret_version.qdrant_api_key]
 }
 
 # ─── RouteLLM Sidecar Service Account ───────────────────────────────────────
