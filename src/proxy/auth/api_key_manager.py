@@ -177,6 +177,36 @@ def is_suspended(metadata: Optional[dict]) -> bool:
     return bool(isinstance(metadata, dict) and metadata.get("suspended"))
 
 
+def is_contract_inactive(metadata: Optional[dict]) -> bool:
+    """Return True when a validated key's tenant has an inactive/pending contract.
+
+    Mirrors ``is_suspended``: the *blocking* state is stamped into the key metadata
+    (``contract_inactive``) by the commercial admin lifecycle via
+    ``set_contract_active``; this proxy only *enforces* it (HTTP 403 at
+    ``_authenticate``). The flag's ABSENCE means "active" — so legacy keys that
+    predate the contract feature (and every key of an active tenant) are never
+    blocked. ``companies.contract_status`` is the source-of-record; this metadata
+    field is the derived per-request enforcement copy.
+    """
+    return bool(isinstance(metadata, dict) and metadata.get("contract_inactive"))
+
+
+def get_ip_allowlist(metadata: Optional[dict]) -> List[str]:
+    """Return the per-tenant source-IP CIDR allowlist stamped in the key metadata.
+
+    Written by the commercial admin lifecycle via ``set_ip_allowlist``; read at
+    ``_authenticate`` alongside the global allowlist from ``config.yaml``. An empty
+    list means "no per-tenant restriction" (the tenant is governed only by the
+    global allowlist, if any). ``companies.ip_allowlist`` is the source-of-record;
+    this is the derived per-request enforcement copy.
+    """
+    if isinstance(metadata, dict):
+        val = metadata.get("ip_allowlist")
+        if isinstance(val, list):
+            return [str(c) for c in val]
+    return []
+
+
 def get_tenant_for_key(api_key: str) -> Optional[dict]:
     """
     Get tenant metadata for a validated API key.
@@ -312,7 +342,8 @@ def create_key(
     metadata: dict = {}
     if isinstance(extra, dict):
         metadata.update({k: v for k, v in extra.items()
-                         if k not in ("tenant_id", "tier", "created_at", "admin", "suspended")})
+                         if k not in ("tenant_id", "tier", "created_at", "admin", "suspended",
+                                      "contract_inactive", "ip_allowlist")})
     metadata.update({
         "tenant_id": tenant_id,
         "tier": (tier or "free").strip().lower(),
@@ -337,6 +368,11 @@ def set_suspended(tenant_id: str, suspended: bool = True) -> int:
 
     Enforcement already exists (``is_suspended`` → HTTP 403 at ``main.py`` ``_authenticate``);
     this is the tool that was missing to actually set the flag. Idempotent.
+
+    Pattern note: ``set_contract_active`` and ``set_ip_allowlist`` mirror this exact
+    load-modify-persist shape — the invariant across all three is that the commercial
+    source-of-record (``companies``) is written by ``api/admin.py``, and the derived
+    per-request enforcement copy rides the key metadata that core reads here.
     """
     tenant_id = (tenant_id or "").strip()
     changed = 0
@@ -355,6 +391,68 @@ def set_suspended(tenant_id: str, suspended: bool = True) -> int:
     logger.info(
         "%s %d key(s) tenant=%s", "Suspended" if suspended else "Unsuspended", changed, tenant_id
     )
+    return changed
+
+
+def set_contract_active(tenant_id: str, active: bool = True) -> int:
+    """Set/clear the ``contract_inactive`` flag on ALL keys for a tenant.
+
+    Mirrors ``set_suspended`` exactly, but with the OPPOSITE sense: the *blocking*
+    state (``contract_inactive``) is stored, and its absence means active — so a key
+    that predates this feature is never accidentally locked out. When ``active`` is
+    False the flag is stamped; when True it is popped. Enforcement lives in
+    ``is_contract_inactive`` → HTTP 403 at ``main.py`` ``_authenticate``. Idempotent.
+    Returns the number of keys changed.
+    """
+    tenant_id = (tenant_id or "").strip()
+    want_inactive = not active
+    changed = 0
+    with _STORE_WRITE_LOCK:
+        store = _load_full_store()
+        for entry in store.values():
+            if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id:
+                if bool(entry.get("contract_inactive")) != want_inactive:
+                    if want_inactive:
+                        entry["contract_inactive"] = True
+                    else:
+                        entry.pop("contract_inactive", None)
+                    changed += 1
+        if changed:
+            _persist_store(store)
+    logger.info(
+        "Contract %s %d key(s) tenant=%s",
+        "deactivated" if want_inactive else "activated", changed, tenant_id,
+    )
+    return changed
+
+
+def set_ip_allowlist(tenant_id: str, cidrs: List[str]) -> int:
+    """Set the per-tenant source-IP CIDR allowlist on ALL keys for a tenant.
+
+    An empty/None ``cidrs`` clears the restriction (the ``ip_allowlist`` key is
+    popped). CIDR *validation* is the caller's responsibility (the commercial admin
+    endpoint validates with ``ipaddress`` before calling this) — the engine stays
+    dumb. Enforcement lives in ``get_ip_allowlist`` + the ``net.ip_allowlist``
+    checker at ``main.py`` ``_authenticate``. Idempotent. Returns keys changed.
+    """
+    tenant_id = (tenant_id or "").strip()
+    new_val = [str(c) for c in (cidrs or [])]
+    changed = 0
+    with _STORE_WRITE_LOCK:
+        store = _load_full_store()
+        for entry in store.values():
+            if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id:
+                cur = entry.get("ip_allowlist") or []
+                if list(cur) != new_val:
+                    if new_val:
+                        entry["ip_allowlist"] = list(new_val)
+                    else:
+                        entry.pop("ip_allowlist", None)
+                    changed += 1
+        if changed:
+            _persist_store(store)
+    logger.info("Set ip_allowlist (%d cidr) on %d key(s) tenant=%s",
+                len(new_val), changed, tenant_id)
     return changed
 
 
@@ -428,9 +526,11 @@ def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
 def list_tenants() -> List[dict]:
     """Aggregate the key store by tenant for the management console.
 
-    Returns ``[{tenant_id, tier, admin, suspended, key_count, created_at}]`` sorted by
-    tenant_id — NEVER any raw key or hash. Legacy string-format entries group under their
-    user_id with tier ``"legacy"``.
+    Returns ``[{tenant_id, tier, admin, suspended, contract_inactive, key_count,
+    created_at}]`` sorted by tenant_id — NEVER any raw key or hash. Legacy
+    string-format entries group under their user_id with tier ``"legacy"``.
+    ``contract_inactive`` is the metadata-derived enforcement copy; the admin router
+    joins the authoritative ``companies.contract_status`` on top for display.
     """
     store = _load_full_store()
     tenants: dict = {}
@@ -439,12 +539,13 @@ def list_tenants() -> List[dict]:
             tid = entry.get("tenant_id", "default")
             agg = tenants.setdefault(tid, {
                 "tenant_id": tid, "tier": entry.get("tier", "free"),
-                "admin": False, "suspended": False, "key_count": 0,
-                "created_at": entry.get("created_at"),
+                "admin": False, "suspended": False, "contract_inactive": False,
+                "key_count": 0, "created_at": entry.get("created_at"),
             })
             agg["key_count"] += 1
             agg["admin"] = agg["admin"] or bool(entry.get("admin"))
             agg["suspended"] = agg["suspended"] or bool(entry.get("suspended"))
+            agg["contract_inactive"] = agg["contract_inactive"] or bool(entry.get("contract_inactive"))
             ca = entry.get("created_at")
             if ca and (agg["created_at"] is None or ca < agg["created_at"]):
                 agg["created_at"] = ca
@@ -452,7 +553,8 @@ def list_tenants() -> List[dict]:
             tid = str(entry)
             agg = tenants.setdefault(tid, {
                 "tenant_id": tid, "tier": "legacy", "admin": False,
-                "suspended": False, "key_count": 0, "created_at": None,
+                "suspended": False, "contract_inactive": False,
+                "key_count": 0, "created_at": None,
             })
             agg["key_count"] += 1
     return sorted(tenants.values(), key=lambda t: t["tenant_id"])

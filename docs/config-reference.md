@@ -60,6 +60,18 @@ behaviour is unchanged.
 | `usage_days` | `0` | Purge `usage_events` older than N days (0 = keep forever; clamped to a 400-day billing floor) |
 | `cache_l2_expired_cleanup` | `true` | Delete `cache_l2` rows past `expires_at` |
 
+### ip_allowlist
+
+App-level source-IP allowlist (CIDR) for the proxy request path. **Off by default** — OSS/self-host is open; the managed enterprise deploy turns it on. Enforced in core `_authenticate` for the `/v1/*` routes (`net/ip_allowlist.py`).
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Master switch. When off, no IP filtering happens |
+| `trust_x_forwarded_for` | `true` | Use the first `X-Forwarded-For` hop as the client IP (Cloud Run / the portal front the proxy). When false, the direct socket peer is used |
+| `global_cidrs` | `[]` | CIDRs applied to **all** tenants (e.g. an office / VPN egress). Unioned with each tenant's own list |
+
+A request is allowed iff its source IP is in `global_cidrs ∪ tenant_cidrs`. **Empty global + empty per-tenant ⇒ the tenant is unrestricted.** Per-tenant CIDRs are set from the adminconsole (`PUT /api/v1/admin/tenants/{id}/ip-allowlist`) and stored in the tenant's key metadata; `global_cidrs` is edited here in `config.yaml` (hot-reloaded; the adminconsole exposes it read-only at `GET /api/v1/admin/ip-allowlist`).
+
 ### proxy
 | Parameter | Default | Description |
 |---|---|---|

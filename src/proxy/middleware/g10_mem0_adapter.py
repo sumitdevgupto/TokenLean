@@ -87,9 +87,10 @@ class Mem0MemoryStore:
                 f"{user_id}:{memory}:{time.time()}".encode()
             ).hexdigest()[:16]
             
-            # Embed memory
-            from fastembed import TextEmbedding
-            model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+            # Embed memory — via shared loader (cached singleton + HF_HUB_OFFLINE guard so the
+            # baked model loads without an HF-CDN metadata call that hangs under VPC egress).
+            from ml_models import get_text_embedding
+            model = get_text_embedding("sentence-transformers/all-MiniLM-L6-v2")
             embedding = list(model.embed([memory]))[0].tolist()
             
             # Calculate expiration
@@ -160,9 +161,9 @@ class Mem0MemoryStore:
             )
             
             if query:
-                # Semantic search
-                from fastembed import TextEmbedding
-                model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+                # Semantic search — via shared loader (cached + HF_HUB_OFFLINE guard).
+                from ml_models import get_text_embedding
+                model = get_text_embedding("sentence-transformers/all-MiniLM-L6-v2")
                 query_embedding = list(model.embed([query]))[0].tolist()
                 
                 results = client.search(

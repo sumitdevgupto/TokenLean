@@ -1,0 +1,24 @@
+# Purpose-built migration image for the in-VPC Cloud Run Job.
+#
+# WHY a dedicated image (not the proxy-commercial image): src/proxy/Dockerfile.commercial
+# is python:3.11-slim and does NOT install postgresql-client, so it has no `psql`.
+# postgres:15-alpine ships psql (and matches the Cloud SQL POSTGRES_15 server version),
+# so we bake the migration .sql files + a runner on top of it. The image is tiny (~80 MB)
+# and carries ONLY the SQL — no app code, no secrets.
+#
+# The job reaches the (public OR private) Cloud SQL instance over the Cloud SQL Auth Proxy
+# Unix socket mounted at /cloudsql/<conn> by --set-cloudsql-instances, so no private IP
+# address is ever needed and the SAME image works for both connectivity modes.
+FROM postgres:15-alpine
+
+WORKDIR /migrations
+
+# Copy the migration SQL (byte-identical to the Terraform local-exec heredocs) + runner.
+COPY billing.sql tenant_configs.sql audit_events.sql rls_policies.sql pgvector.sql ./
+COPY run.sh ./run.sh
+RUN chmod +x ./run.sh
+
+# Clear the base image's CMD ["postgres"] — otherwise it is passed to run.sh as $1.
+# (run.sh ignores args, but an explicit empty CMD removes the confusion.)
+ENTRYPOINT ["/migrations/run.sh"]
+CMD []

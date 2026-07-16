@@ -304,22 +304,47 @@ resource "google_secret_manager_secret" "langfuse_nextauth_secret" {
 # Applied once against the Cloud SQL Postgres instance via a null_resource
 # provisioner so no state is kept in Cloud SQL itself.
 resource "null_resource" "billing_schema_migration" {
+  # PRIVATE-IP path: the off-VPC deploy host (laptop/WSL) cannot reach the private
+  # 10.x instance even via cloud-sql-proxy --private-ip, so these local-exec
+  # provisioners are DISABLED when private_cloud_sql=true and the migrations are
+  # instead applied from an in-VPC Cloud Run Job (scripts/gcp/run-migrations-job.sh,
+  # invoked by gcp-deploy.sh after terraform apply). On the public-IP OSS default
+  # the local-exec path is byte-identical to before.
+  count = var.private_cloud_sql ? 0 : 1
   triggers = {
     schema_version = "2" # v2: +protocol column (#4 multi-protocol ingress)
   }
 
-  # PGPASSWORD is required so psql (invoked by gcloud sql connect) does not
-  # prompt interactively — without it terraform apply hangs indefinitely.
-  # We fetch the password from Secret Manager at apply time.
+  # PGPASSWORD is required so psql does not prompt interactively — without it
+  # terraform apply hangs indefinitely. We fetch the password from Secret
+  # Manager at apply time.
+  #
+  # The Cloud SQL instance is private-IP only, so `gcloud sql connect` (which
+  # needs a public IP to allowlist) cannot reach it. We instead tunnel via the
+  # Cloud SQL Auth Proxy (cloud-sql-proxy) on 127.0.0.1:6543 and run the
+  # migration through psql. Same pattern as
+  # scripts/commercial/billing/run-invoicing-gcp.sh.
   provisioner "local-exec" {
-    command = <<-SHELL
+    # This command is bash (heredocs, $(...), PGPASSWORD). On Windows, Terraform
+    # otherwise runs local-exec via cmd.exe, which cannot parse it. Pin bash.
+    interpreter = ["bash", "-c"]
+    command     = <<-SHELL
       DB_PASS=$(gcloud secrets versions access latest \
         --secret="${google_secret_manager_secret.db_password.secret_id}" \
         --project="${var.project_id}" 2>/dev/null)
-      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
-        --user=token_opt_app \
-        --database=token_opt \
-        --quiet <<'EOSQL'
+      cloud-sql-proxy --port 6543 "${google_sql_database_instance.main.connection_name}" \
+        >/tmp/tf_sqlproxy_billing.log 2>&1 &
+      PROXY_PID=$!
+      trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+      # Wait for the tunnel to accept connections (max ~15s).
+      for _ in $(seq 1 30); do
+        if (exec 3<>/dev/tcp/127.0.0.1/6543) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+        sleep 0.5
+      done
+      (exec 3<>/dev/tcp/127.0.0.1/6543) 2>/dev/null && exec 3>&- 3<&- || \
+        { cat /tmp/tf_sqlproxy_billing.log; echo "cloud-sql-proxy did not open port 6543" >&2; exit 1; }
+      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p 6543 \
+        -U token_opt_app -d token_opt -v ON_ERROR_STOP=1 <<'EOSQL'
 CREATE TABLE IF NOT EXISTS usage_events (
   id             BIGSERIAL PRIMARY KEY,
   tenant_id      TEXT        NOT NULL,
@@ -359,19 +384,33 @@ EOSQL
 
 # ─── E2: tenant_configs Cloud SQL table migration ────────────────────────────
 resource "null_resource" "tenant_configs_schema_migration" {
+  # Disabled on the private-IP path (applied via the in-VPC migration job instead).
+  count = var.private_cloud_sql ? 0 : 1
   triggers = {
     schema_version = "1"
   }
 
+  # Private-IP instance: tunnel via cloud-sql-proxy (127.0.0.1:6544) + psql
+  # instead of `gcloud sql connect` (which needs a public IP).
   provisioner "local-exec" {
-    command = <<-SHELL
+    interpreter = ["bash", "-c"] # bash heredoc/$(...) — not cmd.exe (Windows local-exec default)
+    command     = <<-SHELL
       DB_PASS=$(gcloud secrets versions access latest \
         --secret="${google_secret_manager_secret.db_password.secret_id}" \
         --project="${var.project_id}" 2>/dev/null)
-      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
-        --user=token_opt_app \
-        --database=token_opt \
-        --quiet <<'EOSQL'
+      cloud-sql-proxy --port 6544 "${google_sql_database_instance.main.connection_name}" \
+        >/tmp/tf_sqlproxy_tenant_configs.log 2>&1 &
+      PROXY_PID=$!
+      trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+      # Wait for the tunnel to accept connections (max ~15s).
+      for _ in $(seq 1 30); do
+        if (exec 3<>/dev/tcp/127.0.0.1/6544) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+        sleep 0.5
+      done
+      (exec 3<>/dev/tcp/127.0.0.1/6544) 2>/dev/null && exec 3>&- 3<&- || \
+        { cat /tmp/tf_sqlproxy_tenant_configs.log; echo "cloud-sql-proxy did not open port 6544" >&2; exit 1; }
+      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p 6544 \
+        -U token_opt_app -d token_opt -v ON_ERROR_STOP=1 <<'EOSQL'
 CREATE TABLE IF NOT EXISTS tenant_configs (
   tenant_id        TEXT        PRIMARY KEY,
   config_overrides JSONB       NOT NULL DEFAULT '{}',
@@ -391,6 +430,8 @@ EOSQL
 
 # ─── F2: audit_events Cloud SQL table migration + INSERT-only role ───────────
 resource "null_resource" "audit_events_schema_migration" {
+  # Disabled on the private-IP path (applied via the in-VPC migration job instead).
+  count = var.private_cloud_sql ? 0 : 1
   triggers = {
     # v2 (WS8): + details JSONB for config-change audit events. The app also
     # ensures this column at startup (audit.log.ensure_audit_schema) - this bump
@@ -398,15 +439,27 @@ resource "null_resource" "audit_events_schema_migration" {
     schema_version = "2"
   }
 
+  # Private-IP instance: tunnel via cloud-sql-proxy (127.0.0.1:6545) + psql
+  # instead of `gcloud sql connect` (which needs a public IP).
   provisioner "local-exec" {
-    command = <<-SHELL
+    interpreter = ["bash", "-c"] # bash heredoc/$(...) — not cmd.exe (Windows local-exec default)
+    command     = <<-SHELL
       DB_PASS=$(gcloud secrets versions access latest \
         --secret="${google_secret_manager_secret.db_password.secret_id}" \
         --project="${var.project_id}" 2>/dev/null)
-      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
-        --user=token_opt_app \
-        --database=token_opt \
-        --quiet <<'EOSQL'
+      cloud-sql-proxy --port 6545 "${google_sql_database_instance.main.connection_name}" \
+        >/tmp/tf_sqlproxy_audit_events.log 2>&1 &
+      PROXY_PID=$!
+      trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+      # Wait for the tunnel to accept connections (max ~15s).
+      for _ in $(seq 1 30); do
+        if (exec 3<>/dev/tcp/127.0.0.1/6545) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+        sleep 0.5
+      done
+      (exec 3<>/dev/tcp/127.0.0.1/6545) 2>/dev/null && exec 3>&- 3<&- || \
+        { cat /tmp/tf_sqlproxy_audit_events.log; echo "cloud-sql-proxy did not open port 6545" >&2; exit 1; }
+      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p 6545 \
+        -U token_opt_app -d token_opt -v ON_ERROR_STOP=1 <<'EOSQL'
 CREATE TABLE IF NOT EXISTS audit_events (
   id             BIGSERIAL    PRIMARY KEY,
   tenant_id      TEXT         NOT NULL,
@@ -446,20 +499,35 @@ EOSQL
 
 # ─── I2: Row-Level Security policies on the tenant tables (defense-in-depth) ──
 resource "null_resource" "rls_policies_migration" {
+  # Disabled on the private-IP path (applied via the in-VPC migration job instead).
+  count = var.private_cloud_sql ? 0 : 1
   triggers = {
     schema_version = "1"
     sql_sha        = filesha256("${path.module}/migrations/rls_policies.sql")
   }
 
+  # Private-IP instance: tunnel via cloud-sql-proxy (127.0.0.1:6546) + psql
+  # instead of `gcloud sql connect` (which needs a public IP).
   provisioner "local-exec" {
-    command = <<-SHELL
+    interpreter = ["bash", "-c"] # bash heredoc/$(...) — not cmd.exe (Windows local-exec default)
+    command     = <<-SHELL
       DB_PASS=$(gcloud secrets versions access latest \
         --secret="${google_secret_manager_secret.db_password.secret_id}" \
         --project="${var.project_id}" 2>/dev/null)
-      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
-        --user=token_opt_app \
-        --database=token_opt \
-        --quiet < "${path.module}/migrations/rls_policies.sql"
+      cloud-sql-proxy --port 6546 "${google_sql_database_instance.main.connection_name}" \
+        >/tmp/tf_sqlproxy_rls.log 2>&1 &
+      PROXY_PID=$!
+      trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+      # Wait for the tunnel to accept connections (max ~15s).
+      for _ in $(seq 1 30); do
+        if (exec 3<>/dev/tcp/127.0.0.1/6546) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+        sleep 0.5
+      done
+      (exec 3<>/dev/tcp/127.0.0.1/6546) 2>/dev/null && exec 3>&- 3<&- || \
+        { cat /tmp/tf_sqlproxy_rls.log; echo "cloud-sql-proxy did not open port 6546" >&2; exit 1; }
+      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p 6546 \
+        -U token_opt_app -d token_opt -v ON_ERROR_STOP=1 \
+        -f "${path.module}/migrations/rls_policies.sql"
     SHELL
   }
 
@@ -502,6 +570,11 @@ locals {
     google_secret_manager_secret.langfuse_public_key.secret_id,
     google_secret_manager_secret.langfuse_secret_key.secret_id,
     google_secret_manager_secret.langfuse_nextauth_secret.secret_id,
+    # grafana-svc + token-proxy also run as the proxy SA and mount these
+    # (grafana: GF_SECURITY_ADMIN_PASSWORD; proxy: METRICS_SCRAPE_TOKEN) — without
+    # them the Cloud Run deploy fails with "Permission denied on secret".
+    google_secret_manager_secret.grafana_admin_password.secret_id,
+    google_secret_manager_secret.metrics_scrape_token.secret_id,
   ], [for s in google_secret_manager_secret.llm_key_extra : s.secret_id]) : []
 }
 
@@ -528,8 +601,11 @@ resource "google_project_iam_member" "proxy_storage_admin" {
 }
 
 resource "google_storage_bucket_iam_member" "proxy_config_bucket" {
-  count  = var.least_privilege_secret_iam ? 1 : 0
-  bucket = var.config_bucket_name
+  count = var.least_privilege_secret_iam ? 1 : 0
+  # Must reference the SAME computed name as the bucket resource (local.bucket_name,
+  # line 71) — NOT the raw var.config_bucket_name, which is "" by default and makes
+  # this binding fail with `Import id "" doesn't match any accepted format`.
+  bucket = local.bucket_name
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
@@ -635,19 +711,35 @@ resource "google_project_iam_member" "proxy_run_invoker" {
 # When Qdrant is disabled, G07 uses PostgreSQL/pgvector on Cloud SQL. Enable the
 # `vector` extension on the token_opt DB so PGVectorRAG can create its table.
 resource "null_resource" "pgvector_extension" {
-  count = var.enable_qdrant ? 0 : 1
+  # Only needed when Qdrant is disabled (G07 pgvector fallback). AND only via the
+  # local-exec path on the public-IP deploy — on the private-IP path the in-VPC
+  # migration job applies pgvector.sql instead (gated identically in that script on
+  # ENABLE_QDRANT=false). Both conditions must hold for the local-exec to run.
+  count = (var.enable_qdrant || var.private_cloud_sql) ? 0 : 1
   triggers = {
     schema_version = "1"
   }
+  # Private-IP instance: tunnel via cloud-sql-proxy (127.0.0.1:6547) + psql
+  # instead of `gcloud sql connect` (which needs a public IP).
   provisioner "local-exec" {
-    command = <<-SHELL
+    interpreter = ["bash", "-c"] # bash heredoc/$(...) — not cmd.exe (Windows local-exec default)
+    command     = <<-SHELL
       DB_PASS=$(gcloud secrets versions access latest \
         --secret="${google_secret_manager_secret.db_password.secret_id}" \
         --project="${var.project_id}" 2>/dev/null)
-      PGPASSWORD="$DB_PASS" gcloud sql connect ${google_sql_database_instance.main.name} \
-        --user=token_opt_app \
-        --database=token_opt \
-        --quiet <<'EOSQL'
+      cloud-sql-proxy --port 6547 "${google_sql_database_instance.main.connection_name}" \
+        >/tmp/tf_sqlproxy_pgvector.log 2>&1 &
+      PROXY_PID=$!
+      trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+      # Wait for the tunnel to accept connections (max ~15s).
+      for _ in $(seq 1 30); do
+        if (exec 3<>/dev/tcp/127.0.0.1/6547) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+        sleep 0.5
+      done
+      (exec 3<>/dev/tcp/127.0.0.1/6547) 2>/dev/null && exec 3>&- 3<&- || \
+        { cat /tmp/tf_sqlproxy_pgvector.log; echo "cloud-sql-proxy did not open port 6547" >&2; exit 1; }
+      PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p 6547 \
+        -U token_opt_app -d token_opt -v ON_ERROR_STOP=1 <<'EOSQL'
 CREATE EXTENSION IF NOT EXISTS vector;
 EOSQL
     SHELL

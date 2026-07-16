@@ -26,11 +26,30 @@ The GCP deployment uses Terraform to provision managed services, Cloud Build for
 
 ## Prerequisites
 
-1. **gcloud CLI** installed and authenticated
+> **Deploy host: Linux, WSL Ubuntu, macOS, or GCP Cloud Shell — NOT Windows Git Bash / cmd.**
+> The deploy runs Terraform `local-exec` schema migrations written in bash that connect to
+> Cloud SQL via the Cloud SQL Auth Proxy + `psql`. On native Windows, Terraform launches
+> `local-exec` through `cmd.exe` and `psql` is typically absent — the migrations fail.
+> On Windows, use WSL Ubuntu (your checkout is visible at `/mnt/<drive>/...`).
+
+1. **gcloud CLI** installed and authenticated — including **Application Default Credentials**
+   (`gcloud auth application-default login`; the Cloud SQL Auth Proxy used by the schema
+   migrations authenticates with ADC, not your gcloud login)
 2. **Docker** installed and running
 3. **Terraform** >= 1.8 installed
-4. **Python 3** with PyYAML: `pip install pyyaml`
-5. **redis-cli** (optional, for backup/restore)
+4. **cloud-sql-proxy** (Cloud SQL Auth Proxy v2) — used by the Terraform schema migrations
+5. **psql** (PostgreSQL client) — runs the migration SQL
+6. **Python 3** with PyYAML: `pip install pyyaml`
+7. **redis-cli** (optional, for backup/restore)
+
+**One-shot setup (recommended):** `scripts/gcp/prepare-gcp-deploy-host.sh` installs items
+1–5 if missing (idempotent), drives the interactive gcloud logins, verifies Docker + config
+files, runs the pre-deploy check, and prints an explicit ✅ ALL OK / ❌ NOT READY verdict:
+
+```bash
+bash scripts/gcp/prepare-gcp-deploy-host.sh              # install + login + verify
+bash scripts/gcp/prepare-gcp-deploy-host.sh --no-install # verify only
+```
 
 ### GCP Project Setup
 

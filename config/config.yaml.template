@@ -78,6 +78,17 @@ retention:
   audit_days: 0                 # 0 = keep audit_events forever
   usage_days: 0                 # 0 = keep usage_events forever
   cache_l2_expired_cleanup: true
+# App-level source-IP allowlist (CIDR) for the proxy request path. OFF by default —
+# OSS/self-host is open; the managed enterprise deploy turns it on. Enforced in core
+# _authenticate for the /v1/* routes (net/ip_allowlist.py). global_cidrs apply to ALL
+# tenants (e.g. an office / VPN egress that must always work); per-tenant CIDRs are set
+# from the adminconsole and stored in the tenant's key metadata. Empty global + empty
+# per-tenant ⇒ the tenant is unrestricted. A request is allowed iff its source IP is in
+# (global_cidrs ∪ tenant_cidrs).
+ip_allowlist:
+  enabled: false
+  trust_x_forwarded_for: true   # first XFF hop is the client (Cloud Run / portal front the proxy)
+  global_cidrs: []              # e.g. ["203.0.113.0/24", "198.51.100.7/32"]
 providers:
 - name: openai
   api_base: https://api.openai.com/v1

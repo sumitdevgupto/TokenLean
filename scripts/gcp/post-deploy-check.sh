@@ -119,10 +119,10 @@ SQL_STATE=$(gcloud sql instances describe "${SQL_INSTANCE}" \
 
 if [[ "$SQL_STATE" == "RUNNABLE" ]]; then
   success "Cloud SQL: ${SQL_STATE}"
-  ((HEALTHY++))
+  HEALTHY=$((HEALTHY+1))
 else
   error "Cloud SQL: ${SQL_STATE} (expected: RUNNABLE)"
-  ((UNHEALTHY++))
+  UNHEALTHY=$((UNHEALTHY+1))
 fi
 
 # ─── Check 2: Redis (Memorystore OR the docker-Redis GCE VM) ─────────────────
@@ -142,9 +142,9 @@ if [[ -n "$REDIS_EXISTS" ]]; then
   REDIS_HOST=$(gcloud redis instances describe "${REDIS_INSTANCE}" \
     --project="$PROJECT_ID" --region="$REGION" --format="value(host)" 2>/dev/null || echo "")
   if [[ "$REDIS_STATE" == "READY" ]]; then
-    success "Memorystore Redis: ${REDIS_STATE} (${REDIS_HOST})"; ((HEALTHY++))
+    success "Memorystore Redis: ${REDIS_STATE} (${REDIS_HOST})"; HEALTHY=$((HEALTHY+1))
   else
-    warn "Memorystore Redis: ${REDIS_STATE} (not READY yet)"; ((WARNINGS++))
+    warn "Memorystore Redis: ${REDIS_STATE} (not READY yet)"; WARNINGS=$((WARNINGS+1))
   fi
 else
   # No Memorystore → check the docker-Redis GCE VM (the commercial default, redis_backend=docker).
@@ -153,11 +153,11 @@ else
     --project="$PROJECT_ID" --zone="${REDIS_VM_ZONE}" --format="value(status)" 2>/dev/null || echo "")
   if [[ -z "$VM_STATE" ]]; then
     error "Redis: NEITHER Memorystore (${REDIS_INSTANCE}) NOR the docker-Redis VM (${REDIS_VM}) found"
-    ((UNHEALTHY++))
+    UNHEALTHY=$((UNHEALTHY+1))
   elif [[ "$VM_STATE" == "RUNNING" ]]; then
-    success "docker-Redis VM: ${VM_STATE} (${REDIS_VM} @ ${REDIS_VM_ZONE})"; ((HEALTHY++))
+    success "docker-Redis VM: ${VM_STATE} (${REDIS_VM} @ ${REDIS_VM_ZONE})"; HEALTHY=$((HEALTHY+1))
   else
-    warn "docker-Redis VM: ${VM_STATE} (not RUNNING yet — ${REDIS_VM})"; ((WARNINGS++))
+    warn "docker-Redis VM: ${VM_STATE} (not RUNNING yet — ${REDIS_VM})"; WARNINGS=$((WARNINGS+1))
   fi
 fi
 
@@ -181,10 +181,10 @@ for svc in "${SERVICES[@]}"; do
     
     success "${svc}: ${SVC_URL} (deployed: ${LAST_DEPLOY})"
     SERVICE_URLS+=("$svc:$SVC_URL")
-    ((HEALTHY++))
+    HEALTHY=$((HEALTHY+1))
   else
     error "${svc}: NOT DEPLOYED"
-    ((UNHEALTHY++))
+    UNHEALTHY=$((UNHEALTHY+1))
   fi
 done
 
@@ -201,10 +201,10 @@ if [[ -n "$PROXY_URL" ]]; then
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROXY_URL}/health" 2>/dev/null || echo "000")
   if [[ "$HTTP_STATUS" == "200" ]]; then
     success "token-proxy /health: HTTP ${HTTP_STATUS}"
-    ((HEALTHY++))
+    HEALTHY=$((HEALTHY+1))
   else
     warn "token-proxy /health: HTTP ${HTTP_STATUS} (may still be warming up)"
-    ((WARNINGS++))
+    WARNINGS=$((WARNINGS+1))
   fi
 fi
 
@@ -216,12 +216,18 @@ LANGFUSE_URL=$(gcloud run services describe langfuse-svc \
 
 if [[ -n "$LANGFUSE_URL" ]]; then
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${LANGFUSE_URL}/api/public/health" 2>/dev/null || echo "000")
+  # 401/403 = the service is UP but deployed private (--no-allow-unauthenticated, the default
+  # commercial posture) → Cloud Run's IAM rejects the unauthenticated curl. That's EXPECTED and
+  # healthy, not a warning. Only a non-2xx/non-auth code (000/5xx/404) is a real problem.
   if [[ "$HTTP_STATUS" == "200" ]]; then
     success "langfuse-svc: HTTP ${HTTP_STATUS}"
-    ((HEALTHY++))
+    HEALTHY=$((HEALTHY+1))
+  elif [[ "$HTTP_STATUS" == "401" || "$HTTP_STATUS" == "403" ]]; then
+    success "langfuse-svc: HTTP ${HTTP_STATUS} (up; private — auth required, as expected)"
+    HEALTHY=$((HEALTHY+1))
   else
-    warn "langfuse-svc: HTTP ${HTTP_STATUS} (expected 200)"
-    ((WARNINGS++))
+    warn "langfuse-svc: HTTP ${HTTP_STATUS} (expected 200, or 401/403 if private)"
+    WARNINGS=$((WARNINGS+1))
   fi
 fi
 
@@ -235,10 +241,10 @@ if [[ -n "$LLMLINGUA_URL" ]]; then
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${LLMLINGUA_URL}/health" 2>/dev/null || echo "000")
   if [[ "$HTTP_STATUS" == "200" ]]; then
     success "llmlingua-svc: HTTP ${HTTP_STATUS}"
-    ((HEALTHY++))
+    HEALTHY=$((HEALTHY+1))
   else
     warn "llmlingua-svc: HTTP ${HTTP_STATUS}"
-    ((WARNINGS++))
+    WARNINGS=$((WARNINGS+1))
   fi
 fi
 
@@ -250,16 +256,18 @@ ROUTELLM_URL=$(gcloud run services describe routellm-svc \
 
 if [[ -n "$ROUTELLM_URL" ]]; then
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${ROUTELLM_URL}/health" 2>/dev/null || echo "000")
-  # routellm-svc is deployed --ingress=internal (denial-of-wallet defense: it holds an OpenAI key),
-  # so an EXTERNAL operator curl gets 403 — that's the service up AND correctly locked down. The
-  # proxy reaches it internally (same-project Cloud Run, like Qdrant). Accept 200 or 403.
-  if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "403" ]]; then
-    success "routellm-svc: Reachable (HTTP ${HTTP_STATUS}; 403 = internal-only blocking external, OK)"
-    ((HEALTHY++))
-  else
-    warn "routellm-svc: HTTP ${HTTP_STATUS}"
-    ((WARNINGS++))
-  fi
+  # routellm-svc's /health is a POST route (src/routellm-sidecar/app.py), so a GET probe returns
+  # 404/405 even though the service is UP — that's reachable, not a failure. It may also be
+  # deployed --ingress=internal (denial-of-wallet: it holds an OpenAI key) → 403 to an external
+  # curl. So any of 200/403/404/405 means "up"; only 000/5xx is a real problem.
+  case "$HTTP_STATUS" in
+    200|403|404|405)
+      success "routellm-svc: reachable (HTTP ${HTTP_STATUS}; up — /health is POST-only / internal-ingress)"
+      HEALTHY=$((HEALTHY+1)) ;;
+    *)
+      warn "routellm-svc: HTTP ${HTTP_STATUS}"
+      WARNINGS=$((WARNINGS+1)) ;;
+  esac
 fi
 
 # Check Qdrant (only when enabled — otherwise G07 uses pgvector fallback)
@@ -275,10 +283,10 @@ if [[ "$ENABLE_QDRANT" == "true" ]]; then
     if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "403" ]]; then
       # 403 is OK for internal services (they block external ingress)
       success "token-opt-qdrant: Reachable (${HTTP_STATUS})"
-      ((HEALTHY++))
+      HEALTHY=$((HEALTHY+1))
     else
       warn "token-opt-qdrant: HTTP ${HTTP_STATUS}"
-      ((WARNINGS++))
+      WARNINGS=$((WARNINGS+1))
     fi
   fi
 fi
@@ -294,13 +302,13 @@ if [[ "$ENABLE_SELF_HOSTED_OBS" == "true" ]]; then
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROM_URL}/-/healthy" 2>/dev/null || echo "000")
     if [[ "$HTTP_STATUS" == "200" ]]; then
       success "token-opt-prometheus: HTTP ${HTTP_STATUS}"
-      ((HEALTHY++))
+      HEALTHY=$((HEALTHY+1))
     elif [[ "$HTTP_STATUS" == "403" ]]; then
       success "token-opt-prometheus: Reachable (internal service)"
-      ((HEALTHY++))
+      HEALTHY=$((HEALTHY+1))
     else
       warn "token-opt-prometheus: HTTP ${HTTP_STATUS}"
-      ((WARNINGS++))
+      WARNINGS=$((WARNINGS+1))
     fi
   fi
 fi
@@ -313,25 +321,38 @@ SECRETS_COUNT=$(gcloud secrets list \
 
 if [[ "$SECRETS_COUNT" -gt 0 ]]; then
   success "Secret Manager: ${SECRETS_COUNT} secrets configured"
-  ((HEALTHY++))
+  HEALTHY=$((HEALTHY+1))
 else
   warn "Secret Manager: No secrets found"
-  ((WARNINGS++))
+  WARNINGS=$((WARNINGS+1))
 fi
 
 # Check critical secrets exist. Includes the commercial BYOK secrets:
 # tenant-key-encryption-key = the BYOK master key (Fernet); database-url = the DB DSN
 # stored as a secret (item 9) rather than a plaintext env var.
-CRITICAL_SECRETS=("token-opt-db-password" "llm-key-openai" "tenant-key-encryption-key" "database-url")
+# NOTE: llm-key-openai is NOT here — under strict BYOK (SKIP_PLATFORM_KEYS=true, the commercial
+# default) the deploy DELIBERATELY seeds no platform provider key (every tenant brings its own),
+# so its absence is correct, not a failure. It's checked separately below as expected-absent.
+CRITICAL_SECRETS=("token-opt-db-password" "tenant-key-encryption-key" "database-url")
 for secret in "${CRITICAL_SECRETS[@]}"; do
   if gcloud secrets versions access latest --secret="$secret" --project="$PROJECT_ID" &>/dev/null; then
     success "Secret ${secret}: Has active version"
-    ((HEALTHY++))
+    HEALTHY=$((HEALTHY+1))
   else
     warn "Secret ${secret}: No active version"
-    ((WARNINGS++))
+    WARNINGS=$((WARNINGS+1))
   fi
 done
+
+# Platform provider key: present on a non-BYOK deploy, ABSENT under strict BYOK. Either is fine —
+# report it informationally without ever failing the check.
+if gcloud secrets versions access latest --secret="llm-key-openai" --project="$PROJECT_ID" &>/dev/null; then
+  success "Secret llm-key-openai: present (platform provider key configured)"
+  HEALTHY=$((HEALTHY+1))
+else
+  success "Secret llm-key-openai: absent (strict BYOK — no platform key, as expected)"
+  HEALTHY=$((HEALTHY+1))
+fi
 
 # ─── BYOK hardening posture (commercial) ─────────────────────────────────────
 # Confirms the master key is KMS-wrapped and the KMS key ring exists — i.e. reading
@@ -344,17 +365,17 @@ if [[ "${KMS_ENV:-0}" -ge 1 ]]; then
   # Env-var presence proves KMS unwrap is CONFIGURED, not that the stored secret is actually
   # ciphertext — the behavioural proof (decrypt round-trip) is key-security-harness.sh --gcp stage 11.
   success "BYOK master key: TENANT_KEY_KMS_KEY set (KMS unwrap configured; wrap not behaviourally verified here — see key-security-harness.sh --gcp stage 11)"
-  ((HEALTHY++))
+  HEALTHY=$((HEALTHY+1))
 else
   warn "BYOK master key: plaintext (TENANT_KEY_KMS_KEY not set — enable_kms_master_key=false / HARDEN_KMS=false)"
-  ((WARNINGS++))
+  WARNINGS=$((WARNINGS+1))
 fi
 if gcloud kms keys list --location="$REGION" --keyring=token-opt-byok --project="$PROJECT_ID" &>/dev/null; then
   success "KMS key ring token-opt-byok: present (decrypt is a separable grant)"
-  ((HEALTHY++))
+  HEALTHY=$((HEALTHY+1))
 else
   warn "KMS key ring token-opt-byok: absent (KMS envelope not enabled)"
-  ((WARNINGS++))
+  WARNINGS=$((WARNINGS+1))
 fi
 
 # ─── Check 6: GCS Bucket ─────────────────────────────────────────────────────
@@ -370,16 +391,16 @@ if [[ -n "$CONFIG_BUCKET" ]]; then
   # Check for config.yaml
   if gsutil ls "gs://${CONFIG_BUCKET}/config/config.yaml" &>/dev/null; then
     success "config.yaml: Present in GCS"
-    ((HEALTHY++))
+    HEALTHY=$((HEALTHY+1))
   else
     warn "config.yaml: NOT found in GCS"
-    ((WARNINGS++))
+    WARNINGS=$((WARNINGS+1))
   fi
   
-  ((HEALTHY++))
+  HEALTHY=$((HEALTHY+1))
 else
   error "GCS bucket: NOT FOUND"
-  ((UNHEALTHY++))
+  UNHEALTHY=$((UNHEALTHY+1))
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

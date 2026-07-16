@@ -32,7 +32,11 @@ import litellm
 # belt for OpenAI-compatible custom providers litellm can't introspect.
 litellm.drop_params = True
 
-from auth.api_key_manager import get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended
+from auth.api_key_manager import (
+    get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended,
+    is_contract_inactive, get_ip_allowlist,
+)
+from net.ip_allowlist import client_ip_from_request, ip_allowed
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from providers import get_adapter, apply_context_management, get_provider_entry
 from providers.key_resolver import resolve_provider_key, ProviderKeyError, ProviderKeyDecryptError
@@ -1602,8 +1606,40 @@ async def _authenticate(
             detail="API key suspended. Contact your platform team.",
         )
 
-    # Check for X-User-ID header override (per-user attribution within a tenant)
     cfg = get_config()
+
+    # Contract gate: a tenant whose contract is not active (pending / inactive /
+    # expired) is rejected here (403), same immediacy as suspension. The flag is
+    # mirrored into the key metadata by the commercial admin lifecycle
+    # (set_contract_active); companies.contract_status is the source-of-record.
+    # Checked before any X-User-ID override so the header path can't slip through.
+    if is_contract_inactive(tenant_metadata):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Contract inactive. Contact your account administrator.",
+        )
+
+    # Source-IP allowlist: when enabled, the caller's IP must fall in the union of
+    # the global CIDRs (config.yaml) and the tenant's own CIDRs (key metadata).
+    # Empty+empty ⇒ the tenant is unrestricted. Enforced pre-override for the same
+    # reason as the gates above.
+    ipcfg = cfg.get("ip_allowlist", {}) or {}
+    if ipcfg.get("enabled"):
+        global_cidrs = ipcfg.get("global_cidrs", []) or []
+        tenant_cidrs = get_ip_allowlist(tenant_metadata)
+        if global_cidrs or tenant_cidrs:
+            client_ip = client_ip_from_request(
+                request, bool(ipcfg.get("trust_x_forwarded_for", True)))
+            if not ip_allowed(client_ip, global_cidrs, tenant_cidrs):
+                logger.warning(
+                    "IP allowlist: rejected %s for tenant=%s",
+                    client_ip, _caller_tenant_id(tenant_metadata))
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Source IP not allowed for this tenant.",
+                )
+
+    # Check for X-User-ID header override (per-user attribution within a tenant)
     header_override_enabled = cfg.get("proxy", {}).get("allow_user_id_header_override", False)
     if header_override_enabled:
         header_user_id = request.headers.get("X-User-ID") or request.headers.get("x-user-id")

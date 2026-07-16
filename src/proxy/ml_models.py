@@ -10,11 +10,20 @@ lazily load each distinct model once per process and reuse it thereafter.
 Inference calls (encode/embed/predict) on these models are read-only and
 thread-safe, so a single shared instance can serve concurrent requests.
 """
+import os
 import threading
 from typing import Any, Dict, Tuple
 
 _lock = threading.Lock()
 _instances: Dict[Tuple[str, str], Any] = {}
+
+# When HF_HUB_OFFLINE=1 (the commercial image sets it; models are pre-baked into
+# FASTEMBED_CACHE_PATH), force fastembed's local_files_only so it does NOT make an
+# HF-CDN "is the cache up to date?" metadata call. That call HANGS on an
+# egress-restricted host (Cloud Run --vpc-egress=private-ranges-only) until timeout,
+# even though the model is present locally. Empty (online default) otherwise.
+def _fastembed_offline_kwargs() -> Dict[str, Any]:
+    return {"local_files_only": True} if os.getenv("HF_HUB_OFFLINE", "") in ("1", "true", "True") else {}
 
 # Whether the installed qdrant-client accepts the `check_compatibility` kwarg. It was added
 # in qdrant-client 1.14; on older clients (e.g. 1.12.x) passing it raises
@@ -73,7 +82,7 @@ def get_text_embedding(model_name: str) -> Any:
     """Return a shared fastembed TextEmbedding instance for the given model name."""
     def _load():
         from fastembed import TextEmbedding
-        return TextEmbedding(model_name)
+        return TextEmbedding(model_name, **_fastembed_offline_kwargs())
     return _get_or_create(("text_embedding", model_name), _load)
 
 
@@ -81,7 +90,7 @@ def get_sparse_text_embedding(model_name: str) -> Any:
     """Return a shared fastembed SparseTextEmbedding instance for the given model name."""
     def _load():
         from fastembed import SparseTextEmbedding
-        return SparseTextEmbedding(model_name)
+        return SparseTextEmbedding(model_name, **_fastembed_offline_kwargs())
     return _get_or_create(("sparse_text_embedding", model_name), _load)
 
 

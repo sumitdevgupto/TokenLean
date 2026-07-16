@@ -91,9 +91,11 @@ class PGVectorRAG:
             return []
         
         try:
-            # Generate embedding for the query
-            from fastembed import TextEmbedding
-            model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+            # Generate embedding for the query. Route through the shared ml_models loader so it
+            # (a) reuses the cached singleton and (b) honours HF_HUB_OFFLINE (baked-model, no
+            # HF-CDN metadata call that would hang under egress-restricted VPC).
+            from ml_models import get_text_embedding
+            model = get_text_embedding("sentence-transformers/all-MiniLM-L6-v2")
             query_embedding = list(model.embed([query]))[0].tolist()
             
             async with pool.acquire() as conn:

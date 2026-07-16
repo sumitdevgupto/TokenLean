@@ -71,6 +71,67 @@ class TestSuspendedKeyGate:
         assert returned == meta
 
 
+# ── Contract gate: contract_inactive keys are rejected at _authenticate (403) ─
+class TestContractGate:
+    _REQ = SimpleNamespace(headers={"Authorization": "Bearer tok-x"},
+                           client=SimpleNamespace(host="1.2.3.4"))
+
+    async def test_contract_inactive_rejected_403(self):
+        meta = {"tenant_id": "acme", "tier": "enterprise", "contract_inactive": True}
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value={}):
+            with pytest.raises(HTTPException) as exc:
+                await main._authenticate(self._REQ)
+        assert exc.value.status_code == 403
+
+    async def test_active_contract_passes(self):
+        meta = {"tenant_id": "acme", "tier": "enterprise"}  # absent flag ⇒ active
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value={}):
+            user_id, _api_key, _returned = await main._authenticate(self._REQ)
+        assert user_id == "acme"
+
+
+# ── IP allowlist gate at _authenticate ────────────────────────────────────────
+class TestIpAllowlistGate:
+    def _req(self, xff):
+        return SimpleNamespace(headers={"Authorization": "Bearer tok-x", "x-forwarded-for": xff},
+                               client=SimpleNamespace(host="9.9.9.9"))
+
+    _CFG = {"ip_allowlist": {"enabled": True, "trust_x_forwarded_for": True,
+                             "global_cidrs": ["203.0.113.0/24"]}}
+
+    async def test_ip_outside_allowlist_rejected_403(self):
+        meta = {"tenant_id": "acme", "ip_allowlist": ["10.0.0.0/8"]}
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value=self._CFG):
+            with pytest.raises(HTTPException) as exc:
+                await main._authenticate(self._req("8.8.8.8"))
+        assert exc.value.status_code == 403
+
+    async def test_ip_in_tenant_allowlist_passes(self):
+        meta = {"tenant_id": "acme", "ip_allowlist": ["10.0.0.0/8"]}
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value=self._CFG):
+            user_id, _k, _m = await main._authenticate(self._req("10.1.2.3"))
+        assert user_id == "acme"
+
+    async def test_ip_in_global_allowlist_passes(self):
+        meta = {"tenant_id": "acme"}  # no per-tenant list → bound to global
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value=self._CFG):
+            user_id, _k, _m = await main._authenticate(self._req("203.0.113.9"))
+        assert user_id == "acme"
+
+    async def test_disabled_allowlist_is_noop(self):
+        meta = {"tenant_id": "acme", "ip_allowlist": ["10.0.0.0/8"]}
+        cfg = {"ip_allowlist": {"enabled": False}}
+        with patch.object(main, "validate_proxy_key", return_value=(True, "acme", meta)), \
+             patch.object(main, "get_config", return_value=cfg):
+            user_id, _k, _m = await main._authenticate(self._req("8.8.8.8"))
+        assert user_id == "acme"
+
+
 # ── H1: admin endpoints require the admin scope ──────────────────────────────
 class TestAdminEndpointAuthz:
     def _auth(self, metadata):

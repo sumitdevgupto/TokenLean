@@ -90,7 +90,8 @@ def test_list_tenants_never_leaks_key_material(temp_store):
     assert tenants["beta"]["admin"] is True and tenants["beta"]["suspended"] is True
     # only safe aggregate fields — no hash, no raw key
     for t in tenants.values():
-        assert set(t) == {"tenant_id", "tier", "admin", "suspended", "key_count", "created_at"}
+        assert set(t) == {"tenant_id", "tier", "admin", "suspended",
+                          "contract_inactive", "key_count", "created_at"}
 
 
 def test_atomic_write_leaves_no_tmp_file(temp_store):

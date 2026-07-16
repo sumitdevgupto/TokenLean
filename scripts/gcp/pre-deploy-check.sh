@@ -26,7 +26,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PROJECT_ID=""
 REGION=""   # resolved below: --region flag > GCP_REGION (.env.gcp) > asia-south1
 
@@ -91,6 +91,20 @@ if gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q "
   success "Authenticated as: ${ACCOUNT}"
 else
   error "Not authenticated. Run: gcloud auth login"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# ─── Check 2b: Application Default Credentials ───────────────────────────────
+# Terraform's google provider AND the Cloud SQL Auth Proxy (used by the schema
+# migrations, host-side on the public path / in the Cloud Run Job on the private
+# path) authenticate with ADC — which is SEPARATE from `gcloud auth login`. A
+# missing ADC otherwise surfaces only mid-`terraform apply` as a cryptic proxy
+# auth error.
+info "Checking Application Default Credentials (ADC)..."
+if gcloud auth application-default print-access-token &>/dev/null; then
+  success "ADC present (Terraform + Cloud SQL Auth Proxy can authenticate)"
+else
+  error "ADC not set. Run: gcloud auth application-default login"
   ERRORS=$((ERRORS + 1))
 fi
 

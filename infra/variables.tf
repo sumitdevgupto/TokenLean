@@ -99,7 +99,7 @@ variable "least_privilege_secret_iam" {
 }
 
 variable "private_cloud_sql" {
-  description = "Item 8: put Cloud SQL on a private IP (no public IPv4) + ENCRYPTED_ONLY SSL via Private Service Access. Default false keeps public IPv4. NOTE: the `gcloud sql connect` migration steps need a public/authorized path — enable the connector or run migrations from within the VPC before turning this on."
+  description = "Item 8: put Cloud SQL on a private IP (no public IPv4) + ENCRYPTED_ONLY SSL via Private Service Access. Default false keeps public IPv4. When true, the local-exec schema migrations are skipped (count=0 — an off-VPC host cannot reach the private IP) and gcp-deploy.sh applies them via the in-VPC Cloud Run Job instead (scripts/gcp/run-migrations-job.sh); DB-connected Cloud Run services additionally get Direct VPC egress."
   type        = bool
   default     = false
 }

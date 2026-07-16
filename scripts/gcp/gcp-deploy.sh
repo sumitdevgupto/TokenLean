@@ -74,6 +74,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ─── Resolve whether Cloud SQL is private-IP-only ─────────────────────────────
+# private_cloud_sql=true means the instance has no public IPv4, so the off-VPC
+# deploy host cannot tunnel to it — migrations run from an in-VPC Cloud Run Job
+# instead of the Terraform local-exec provisioners (which are count=0 in that
+# case). Resolution order: TF_VAR_private_cloud_sql env (set by the commercial
+# deploy) → an uncommented private_cloud_sql line in infra/terraform.tfvars →
+# false (OSS public-IP default).
+resolve_private_sql() {
+  if [[ -n "${TF_VAR_private_cloud_sql:-}" ]]; then
+    PRIVATE_SQL="${TF_VAR_private_cloud_sql}"
+  elif [[ -f "${REPO_ROOT}/infra/terraform.tfvars" ]] \
+       && grep -Eq '^[[:space:]]*private_cloud_sql[[:space:]]*=[[:space:]]*true' "${REPO_ROOT}/infra/terraform.tfvars"; then
+    PRIVATE_SQL="true"
+  else
+    PRIVATE_SQL="false"
+  fi
+}
+
 # ─── Prerequisites check ──────────────────────────────────────────────────────
 check_prereqs() {
   info "Checking prerequisites..."
@@ -81,8 +99,44 @@ check_prereqs() {
     command -v "$cmd" &>/dev/null || error "$cmd is required but not installed."
   done
 
+  resolve_private_sql
+
+  # The schema migrations run through cloud-sql-proxy + psql ON THE HOST only on
+  # the PUBLIC-IP path (Terraform local-exec provisioners). On the private-IP path
+  # (PRIVATE_SQL=true) they run from an in-VPC Cloud Run Job (run-migrations-job.sh)
+  # where psql executes in-cloud — so the host needs NEITHER tool. Only require them
+  # for the public path.
+  if [[ "$PRIVATE_SQL" != "true" ]]; then
+    command -v cloud-sql-proxy &>/dev/null \
+      || error "cloud-sql-proxy is required for schema migrations (public-IP Cloud SQL) but not installed. Install: https://cloud.google.com/sql/docs/postgres/sql-proxy#install (Linux: curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.11.0/cloud-sql-proxy.linux.amd64 && chmod +x cloud-sql-proxy && sudo mv cloud-sql-proxy /usr/local/bin/)."
+    command -v psql &>/dev/null \
+      || error "psql (PostgreSQL client) is required for schema migrations but not installed. Install: sudo apt-get install -y postgresql-client"
+  else
+    info "private_cloud_sql=true — host psql/cloud-sql-proxy not required (migrations run from an in-VPC Cloud Run Job)"
+  fi
+
+  # Direct VPC egress for the Cloud Run services that mount the Cloud SQL socket
+  # (langfuse-svc, token-proxy, grafana-svc). On a PRIVATE-IP instance the socket
+  # connector must dial 10.x:3307, which is only routable with VPC egress — without
+  # it the container gets "connection to Cloud SQL instance at 10.x:3307 timed out"
+  # and (for langfuse, which migrates at boot) fails its PORT startup probe.
+  # Empty on the public-IP path so the OSS deploy is unchanged.
+  VPC_EGRESS_FLAGS=""
+  if [[ "$PRIVATE_SQL" == "true" ]]; then
+    VPC_EGRESS_FLAGS="--network=default --subnet=default --vpc-egress=private-ranges-only"
+    info "private_cloud_sql=true — DB-connected services get Direct VPC egress (${VPC_EGRESS_FLAGS})"
+  fi
+
   gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q "@" \
     || error "Not authenticated. Run: gcloud auth login"
+
+  # ADC — Terraform's google provider AND the Cloud SQL Auth Proxy (host-side on the
+  # public path, in the Cloud Run migration Job on the private path) authenticate with
+  # Application Default Credentials, which are SEPARATE from `gcloud auth login`.
+  # Without this check a missing ADC surfaces only mid-`terraform apply` as a cryptic
+  # provider/proxy auth error.
+  gcloud auth application-default print-access-token &>/dev/null \
+    || error "Application Default Credentials not set. Run: gcloud auth application-default login"
 
   if [[ -z "$PROJECT_ID" ]]; then
     PROJECT_ID="${GCP_PROJECT_ID:-}"
@@ -394,7 +448,11 @@ deploy_services() {
   fi
   # Prisma (used by Langfuse v2) requires the host to be non-empty.
   # Cloud SQL Unix socket path must be set via DIRECT_URL or as host param with explicit value.
-  DB_URL="postgresql://token_opt_app:${LANGFUSE_SECRET}@localhost/token_opt?host=/cloudsql/${DB_CONNECTION}"
+  # Database: the DEDICATED `langfuse` DB (google_sql_database.langfuse) — NOT the proxy's
+  # token_opt. Pointing Langfuse at token_opt makes Prisma hit P3005 ("schema is not empty")
+  # on first boot once the proxy schema migrations have run, and grafana's Langfuse
+  # datasource already expects LANGFUSE_DB_NAME=langfuse.
+  DB_URL="postgresql://token_opt_app:${LANGFUSE_SECRET}@localhost/langfuse?host=/cloudsql/${DB_CONNECTION}"
 
   # Deploy LLMLingua-2 sidecar (internal only, allow unauthenticated for proxy SA access)
   gcloud run deploy llmlingua-svc \
@@ -478,6 +536,22 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
   ensure_secret_has_version "langfuse-salt"            "$(openssl rand -hex 32)"
   ensure_secret_has_version "grafana-admin-password"   "$(openssl rand -base64 12)"
 
+  # Under least-privilege secret IAM (TF_VAR_least_privilege_secret_iam=true) the proxy SA
+  # has NO project-wide secretAccessor — only per-secret bindings from Terraform's
+  # proxy_secret_ids list. langfuse-salt is created HERE by this script (not Terraform),
+  # so it cannot be in that list; bind it explicitly or langfuse-svc (which runs as the
+  # proxy SA and mounts SALT=langfuse-salt) fails to deploy with "Permission denied on
+  # secret". Idempotent; must run even when the secret already existed. No-op without
+  # least-priv (the project-wide grant covers it).
+  if [[ "${TF_VAR_least_privilege_secret_iam:-false}" == "true" && -n "${PROXY_SA:-}" ]]; then
+    timeout 30 gcloud secrets add-iam-policy-binding "langfuse-salt" \
+      --member="serviceAccount:${PROXY_SA}" \
+      --role="roles/secretmanager.secretAccessor" \
+      --project="$PROJECT_ID" &>/dev/null \
+      && success "least-priv: proxy SA granted accessor on langfuse-salt" \
+      || warn "Could not bind proxy SA on langfuse-salt — langfuse-svc deploy may fail (grant manually: gcloud secrets add-iam-policy-binding langfuse-salt --member=serviceAccount:${PROXY_SA} --role=roles/secretmanager.secretAccessor)"
+  fi
+
   # Issue an initial proxy API key for the 'admin' user if none exists yet.
   # Delegates to issue-key.sh which correctly sha256-hashes the raw key before storing.
   if ! timeout 30 gcloud secrets versions access latest --secret="token-proxy-api-keys" \
@@ -504,6 +578,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --project="$PROJECT_ID" \
     --service-account="$PROXY_SA" \
     --add-cloudsql-instances="${DB_CONNECTION}" \
+    ${VPC_EGRESS_FLAGS} \
     ${LF_AUTH_FLAG} \
     --memory=1Gi --cpu=1 \
     --cpu-boost \
@@ -548,6 +623,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --project="$PROJECT_ID" \
     --service-account="$PROXY_SA" \
     --add-cloudsql-instances="${DB_CONNECTION}" \
+    ${VPC_EGRESS_FLAGS} \
     --allow-unauthenticated \
     --memory=4Gi --cpu=2 \
     --cpu-boost \
@@ -603,6 +679,7 @@ LOG_LEVEL=INFO" \
     --project="$PROJECT_ID" \
     --service-account="$PROXY_SA" \
     --add-cloudsql-instances="${DB_CONNECTION}" \
+    ${VPC_EGRESS_FLAGS} \
     --allow-unauthenticated \
     --memory=512Mi --cpu=1 \
     --cpu-boost \
@@ -946,6 +1023,15 @@ main() {
     load_infra_outputs
   else
     provision_infra
+    # Private-IP path: the Terraform local-exec schema migrations are count=0
+    # (the off-VPC host cannot reach the private instance), so apply them from an
+    # in-VPC Cloud Run Job now that the instance/db/user/password-secret exist.
+    # Public-IP path: local-exec already ran during `terraform apply` — no-op here.
+    if [[ "${PRIVATE_SQL:-false}" == "true" ]]; then
+      info "Applying Cloud SQL schema migrations via in-VPC Cloud Run Job (private_cloud_sql)..."
+      bash "${SCRIPT_DIR}/run-migrations-job.sh" --project "$PROJECT_ID" --region "$REGION" \
+        || error "In-VPC schema migration job failed — see logs above."
+    fi
   fi
 
   # Always upload config — ensures GCS stays in sync whether or not Terraform ran
