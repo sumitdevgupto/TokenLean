@@ -55,7 +55,9 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 ENV_FILE="${REPO_ROOT}/.env.gcp"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="${REPO_ROOT}/.env"
 if [[ -f "$ENV_FILE" ]]; then
-  set -a; source "$ENV_FILE"; set +a
+  # Strip CRLF on the fly: env files edited on Windows carry \r, which bash would
+  # append to every value (e.g. GCP_REGION=asia-south1$'\r') and corrupt gcloud args.
+  set -a; source <(tr -d '\r' < "$ENV_FILE"); set +a
 fi
 
 while [[ $# -gt 0 ]]; do

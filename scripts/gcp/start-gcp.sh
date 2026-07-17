@@ -52,7 +52,9 @@ fi
 if [[ -f "$ENV_FILE" ]]; then
   info "Loading environment variables from ${ENV_FILE}..."
   set -a
-  source "$ENV_FILE"
+  # Strip CRLF on the fly: env files edited on Windows carry \r, which bash would
+  # append to every value (e.g. GCP_REGION=asia-south1$'\r') and corrupt gcloud args.
+  source <(tr -d '\r' < "$ENV_FILE")
   set +a
   success "Loaded env file"
 fi

@@ -31,6 +31,15 @@ The GCP deployment uses Terraform to provision managed services, Cloud Build for
 > Cloud SQL via the Cloud SQL Auth Proxy + `psql`. On native Windows, Terraform launches
 > `local-exec` through `cmd.exe` and `psql` is typically absent — the migrations fail.
 > On Windows, use WSL Ubuntu (your checkout is visible at `/mnt/<drive>/...`).
+>
+> This is **enforced in-script**: every WSL-only GCP script (deploy, start/stop, teardown,
+> pre-deploy-check, the in-VPC migration/key-sync jobs, secrets backup/restore) aborts with
+> exit 2 if launched from Git Bash (`MINGW*/MSYS*/CYGWIN*`). Dual-mode scripts that also run
+> against the local Docker stack (e.g. `create-operator.sh`, `key-security-harness.sh`) guard
+> **only their `--gcp` path**, so local use from any shell still works. Read-only status checks
+> (`check-gcp-status.sh`, `post-deploy-check.sh`) and env sourcing (CRLF-tolerant) are shell-
+> agnostic. Env files edited on Windows are auto-stripped of CRLF at `source` time so a
+> Windows-saved `.env.gcp` never corrupts gcloud args.
 
 1. **gcloud CLI** installed and authenticated — including **Application Default Credentials**
    (`gcloud auth application-default login`; the Cloud SQL Auth Proxy used by the schema
