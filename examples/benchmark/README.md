@@ -37,6 +37,14 @@ LLM_KEY_OPENAI=sk-...        # NOTE: LLM_KEY_OPENAI, not OPENAI_API_KEY
 > After changing proxy code, append `--rebuild` to rebuild the image before running.
 > Add `--quality-check` to assert each answer still contains its required policy
 > facts (no extra cost); add `--judge` for an opt-in LLM faithfulness score.
+>
+> Add `--security-smoke` for a Trust & Safety check instead of the savings run: it
+> sends `security-smoke.jsonl` (an indirect / RAG prompt injection hidden in a
+> `system`/`tool` retrieved-context message → **G31**, plus a user-turn injection →
+> **G30**) with G29/G30/G31 pinned to block mode, and asserts every attack is either
+> refused (`finish_reason=content_filter`) or not obeyed (its forbidden marker never
+> appears). Exits non-zero on any leak. It runs a separate dataset, so it never
+> moves the calibrated savings number.
 
 The benchmark runs under a **dedicated tenant** (`bench`, sent via the
 `X-Tenant-ID` header), so every key it creates is namespaced under `t:bench:`.

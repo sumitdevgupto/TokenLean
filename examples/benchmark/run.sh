@@ -12,6 +12,12 @@
 #                                                #   G06 routing fix this benchmark relies on)
 #   ./examples/benchmark/run.sh --quality-check  # also assert each answer's curated facts
 #                                                #   (proves the savings did not hurt quality)
+#   ./examples/benchmark/run.sh --security-smoke # Trust & Safety smoke instead of the savings
+#                                                #   run: sends security-smoke.jsonl (indirect/RAG
+#                                                #   injection → G31, user-turn injection → G30)
+#                                                #   with G29/G30/G31 pinned to BLOCK, and asserts
+#                                                #   each attack is refused / not obeyed. Does not
+#                                                #   touch the calibrated savings number.
 #   ./examples/benchmark/run.sh --limit 5        # pass-through args go to run_benchmark.py
 #   ./examples/benchmark/run.sh --no-pin-config  # measure the LIVE config as-is. By default
 #                                                #   the launcher PINS a known-good config that
@@ -29,15 +35,20 @@ die()  { printf '\033[31m[benchmark] ERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
 # Separate launcher-only flags (--rebuild, --keep-cache, --no-pin-config) from
 # run_benchmark.py args.
-REBUILD=0; KEEP_CACHE=0; PIN_CONFIG=1; ARGS=()
+REBUILD=0; KEEP_CACHE=0; PIN_CONFIG=1; SECURITY_SMOKE=0; ARGS=()
 for a in "$@"; do
   case "$a" in
     --rebuild)        REBUILD=1 ;;
     --keep-cache)     KEEP_CACHE=1 ;;
     --no-pin-config)  PIN_CONFIG=0 ;;
+    # --security-smoke also forwards to run_benchmark.py (kept in ARGS); the flag
+    # here makes the pinned config force G29/G30/G31 to block mode for a
+    # deterministic refusal.
+    --security-smoke) SECURITY_SMOKE=1; ARGS+=("$a") ;;
     *)                ARGS+=("$a") ;;
   esac
 done
+export SECURITY_SMOKE
 
 # 1. Docker present + running ---------------------------------------------------
 command -v docker >/dev/null 2>&1 || die "Docker not found. Install Docker and retry."
@@ -150,6 +161,16 @@ for k in enable:
     _block(k)['enabled'] = True
 for k in disable:
     _block(k)['enabled'] = False
+# --security-smoke: force the trust & safety trio to BLOCK so each attack is
+# refused deterministically (finish_reason=content_filter), independent of whether
+# gpt-4o-mini would have resisted the injection on its own.
+import os as _os
+if _os.environ.get('SECURITY_SMOKE') == '1':
+    for k in ('G29_pii_redaction', 'G30_guardrails', 'G31_context_trust'):
+        blk = _block(k)
+        blk['enabled'] = True
+        blk['mode'] = 'block'
+    print("  security-smoke: G29/G30/G31 pinned to block mode")
 yaml.safe_dump(c, open('config/config.yaml', 'w'), sort_keys=False)
 if created:
     print("  note: created missing group blocks:", ", ".join(created))
