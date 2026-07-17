@@ -26,6 +26,18 @@
 # Fails LOUDLY if the sync errors.
 # =============================================================================
 set -euo pipefail
+# ── Host-shell guard ────────────────────────────────────────────────────────────
+# GCP deploy-family operations must run from WSL Ubuntu / Linux / Cloud Shell — NEVER
+# Git Bash or any Windows shell (Terraform local-exec via cmd.exe, psql/docker host
+# tooling, CRLF-corrupted env sourcing). Abort up front with the fix. (Read-only checks
+# like check-gcp-status.sh / post-deploy-check.sh are intentionally NOT guarded — they
+# work from any shell.)
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ERROR: run this from WSL Ubuntu (or Linux/Cloud Shell), NOT Git Bash/Windows." >&2
+    echo "  In WSL:  cd /mnt/d/token-optimisation && bash $0 $*" >&2
+    exit 2 ;;
+esac
 
 PROJECT_ID=""
 REGION=""

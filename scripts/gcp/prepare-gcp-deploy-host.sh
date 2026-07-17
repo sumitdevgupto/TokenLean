@@ -39,6 +39,17 @@
 # =============================================================================
 set -uo pipefail   # NOT -e: we tally failures and print a full report, not abort on first.
 
+# ── Host-shell guard ────────────────────────────────────────────────────────────
+# This script prepares a WSL/Linux deploy host (apt installs, Linux gcloud, psql).
+# On Git Bash / any Windows shell none of that exists — abort with the fix instead
+# of a cascade of confusing failures.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ERROR: run this from WSL Ubuntu (or Linux), NOT Git Bash/Windows." >&2
+    echo "  In WSL:  cd /mnt/d/token-optimisation && bash scripts/gcp/prepare-gcp-deploy-host.sh" >&2
+    exit 2 ;;
+esac
+
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1   # never let a gcloud API-enable prompt block us
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -46,6 +46,7 @@ dist/
 .installed.cfg
 *.egg
 .venv/
+.venv-harness/
 venv/
 env/
 .pytest_cache/

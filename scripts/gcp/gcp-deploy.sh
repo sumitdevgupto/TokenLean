@@ -28,6 +28,18 @@
 # =============================================================================
 set -euo pipefail
 
+# ── Host-shell guard ────────────────────────────────────────────────────────────
+# The GCP deploy must run from WSL Ubuntu / Linux / macOS / Cloud Shell — NEVER Git
+# Bash or any Windows shell: Terraform launches local-exec provisioners via cmd.exe
+# there (bash heredocs fail), psql is absent for the public-IP migrations, and CRLF
+# corrupts sourced env files. Abort up front with the fix (docs/deployment-gcp.md).
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ERROR: run this from WSL Ubuntu (or Linux/macOS/Cloud Shell), NOT Git Bash/Windows." >&2
+    echo "  In WSL:  cd /mnt/d/<repo> && bash scripts/gcp/gcp-deploy.sh $*" >&2
+    exit 2 ;;
+esac
+
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 SKIP_INFRA=false
 SKIP_BUILD=false
