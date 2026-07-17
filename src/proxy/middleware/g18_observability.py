@@ -191,6 +191,14 @@ GUARDRAIL_EVENTS_TOTAL = Counter(
     "attack class (instruction_override, system_prompt_exfil, …)",
     ["tenant_id", "category", "action"],
 )
+CONTEXT_TRUST_EVENTS_TOTAL = Counter(
+    "token_opt_context_trust_events_total",
+    "Indirect prompt-injection events from G31, one increment per flagged/blocked/stripped "
+    "request per matched category. Unlike G30 (which scans the user prompt), G31 scans "
+    "content injected by retrieval (G07) / memory (G10) into system/tool roles. `action` is "
+    "flag, block or strip; `category` is the PII-free attack class.",
+    ["tenant_id", "category", "action"],
+)
 # G03 fine-tuning: one increment per trigger, labelled by tenant. Emitted from the trigger
 # (g03_doc_pipeline.trigger_fine_tuning_pipeline) since the Cloud Run Job runs out-of-process
 # and can't push to the proxy registry — so this counts SUBMISSIONS, not completions.

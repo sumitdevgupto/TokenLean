@@ -37,6 +37,7 @@ from middleware.g27_multimodal_optimizer import G27MultimodalOptimizer
 from middleware.g28_ccr import G28CCR
 from middleware.g29_pii_redaction import G29PiiRedaction
 from middleware.g30_guardrails import G30Guardrails
+from middleware.g31_context_trust import G31ContextTrust
 from middleware import langfuse_tracing
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ class OptimisationPipeline:
     """
     Orchestrates the full G0–G28 token optimisation pipeline.
 
-    Request path:  G0 → G24 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G16 → G11 → G25 → G12 → G13 → G17 → G21
+    Request path:  G0 → G24 → G30 → G29 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21
     Response path: G14 → G23 → G19 → G15 → G11(feedback) → G18
     """
 
@@ -85,6 +86,7 @@ class OptimisationPipeline:
         self.g28 = G28CCR()
         self.g29 = G29PiiRedaction()
         self.g30 = G30Guardrails()
+        self.g31 = G31ContextTrust()
 
     def set_db_pool(self, pool) -> None:
         """Inject the asyncpg pool into the tenant-config loader after startup.
@@ -242,6 +244,17 @@ class OptimisationPipeline:
                 logger.debug("[%s] G24 skipping %s", ctx.request_id, _group)
                 continue
             ctx = await self._run_timed(_name, ctx, _mid.process_request(ctx))
+
+        # Stage 3b — Context-Trust (G31 indirect-injection scan). Runs AFTER G07/G10/G28
+        # have injected retrieved documents / memories into the prompt, and is NOT gated
+        # by ctx.skip_groups — G30's user-prompt scan cannot see this appended context, so
+        # a poisoned RAG doc / stored memory would otherwise reach the model un-inspected.
+        # A block short-circuits the pipeline like G30 (content-filter 200).
+        ctx = await self._run_timed("G31-context-trust", ctx, self.g31.process_request(ctx))
+        if ctx.security_blocked:
+            logger.info("[%s] G31 blocked request (context-injection guardrail)", ctx.request_id)
+            otel.end_span(pipeline_span)
+            return ctx
 
         # Stage 4 — Inside the LLM (architecture advisory + parameter injection)
         for _name, _mid, _group in [

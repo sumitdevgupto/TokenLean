@@ -86,6 +86,13 @@ class RequestContext:
     # metric + the PII-free security audit row + the commercial Security tab.
     guardrail_action: Optional[str] = None
     guardrail_categories: List[str] = field(default_factory=list)
+    # G31 context-trust verdict. Distinct from guardrail_action (G30 scans the
+    # untrusted *user* prompt) — G31 scans content INJECTED by retrieval/memory
+    # (system/tool roles) for indirect prompt injection. action ∈
+    # {None,"allow","flag","block","strip"}; categories are the same PII-free
+    # attack classes. Consumed by the G18 context-trust metric + Security surface.
+    context_trust_action: Optional[str] = None
+    context_trust_categories: List[str] = field(default_factory=list)
     # G29 redaction summary. action ∈ {None,"flag","mask","block"}; entities are
     # PII-free entity TYPES only (e.g. "EMAIL","US_SSN") — never the matched text;
     # count is the number of spans redacted across request (+ non-stream response).

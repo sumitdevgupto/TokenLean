@@ -579,6 +579,19 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `extra_rules` | `[]` | `[[id, category, severity, regex], …]` operator/managed additions (Enterprise ships a managed red-team ruleset feed) |
 | `block_message` | *(built-in)* | Optional custom refusal text |
 
+### G31_context_trust
+**Trust & Safety (Context Quality).** Indirect / RAG prompt-injection defence. G30 scans the untrusted **user** prompt, but retrieval (G07) and memory (G10) then append retrieved documents and stored memories into the prompt as `system` / `tool` messages **after** G30 has already run — so a poisoned document in the vector store or a poisoned stored memory would otherwise reach the model un-inspected. G31 re-runs the same `guardrails/injection.py` scanner over the **assembled** context (the `system` / `tool` roles), right after the G07/G10/G22 stages and **outside the `skip_groups` loops** (non-bypassable). A `block` match short-circuits with an OpenAI content-filter response (HTTP 200, `finish_reason: "content_filter"`) exactly like G30; `strip` mode drops only the offending injected message (or multimodal text part) and continues. Metrics: `token_opt_context_trust_events_total{category,action}`. Per-tenant via `tenants.<id>.groups.G31_context_trust`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Run the context-trust scanner |
+| `mode` | `flag` | `allow` (passthrough) · `flag` (detect + record, pass) · `block` (refuse on match) · `strip` (drop the poisoned injected content, continue) |
+| `threshold` | `0.5` | Minimum rule severity to fire |
+| `scan_roles` | `[system, tool]` | Roles that retrieval/memory inject into (`user` is G30's job) |
+| `metrics_enabled` | `true` | Emit the Prometheus counter |
+| `extra_rules` | `[]` | `[[id, category, severity, regex], …]` additions (Enterprise ships a managed red-team ruleset feed) |
+| `block_message` | *(built-in)* | Optional custom refusal text |
+
 ### G29_pii_redaction
 **Trust & Safety.** PII detection + redaction (`guardrails/pii.py`): email, US SSN (separated forms only), Luhn-validated credit card, North-American phone, IPv4 — plus an optional Microsoft Presidio backend for higher recall. Runs **right after G30, before G04/G05** so cache keys/embeddings, RAG, memory, and CCR only ever see redacted content; in `mask` mode it also scrubs the raw `rag_query` snapshot and the `original_messages` copy. Reversible masking (default) shows the model numbered placeholders (`[PII:EMAIL:1]`) and the **non-streaming** response restores them for the data owner (response-side redaction is non-streaming-only in this version). Metrics: `token_opt_pii_redactions_total{entity_type,action}`; PII-free audit rows (`redaction.flagged` / `redaction.applied` — entity types + counts only, never the matched value). Per-tenant via `tenants.<id>.groups.G29_pii_redaction`.
 

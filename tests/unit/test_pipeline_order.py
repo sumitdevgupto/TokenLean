@@ -81,6 +81,7 @@ class TestPipelineStageOrdering:
         pipeline.g28 = _make("G28")
         pipeline.g29 = _make("G29")
         pipeline.g30 = _make("G30")
+        pipeline.g31 = _make("G31")
         # G18 is only in process_response; stub it for completeness
         pipeline.g18 = MagicMock()
         pipeline.g15 = _make("G15")
@@ -142,6 +143,7 @@ class TestPipelineStageOrdering:
         pipeline.g28 = _make("G28")
         pipeline.g29 = _make("G29")
         pipeline.g30 = _make("G30")
+        pipeline.g31 = _make("G31")
         pipeline.g18 = MagicMock()
         pipeline.g15 = _make("G15")
 
@@ -235,7 +237,7 @@ def _build_stubbed_pipeline(call_log):
 
     for n in ["g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
               "g11", "g12", "g13", "g15", "g16", "g17", "g19", "g20", "g21", "g22",
-              "g24", "g25", "g27", "g28", "g29", "g30"]:
+              "g24", "g25", "g27", "g28", "g29", "g30", "g31"]:
         setattr(p, n, _mk(n.upper()))
     p.g18 = MagicMock()
     return p
@@ -260,6 +262,45 @@ class TestTrustSafetyStageOrdering:
         assert (call_log.index("G24") < call_log.index("G30")
                 < call_log.index("G29") < call_log.index("G04")
                 < call_log.index("G05")), call_log
+
+    @pytest.mark.asyncio
+    async def test_g31_context_trust_runs_after_g22_before_g16(self):
+        """G31 must scan the ASSEMBLED context — after G07/G10/G22 have injected/mutated
+        it — and before the model-facing Stage-4 groups (G16…)."""
+        call_log = []
+        pipeline = _build_stubbed_pipeline(call_log)
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(_make_ctx())
+
+        for g in ["G22", "G31", "G16"]:
+            assert g in call_log, f"{g} did not run: {call_log}"
+        assert call_log.index("G22") < call_log.index("G31") < call_log.index("G16"), call_log
+
+    @pytest.mark.asyncio
+    async def test_g31_block_short_circuits_before_g16(self):
+        """A G31 context-injection block returns immediately — Stage-4 (G16) must not run."""
+        call_log = []
+        pipeline = _build_stubbed_pipeline(call_log)
+
+        async def _blocking(ctx):
+            call_log.append("G31")
+            ctx.security_blocked = True
+            ctx.security_block_response = {"choices": []}
+            return ctx
+
+        pipeline.g31.process_request.side_effect = _blocking
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            ctx = await pipeline.process_request(_make_ctx())
+
+        assert ctx.security_blocked
+        assert "G31" in call_log
+        assert "G16" not in call_log
 
     @pytest.mark.asyncio
     async def test_guardrail_block_short_circuits_before_g29_and_g04(self):

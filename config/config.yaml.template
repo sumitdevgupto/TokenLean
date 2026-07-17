@@ -866,3 +866,19 @@ groups:
     use_presidio: false        # optional higher-recall backend (needs presidio-analyzer)
     metrics_enabled: true
     # block_message: "This request was blocked because it contained personal data."
+  # ── Context-Trust (G31 indirect prompt-injection defence) ────────────────────
+  # G30 scans the untrusted USER prompt; G31 scans content INJECTED by retrieval
+  # (G07) and memory (G10) into system/tool roles — the indirect / RAG injection
+  # path that G30 (running earlier) cannot see. Runs after the G07/G10 stages and
+  # is NON-BYPASSABLE (not gated by skip_groups). Default mode: flag (non-mutating).
+  G31_context_trust:
+    enabled: true
+    mode: flag                 # allow | flag | block | strip. flag = detect + record +
+                               # pass (default, non-mutating). block = content-filter 200.
+                               # strip = drop the poisoned injected message/part & continue.
+                               # allow = passthrough (no scan).
+    threshold: 0.5             # minimum rule severity to fire
+    scan_roles: [system, tool] # roles that retrieval/memory inject into (user is G30's job)
+    metrics_enabled: true
+    extra_rules: []            # [[id, category, severity, regex], …] managed-feed additions
+    # block_message: "Retrieved context contained a prompt-injection attempt."
