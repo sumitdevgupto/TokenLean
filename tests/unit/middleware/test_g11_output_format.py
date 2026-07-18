@@ -263,3 +263,142 @@ class TestG11OutputHoldout:
         with patch("middleware.g18_observability.OUTPUT_HOLDOUT_COMPLETION_TOKENS") as mock_metric:
             ctx, resp = await G11OutputFormat().process_response(ctx, response)
         mock_metric.labels.assert_not_called()
+
+
+# ── Task 4: output JSON-schema validation ─────────────────────────────────────
+def _resp(content):
+    """A minimal OpenAI chat-completion with one text answer."""
+    return {
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}],
+        "usage": {"completion_tokens": 12},
+    }
+
+
+_SCHEMA_RF = {
+    "type": "json_schema",
+    "json_schema": {"schema": {
+        "type": "object", "required": ["name"],
+        "properties": {"name": {"type": "string"}},
+    }},
+}
+
+
+@pytest.mark.asyncio
+class TestG11OutputValidation:
+    """Task 4 — validate a structured-output answer is parseable JSON (and schema-valid)."""
+
+    async def test_off_by_default_is_passthrough(self, make_ctx):
+        ctx = make_ctx(params={"response_format": {"type": "json_object"}})
+        # validate_output unset → defaults to off
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("not json at all"))
+        m.assert_not_called()
+        assert resp["choices"][0]["message"]["content"] == "not json at all"
+        assert "_token_opt" not in resp
+
+    async def test_no_response_format_skips_validation(self, make_ctx):
+        ctx = make_ctx()  # no response_format → nothing to validate even in flag mode
+        ctx.config["groups"]["G11_output"]["validate_output"] = "flag"
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("plain prose"))
+        m.assert_not_called()
+
+    async def test_valid_json_object_passes(self, make_ctx):
+        ctx = make_ctx(params={"response_format": {"type": "json_object"}})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "flag"
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp('{"ok": true}'))
+        m.assert_not_called()
+        assert resp.get("_token_opt", {}).get("output_validation") is None
+
+    async def test_flag_mode_records_and_annotates_on_bad_json(self, make_ctx):
+        ctx = make_ctx(params={"response_format": {"type": "json_object"}})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "flag"
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("this is not json"))
+        m.assert_called_once()
+        assert m.call_args.args[1] == "flag"
+        assert resp["_token_opt"]["output_validation"]["validated"] is False
+        # answer is unchanged in flag mode
+        assert resp["choices"][0]["message"]["content"] == "this is not json"
+
+    async def test_schema_missing_required_field_detected(self, make_ctx):
+        ctx = make_ctx(params={"response_format": _SCHEMA_RF})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "flag"
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            # valid JSON, but missing the required "name" field
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp('{"age": 5}'))
+        m.assert_called_once()
+        assert resp["_token_opt"]["output_validation"]["validated"] is False
+
+    async def test_schema_satisfied_passes(self, make_ctx):
+        ctx = make_ctx(params={"response_format": _SCHEMA_RF})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "flag"
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp('{"name": "Ada"}'))
+        m.assert_not_called()
+
+    async def test_block_mode_withholds_bad_json(self, make_ctx):
+        ctx = make_ctx(params={"response_format": {"type": "json_object"}})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "block"
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("nope"))
+        m.assert_called_once()
+        assert resp["choices"][0]["finish_reason"] == "content_filter"
+        assert ctx.no_cache is True
+
+    async def test_repair_success_replaces_answer(self, make_ctx):
+        ctx = make_ctx(params={"response_format": _SCHEMA_RF})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "repair"
+        from middleware.g11_output_format import G11OutputFormat
+        # I4: mocked single re-ask returning a repaired, schema-valid answer
+        reask = AsyncMock(return_value='{"name": "Grace"}')
+        with patch("middleware.g11_output_format._reask", reask), \
+             patch("middleware.quality_metrics.record_schema_failure"):
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("broken"))
+        reask.assert_awaited_once()          # exactly ONE re-ask, no loop
+        assert resp["choices"][0]["message"]["content"] == '{"name": "Grace"}'
+        assert resp["_token_opt"]["output_validation"] == {"validated": True, "repaired": True}
+
+    async def test_repair_still_invalid_falls_back_to_flag_no_loop(self, make_ctx):
+        ctx = make_ctx(params={"response_format": _SCHEMA_RF})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "repair"  # repair_fallback defaults to flag
+        from middleware.g11_output_format import G11OutputFormat
+        reask = AsyncMock(return_value="still not json")   # re-ask fails to repair
+        with patch("middleware.g11_output_format._reask", reask), \
+             patch("middleware.quality_metrics.record_schema_failure"):
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("broken"))
+        reask.assert_awaited_once()          # NO second re-ask
+        assert resp["_token_opt"]["output_validation"]["repaired"] is False
+        assert resp["choices"][0].get("finish_reason") != "content_filter"   # flag fallback, not block
+
+    async def test_repair_fallback_block(self, make_ctx):
+        ctx = make_ctx(params={"response_format": _SCHEMA_RF})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "repair"
+        ctx.config["groups"]["G11_output"]["repair_fallback"] = "block"
+        from middleware.g11_output_format import G11OutputFormat
+        reask = AsyncMock(return_value=None)   # re-ask errored out
+        with patch("middleware.g11_output_format._reask", reask), \
+             patch("middleware.quality_metrics.record_schema_failure"):
+            ctx, resp = await G11OutputFormat().process_response(ctx, _resp("broken"))
+        reask.assert_awaited_once()
+        assert resp["choices"][0]["finish_reason"] == "content_filter"
+
+    async def test_tool_call_answer_not_validated(self, make_ctx):
+        # A tool-call answer has content=None → not a JSON text answer, skip validation.
+        ctx = make_ctx(params={"response_format": {"type": "json_object"}})
+        ctx.config["groups"]["G11_output"]["validate_output"] = "block"
+        resp_in = {"choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                   "tool_calls": [{"id": "c1"}]}}], "usage": {"completion_tokens": 3}}
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.quality_metrics.record_schema_failure") as m:
+            ctx, resp = await G11OutputFormat().process_response(ctx, resp_in)
+        m.assert_not_called()
+        assert resp["choices"][0]["message"].get("finish_reason") is None

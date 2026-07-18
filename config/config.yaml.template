@@ -640,6 +640,12 @@ groups:
       enabled: false
       default_suffix: ''
       per_tenant_suffix: {}
+    # Output JSON-schema validation (Task 4). Only acts when the request asked for
+    # structured output (response_format json_object/json_schema or a json_schema param).
+    validate_output: off        # off (default, no-op) | flag | repair | block
+    repair_fallback: flag       # when repair's single re-ask is still invalid: flag | block
+    repair_max_tokens: null      # cap on the corrective re-ask (null → reuse the request's max_tokens)
+    validate_block_message: 'The response did not conform to the required output schema and was withheld.'
     output_holdout:
       enabled: false
       fraction: 0.05

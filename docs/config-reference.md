@@ -363,6 +363,10 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | `output_holdout.enabled` | `false` | A3 holdout: route a % of traffic to a control cohort that **skips** G11 shaping, so the real output-token reduction can be measured (treatment vs holdout) via the `g11_output_holdout_completion_tokens` metric. Opt-in — control traffic is intentionally un-optimised. |
 | `output_holdout.fraction` | `0.05` | Share of requests in the control cohort (0.0–1.0) |
 | `output_holdout.sticky_key` | `workflow_id` | Stable cohort key (sticky per conversation); falls back to `user_id` then `request_id` |
+| `validate_output` | `off` | Validate a **structured-output** answer (only when the request set `response_format` `json_object`/`json_schema`, or a `json_schema` param). `off` (no-op) / `flag` (record + annotate `_token_opt.output_validation`, non-mutating) / `repair` (one bounded corrective re-ask) / `block` (withhold with a content-filter 200, not cached). Emits `token_opt_output_schema_failures_total`. |
+| `repair_fallback` | `flag` | When `repair`'s single re-ask is still invalid: `flag` (annotate + return) or `block` (withhold). Exactly one re-ask — never loops. |
+| `repair_max_tokens` | `null` | Cap on the corrective re-ask (`null` → reuse the request's `max_tokens`). |
+| `validate_block_message` | *(default text)* | Message returned when a malformed answer is withheld in `block` mode. |
 
 ### G12_reasoning
 | Parameter | Default | Description |

@@ -13,6 +13,14 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — Output JSON-schema validation (G11)
+**Type:** Enhancement (OSS + Enterprise)
+
+When a request asks for **structured output** (OpenAI `response_format` `json_object`/`json_schema`, or a `json_schema` param), G11 can now **validate the model's answer is parseable JSON and conforms to the schema** — closing the "malformed JSON / missing required field" gap on the response path. Opt-in via `groups.G11_output.validate_output`: `off` (default, unchanged behaviour) / `flag` (record + annotate `_token_opt.output_validation`, non-mutating) / `repair` (**one** bounded corrective re-ask — never loops; `repair_fallback: flag|block` if the single retry still fails) / `block` (withhold the malformed answer with a content-filter 200, not cached). Emits `token_opt_output_schema_failures_total{tenant_id,mode}`. Tool-call and multimodal answers are never touched. Config: `docs/config-reference.md`; 11 new unit tests.
+
+- **OSS:** the JSON/schema validator + `flag`/`repair`/`block` modes ship in every tier.
+- **[Enterprise]:** the `output-reliability` dashboards + anomaly alerting over schema-failure rates — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18 — Application-quality metrics surface
 **Type:** Enhancement (OSS + Enterprise)
 

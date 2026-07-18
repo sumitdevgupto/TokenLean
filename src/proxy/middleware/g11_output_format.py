@@ -188,6 +188,124 @@ def _record_holdout_metric(ctx: RequestContext, completion_tokens: int) -> None:
         logger.debug("[%s] G11 holdout metric emit failed: %s", ctx.request_id, exc)
 
 
+# ─── Task 4: output JSON-schema validation ────────────────────────────────────
+# When the request asked for structured output (response_format json_object/json_schema,
+# or a bare json_schema param), validate the model's answer is parseable JSON (and, if a
+# schema was supplied, conforms to it). Modes: off (default) | flag | repair | block.
+_VALIDATE_MODES = ("off", "flag", "repair", "block")
+
+
+def _extract_answer(response: Dict[str, Any]) -> Optional[str]:
+    """Return the first choice's assistant text, or None if it isn't a plain string
+    (tool-call / multimodal answers are not JSON-validated here)."""
+    choices = response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return None
+    msg = choices[0].get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    return content if isinstance(content, str) else None
+
+
+def _replace_answer(response: Dict[str, Any], new_content: str) -> Dict[str, Any]:
+    """Return response with the first choice's assistant content replaced (in place)."""
+    try:
+        response["choices"][0]["message"]["content"] = new_content
+    except Exception:
+        pass
+    return response
+
+
+def _wants_structured_output(ctx: RequestContext) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Did the request ask for JSON output? Return (wants_json, json_schema_or_None).
+
+    Recognises the OpenAI ``response_format`` shape (json_object / json_schema) and a
+    bare ``json_schema`` param. The schema (when present) is what jsonschema validates."""
+    wants = False
+    schema: Optional[Dict[str, Any]] = None
+    rf = ctx.params.get("response_format")
+    if isinstance(rf, dict):
+        rtype = rf.get("type")
+        if rtype in ("json_object", "json_schema"):
+            wants = True
+        if rtype == "json_schema":
+            js = rf.get("json_schema")
+            if isinstance(js, dict):
+                schema = js.get("schema") or js
+    bare = ctx.params.get("json_schema")
+    if isinstance(bare, dict) and schema is None:
+        schema, wants = bare, True
+    return wants, schema
+
+
+def _validate_answer(answer: str, schema: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    """(is_valid, reason). Parse JSON; if a schema is given, validate against it.
+    A malformed schema is treated as a validation miss (never crashes the request)."""
+    try:
+        parsed = json.loads(answer)
+    except Exception as exc:
+        return False, f"unparseable JSON ({exc})"
+    if schema:
+        try:
+            import jsonschema  # optional dep; pinned in requirements.txt
+            jsonschema.validate(parsed, schema)
+        except ImportError:
+            logger.warning("G11 validate_output: jsonschema not installed — skipping schema check")
+            return True, "ok (schema check skipped: jsonschema missing)"
+        except Exception as exc:
+            return False, f"schema validation failed ({getattr(exc, 'message', exc)})"
+    return True, "ok"
+
+
+async def _reask(ctx: RequestContext, answer: str, schema: Optional[Dict[str, Any]],
+                 max_tokens: Optional[int]) -> Optional[str]:
+    """One bounded corrective LLM call to repair a malformed structured answer.
+
+    Returns the repaired answer text, or None on any error (the caller then falls back
+    to flag/block — never loops). Injectable: tests monkeypatch this to avoid a live call.
+    BYOK: resolves the tenant's provider key when it can, else lets litellm use its env."""
+    try:
+        import litellm
+    except Exception:
+        return None
+    model = getattr(ctx, "routed_model", None) or ctx.model
+    provider_key = None
+    try:
+        from config_loader import get_provider_model_prefixes
+        from providers.key_resolver import resolve_provider_key
+        for fragment, prov in (get_provider_model_prefixes() or {}).items():
+            if fragment in str(model).lower():
+                provider_key = await resolve_provider_key(prov, getattr(ctx, "tenant_id", "default"), ctx)
+                break
+    except Exception:
+        provider_key = None
+
+    schema_hint = json.dumps(schema) if schema else "a single valid JSON object"
+    repair_messages = list(ctx.messages) + [
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": (
+            "Your previous reply was not valid JSON for the required format. Reply again "
+            "with ONLY valid JSON — no prose, no markdown fences — conforming to: " + schema_hint
+        )},
+    ]
+    kwargs: Dict[str, Any] = {}
+    if provider_key:
+        kwargs["api_key"] = provider_key
+    rf = ctx.params.get("response_format")
+    if isinstance(rf, dict):
+        kwargs["response_format"] = rf
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    try:
+        resp = await litellm.acompletion(model=model, messages=repair_messages, **kwargs)
+        rd = resp.model_dump() if hasattr(resp, "model_dump") else resp
+        return _extract_answer(rd if isinstance(rd, dict) else {})
+    except Exception as exc:
+        logger.warning("[%s] G11 repair re-ask failed: %s", ctx.request_id, exc)
+        return None
+
+
 class G11OutputFormat:
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         cfg = ctx.config.get("groups", {}).get("G11_output", {})
@@ -347,6 +465,13 @@ class G11OutputFormat:
         if not cfg.get("enabled", False):
             return ctx, response
 
+        # ── Task 4: output JSON-schema validation ─────────────────────────────
+        # Runs before the feedback loop so a `block` withholds the malformed answer
+        # (and a `repair` replaces it) before it is recorded/cached. Off by default.
+        block_resp = await self._validate_output(ctx, cfg, response)
+        if block_resp is not None:
+            return ctx, block_resp   # block / repair-fallback-block → withhold, skip feedback
+
         usage = response.get("usage", {})
         completion_tokens = usage.get("completion_tokens", 0)
 
@@ -385,3 +510,69 @@ class G11OutputFormat:
             ctx.params.setdefault("_token_opt_feedback", {})["max_tokens_utilization"] = utilization
 
         return ctx, response
+
+    async def _validate_output(
+        self, ctx: RequestContext, cfg: Dict[str, Any], response: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a structured-output answer. Returns a content-filter block response
+        when the answer must be WITHHELD (block mode, or repair fell back to block); else
+        None (annotating/repairing `response` in place). Off by default → no-op passthrough."""
+        mode = str(cfg.get("validate_output", "off")).lower()
+        if mode not in ("flag", "repair", "block"):
+            return None  # off / unknown → passthrough (no validation, no metric)
+
+        wants, schema = _wants_structured_output(ctx)
+        if not wants:
+            return None  # request didn't ask for JSON — nothing to validate
+        answer = _extract_answer(response)
+        if answer is None:
+            return None  # tool-call / multimodal / empty answer — not validated here
+
+        ok, reason = _validate_answer(answer, schema)
+        if ok:
+            return None
+
+        # Invalid structured output.
+        self._emit_schema_failure(ctx, mode)
+
+        if mode == "block":
+            return self._schema_block(ctx, cfg)
+
+        if mode == "repair":
+            max_reask = cfg.get("repair_max_tokens", ctx.params.get("max_tokens"))
+            repaired = await _reask(ctx, answer, schema, max_reask)
+            if repaired is not None and _validate_answer(repaired, schema)[0]:
+                _replace_answer(response, repaired)
+                self._annotate(response, {"validated": True, "repaired": True})
+                return None
+            # Bounded: exactly one re-ask. Still invalid → fall back (no loop).
+            fallback = str(cfg.get("repair_fallback", "flag")).lower()
+            if fallback == "block":
+                return self._schema_block(ctx, cfg)
+            self._annotate(response, {"validated": False, "repaired": False, "reason": reason})
+            return None
+
+        # flag
+        self._annotate(response, {"validated": False, "reason": reason})
+        return None
+
+    @staticmethod
+    def _annotate(response: Dict[str, Any], info: Dict[str, Any]) -> None:
+        response.setdefault("_token_opt", {})["output_validation"] = info
+
+    def _schema_block(self, ctx: RequestContext, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Withhold a malformed structured answer with a content-filter 200 (not cached)."""
+        from guardrails import content_filter_response
+        ctx.no_cache = True
+        message = cfg.get(
+            "validate_block_message",
+            "The response did not conform to the required output schema and was withheld.",
+        )
+        return content_filter_response(ctx.request_id, ctx.routed_model or ctx.model, message)
+
+    def _emit_schema_failure(self, ctx: RequestContext, mode: str) -> None:
+        try:
+            from middleware.quality_metrics import record_schema_failure
+            record_schema_failure(getattr(ctx, "tenant_id", "default"), mode)
+        except Exception as exc:  # never let metrics break the response
+            logger.debug("[%s] G11 schema-failure metric emit failed: %s", ctx.request_id, exc)

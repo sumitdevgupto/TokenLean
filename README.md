@@ -312,7 +312,7 @@ tests/                      # Unit and integration tests (pytest)
 | **G8** | Tool Loading | 10-20% | MCP lazy-load manifest protocol with scheduled pruning |
 | **G9** | Context Schema | 15-25% | Instructor library with timeout fallback to heuristic |
 | **G10** | Memory Management | 20-40% | Mem0 OSS integration for long-horizon conversation memory |
-| **G11** | Output Format | 10-25% | Auto max_tokens with Redis feedback loop (p95 tuning) |
+| **G11** | Output Format | 10-25% | Auto max_tokens with Redis feedback loop (p95 tuning). Opt-in **output JSON-schema validation** (`validate_output`) — flag / one-shot repair / block a structured answer that isn't valid JSON or misses a schema field |
 | **G12** | Reasoning Budget | 10-30% | Low/medium/high effort suppression prompts |
 | **G13** | Batch/Compact | 25-60% | TOON (Token-Optimized Object Notation) + Kafka batching |
 | **G14** | Tool Output | 15-30% | Dependency-aware parallel tool combining |
