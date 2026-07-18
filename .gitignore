@@ -206,6 +206,8 @@ skills/
 scripts/verify-oss-gates.sh
 # item 20 (P2) — tier-build matrix runner (private; exercises commercial builds)
 scripts/test-tiers.sh
+# doctrine enforcement gate (private; release-notes + unit-test presence, run by checkin-push.sh)
+scripts/check-release-notes.sh
 
 # ─── Commercial layer (private — open-core split) ────────────────────────────
 # Pure-commercial source (item 8). Engines STAY in core (billing/metering.py,
