@@ -221,3 +221,55 @@ class TestRerankFailClosed:
         with patch("ml_models.get_cross_encoder", side_effect=RuntimeError("reranker down")):
             out = await _rerank("q", chunks, top_k=3, threshold=0.0, fallback_floor=0.85)
         assert len(out) == 3
+
+
+@pytest.mark.asyncio
+class TestG07Freshness:
+    """Task 10 — chunk age computation + max_age_days soft filter (pure helpers,
+    deterministic via an injected `now`)."""
+
+    def _now(self):
+        from datetime import datetime, timezone
+        return datetime(2026, 7, 18, tzinfo=timezone.utc)
+
+    def _chunk(self, days_old, key="ingested_at"):
+        from datetime import timedelta
+        ts = (self._now() - timedelta(days=days_old)).isoformat()
+        return {"text": f"{days_old}d", key: ts}
+
+    async def test_age_prefers_source_date_over_ingested_at(self):
+        from middleware.g07_retrieval import _chunk_age_seconds
+        from datetime import timedelta
+        c = {"text": "x",
+             "ingested_at": (self._now() - timedelta(days=1)).isoformat(),
+             "source_date": (self._now() - timedelta(days=10)).isoformat()}
+        age_days = _chunk_age_seconds(c, self._now()) / 86400.0
+        assert round(age_days) == 10   # source_date wins
+
+    async def test_missing_timestamp_is_unknown_age(self):
+        from middleware.g07_retrieval import _chunk_age_seconds
+        assert _chunk_age_seconds({"text": "x"}, self._now()) is None
+
+    async def test_filter_drops_stale_keeps_fresh(self):
+        from middleware.g07_retrieval import _filter_by_freshness
+        chunks = [self._chunk(2), self._chunk(400)]   # 2 days, 400 days
+        kept = _filter_by_freshness(chunks, max_age_days=30, now=self._now())
+        assert [c["text"] for c in kept] == ["2d"]
+
+    async def test_filter_keeps_unknown_age_chunks(self):
+        from middleware.g07_retrieval import _filter_by_freshness
+        chunks = [self._chunk(400), {"text": "no-ts"}]
+        kept = _filter_by_freshness(chunks, max_age_days=30, now=self._now())
+        assert "no-ts" in [c["text"] for c in kept]   # unknown age never dropped
+
+    async def test_no_max_age_is_passthrough(self):
+        from middleware.g07_retrieval import _filter_by_freshness
+        chunks = [self._chunk(400), self._chunk(2)]
+        assert _filter_by_freshness(chunks, max_age_days=None, now=self._now()) == chunks
+        assert _filter_by_freshness(chunks, max_age_days=0, now=self._now()) == chunks
+
+    async def test_max_age_seconds(self):
+        from middleware.g07_retrieval import _max_chunk_age_seconds
+        chunks = [self._chunk(1), self._chunk(5)]
+        assert round(_max_chunk_age_seconds(chunks, self._now()) / 86400.0) == 5
+        assert _max_chunk_age_seconds([{"text": "x"}], self._now()) is None

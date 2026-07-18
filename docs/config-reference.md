@@ -311,6 +311,7 @@ It runs each case tier-1 → LLM judge → optional tier-3 escalation, sweeps th
 | `max_total_context_tokens` | `4000` | ⚠ Hard cap on total injected context |
 | `max_chunk_tokens` | `1000` | ⚠ Per-chunk token guard |
 | `rrf_alpha` | `0.5` | Dense-vs-sparse fusion weight (Reciprocal Rank Fusion) |
+| `max_age_days` | `null` | ⚠ Freshness soft-filter — drop retrieved chunks older than N days (by the document's `source_date`, else its `ingested_at` stamp). `null`/`0` = off. Chunks with no timestamp (ingested before freshness stamping) are always kept. |
 | `jit_require_rag_intent` | `false` | When `true`, JIT retrieval only runs if the caller signalled RAG intent (`rag_query` param or `X-Rag-Collection` header); non-RAG chat requests skip the embed + Qdrant search + rerank. Default `false` auto-extracts a query from the last user message on every request. |
 
 Also present: `dense_model`, `sparse_model`, `reranker_model`, `rrf_k` (60), `jit_retrieval_enabled` (true), `use_pgvector_fallback` (false).

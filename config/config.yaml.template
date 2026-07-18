@@ -538,6 +538,9 @@ groups:
     reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
     rrf_k: 60
     rrf_alpha: 0.5
+    max_age_days: null         # freshness soft-filter: drop retrieved chunks older than
+                               # N days (by source_date, else ingested_at). null/0 = off.
+                               # Chunks with no timestamp (pre-freshness corpora) are kept.
     jit_retrieval_enabled: true
     # When true, JIT retrieval only runs if the caller signalled RAG intent
     # (rag_query param or X-Rag-Collection header) — non-RAG chat requests skip

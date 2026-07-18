@@ -13,6 +13,14 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — RAG context freshness (ingest timestamps + max-age filter)
+**Type:** Enhancement (OSS + Enterprise)
+
+RAG chunks now carry freshness metadata: the ingestion pipeline (G03) stamps `ingested_at` on every chunk (and `source_date` when the operator supplies the document's own date via `SOURCE_DATE`), and retrieval (G07) can **soft-filter stale context** with `max_age_days` — dropping chunks older than the window (by `source_date`, else `ingested_at`) before they reach the model. It fails safe: `max_age_days: null` (default) is off, and a chunk with no timestamp (ingested before this feature) is never dropped, so existing corpora keep working. Chunk age is surfaced on the retrieval trace. Config: `groups.G7_retrieval.max_age_days` (see `docs/config-reference.md`); 10 new tests.
+
+- **OSS:** the freshness stamp + max-age filter ship in every tier.
+- **[Enterprise]:** freshness/staleness dashboards + alerting over the retrieval corpus — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18 — PII/PHI redaction at RAG ingest (opt-in, G03)
 **Type:** Enhancement (OSS + Enterprise)
 

@@ -117,3 +117,55 @@ def test_run_masks_pii_before_store(monkeypatch):
     assert SSN not in stored
     assert DEA not in stored
     assert "[EMAIL]" in stored   # placeholders present → redaction actually ran
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 10 — freshness metadata stamped at ingest
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import datetime
+
+
+def _run_full(monkeypatch, **env):
+    """Drive run() end-to-end with fakes; return the upserted points."""
+    mod = _load_pipeline(
+        monkeypatch,
+        GCS_BUCKET="b", GCS_OBJECT="doc.txt",
+        TENANT_ID="NOVA-STG-01", QDRANT_COLLECTION="rag_nova-stg-01",
+        **env,
+    )
+    text = ("This is a sufficiently long document section that clears the minimum "
+            "length guard so the ingestion pipeline processes and upserts it.")
+    monkeypatch.setattr(mod, "download_from_gcs", lambda b, o: b"bytes")
+    monkeypatch.setattr(mod, "extract_text", lambda content, name: text)
+    monkeypatch.setattr(mod, "embed_chunks_dense", lambda chunks: [[0.1, 0.2] for _ in chunks])
+    monkeypatch.setattr(mod, "embed_chunks_sparse", lambda chunks: [object() for _ in chunks])
+    monkeypatch.setattr(mod, "_to_sparse_vector", lambda x: x, raising=False)
+    fake = _FakeQdrant()
+    _install_fake_qdrant(monkeypatch, fake)
+    mod.run()
+    return fake.upserted
+
+
+class TestIngestFreshness:
+    def test_ingested_at_stamped_and_iso(self, monkeypatch):
+        points = _run_full(monkeypatch)
+        assert points
+        for p in points:
+            ts = p["payload"]["ingested_at"]
+            # present + ISO-parseable
+            datetime.fromisoformat(ts)
+
+    def test_source_date_null_by_default(self, monkeypatch):
+        points = _run_full(monkeypatch)
+        assert all(p["payload"]["source_date"] is None for p in points)
+
+    def test_source_date_from_env(self, monkeypatch):
+        points = _run_full(monkeypatch, SOURCE_DATE="2024-01-15")
+        for p in points:
+            assert p["payload"]["source_date"].startswith("2024-01-15")
+
+    def test_bad_source_date_falls_back_to_null(self, monkeypatch):
+        points = _run_full(monkeypatch, SOURCE_DATE="not-a-date")
+        assert all(p["payload"]["source_date"] is None for p in points)
+        # ingested_at is still always present
+        assert all(p["payload"]["ingested_at"] for p in points)

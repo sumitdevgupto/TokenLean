@@ -10,7 +10,8 @@ import os
 import re
 import sys
 import uuid
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), stream=sys.stdout)
@@ -38,6 +39,26 @@ _VALID_COLLECTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 # Fixed namespace for deterministic, tenant-scoped point ids (uuid5). Replaces the old
 # 32-bit md5-truncation which could silently overwrite another doc's/tenant's chunk.
 _POINT_ID_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+
+def _now_iso() -> str:
+    """Ingest timestamp (UTC, ISO-8601). Wrapped so tests can inject a fixed 'now'."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _source_date() -> Optional[str]:
+    """The document's own authored/effective date, if the operator supplied one via
+    the ``SOURCE_DATE`` env override (ISO-8601). Returns the normalised ISO string, or
+    ``None`` when absent/unparseable — freshness then falls back to ``ingested_at``."""
+    raw = os.getenv("SOURCE_DATE", "").strip()
+    if not raw:
+        return None
+    try:
+        # Accept a plain date or a full timestamp; normalise to ISO. 'Z' → +00:00.
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
+    except Exception:
+        logger.warning("SOURCE_DATE=%r is not ISO-8601 — ignoring (falling back to ingested_at)", raw)
+        return None
 
 
 def download_from_gcs(bucket: str, obj: str) -> bytes:
@@ -294,6 +315,8 @@ def upsert_to_qdrant(
             },
         )
 
+    ingested_at = _now_iso()
+    source_date = _source_date()
     points = [
         PointStruct(
             # Deterministic + tenant-namespaced: re-ingesting the same doc updates in
@@ -308,6 +331,11 @@ def upsert_to_qdrant(
                 "source": source,
                 "chunk_index": i,
                 "tenant_id": _TENANT_ID,
+                # Freshness (Task 10): ingested_at is always stamped; source_date is the
+                # document's own date when the operator supplied one (else null). G07
+                # reads these to compute chunk age + apply an optional max-age filter.
+                "ingested_at": ingested_at,
+                "source_date": source_date,
             },
         )
         for i in range(len(chunks))

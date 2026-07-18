@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext
@@ -262,10 +263,21 @@ class G07Retrieval:
                     )
                     fallback_used = bool(chunks)
 
+            # Freshness (Task 10): soft-filter chunks older than max_age_days before
+            # anything else consumes them (unknown-age chunks are kept). Off unless
+            # `max_age_days` is configured.
+            max_age_days = cfg.get("max_age_days")
+            if max_age_days:
+                _before = len(chunks)
+                chunks = _filter_by_freshness(chunks, max_age_days)
+                if len(chunks) < _before:
+                    logger.debug("[%s] G07 freshness: dropped %d stale chunk(s) (> %s days)",
+                                 ctx.request_id, _before - len(chunks), max_age_days)
+
             # Apply chunk guard
             chunk_guard = self._get_chunk_guard(cfg)
             chunks = chunk_guard.validate_chunks(chunks)
-            
+
             # Rerank if Qdrant mode
             if not use_pgvector:
                 reranker_model = cfg.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
@@ -294,6 +306,9 @@ class G07Retrieval:
                         "top_k_after_rerank": top_k_after_rerank,
                         "similarity_threshold": sim_threshold,
                         "chunk_scores": [round(c.get("score", 0.0), 3) for c in ranked],
+                        # Freshness (Task 10): oldest injected chunk age in seconds
+                        # (None = no chunk carried a timestamp). Task 11 emits the metric.
+                        "context_max_age_seconds": _max_chunk_age_seconds(ranked),
                         "jit_enabled": jit_enabled,
                         "pgvector_fallback": use_pgvector,
                         "rag_fallback_chain_used": fallback_used,
@@ -467,12 +482,60 @@ async def _hybrid_search(
         # The request-path caller ignores it, so this is a no-op for existing behaviour.
         return [
             {"text": r.payload.get("text", ""), "score": r.score,
-             "source": (r.payload or {}).get("source", ""), "_score_kind": score_kind}
+             "source": (r.payload or {}).get("source", ""), "_score_kind": score_kind,
+             # Freshness (Task 10): carried through so G07 can compute chunk age +
+             # apply the optional max-age filter. Absent on old points → treated as
+             # unknown age (never dropped).
+             "ingested_at": (r.payload or {}).get("ingested_at"),
+             "source_date": (r.payload or {}).get("source_date")}
             for r in results.points
         ]
     except Exception as exc:
         logger.warning("G07 Qdrant search failed: %s", exc)
         return []
+
+
+def _chunk_age_seconds(chunk: Dict, now: Optional[datetime] = None) -> Optional[float]:
+    """Age of a retrieved chunk in seconds, from its `source_date` (the document's own
+    date, preferred) or else `ingested_at`. Returns None when the chunk carries no
+    parseable timestamp — such a chunk has unknown freshness and is never dropped."""
+    now = now or datetime.now(timezone.utc)
+    raw = chunk.get("source_date") or chunk.get("ingested_at")
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if ts.tzinfo is None:                      # treat a naive stamp as UTC
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - ts).total_seconds())
+
+
+def _filter_by_freshness(chunks: List[Dict], max_age_days: Optional[float],
+                         now: Optional[datetime] = None) -> List[Dict]:
+    """Soft freshness filter: drop chunks older than `max_age_days`. A chunk with no
+    timestamp (unknown age) is KEPT — freshness filtering must never silently gut RAG
+    for a corpus ingested before freshness stamping existed. `max_age_days` None/<=0 →
+    no filtering (returns the input unchanged)."""
+    if not max_age_days or max_age_days <= 0:
+        return chunks
+    now = now or datetime.now(timezone.utc)
+    cutoff = float(max_age_days) * 86400.0
+    kept = []
+    for c in chunks:
+        age = _chunk_age_seconds(c, now)
+        if age is None or age <= cutoff:
+            kept.append(c)
+    return kept
+
+
+def _max_chunk_age_seconds(chunks: List[Dict], now: Optional[datetime] = None) -> Optional[float]:
+    """Oldest chunk age in seconds across those that carry a timestamp (for the
+    freshness metric). None when no chunk has a timestamp."""
+    now = now or datetime.now(timezone.utc)
+    ages = [a for a in (_chunk_age_seconds(c, now) for c in chunks) if a is not None]
+    return max(ages) if ages else None
 
 
 async def _rerank(
