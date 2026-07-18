@@ -1,104 +1,85 @@
 # Release Notes — TokenLean
 
-Newest entries first. Each entry is dated (`YYYY-MM-DD`). Bug fixes and feature
-enhancements are logged here as they ship. Enterprise-only items are labelled
-**[Enterprise]** and link to <https://tokenlean.cbeyond.cloud/>.
+Newest date first. All changes that shipped on the same day are grouped under **one**
+`## YYYY-MM-DD` header. Enterprise-only items are labelled **[Enterprise]** and link to
+<https://tokenlean.cbeyond.cloud/>.
 
 <!--
-Entry format (add new entries directly BELOW this comment, newest at top):
+Format (newest date at the TOP; ONE date header per day):
 
-## YYYY-MM-DD — <one-line summary>
-**Type:** Bug fix | Enhancement (OSS) | Enhancement (OSS + Enterprise) | Enhancement [Enterprise]
-<details of what changed and why. For Enterprise items, state it explicitly and link
-https://tokenlean.cbeyond.cloud/ >
+## YYYY-MM-DD
+### <one-line summary> — <Type>
+<what changed and why — keep to ~5-7 lines where possible; don't force-fit a genuinely
+large change. For Enterprise items, state it explicitly and link the URL below.>
+- **OSS:** <what ships in every tier>            (omit both bullets for a pure bug fix)
+- **[Enterprise]:** <the managed depth> — <https://tokenlean.cbeyond.cloud/>
+
+Type = Bug fix | Enhancement (OSS) | Enhancement (OSS + Enterprise) | Enhancement [Enterprise].
+Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD` when the
+date changes.
 -->
 
-## 2026-07-18 — Output JSON-schema validation (G11)
-**Type:** Enhancement (OSS + Enterprise)
+## 2026-07-18
 
-When a request asks for **structured output** (OpenAI `response_format` `json_object`/`json_schema`, or a `json_schema` param), G11 can now **validate the model's answer is parseable JSON and conforms to the schema** — closing the "malformed JSON / missing required field" gap on the response path. Opt-in via `groups.G11_output.validate_output`: `off` (default, unchanged behaviour) / `flag` (record + annotate `_token_opt.output_validation`, non-mutating) / `repair` (**one** bounded corrective re-ask — never loops; `repair_fallback: flag|block` if the single retry still fails) / `block` (withhold the malformed answer with a content-filter 200, not cached). Emits `token_opt_output_schema_failures_total{tenant_id,mode}`. Tool-call and multimodal answers are never touched. Config: `docs/config-reference.md`; 11 new unit tests.
+### Output JSON-schema validation (G11) — Enhancement (OSS + Enterprise)
+When a request asks for **structured output** (OpenAI `response_format` `json_object`/`json_schema`, or a `json_schema` param), G11 now validates the answer is parseable JSON and schema-conformant — closing the malformed-JSON / missing-field gap on the response path. Opt-in via `groups.G11_output.validate_output`: `off` (default) / `flag` (record + annotate, non-mutating) / `repair` (one bounded re-ask — never loops; `repair_fallback: flag|block`) / `block` (withhold with a content-filter 200, not cached). Tool-call and multimodal answers are untouched. Emits `token_opt_output_schema_failures_total`; 11 tests.
 
 - **OSS:** the JSON/schema validator + `flag`/`repair`/`block` modes ship in every tier.
-- **[Enterprise]:** the `output-reliability` dashboards + anomaly alerting over schema-failure rates — <https://tokenlean.cbeyond.cloud/>.
+- **[Enterprise]:** `output-reliability` dashboards + anomaly alerting over schema-failure rates — <https://tokenlean.cbeyond.cloud/>.
 
-## 2026-07-18 — Application-quality metrics surface
-**Type:** Enhancement (OSS + Enterprise)
-
-A new metrics module (`middleware/quality_metrics.py`), kept deliberately **separate** from the operational/savings metrics (G18) so reasoning-quality signals are never confused with gateway health. It defines a PII-free surface (labels are `tenant_id` only): **Context Quality** — retrieval hit-rate, chunks-returned, context freshness (oldest injected chunk age), and a cheap **grounding-coverage** heuristic (fraction of answer sentences supported by the retrieved context); **Output Reliability** — schema-validation failures, tool-eligibility denials, and inline-judge scores. This release **wires the retrieval-quality metrics live from G07** (emitted on every RAG retrieval, hit or miss) and ships the grounding heuristic fully tested; the output-reliability counters are defined for the schema-validation / tool-eligibility / judge features to emit as they land.
+### Application-quality metrics surface — Enhancement (OSS + Enterprise)
+A new metrics module (`middleware/quality_metrics.py`), kept **separate** from the operational/savings metrics (G18) so reasoning-quality is never confused with gateway health. PII-free (labels are `tenant_id` only): **Context Quality** — retrieval hit-rate, chunks-returned, context freshness, and a cheap grounding-coverage heuristic; **Output Reliability** — schema failures, tool-eligibility denials, inline-judge scores. This release wires the retrieval metrics live from G07 (hit or miss) and ships the grounding heuristic tested; the reliability counters are defined for later features to emit. 13 tests.
 
 - **OSS:** the metric emission ships in every tier at `/metrics`.
-- **[Enterprise]:** `context-quality` + `output-reliability` dashboards, trends, and anomaly alerting over these signals — <https://tokenlean.cbeyond.cloud/>.
+- **[Enterprise]:** `context-quality` + `output-reliability` dashboards, trends, and anomaly alerting — <https://tokenlean.cbeyond.cloud/>.
 
-## 2026-07-18 — RAG context freshness (ingest timestamps + max-age filter)
-**Type:** Enhancement (OSS + Enterprise)
-
-RAG chunks now carry freshness metadata: the ingestion pipeline (G03) stamps `ingested_at` on every chunk (and `source_date` when the operator supplies the document's own date via `SOURCE_DATE`), and retrieval (G07) can **soft-filter stale context** with `max_age_days` — dropping chunks older than the window (by `source_date`, else `ingested_at`) before they reach the model. It fails safe: `max_age_days: null` (default) is off, and a chunk with no timestamp (ingested before this feature) is never dropped, so existing corpora keep working. Chunk age is surfaced on the retrieval trace. Config: `groups.G7_retrieval.max_age_days` (see `docs/config-reference.md`); 10 new tests.
+### RAG context freshness (ingest timestamps + max-age filter) — Enhancement (OSS + Enterprise)
+RAG chunks now carry freshness metadata: ingestion (G03) stamps `ingested_at` (and `source_date` when supplied via `SOURCE_DATE`), and retrieval (G07) can **soft-filter stale context** with `max_age_days`, dropping chunks older than the window before they reach the model. Fails safe: `max_age_days: null` (default) is off, and a chunk with no timestamp is never dropped, so existing corpora keep working. Chunk age is surfaced on the retrieval trace. Config: `groups.G7_retrieval.max_age_days`; 10 tests.
 
 - **OSS:** the freshness stamp + max-age filter ship in every tier.
 - **[Enterprise]:** freshness/staleness dashboards + alerting over the retrieval corpus — <https://tokenlean.cbeyond.cloud/>.
 
-## 2026-07-18 — PII/PHI redaction at RAG ingest (opt-in, G03)
-**Type:** Enhancement (OSS + Enterprise)
-
-The document-ingestion pipeline (G03) can now **mask PII/PHI before a document is chunked, embedded, and stored** — so the vector store never holds raw personal data and G07 retrieval can never inject it into a prompt. Scanning the full text before chunking also prevents a value being split across a chunk boundary and evading the scan. Opt-in via `INGEST_PII_MODE=flag|mask` (default `off`, ingestion unchanged) and `INGEST_PII_PHI=true` for the health-entity set; it reuses the same precision-biased OSS `guardrails` engine as G29. Covered by an end-to-end test proving the stored chunk payload carries placeholders, not the original PII.
+### PII/PHI redaction at RAG ingest (opt-in, G03) — Enhancement (OSS + Enterprise)
+The ingestion pipeline (G03) can now **mask PII/PHI before a document is chunked, embedded, and stored** — so the vector store never holds raw personal data and G07 can't inject it into a prompt. Scanning the full text before chunking also stops a value split across a chunk boundary from evading the scan. Opt-in via `INGEST_PII_MODE=flag|mask` (default `off`) and `INGEST_PII_PHI=true`; it reuses the same precision-biased OSS `guardrails` engine as G29. An end-to-end test proves the stored chunk payload carries placeholders, not the original PII.
 
 - **OSS:** the ingest-time masking ships in the engine.
-- **[Enterprise]:** managed medical-NER recognisers + compliance (HIPAA/PCI) attestation over ingested corpora — <https://tokenlean.cbeyond.cloud/>.
+- **[Enterprise]:** managed medical-NER recognisers + HIPAA/PCI attestation over ingested corpora — <https://tokenlean.cbeyond.cloud/>.
 
-## 2026-07-18 — PHI detection (opt-in) added to PII redaction (G29)
-**Type:** Enhancement (OSS + Enterprise)
-
-G29 can now detect **health identifiers** in addition to PII — US **DEA** and **NPI** numbers (checksum-validated) and, behind a required medical context cue, **MRN** and **ICD-10** codes. It is **opt-in** (`phi: true` or listing the entities explicitly) and precision-biased so it does not fire on look-alikes — a bare 10-digit number, an order id, or a version string like "B20.1" stays clean. PHI flows through G29's existing `flag`/`mask`/`block` modes and PII-free metrics/audit. Default off → existing tenants are unchanged. Config: `groups.G29_pii_redaction.phi` (see `docs/config-reference.md`); shipped with a dedicated false-positive corpus and 20+ tests.
+### PHI detection (opt-in) added to PII redaction (G29) — Enhancement (OSS + Enterprise)
+G29 can now detect **health identifiers** as well as PII — US **DEA** and **NPI** numbers (checksum-validated) and, behind a required medical context cue, **MRN** and **ICD-10** codes. It is **opt-in** (`phi: true`) and precision-biased so it does not fire on look-alikes — a bare 10-digit number, an order id, or a version like "B20.1" stays clean. PHI flows through G29's existing `flag`/`mask`/`block` modes and PII-free metrics/audit. Default off. Config: `groups.G29_pii_redaction.phi`; shipped with a false-positive corpus and 20+ tests.
 
 - **OSS:** the checksum/context-gated regex detectors ship in every tier.
-- **[Enterprise]:** higher-recall medical NER (Presidio recognisers) + HIPAA/PCI policy mapping and attestation — <https://tokenlean.cbeyond.cloud/>.
+- **[Enterprise]:** higher-recall medical NER (Presidio) + HIPAA/PCI policy mapping and attestation — <https://tokenlean.cbeyond.cloud/>.
 
-## 2026-07-18 — Malformed OpenAI requests return a clean 400
-**Type:** Bug fix
-
-The `/v1/chat/completions` (OpenAI) route now validates the request envelope and returns a clean, OpenAI-shaped **400** for a malformed body — a non-JSON body, or `messages` that isn't a non-empty array of role-bearing objects. Previously such requests surfaced as a 500 (or were forwarded to the provider only to 400 there); the Anthropic (`/v1/messages`) and Gemini routes already returned a proper 400, so this brings the OpenAI route to parity. The check is deliberately light (envelope only) — semantic validation still belongs to litellm/the provider. Covered by 8 new unit tests.
-
-## 2026-07-18 — RAG retrieval fails closed (relevance floor hardening)
-**Type:** Bug fix
-
-Two RAG relevance gaps in retrieval (G07) closed so low-relevance context can't slip into the prompt:
-
-- **Reranker now fails *closed*.** Previously, if the cross-encoder reranker errored it returned the *unfiltered* candidate set — injecting chunks the reranker was meant to drop. It now re-applies the retrieval cosine floor to cosine-scored chunks on failure (RRF-fused chunks keep their fusion ranking, since a cosine floor is meaningless on reciprocal-rank scores), so a transient reranker hiccup no longer degrades relevance.
-- **Dense Qdrant search now has a score floor.** The dense-only Qdrant paths now pass `score_threshold` (matching the pgvector path and the relaxed-fallback chain), so weakly-matching chunks are dropped at retrieval rather than relying solely on the reranker.
-
-No config change; behaviour is strictly more conservative. Covered by 4 new unit tests.
-
-## 2026-07-18 — G30 response-side injection/moderation scan
-**Type:** Enhancement (OSS + Enterprise)
-
-G30 gained an opt-in **response-side scan** (`scan_response`, default off) that applies the injection engine to the model's **output** — catching a model that echoes an attack payload or emits unsafe instructions a downstream agent might act on. Modes: `flag` (detect + record, non-mutating) or `block` (withhold the unsafe answer with a content-filter 200; not cached). Non-streaming responses only; shipped behaviour is unchanged until enabled. New response verdict on the existing guardrail metric (`action=response_flag|response_block`). Config: `groups.G30_guardrails.scan_response` / `response_mode` (see `docs/config-reference.md`).
+### G30 response-side injection/moderation scan — Enhancement (OSS + Enterprise)
+G30 gained an opt-in **response-side scan** (`scan_response`, default off) that applies the injection engine to the model's **output** — catching a model that echoes an attack payload or emits unsafe instructions a downstream agent might act on. Modes: `flag` (detect + record, non-mutating) or `block` (withhold with a content-filter 200; not cached). Non-streaming responses only; behaviour is unchanged until enabled. New verdict on the existing guardrail metric (`action=response_flag|response_block`). Config: `groups.G30_guardrails.scan_response` / `response_mode`.
 
 - **OSS:** the output-scan engine + static ruleset ship in every tier.
 - **[Enterprise]:** the managed moderation ruleset feed (`extra_rules`) raises recall on novel output-safety patterns — <https://tokenlean.cbeyond.cloud/>.
 
-## 2026-07-18 — GCP cost-inventory script + teardown status wiring + `--nuke`
-**Type:** Enhancement (OSS)
+### Malformed OpenAI requests return a clean 400 — Bug fix
+The `/v1/chat/completions` (OpenAI) route now validates the request envelope and returns a clean, OpenAI-shaped **400** for a malformed body — a non-JSON body, or `messages` that isn't a non-empty array of role-bearing objects. Previously such requests surfaced as a 500 (or 400'd at the provider); the Anthropic (`/v1/messages`) and Gemini routes already returned a proper 400, so this brings the OpenAI route to parity. The check is envelope-only — semantic validation still belongs to litellm/the provider. 8 tests.
 
+### RAG retrieval fails closed (relevance floor hardening) — Bug fix
+Two RAG relevance gaps in retrieval (G07) closed so low-relevance context can't slip into the prompt: (1) the cross-encoder **reranker now fails *closed*** — on error it re-applies the retrieval cosine floor to cosine-scored chunks (RRF-fused chunks keep their fusion ranking, where a cosine floor is meaningless) instead of returning the unfiltered set; (2) the **dense-only Qdrant paths now pass `score_threshold`**, matching the pgvector path, so weak matches are dropped at retrieval rather than relying on the reranker. No config change; strictly more conservative. 4 tests.
+
+### GCP cost-inventory script + teardown status wiring + `--nuke` — Enhancement (OSS)
 Operator tooling for cleanly exiting / auditing a GCP deployment:
+- **New `scripts/gcp/gcp-running-inventory.sh`** — a read-only, project-wide sweep across all regions of every cost-bearing resource, grouped by cost behaviour (bills-continuously / scale-to-zero / storage) and ending in a two-tier **COST SUMMARY**; exits non-zero if anything bills continuously. Optional `--asset` adds a Cloud Asset Inventory dump.
+- **`teardown-gcp.sh` consolidated status** — teardown now ends by running the status + inventory scripts for one post-teardown view (skip with `--no-status`).
+- **`teardown-gcp.sh --nuke`** — "exit the project" mode: everything `--full` does **plus** deleting the tf-state and Cloud Build buckets, emptying the project to the GCP floor while keeping the project + KMS key ring (GCP forbids deleting rings, and keeping it lets `terraform apply` reattach on rebuild). Residual ≈ $0.06/mo; rebuildable (infra only — data is not restored); requires typing `nuke`.
 
-- **New `scripts/gcp/gcp-running-inventory.sh`** — a read-only, project-wide sweep across **all regions/zones** of every cost-bearing resource (Cloud SQL, Compute VMs, Memorystore, Serverless VPC connectors, reserved external IPs, load balancers, Cloud NAT, Cloud Run services/jobs, disks, buckets, Artifact Registry, secrets, KMS), grouped by cost behaviour (bills-continuously / scale-to-zero / storage) and ending in a two-tier **COST SUMMARY**. Exits non-zero if anything bills continuously. Runs from any shell (forces `CLOUDSDK_CORE_DISABLE_PROMPTS` so a disabled-API prompt can't hang it). Optional `--asset` adds a full Cloud Asset Inventory dump.
-- **`teardown-gcp.sh` consolidated status** — teardown now ends by running `check-gcp-status.sh` + `gcp-running-inventory.sh` for one consolidated post-teardown view; skip with `--no-status`.
-- **`teardown-gcp.sh --nuke`** — "exit the project" mode: everything `--full` does **plus** deleting the tf-state and Cloud Build buckets, emptying the project to the GCP floor while keeping the **project** and the **KMS key ring** (GCP forbids deleting key rings; keeping it lets `terraform apply` reattach on rebuild). Residual cost ≈ $0.06/mo. Rebuildable via `run-gcp-commercial-lifecycle.sh` (infra only — data is not restored); requires typing `nuke` to confirm. The summary prints the `gcloud projects delete` command for the literal-$0 path.
-
-## 2026-07-18 — Test-harness doctrine, Security Suite & deploy-readiness gating
-**Type:** Enhancement (OSS + Enterprise)
-
+### Test-harness doctrine, Security Suite & deploy-readiness gating — Enhancement (OSS + Enterprise)
 Clarified and enforced the change-completion doctrine, and expanded deployment verification:
+- **Harness routing by feature type.** `examples/benchmark` (and the internal pitch-test-plan) are now savings-validation only — a non-savings change no longer touches them, protecting the calibrated benchmark number and the reproducible savings headline. Non-savings validation (trust & safety, protocols, auth, billing, portal) lives in the deployment-readiness harness.
+- **[Enterprise] Security Suite** — a standalone, non-destructive security posture check (auth/authz, endpoint-exposure, BYOK/402, trust-safety engine proof) that also runs as a gating section of the readiness harness — <https://tokenlean.cbeyond.cloud/>.
+- **[Enterprise] Deployment-readiness tiers + gating** — `--quick` (cheap deploy gate) and `--full` (deep pre-release) tiers; every deploy auto-runs the quick gate and a NOT-READY verdict blocks it — <https://tokenlean.cbeyond.cloud/>.
+- **Commit-time enforcement (OSS):** a change under `src/` must ship a `release-notes.md` entry and a matching `tests/` change, or the commit is blocked (override with `[skip-relnotes]` / `[skip-tests]` tokens). A guard test keeps trust-safety groups out of the savings registry.
 
-- **Harness routing by feature type.** `examples/benchmark` (and the internal pitch-test-plan) are now savings-validation only — a non-savings change no longer touches them, protecting the calibrated benchmark number and the reproducible savings headline. Non-savings validation (trust & safety, protocols, auth, billing, portal) lives in the deployment-readiness harness. The misplaced `--security-smoke` benchmark mode added earlier was removed; the benchmark is savings-only again.
-- **[Enterprise] Security Suite** — a standalone, non-destructive security posture check (auth/authz, endpoint-exposure, BYOK/402, and a trust-safety engine proof) that also runs as a gating section of the deployment-readiness harness. Operator tooling — see <https://tokenlean.cbeyond.cloud/>.
-- **[Enterprise] Deployment-readiness tiers + gating** — the readiness harness gained `--quick` (cheap deploy gate) and `--full` (deep pre-release) tiers; every deploy now auto-runs the quick gate and a NOT-READY verdict blocks the deploy, so a broken stack is never declared customer-ready. Commercial-portal checks gate on a detected commercial deploy. See <https://tokenlean.cbeyond.cloud/>.
-- **Commit-time enforcement (OSS):** a change under `src/` must ship a `release-notes.md` entry and a matching `tests/` change, or the commit is blocked (override with `[skip-relnotes]` / `[skip-tests]` tokens for genuine no-logic commits). A guard test keeps trust-safety groups out of the savings registry.
+## 2026-07-15
 
-## 2026-07-15 — G31 Context-Trust: indirect (RAG) prompt-injection defence
-**Type:** Enhancement (OSS + Enterprise)
+### G31 Context-Trust: indirect (RAG) prompt-injection defence — Enhancement (OSS + Enterprise)
+New **G31** middleware closes the indirect prompt-injection gap. G30 scans the untrusted user prompt, but retrieval (G07) and memory (G10) append retrieved documents / stored memories into the prompt **after** G30 runs — so a poisoned document could previously reach the model un-inspected. G31 re-scans the *assembled* context (`system` / `tool` roles) with the `guardrails/injection.py` engine, runs non-bypassably right after the G07/G10/G22 stages, and supports `allow` / `flag` (default, non-mutating) / `block` (content-filter 200) / `strip` (drop only the poisoned content). New metric `token_opt_context_trust_events_total{category,action}`. Config: `groups.G31_context_trust`.
 
-New **G31** middleware closes the indirect prompt-injection gap. G30 scans the untrusted user prompt, but retrieval (G07) and memory (G10) append retrieved documents / stored memories into the prompt **after** G30 runs — so a poisoned document in the vector store could previously reach the model un-inspected. G31 re-scans the *assembled* context (`system` / `tool` roles) with the existing `guardrails/injection.py` engine, runs non-bypassably right after the G07/G10/G22 stages, and supports `allow` / `flag` (default, non-mutating) / `block` (content-filter 200) / `strip` (drop only the poisoned injected content) modes. New metric `token_opt_context_trust_events_total{category,action}`. Config: `groups.G31_context_trust` (see `docs/config-reference.md`).
-
-- **OSS:** the scanner engine + static default ruleset ship in every tier; default `flag` mode is non-mutating (savings/token accounting unchanged).
+- **OSS:** the scanner engine + static default ruleset ship in every tier; default `flag` mode is non-mutating.
 - **[Enterprise]:** the continuously-updated managed red-team ruleset feed (via `extra_rules`) and the Security dashboards/console — <https://tokenlean.cbeyond.cloud/>.
