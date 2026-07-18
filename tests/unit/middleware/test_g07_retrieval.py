@@ -273,3 +273,18 @@ class TestG07Freshness:
         chunks = [self._chunk(1), self._chunk(5)]
         assert round(_max_chunk_age_seconds(chunks, self._now()) / 86400.0) == 5
         assert _max_chunk_age_seconds([{"text": "x"}], self._now()) is None
+
+
+@pytest.mark.asyncio
+async def test_g07_emits_retrieval_metric(make_ctx):
+    """G07 records a quality-metric (hit + chunk count) on a RAG retrieval (Task 11)."""
+    from unittest.mock import AsyncMock, patch
+    ctx = make_ctx([{"role": "user", "content": "q"}], params={"rag_query": "capital of France"})
+    chunks = [{"text": "Paris is the capital of France.", "score": 0.95, "_score_kind": "cosine"}]
+    with patch("middleware.g07_retrieval._hybrid_search", new_callable=AsyncMock, return_value=chunks), \
+         patch("middleware.g07_retrieval._rerank", new_callable=AsyncMock, return_value=chunks), \
+         patch("middleware.quality_metrics.record_retrieval") as rec:
+        from middleware.g07_retrieval import G07Retrieval
+        await G07Retrieval().process_request(ctx)
+    rec.assert_called_once()
+    assert rec.call_args.args[1] == 1   # (tenant_id, n_chunks, max_age) → 1 chunk (hit)

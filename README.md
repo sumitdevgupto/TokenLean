@@ -29,7 +29,7 @@
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation
 - 📉 **Broad reduction** — 27 stacked techniques from the Token Optimisation Playbook v7, not just caching
-- 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown; per-call → quarterly Grafana dashboards
+- 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown; per-call → quarterly Grafana dashboards; plus a separate **application-quality** metrics surface (retrieval hit-rate, context freshness, grounding coverage) kept distinct from operational health
 - 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
 - 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII) run non-bypassably before any tokens are spent
 - ♻️ **Hot-reload config** — tune or A/B any technique without a redeploy

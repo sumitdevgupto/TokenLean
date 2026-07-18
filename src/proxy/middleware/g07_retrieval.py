@@ -286,6 +286,16 @@ class G07Retrieval:
             else:
                 ranked = chunks[:top_k_after_rerank]
 
+            # Quality metrics (Task 11): record the retrieval outcome — hit/miss,
+            # chunks injected, and freshness (oldest injected chunk age). Emitted on
+            # every RAG retrieval attempt (a miss is a signal too). Never breaks the path.
+            _max_age = _max_chunk_age_seconds(ranked)
+            try:
+                from middleware.quality_metrics import record_retrieval
+                record_retrieval(getattr(ctx, "tenant_id", "default"), len(ranked), _max_age)
+            except Exception:
+                pass
+
             if ranked:
                 context_text = "\n\n".join(c["text"] for c in ranked)
                 ctx.messages = _inject_context(ctx.messages, context_text)
@@ -307,8 +317,8 @@ class G07Retrieval:
                         "similarity_threshold": sim_threshold,
                         "chunk_scores": [round(c.get("score", 0.0), 3) for c in ranked],
                         # Freshness (Task 10): oldest injected chunk age in seconds
-                        # (None = no chunk carried a timestamp). Task 11 emits the metric.
-                        "context_max_age_seconds": _max_chunk_age_seconds(ranked),
+                        # (None = no chunk carried a timestamp). Also emitted as a metric (Task 11).
+                        "context_max_age_seconds": _max_age,
                         "jit_enabled": jit_enabled,
                         "pgvector_fallback": use_pgvector,
                         "rag_fallback_chain_used": fallback_used,

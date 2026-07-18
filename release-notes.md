@@ -13,6 +13,14 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — Application-quality metrics surface
+**Type:** Enhancement (OSS + Enterprise)
+
+A new metrics module (`middleware/quality_metrics.py`), kept deliberately **separate** from the operational/savings metrics (G18) so reasoning-quality signals are never confused with gateway health. It defines a PII-free surface (labels are `tenant_id` only): **Context Quality** — retrieval hit-rate, chunks-returned, context freshness (oldest injected chunk age), and a cheap **grounding-coverage** heuristic (fraction of answer sentences supported by the retrieved context); **Output Reliability** — schema-validation failures, tool-eligibility denials, and inline-judge scores. This release **wires the retrieval-quality metrics live from G07** (emitted on every RAG retrieval, hit or miss) and ships the grounding heuristic fully tested; the output-reliability counters are defined for the schema-validation / tool-eligibility / judge features to emit as they land.
+
+- **OSS:** the metric emission ships in every tier at `/metrics`.
+- **[Enterprise]:** `context-quality` + `output-reliability` dashboards, trends, and anomaly alerting over these signals — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18 — RAG context freshness (ingest timestamps + max-age filter)
 **Type:** Enhancement (OSS + Enterprise)
 
