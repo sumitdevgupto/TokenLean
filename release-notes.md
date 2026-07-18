@@ -13,6 +13,14 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — PII/PHI redaction at RAG ingest (opt-in, G03)
+**Type:** Enhancement (OSS + Enterprise)
+
+The document-ingestion pipeline (G03) can now **mask PII/PHI before a document is chunked, embedded, and stored** — so the vector store never holds raw personal data and G07 retrieval can never inject it into a prompt. Scanning the full text before chunking also prevents a value being split across a chunk boundary and evading the scan. Opt-in via `INGEST_PII_MODE=flag|mask` (default `off`, ingestion unchanged) and `INGEST_PII_PHI=true` for the health-entity set; it reuses the same precision-biased OSS `guardrails` engine as G29. Covered by an end-to-end test proving the stored chunk payload carries placeholders, not the original PII.
+
+- **OSS:** the ingest-time masking ships in the engine.
+- **[Enterprise]:** managed medical-NER recognisers + compliance (HIPAA/PCI) attestation over ingested corpora — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18 — PHI detection (opt-in) added to PII redaction (G29)
 **Type:** Enhancement (OSS + Enterprise)
 

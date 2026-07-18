@@ -320,6 +320,45 @@ def upsert_to_qdrant(
     )
 
 
+def redact_ingest_pii(text: str) -> str:
+    """Mask/flag PII (and optional PHI) in a document BEFORE it is chunked, embedded,
+    and stored — so the vector store never holds raw personal data and G07 retrieval
+    can never inject it into a prompt. Scanning the full text before chunking also
+    stops a PII value being split across a chunk boundary and evading the scan.
+
+    Runtime config (Cloud Run Job env):
+      * ``INGEST_PII_MODE`` — ``off`` (default; ingestion unchanged) | ``flag`` (detect
+        + log, do not mutate) | ``mask`` (replace in place, irreversible — there is no
+        response to restore at ingest).
+      * ``INGEST_PII_PHI``  — ``true`` also scans the PHI entity set.
+
+    Uses the shared OSS ``guardrails`` engine. If it isn't importable in this container
+    the scan safely no-ops with a one-time warning (default mode is off, so this never
+    changes behaviour unless an operator opted in)."""
+    mode = os.getenv("INGEST_PII_MODE", "off").lower()
+    if mode not in ("flag", "mask") or not text:
+        return text
+    try:
+        from guardrails.pii import PiiDetector, mask_matches, DEFAULT_ENTITIES, PHI_ENTITIES
+    except Exception:
+        logger.warning(
+            "INGEST_PII_MODE=%s but the guardrails engine is not importable in this "
+            "container — skipping ingest PII scan", mode,
+        )
+        return text
+    phi = os.getenv("INGEST_PII_PHI", "false").lower() == "true"
+    entities = list(DEFAULT_ENTITIES) + (list(PHI_ENTITIES) if phi else [])
+    matches = PiiDetector(entities=entities).detect(text)
+    if not matches:
+        return text
+    types_ = ",".join(sorted({m.entity_type for m in matches}))  # types only — never the value
+    if mode == "flag":
+        logger.warning("Ingest PII (flag mode, not masked): %d span(s) across %s", len(matches), types_)
+        return text
+    logger.info("Ingest PII masked: %d span(s) across %s", len(matches), types_)
+    return mask_matches(text, matches, reversible=False).text
+
+
 def run() -> None:
     if not _GCS_BUCKET or not _GCS_OBJECT:
         logger.error("GCS_BUCKET and GCS_OBJECT environment variables are required")
@@ -337,6 +376,10 @@ def run() -> None:
 
     # Tables → compact CSV (reduces token cost of table-heavy docs)
     text = table_to_csv(text)
+
+    # Trust & safety: redact PII/PHI BEFORE chunk/embed/store (no-op unless
+    # INGEST_PII_MODE is flag/mask) so the vector store never holds raw personal data.
+    text = redact_ingest_pii(text)
 
     chunks = chunk_text(text)
     logger.info("Created %d chunks", len(chunks))
