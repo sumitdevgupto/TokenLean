@@ -17,6 +17,10 @@ Policy modes (per-tenant via `groups.G30_guardrails.mode`, deep-merged into ctx.
   * ``block``  — scan; on a hit short-circuit with a structured content-filter refusal
                  (HTTP 200, ``finish_reason: content_filter``), billed like a bypass.
 
+A separate, opt-in RESPONSE-side scan (``scan_response``, default OFF) applies the
+same engine to the model's OUTPUT — catching a model that echoes an attack payload or
+emits unsafe instructions a downstream agent might act on. See ``process_response``.
+
 The engine lives in ``guardrails/injection.py`` (OSS core). This middleware only
 applies policy + records observability. It carries attack *categories* and rule ids —
 never raw prompt text — into metrics/audit.
@@ -90,6 +94,66 @@ class G30Guardrails:
             ctx.security_blocked = True
             ctx.security_block_response = self._refusal(ctx, cfg)
         return ctx
+
+    async def process_response(self, ctx: RequestContext, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Scan the model's OUTPUT for injection / jailbreak content (a model echoing
+        an attack payload, or emitting unsafe instructions a downstream agent might act
+        on). Opt-in via `scan_response` (default OFF, so shipped behaviour is unchanged).
+
+        Modes (`response_mode`): `flag` (detect + annotate + metric, non-mutating,
+        default) or `block` (withhold the unsafe answer with a content-filter 200 and
+        disable caching of it). NON-STREAMING only — a streamed response bypasses this
+        path (mirrors G29's response-side limitation). The managed moderation ruleset
+        (Enterprise) raises recall via `extra_rules`; the static ruleset ships OSS."""
+        cfg = self._config(ctx)
+        if not cfg.get("enabled", True):
+            return response
+        if not cfg.get("scan_response", False):
+            return response
+
+        resp_mode = str(cfg.get("response_mode", "flag")).lower()
+        if resp_mode not in ("flag", "block"):
+            resp_mode = "flag"
+
+        scanner = self._get_scanner(cfg)
+        categories: List[str] = []
+        matched: Optional[InjectionVerdict] = None
+        for choice in response.get("choices", []) or []:
+            msg = choice.get("message") if isinstance(choice, dict) else None
+            if not isinstance(msg, dict):
+                continue
+            for text in _iter_text(msg.get("content")):
+                v = scanner.scan(text)
+                if not v.matched:
+                    continue
+                for c in v.categories:
+                    if c not in categories:
+                        categories.append(c)
+                if matched is None or v.score > matched.score:
+                    matched = v
+        if matched is None:
+            return response
+
+        ctx.guardrail_response_action = resp_mode
+        ctx.guardrail_response_categories = categories
+        # Distinct action label ("response_flag"/"response_block") so observability can
+        # separate OUTPUT events from the request-side ones on the same counter.
+        self._emit_metric(ctx, categories, f"response_{resp_mode}", cfg)
+        logger.warning(
+            "[%s] G30 %s response-injection: category=%s rule=%s",
+            ctx.request_id, resp_mode, matched.category, matched.rule_id,
+        )
+
+        if resp_mode == "block":
+            # Withhold the unsafe answer. The LLM already ran (cost incurred), but the
+            # caller must not receive the flagged output. Don't cache a refusal.
+            ctx.no_cache = True
+            message = cfg.get(
+                "response_block_message",
+                "The response was withheld by the safety guardrails.",
+            )
+            return content_filter_response(ctx.request_id, ctx.routed_model or ctx.model, message)
+        return response
 
     def _scan(self, scanner: InjectionScanner, messages: List[Dict[str, Any]], scan_roles) -> InjectionVerdict:
         """Scan the in-scope roles; return the highest-severity match with the union

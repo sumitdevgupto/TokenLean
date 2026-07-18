@@ -578,6 +578,9 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `metrics_enabled` | `true` | Emit the Prometheus counter |
 | `extra_rules` | `[]` | `[[id, category, severity, regex], …]` operator/managed additions (Enterprise ships a managed red-team ruleset feed) |
 | `block_message` | *(built-in)* | Optional custom refusal text |
+| `scan_response` | `false` | Opt-in: also scan the **model's output** for injection/jailbreak content (a model echoing an attack payload or emitting unsafe instructions). Default off = shipped behaviour unchanged. Non-streaming responses only. |
+| `response_mode` | `flag` | When `scan_response`: `flag` (detect + record) · `block` (withhold the unsafe answer with a content-filter 200; the LLM already ran, but the caller never sees the flagged output, and it is not cached). |
+| `response_block_message` | *(built-in)* | Optional custom text for a withheld response. |
 
 ### G31_context_trust
 **Trust & Safety (Context Quality).** Indirect / RAG prompt-injection defence. G30 scans the untrusted **user** prompt, but retrieval (G07) and memory (G10) then append retrieved documents and stored memories into the prompt as `system` / `tool` messages **after** G30 has already run — so a poisoned document in the vector store or a poisoned stored memory would otherwise reach the model un-inspected. G31 re-runs the same `guardrails/injection.py` scanner over the **assembled** context (the `system` / `tool` roles), right after the G07/G10/G22 stages and **outside the `skip_groups` loops** (non-bypassable). A `block` match short-circuits with an OpenAI content-filter response (HTTP 200, `finish_reason: "content_filter"`) exactly like G30; `strip` mode drops only the offending injected message (or multimodal text part) and continues. Metrics: `token_opt_context_trust_events_total{category,action}`. Per-tenant via `tenants.<id>.groups.G31_context_trust`.

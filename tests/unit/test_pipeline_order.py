@@ -191,6 +191,7 @@ class TestPipelineStageOrdering:
         # so we only need process_response stubs for the response path)
         pipeline.g14 = _make_resp_mock("G14")
         pipeline.g29 = _make_resp_mock("G29")
+        pipeline.g30 = _make_resp_mock("G30")
         pipeline.g28 = _make_resp_mock("G28")
         pipeline.g23 = _make_resp_mock("G23")
         pipeline.g19 = _make_resp_mock("G19")

@@ -331,7 +331,7 @@ tests/                      # Unit and integration tests (pytest)
 | **G27** | Multimodal Optimizer | Variable | Compress inline base64 images (Headroom + LRU cache) |
 | **G28** | Context Compression & Reuse | 20-50% | Replace repeated blocks with `[CCR:sha256]` + headroom MCP tools |
 | **G29** | PII Redaction *(trust & safety)* | — | Detect + `off\|flag\|mask\|block` personal data (email/SSN/card/phone/IP + optional Presidio) before the provider call |
-| **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts in the user prompt; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens |
+| **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts in the user prompt; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens. Optional response-side scan (`scan_response`) also checks the model's **output** |
 | **G31** | Context-Trust *(trust & safety)* | — | Indirect / RAG prompt-injection defence — re-scans retrieved documents + memories (injected after G30) for injection; `allow\|flag\|block\|strip`; non-bypassable |
 
 > **G29/G30/G31 are trust & safety groups, not token-savings optimisations** — they don't contribute to the 54.1% headline and are kept out of the ablation harness. All groups are OSS (Apache-2.0) and never tier-gated; the managed red-team ruleset feed, the portal Security tab, and the compliance attestation are the commercial layer.

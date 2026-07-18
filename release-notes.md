@@ -13,6 +13,14 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — G30 response-side injection/moderation scan
+**Type:** Enhancement (OSS + Enterprise)
+
+G30 gained an opt-in **response-side scan** (`scan_response`, default off) that applies the injection engine to the model's **output** — catching a model that echoes an attack payload or emits unsafe instructions a downstream agent might act on. Modes: `flag` (detect + record, non-mutating) or `block` (withhold the unsafe answer with a content-filter 200; not cached). Non-streaming responses only; shipped behaviour is unchanged until enabled. New response verdict on the existing guardrail metric (`action=response_flag|response_block`). Config: `groups.G30_guardrails.scan_response` / `response_mode` (see `docs/config-reference.md`).
+
+- **OSS:** the output-scan engine + static ruleset ship in every tier.
+- **[Enterprise]:** the managed moderation ruleset feed (`extra_rules`) raises recall on novel output-safety patterns — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18 — GCP cost-inventory script + teardown status wiring + `--nuke`
 **Type:** Enhancement (OSS)
 

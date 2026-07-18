@@ -293,6 +293,7 @@ class OptimisationPipeline:
         # store — every downstream response consumer sees the redacted content.
         for _name, _fn in [
             ("G29-pii-redaction-resp", lambda r: self.g29.process_response(ctx, r)),
+            ("G30-guardrails-resp", lambda r: self.g30.process_response(ctx, r)),
             ("G14-tool-output", lambda r: self.g14.process_response(ctx, r)),
             ("G28-ccr-resp", lambda r: self.g28.process_response(ctx, r)),
             ("G23-streaming-compression", lambda r: self.g23.process_response(ctx, r)),

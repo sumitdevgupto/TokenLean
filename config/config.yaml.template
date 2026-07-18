@@ -854,6 +854,12 @@ groups:
     metrics_enabled: true
     extra_rules: []            # [[id, category, severity, regex], …] operator/managed additions
     # block_message: "This request was blocked by the safety guardrails."
+    scan_response: false       # opt-in: also scan the MODEL'S OUTPUT for injection /
+                               # jailbreak content (a model echoing an attack payload or
+                               # emitting unsafe instructions). Default off = unchanged.
+    response_mode: flag        # flag | block (when scan_response). flag = detect + record;
+                               # block = withhold the unsafe answer with a content-filter 200.
+    # response_block_message: "The response was withheld by the safety guardrails."
   G29_pii_redaction:
     enabled: true
     mode: flag                 # off | flag | mask | block. flag = detect + record only

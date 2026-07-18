@@ -86,6 +86,13 @@ class RequestContext:
     # metric + the PII-free security audit row + the commercial Security tab.
     guardrail_action: Optional[str] = None
     guardrail_categories: List[str] = field(default_factory=list)
+    # G30 RESPONSE-side verdict — the model's OUTPUT scanned for injection/jailbreak
+    # content (a model echoing an attack payload, or emitting unsafe instructions).
+    # Kept separate from guardrail_action (the request verdict) so the two are never
+    # conflated. action ∈ {None,"flag","block"}; block withholds the unsafe answer
+    # with a content-filter response. Non-streaming only (see G30.process_response).
+    guardrail_response_action: Optional[str] = None
+    guardrail_response_categories: List[str] = field(default_factory=list)
     # G31 context-trust verdict. Distinct from guardrail_action (G30 scans the
     # untrusted *user* prompt) — G31 scans content INJECTED by retrieval/memory
     # (system/tool roles) for indirect prompt injection. action ∈
