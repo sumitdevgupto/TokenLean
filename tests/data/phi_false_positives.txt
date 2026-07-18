@@ -1,0 +1,45 @@
+# PHI false-positive corpus (I1) — strings that must NOT trip ANY PHI entity.
+# One candidate per non-comment line. This is the load-bearing precision fixture:
+# the PHI detectors (MRN / ICD-10 / NPI / DEA) are precision-biased and MUST leave
+# every line below clean. A failure here means a legitimate prompt would be corrupted.
+# Blank lines and #-comments are ignored by the test loader.
+
+# ── bare digit runs that resemble an NPI (10 digits) but carry no NPI context ──
+1234567890
+9998887777
+Order number 4025519100 shipped today
+account 1000000009 was credited
+
+# ── phone numbers (must stay a PHONE concern, never PHI) ──
+555-123-4567
+(212) 555-0198
+call us at 1-800-555-0199
+
+# ── dates / timestamps ──
+2026-07-18
+07/18/2026
+release scheduled for 2026.07.18
+
+# ── order / invoice / account identifiers ──
+Order #12345678
+INV-20260718-004
+Account 987654321 is past due
+SKU AB1234567 is out of stock
+ticket XY0000000 was closed
+
+# ── dotted alphanumerics that LOOK like an ICD-10 code but have no medical context ──
+See Section B20.1 of the master services agreement
+Model E11.9 was discontinued
+firmware A00.3 rolled out
+clause I10 of the contract
+
+# ── 2-letter + 7-digit strings that fail the DEA checksum (must not trip) ──
+AB1234567
+ZZ9999999
+Q5 1234560 warranty code
+
+# ── medical-sounding words that are NOT identifiers ──
+the patient reported improvement
+discuss the diagnosis with your doctor
+diabetes management plan
+prescription refill reminder

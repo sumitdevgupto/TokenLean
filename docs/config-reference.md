@@ -604,7 +604,8 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `mode` | `flag` | `off` · `flag` (detect + record) · `mask` (replace in place) · `block` (refuse a request containing PII) |
 | `reversible` | `true` | Mask mode: numbered placeholders + response-side restore for the caller |
 | `scan_roles` | `[user, assistant, tool]` | Roles scanned (the developer's system prompt is left untouched) |
-| `entities` | `[]` | Empty = all built-ins; or narrow, e.g. `[EMAIL, CREDIT_CARD]` |
+| `entities` | `[]` | Empty = all built-in **PII**; or narrow, e.g. `[EMAIL, CREDIT_CARD]`. **PHI is opt-in** — add health entities explicitly (`[DEA, NPI, MRN, ICD10]`) or the `phi` shortcut token. |
+| `phi` | `false` | `true` = **also** scan health identifiers (DEA & NPI checksum-gated; MRN & ICD-10 require a medical context cue, so a bare number / dotted code isn't flagged). Precision-biased, opt-in — default off keeps PII-only behaviour. Flows through the same `flag`/`mask`/`block` modes. |
 | `use_presidio` | `false` | Optional higher-recall backend (needs `presidio-analyzer`; regex tier is the default) |
 | `metrics_enabled` | `true` | Emit the Prometheus counter |
 | `block_message` | *(built-in)* | Optional custom refusal text |

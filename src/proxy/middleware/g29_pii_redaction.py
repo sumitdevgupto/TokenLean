@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext
 from guardrails import content_filter_response
-from guardrails.pii import PiiDetector, mask_matches, unmask_text
+from guardrails.pii import PiiDetector, mask_matches, unmask_text, PHI_ENTITIES, DEFAULT_ENTITIES
 
 logger = logging.getLogger(__name__)
 GROUP = "G29"
@@ -66,14 +66,36 @@ class G29PiiRedaction:
         mode = str(cfg.get("mode", "flag")).lower()
         return mode if mode in _VALID_MODES else "flag"
 
+    @staticmethod
+    def _resolve_entities(cfg: Dict[str, Any]):
+        """Resolve the config `entities` list + `phi` convenience into a concrete tuple
+        (or None → the detector's DEFAULT_ENTITIES, i.e. PII only). PHI is opt-in:
+          * `entities` unset + `phi` false → None (existing behaviour, PII only).
+          * `entities: [EMAIL, phi]`       → EMAIL + the whole PHI set (a `phi` token expands).
+          * `phi: true`                    → whatever `entities` resolves to (or the PII
+                                             default) PLUS the whole PHI set."""
+        raw = cfg.get("entities") or None
+        phi = bool(cfg.get("phi", False))
+        if raw is None and not phi:
+            return None
+        base = list(raw) if raw else list(DEFAULT_ENTITIES)
+        out: List[str] = []
+        for e in base:
+            out.extend(PHI_ENTITIES if str(e).lower() == "phi" else [e])
+        if phi:
+            for e in PHI_ENTITIES:
+                if e not in out:
+                    out.append(e)
+        return tuple(out)
+
     def _get_detector(self, cfg: Dict[str, Any]) -> PiiDetector:
-        entities = cfg.get("entities") or None
+        entities = self._resolve_entities(cfg)
         use_presidio = bool(cfg.get("use_presidio", False))
-        sig = (tuple(entities) if entities else None, use_presidio)
+        sig = (entities, use_presidio)
         cache = self._detector_cache            # single atomic read (no torn pair)
         if cache is not None and cache[0] == sig:
             return cache[1]
-        det = PiiDetector(entities=entities, use_presidio=use_presidio)
+        det = PiiDetector(entities=list(entities) if entities else None, use_presidio=use_presidio)
         self._detector_cache = (sig, det)       # single atomic swap
         return det                              # return the LOCAL, never self._…
 

@@ -168,3 +168,84 @@ def test_detect_returns_sorted_non_overlapping():
     assert starts == sorted(starts)
     for a, b in zip(matches, matches[1:]):
         assert a.end <= b.start
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHI entities (opt-in): DEA / NPI / MRN / ICD-10 — Task 9
+# ══════════════════════════════════════════════════════════════════════════════
+from pathlib import Path
+
+from guardrails.pii import (
+    DEA, NPI, MRN, ICD10, PHI_ENTITIES, DEFAULT_ENTITIES,
+    _dea_ok, _npi_ok,
+)
+
+_PHI_DETECTOR = PiiDetector(entities=list(PHI_ENTITIES))
+
+# (text, expected entity) — each MUST trip. Values are format-valid:
+# DEA AB1234563 (checksum 3), NPI 1234567893 (80840-Luhn valid).
+_PHI_TRUE_POSITIVES = [
+    ("prescriber DEA AB1234563 on the script", DEA),
+    ("registration BF1234563 verified", DEA),
+    ("provider NPI: 1234567893 billed", NPI),
+    ("Patient MRN: 00456789 admitted", MRN),
+    ("the medical record number 123456 was updated", MRN),
+    ("ICD-10 code E11.9 recorded", ICD10),
+    ("diagnosed with E11.9 last week", ICD10),
+    ("diagnosis: I10", ICD10),
+    ("patient dx J45.909 noted", ICD10),
+]
+
+
+def _load_false_positive_corpus():
+    p = Path(__file__).resolve().parents[2] / "data" / "phi_false_positives.txt"
+    return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+class TestPhiChecksums:
+    def test_dea_checksum(self):
+        assert _dea_ok("1234563") is True     # (1+3+5)+2*(2+4+6)=33 → units 3 == d7
+        assert _dea_ok("1234567") is False
+        assert _dea_ok("123") is False         # wrong length
+
+    def test_npi_checksum(self):
+        assert _npi_ok("1234567893") is True
+        assert _npi_ok("1234567890") is False
+        assert _npi_ok("123") is False
+
+
+class TestPhiTruePositives:
+    @pytest.mark.parametrize("text,entity", _PHI_TRUE_POSITIVES)
+    def test_each_phi_form_is_detected(self, text, entity):
+        found = {m.entity_type for m in _PHI_DETECTOR.detect(text)}
+        assert entity in found, f"{entity} not detected in {text!r} (found {found})"
+
+
+class TestPhiFalsePositiveCorpus:
+    @pytest.mark.parametrize("line", _load_false_positive_corpus())
+    def test_corpus_line_is_clean(self, line):
+        # A detector with ALL PHI entities on must find NOTHING in a benign line.
+        matches = _PHI_DETECTOR.detect(line)
+        assert matches == [], f"false positive on {line!r}: {[(m.entity_type, m.text) for m in matches]}"
+
+    def test_corpus_is_nonempty(self):
+        # Guard against a silently-emptied fixture giving a vacuous pass.
+        assert len(_load_false_positive_corpus()) >= 15
+
+
+class TestPhiIsOptIn:
+    def test_phi_excluded_from_default_entities(self):
+        for e in PHI_ENTITIES:
+            assert e not in DEFAULT_ENTITIES
+
+    def test_default_detector_ignores_phi(self):
+        # The default detector (existing tenants) must not start flagging PHI.
+        d = PiiDetector()
+        assert d.detect("DEA AB1234563 NPI: 1234567893 MRN: 00456789 dx E11.9") == []
+
+    def test_pii_still_works_alongside_phi(self):
+        # Enabling PHI must not break the existing PII entities.
+        d = PiiDetector(entities=[EMAIL, US_SSN, DEA, NPI, MRN, ICD10])
+        found = {m.entity_type for m in d.detect("email x@y.com ssn 123-45-6789 DEA AB1234563")}
+        assert {EMAIL, US_SSN, DEA} <= found

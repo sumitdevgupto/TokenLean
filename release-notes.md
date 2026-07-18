@@ -13,6 +13,14 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — PHI detection (opt-in) added to PII redaction (G29)
+**Type:** Enhancement (OSS + Enterprise)
+
+G29 can now detect **health identifiers** in addition to PII — US **DEA** and **NPI** numbers (checksum-validated) and, behind a required medical context cue, **MRN** and **ICD-10** codes. It is **opt-in** (`phi: true` or listing the entities explicitly) and precision-biased so it does not fire on look-alikes — a bare 10-digit number, an order id, or a version string like "B20.1" stays clean. PHI flows through G29's existing `flag`/`mask`/`block` modes and PII-free metrics/audit. Default off → existing tenants are unchanged. Config: `groups.G29_pii_redaction.phi` (see `docs/config-reference.md`); shipped with a dedicated false-positive corpus and 20+ tests.
+
+- **OSS:** the checksum/context-gated regex detectors ship in every tier.
+- **[Enterprise]:** higher-recall medical NER (Presidio recognisers) + HIPAA/PCI policy mapping and attestation — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18 — Malformed OpenAI requests return a clean 400
 **Type:** Bug fix
 

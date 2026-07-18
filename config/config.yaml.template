@@ -868,7 +868,12 @@ groups:
     reversible: true           # mask mode: the model sees numbered placeholders and the
                                # non-streaming response restores them for the data owner.
     scan_roles: [user, assistant, tool]   # roles scanned (system prompt left untouched)
-    entities: []               # empty = all built-ins; or narrow, e.g. [EMAIL, CREDIT_CARD]
+    entities: []               # empty = all built-in PII; or narrow, e.g. [EMAIL, CREDIT_CARD].
+                               # PHI is opt-in: add health entities explicitly
+                               # ([DEA, NPI, MRN, ICD10]) or the `phi` shortcut token.
+    phi: false                 # true = ALSO scan health identifiers (DEA/NPI/MRN/ICD-10,
+                               # precision-biased: DEA/NPI checksum-gated, MRN/ICD-10 need a
+                               # medical context cue). Default off — PII-only, unchanged.
     use_presidio: false        # optional higher-recall backend (needs presidio-analyzer)
     metrics_enabled: true
     # block_message: "This request was blocked because it contained personal data."

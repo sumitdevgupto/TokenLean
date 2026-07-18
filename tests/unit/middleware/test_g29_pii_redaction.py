@@ -245,3 +245,55 @@ async def test_metric_emitted():
     after = PII_REDACTIONS_TOTAL.labels(
         tenant_id="default", entity_type="EMAIL", action="flag")._value.get()
     assert after == before + 1
+
+
+# ── PHI opt-in (Task 9) ──────────────────────────────────────────────────────
+from middleware.g29_pii_redaction import G29PiiRedaction as _G29
+
+DEA_NUM = "AB1234563"   # checksum-valid DEA
+
+
+class TestG29PhiOptIn:
+    def test_resolve_entities_default_is_none(self):
+        assert _G29._resolve_entities({}) is None
+
+    def test_resolve_entities_phi_flag_adds_phi_set(self):
+        out = _G29._resolve_entities({"phi": True})
+        assert "DEA" in out and "NPI" in out and "MRN" in out and "ICD10" in out
+        assert "EMAIL" in out   # PII default retained
+
+    def test_resolve_entities_phi_token_expands(self):
+        out = _G29._resolve_entities({"entities": ["EMAIL", "phi"]})
+        assert "EMAIL" in out and "DEA" in out
+        assert "US_SSN" not in out   # explicit list wasn't the default
+
+    @pytest.mark.asyncio
+    async def test_default_config_ignores_phi(self):
+        # An existing tenant (no phi config) must NOT start flagging a DEA number.
+        ctx = _ctx([{"role": "user", "content": f"prescriber DEA {DEA_NUM}"}], mode="flag")
+        out = await G29PiiRedaction().process_request(ctx)
+        assert out.pii_action is None
+
+    @pytest.mark.asyncio
+    async def test_phi_flagged_when_enabled(self):
+        ctx = _ctx([{"role": "user", "content": f"prescriber DEA {DEA_NUM}"}],
+                   mode="flag", phi=True)
+        out = await G29PiiRedaction().process_request(ctx)
+        assert out.pii_action == "flag"
+        assert "DEA" in out.pii_entities
+
+    @pytest.mark.asyncio
+    async def test_phi_masked_when_enabled(self):
+        ctx = _ctx([{"role": "user", "content": f"prescriber DEA {DEA_NUM}"}],
+                   mode="mask", phi=True)
+        out = await G29PiiRedaction().process_request(ctx)
+        assert DEA_NUM not in out.messages[0]["content"]
+        assert "[PII:DEA:1]" in out.messages[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_phi_blocks_when_enabled(self):
+        ctx = _ctx([{"role": "user", "content": f"prescriber DEA {DEA_NUM}"}],
+                   mode="block", phi=True)
+        out = await G29PiiRedaction().process_request(ctx)
+        assert out.security_blocked is True
+        assert out.security_block_response["choices"][0]["finish_reason"] == "content_filter"
