@@ -269,7 +269,8 @@ class G07Retrieval:
             # Rerank if Qdrant mode
             if not use_pgvector:
                 reranker_model = cfg.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-                ranked = await _rerank(rag_query, chunks, top_k_after_rerank, sim_threshold, reranker_model)
+                ranked = await _rerank(rag_query, chunks, top_k_after_rerank, sim_threshold,
+                                       reranker_model, fallback_floor=sim_threshold)
             else:
                 ranked = chunks[:top_k_after_rerank]
 
@@ -408,6 +409,14 @@ async def _hybrid_search(
                 ),
             )
 
+        # Cosine floor for the DENSE-ONLY paths (matches pgvector + the G3 relaxed
+        # fallback chain). NOT applied to the RRF fusion query — reciprocal-rank
+        # fusion scores (~0.016) are not on the cosine scale, so a cosine threshold
+        # there would drop every result. `_score_kind` records which scale each
+        # returned chunk carries, so the rerank fail-closed path floors only cosine.
+        sim_threshold = float(cfg.get("similarity_threshold", 0.85))
+        score_kind = "rrf"
+
         try:
             if sparse_embedding is not None:
                 # Hybrid search with RRF fusion. The top-level fusion query MUST be wrapped in
@@ -427,11 +436,13 @@ async def _hybrid_search(
                 # collection stores named vectors, so `using="dense"` is required
                 # to disambiguate which vector to query against.
                 logger.debug("G07 using dense-only search (fastembed unavailable)")
+                score_kind = "cosine"
                 results = await client.query_points(
                     collection_name=collection,
                     query=dense_embedding,
                     using="dense",
                     limit=top_k_final,
+                    score_threshold=sim_threshold,
                     with_payload=True,
                 )
         except Exception as inner_exc:
@@ -440,11 +451,13 @@ async def _hybrid_search(
                 "G07 named-vector hybrid failed (%s) — falling back to dense-only search",
                 inner_exc,
             )
+            score_kind = "cosine"
             results = await client.query_points(
                 collection_name=collection,
                 query=dense_embedding,
                 using="dense",
                 limit=top_k_final,
+                score_threshold=sim_threshold,
                 with_payload=True,
             )
 
@@ -454,7 +467,7 @@ async def _hybrid_search(
         # The request-path caller ignores it, so this is a no-op for existing behaviour.
         return [
             {"text": r.payload.get("text", ""), "score": r.score,
-             "source": (r.payload or {}).get("source", "")}
+             "source": (r.payload or {}).get("source", ""), "_score_kind": score_kind}
             for r in results.points
         ]
     except Exception as exc:
@@ -468,8 +481,18 @@ async def _rerank(
     top_k: int,
     threshold: float,
     model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    fallback_floor: Optional[float] = None,
 ) -> List[Dict]:
-    """Cross-encoder reranker — keeps only chunks above similarity threshold."""
+    """Cross-encoder reranker — keeps only chunks above similarity threshold.
+
+    On reranker error the reranker FAILS CLOSED rather than open: instead of
+    injecting the unfiltered candidate set, it re-applies the retrieval cosine floor
+    (`fallback_floor`) to any chunk that carries a cosine-scale score (`_score_kind ==
+    "cosine"`). RRF-fused chunks (`_score_kind == "rrf"`) keep their fusion ranking —
+    a cosine floor is meaningless on reciprocal-rank scores — so RAG still works when
+    the reranker has a transient failure, without silently injecting low-relevance
+    context. `fallback_floor=None` preserves the legacy pass-through for callers that
+    don't supply a floor."""
     if not chunks:
         return []
     try:
@@ -488,8 +511,19 @@ async def _rerank(
         )
         return [c for c, s in ranked[:top_k] if s >= threshold]
     except Exception as exc:
-        logger.warning("G07 reranker failed: %s — using original order", exc)
-        return chunks[:top_k]
+        if fallback_floor is None:
+            logger.warning("G07 reranker failed: %s — using original order", exc)
+            return chunks[:top_k]
+        kept = [
+            c for c in chunks
+            if c.get("_score_kind") != "cosine"
+            or float(c.get("score", 0.0) or 0.0) >= fallback_floor
+        ]
+        logger.warning(
+            "G07 reranker failed: %s — failing closed via cosine floor %.2f (%d/%d chunks kept)",
+            exc, fallback_floor, len(kept[:top_k]), len(chunks),
+        )
+        return kept[:top_k]
 
 
 async def retrieve(
@@ -534,7 +568,8 @@ async def retrieve(
 
         chunks = await _hybrid_search(query, top_k, top_k_final, _QDRANT_URL, collection, cfg)
         guarded = ChunkGuard(max_chunk_tokens, max_total_tokens).validate_chunks(chunks)
-        return await _rerank(query, guarded, top_k_final, similarity_threshold, reranker_model)
+        return await _rerank(query, guarded, top_k_final, similarity_threshold, reranker_model,
+                             fallback_floor=similarity_threshold)
     except Exception as exc:
         logger.warning("retrieve() failed for collection %s: %s", collection, exc)
         return []

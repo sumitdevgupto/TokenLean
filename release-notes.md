@@ -13,6 +13,16 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — RAG retrieval fails closed (relevance floor hardening)
+**Type:** Bug fix
+
+Two RAG relevance gaps in retrieval (G07) closed so low-relevance context can't slip into the prompt:
+
+- **Reranker now fails *closed*.** Previously, if the cross-encoder reranker errored it returned the *unfiltered* candidate set — injecting chunks the reranker was meant to drop. It now re-applies the retrieval cosine floor to cosine-scored chunks on failure (RRF-fused chunks keep their fusion ranking, since a cosine floor is meaningless on reciprocal-rank scores), so a transient reranker hiccup no longer degrades relevance.
+- **Dense Qdrant search now has a score floor.** The dense-only Qdrant paths now pass `score_threshold` (matching the pgvector path and the relaxed-fallback chain), so weakly-matching chunks are dropped at retrieval rather than relying solely on the reranker.
+
+No config change; behaviour is strictly more conservative. Covered by 4 new unit tests.
+
 ## 2026-07-18 — G30 response-side injection/moderation scan
 **Type:** Enhancement (OSS + Enterprise)
 

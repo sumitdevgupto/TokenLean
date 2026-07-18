@@ -178,3 +178,46 @@ class TestG07PgVectorPool:
         assert mock_pool.acquire.call_count == 2
         for call in mock_get_pool.await_args_list:
             assert call.args[0] == "postgresql://test/db"
+
+
+@pytest.mark.asyncio
+class TestRerankFailClosed:
+    """When the cross-encoder reranker errors, G07 must FAIL CLOSED — re-apply the
+    retrieval cosine floor to cosine-scored chunks instead of injecting the
+    unfiltered candidate set, while leaving RRF-fused chunks (different scale) intact."""
+
+    async def test_fail_closed_drops_low_cosine_chunks(self):
+        from middleware.g07_retrieval import _rerank
+        chunks = [
+            {"text": "relevant", "score": 0.90, "_score_kind": "cosine"},
+            {"text": "marginal", "score": 0.30, "_score_kind": "cosine"},
+        ]
+        with patch("ml_models.get_cross_encoder", side_effect=RuntimeError("reranker down")):
+            out = await _rerank("q", chunks, top_k=5, threshold=0.0, fallback_floor=0.85)
+        texts = [c["text"] for c in out]
+        assert "relevant" in texts
+        assert "marginal" not in texts   # below the 0.85 cosine floor → dropped
+
+    async def test_fail_closed_keeps_rrf_chunks(self):
+        # RRF fusion scores (~0.016) are NOT on the cosine scale — a cosine floor must
+        # not nuke them (that would break hybrid RAG on any reranker hiccup).
+        from middleware.g07_retrieval import _rerank
+        chunks = [{"text": "fused", "score": 0.016, "_score_kind": "rrf"}]
+        with patch("ml_models.get_cross_encoder", side_effect=RuntimeError("reranker down")):
+            out = await _rerank("q", chunks, top_k=5, threshold=0.0, fallback_floor=0.85)
+        assert [c["text"] for c in out] == ["fused"]
+
+    async def test_no_floor_preserves_legacy_passthrough(self):
+        # Back-compat: a caller that supplies no fallback_floor keeps the old behaviour.
+        from middleware.g07_retrieval import _rerank
+        chunks = [{"text": "a", "score": 0.10, "_score_kind": "cosine"}]
+        with patch("ml_models.get_cross_encoder", side_effect=RuntimeError("reranker down")):
+            out = await _rerank("q", chunks, top_k=5, threshold=0.0)
+        assert [c["text"] for c in out] == ["a"]
+
+    async def test_fail_closed_still_caps_to_top_k(self):
+        from middleware.g07_retrieval import _rerank
+        chunks = [{"text": f"c{i}", "score": 0.95, "_score_kind": "cosine"} for i in range(6)]
+        with patch("ml_models.get_cross_encoder", side_effect=RuntimeError("reranker down")):
+            out = await _rerank("q", chunks, top_k=3, threshold=0.0, fallback_floor=0.85)
+        assert len(out) == 3
