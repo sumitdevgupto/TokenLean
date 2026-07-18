@@ -68,6 +68,8 @@ REDIS_INSTANCE="token-opt-redis"        # Memorystore instance name (redis_backe
 REDIS_VM="token-opt-redis-vm"           # GCE VM name (redis_backend=docker, THE DEFAULT)
 DELETE_IMAGES=false
 FULL=false                              # --full → true clean slate (state + secrets + SAs + buckets + AR)
+NUKE=false                              # --nuke → --full PLUS tf-state + Cloud Build buckets (project + KMS ring kept)
+SHOW_STATUS=true                        # --no-status → skip the consolidated post-teardown status view
 TF_STATE_PREFIX="token-opt"             # backend prefix (matches gcp-deploy.sh -backend-config prefix=)
 ARTIFACT_REPO="token-opt"               # Artifact Registry repo id (matches infra artifact_registry_repo default)
 # Service accounts created by the deploy (deleted only in --full).
@@ -109,6 +111,8 @@ while [[ $# -gt 0 ]]; do
     --region)   REGION="$2"; shift 2 ;;
     --delete-images) DELETE_IMAGES=true; shift ;;
     --full)     FULL=true; DELETE_IMAGES=true; shift ;;   # true clean slate; AR repo delete implies image delete
+    --nuke)     NUKE=true; FULL=true; DELETE_IMAGES=true; shift ;;   # --full + tf-state/cloudbuild buckets (project + KMS ring kept)
+    --no-status) SHOW_STATUS=false; shift ;;              # skip the consolidated post-teardown status view
     --help)
       echo "Usage: ./scripts/gcp/teardown-gcp.sh [--project PROJECT_ID] [--region REGION] [--full] [--delete-images]"
       echo ""
@@ -119,6 +123,11 @@ while [[ $# -gt 0 ]]; do
       echo "  --full             TRUE clean slate: also reset Terraform state + delete secrets,"
       echo "                     service accounts, config bucket, and Artifact Registry repo."
       echo "                     Use to re-run 'as if the first time'. (implies --delete-images)"
+      echo "  --nuke             EXIT-THE-PROJECT: everything --full does PLUS delete the tf-state"
+      echo "                     and Cloud Build buckets. Keeps the PROJECT + KMS key ring (GCP"
+      echo "                     forbids deleting key rings). Rebuildable via the deploy (buckets"
+      echo "                     auto-recreate). For literal \$0, delete the whole project instead."
+      echo "  --no-status        Skip the consolidated post-teardown status view (for scripted runs)"
       echo "  --help             Show this help"
       exit 0 ;;
     *) error "Unknown option: $1" ;;
@@ -150,7 +159,15 @@ echo "║    • Terraform remote state (next deploy = fresh create)      ║"
 echo "║    • Secret Manager secrets (incl. tokenlean-backup-*)        ║"
 echo "║    • Service accounts (proxy-sa, routellm-sa, ingest-push-sa) ║"
 echo "║    • config GCS bucket + Artifact Registry repo               ║"
+if [[ "$NUKE" == true ]]; then
+echo "║                                                                ║"
+echo "║   🔥🔥 --nuke EXIT PROJECT — ALSO deletes:                    ║"
+echo "║    • tf-state bucket + Cloud Build bucket (auto-recreated)     ║"
+echo "║    ★ PROJECT + KMS key ring KEPT (GCP can't delete key rings) ║"
+echo "║    ★ Rebuildable: run-gcp-commercial-lifecycle.sh (infra only) ║"
+else
 echo "║    ★ tf-state BUCKET kept (empty); KMS key material kept       ║"
+fi
 else
 echo "║                                                                ║"
 echo "║  ★ GCS bucket, Secret Manager, service accounts, TF state     ║"
@@ -165,9 +182,12 @@ echo "Mode:    $([[ "$FULL" == true ]] && echo 'FULL clean slate (state + secret
 echo ""
 
 # ─── Confirm ──────────────────────────────────────────────────────────────────
-echo -en "${YELLOW}Are you ABSOLUTELY SURE? Type 'destroy' to confirm: ${NC}"
+# --nuke requires the stronger keyword 'nuke' (it removes even the tf-state bucket);
+# --full/default require 'destroy'.
+CONFIRM_WORD=$([[ "$NUKE" == true ]] && echo "nuke" || echo "destroy")
+echo -en "${YELLOW}Are you ABSOLUTELY SURE? Type '${CONFIRM_WORD}' to confirm: ${NC}"
 read -r confirm
-[[ "$confirm" != "destroy" ]] && { info "Aborted."; exit 0; }
+[[ "$confirm" != "$CONFIRM_WORD" ]] && { info "Aborted."; exit 0; }
 
 # ─── Step 1: Delete Cloud Run Services ───────────────────────────────────────
 echo ""
@@ -389,12 +409,42 @@ else
   info "Step 5/5: Skipping Artifact Registry (use --delete-images to remove images, or --full to remove the repo)"
 fi
 
+# ─── Step 6: --nuke extras — remove the buckets --full keeps (project stays) ───
+# --full leaves the (emptied) tf-state bucket + Cloud Build's bucket. --nuke also
+# removes those so nothing but the un-deletable KMS key ring remains. BOTH are
+# auto-recreated by the deploy: gcp-deploy.sh:ensure_tf_state_bucket() re-makes the
+# tf-state bucket, and Cloud Build re-creates its bucket on the next build — so a
+# redeploy still works. The KMS key ring CANNOT be deleted in GCP (only key versions
+# destroyed); it is KEPT intact so `terraform apply` reattaches cleanly on rebuild.
+if [[ "$NUKE" == true ]]; then
+  echo ""
+  info "Step 6/6: --nuke extras (removing tf-state + Cloud Build buckets; project + KMS ring kept)..."
+  for bkt in "${PROJECT_ID}-tf-state" "${PROJECT_ID}_cloudbuild"; do
+    if gcloud storage ls "gs://${bkt}" &>/dev/null; then
+      gcloud storage rm -r "gs://${bkt}" --quiet 2>/dev/null \
+        && success "  Deleted bucket ${bkt} (auto-recreated on next deploy)" \
+        || warn "  Failed to delete ${bkt} (may be retention-locked; delete manually)"
+    else
+      success "  Bucket ${bkt} not found (already gone)"
+    fi
+  done
+  warn "  KMS key ring 'token-opt-byok' KEPT — GCP forbids deleting key rings; for literal \$0, delete the whole project (see summary)."
+fi
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║   TEARDOWN COMPLETE                                            ║${NC}"
 echo -e "${GREEN}╠════════════════════════════════════════════════════════════════╣${NC}"
-if [[ "$FULL" == true ]]; then
+if [[ "$NUKE" == true ]]; then
+echo -e "${GREEN}║${NC} 🔥 NUKED — project emptied to the GCP floor. Only the KMS key   ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC} ring remains (~\$0.06/mo — GCP can't delete key rings).         ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}                                                               ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC} Rebuild to a fresh (empty-data) deploy —                      ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}   sh scripts/commercial/run-gcp-commercial-lifecycle.sh        ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC} For LITERAL \$0 (delete the project, 30-day undo):             ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}   gcloud projects delete ${PROJECT_ID}"
+elif [[ "$FULL" == true ]]; then
 echo -e "${GREEN}║${NC} FULL clean slate — project is deployable as if the first run.  ${GREEN}║${NC}"
 echo -e "${GREEN}║${NC} Kept (intentionally): tf-state BUCKET (empty), KMS key material.${GREEN}║${NC}"
 echo -e "${GREEN}║${NC}                                                               ${GREEN}║${NC}"
@@ -456,4 +506,30 @@ if [[ "$CLEAN" == true ]]; then
   echo -e "${GREEN}✔ CLEAN SLATE VERIFIED${NC}$([[ "$FULL" == true ]] && echo ' — ready for a first-run deploy.')"
 else
   echo -e "${YELLOW}⚠ Some resources remain (see ❌ above). Re-run, or delete them manually.${NC}"
+fi
+
+# ─── Consolidated post-teardown status ───────────────────────────────────────
+# End the teardown with ONE consolidated view by wiring in the two read-only status
+# tools: check-gcp-status.sh (the named token-opt-* quick check) + gcp-running-inventory.sh
+# (the project-wide, all-regions cost sweep + final COST SUMMARY). Both are read-only
+# and MUST be guarded with `|| true`: this script runs under `set -e`, and the inventory
+# deliberately exits 1 when anything is still billing — that non-zero must not abort us.
+# Skip with --no-status (scripted/CI teardowns).
+if [[ "$SHOW_STATUS" == true ]]; then
+  echo ""
+  echo -e "${BLUE}════════════════════════════════════════════════════════════════════${NC}"
+  echo -e "${BLUE}  CONSOLIDATED POST-TEARDOWN STATUS${NC}"
+  echo -e "${BLUE}════════════════════════════════════════════════════════════════════${NC}"
+
+  if [[ -f "${SCRIPT_DIR}/check-gcp-status.sh" ]]; then
+    echo ""
+    info "── Named-resource quick check (check-gcp-status.sh) ──"
+    bash "${SCRIPT_DIR}/check-gcp-status.sh" --project "$PROJECT_ID" --region "$REGION" || true
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/gcp-running-inventory.sh" ]]; then
+    echo ""
+    info "── Project-wide cost inventory (gcp-running-inventory.sh) ──"
+    bash "${SCRIPT_DIR}/gcp-running-inventory.sh" --project "$PROJECT_ID" --region "$REGION" || true
+  fi
 fi

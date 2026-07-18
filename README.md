@@ -456,7 +456,8 @@ main._record_outcome ───────────────────�
 | `post-deploy-check.sh` | Verify all services are running |
 | `stop-gcp.sh` | Export Redis to GCS, stop Cloud SQL (cost savings) |
 | `start-gcp.sh` | Restore Redis from GCS, start Cloud SQL |
-| `teardown-gcp.sh` | Delete all GCP resources |
+| `gcp-running-inventory.sh` | Read-only project-wide cost sweep (all regions) + consolidated COST SUMMARY |
+| `teardown-gcp.sh` | Delete GCP resources; `--full` clean slate, `--nuke` empty the project to the GCP floor (keeps project + KMS ring), ends with a consolidated status |
 
 ### Shared / utilities (`scripts/`)
 

@@ -13,6 +13,25 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — GCP cost-inventory script + teardown status wiring + `--nuke`
+**Type:** Enhancement (OSS)
+
+Operator tooling for cleanly exiting / auditing a GCP deployment:
+
+- **New `scripts/gcp/gcp-running-inventory.sh`** — a read-only, project-wide sweep across **all regions/zones** of every cost-bearing resource (Cloud SQL, Compute VMs, Memorystore, Serverless VPC connectors, reserved external IPs, load balancers, Cloud NAT, Cloud Run services/jobs, disks, buckets, Artifact Registry, secrets, KMS), grouped by cost behaviour (bills-continuously / scale-to-zero / storage) and ending in a two-tier **COST SUMMARY**. Exits non-zero if anything bills continuously. Runs from any shell (forces `CLOUDSDK_CORE_DISABLE_PROMPTS` so a disabled-API prompt can't hang it). Optional `--asset` adds a full Cloud Asset Inventory dump.
+- **`teardown-gcp.sh` consolidated status** — teardown now ends by running `check-gcp-status.sh` + `gcp-running-inventory.sh` for one consolidated post-teardown view; skip with `--no-status`.
+- **`teardown-gcp.sh --nuke`** — "exit the project" mode: everything `--full` does **plus** deleting the tf-state and Cloud Build buckets, emptying the project to the GCP floor while keeping the **project** and the **KMS key ring** (GCP forbids deleting key rings; keeping it lets `terraform apply` reattach on rebuild). Residual cost ≈ $0.06/mo. Rebuildable via `run-gcp-commercial-lifecycle.sh` (infra only — data is not restored); requires typing `nuke` to confirm. The summary prints the `gcloud projects delete` command for the literal-$0 path.
+
+## 2026-07-18 — Test-harness doctrine, Security Suite & deploy-readiness gating
+**Type:** Enhancement (OSS + Enterprise)
+
+Clarified and enforced the change-completion doctrine, and expanded deployment verification:
+
+- **Harness routing by feature type.** `examples/benchmark` (and the internal pitch-test-plan) are now savings-validation only — a non-savings change no longer touches them, protecting the calibrated benchmark number and the reproducible savings headline. Non-savings validation (trust & safety, protocols, auth, billing, portal) lives in the deployment-readiness harness. The misplaced `--security-smoke` benchmark mode added earlier was removed; the benchmark is savings-only again.
+- **[Enterprise] Security Suite** — a standalone, non-destructive security posture check (auth/authz, endpoint-exposure, BYOK/402, and a trust-safety engine proof) that also runs as a gating section of the deployment-readiness harness. Operator tooling — see <https://tokenlean.cbeyond.cloud/>.
+- **[Enterprise] Deployment-readiness tiers + gating** — the readiness harness gained `--quick` (cheap deploy gate) and `--full` (deep pre-release) tiers; every deploy now auto-runs the quick gate and a NOT-READY verdict blocks the deploy, so a broken stack is never declared customer-ready. Commercial-portal checks gate on a detected commercial deploy. See <https://tokenlean.cbeyond.cloud/>.
+- **Commit-time enforcement (OSS):** a change under `src/` must ship a `release-notes.md` entry and a matching `tests/` change, or the commit is blocked (override with `[skip-relnotes]` / `[skip-tests]` tokens for genuine no-logic commits). A guard test keeps trust-safety groups out of the savings registry.
+
 ## 2026-07-15 — G31 Context-Trust: indirect (RAG) prompt-injection defence
 **Type:** Enhancement (OSS + Enterprise)
 
