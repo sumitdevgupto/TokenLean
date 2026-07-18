@@ -13,6 +13,11 @@ Entry format (add new entries directly BELOW this comment, newest at top):
 https://tokenlean.cbeyond.cloud/ >
 -->
 
+## 2026-07-18 — Malformed OpenAI requests return a clean 400
+**Type:** Bug fix
+
+The `/v1/chat/completions` (OpenAI) route now validates the request envelope and returns a clean, OpenAI-shaped **400** for a malformed body — a non-JSON body, or `messages` that isn't a non-empty array of role-bearing objects. Previously such requests surfaced as a 500 (or were forwarded to the provider only to 400 there); the Anthropic (`/v1/messages`) and Gemini routes already returned a proper 400, so this brings the OpenAI route to parity. The check is deliberately light (envelope only) — semantic validation still belongs to litellm/the provider. Covered by 8 new unit tests.
+
 ## 2026-07-18 — RAG retrieval fails closed (relevance floor hardening)
 **Type:** Bug fix
 

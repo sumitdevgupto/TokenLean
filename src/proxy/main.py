@@ -1048,13 +1048,47 @@ def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResp
     return JSONResponse(content=response_dict, headers=headers)
 
 
+_OPENAI_VALID_ROLES = {"system", "user", "assistant", "tool", "function", "developer"}
+
+
+def _validate_openai_request(messages: Any) -> None:
+    """Light shape check for the OpenAI ingress body. Malformed input gets a clean
+    400 here — matching the Anthropic/Gemini routes, which already return a 400 —
+    instead of surfacing as a 500 or being forwarded to the provider only to 400
+    there. Deliberately minimal: it validates the envelope (`messages` is a non-empty
+    array of role-bearing objects), not the full schema (litellm/the provider still
+    own semantic validation)."""
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="`messages` must be a non-empty array")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            raise HTTPException(status_code=400, detail=f"messages[{i}] must be an object")
+        role = m.get("role")
+        if not isinstance(role, str) or not role:
+            raise HTTPException(status_code=400, detail=f"messages[{i}] is missing a string `role`")
+        if role not in _OPENAI_VALID_ROLES:
+            raise HTTPException(status_code=400, detail=f"messages[{i}] has an invalid role '{role}'")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     _request_start = time.time()
     request_id = str(uuid.uuid4())
     user_id, api_key, tenant_metadata = await _authenticate(request)
-    body = await request.json()
-    messages, model, params = OPENAI.parse_request(body, dict(request.headers))
+    # Parse + validate the body inside a guard so a malformed OpenAI request returns a
+    # clean OpenAI-shaped 400 (the Anthropic/Gemini routes already do this via
+    # _serve_protocol). _authenticate stays outside — its 401/403 handling is unchanged.
+    try:
+        body = await request.json()
+        messages, model, params = OPENAI.parse_request(body, dict(request.headers))
+        _validate_openai_request(messages)
+    except HTTPException as exc:
+        eb, st = OPENAI.serialise_error(exc.status_code, _detail_str(exc))
+        return JSONResponse(status_code=st, content=eb)
+    except Exception as exc:
+        logger.warning("[%s] OpenAI ingress: bad request: %s", request_id, _redact_secrets(exc))
+        eb, st = OPENAI.serialise_error(400, "Invalid request body")
+        return JSONResponse(status_code=st, content=eb)
     return await _serve_core(
         request, request_id, _request_start, messages, model, params,
         user_id, api_key, tenant_metadata, OPENAI.name,
