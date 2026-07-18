@@ -258,6 +258,10 @@ tests/test_attestation.py
 # ruleset stay in core (guardrails/injection.py, guardrails/pii.py, guardrails/__init__.py).
 src/proxy/guardrails/ruleset_feed.py
 tests/test_ruleset_feed.py
+# Build-time artifact: ci/cloudbuild.yaml stages the OSS guardrails engine into the
+# doc-pipeline build context (3 public files, never ruleset_feed.py). Never committed —
+# it is regenerated on every build. Also ignored so a local build-verify can't stage it.
+src/doc-pipeline/guardrails/
 # Commercial app entrypoint — wires the gated GDPR/portal/billing routers (item 26).
 # Must stay out of core so verify-oss-gates Gate 7 (core barricade) stays clean.
 src/proxy/commercial_app.py

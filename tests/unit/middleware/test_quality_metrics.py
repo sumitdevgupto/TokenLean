@@ -81,6 +81,50 @@ class TestEmitHelpers:
         Q.record_tool_denied(None, 0)
 
 
+# ── emit_grounding (response-path wiring) ─────────────────────────────────────
+class _Ctx:
+    def __init__(self, chunks=None, tenant_id="tg"):
+        if chunks is not None:
+            self.rag_chunk_texts = chunks
+        self.tenant_id = tenant_id
+
+
+def _answer_resp(text):
+    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+
+class TestEmitGrounding:
+    def test_emits_when_chunks_and_answer_present(self):
+        from unittest.mock import patch
+        ctx = _Ctx(chunks=["Paris is the capital of France."])
+        with patch.object(Q, "record_grounding") as m:
+            Q.emit_grounding(ctx, _answer_resp("Paris is the capital of France."))
+        m.assert_called_once()
+        assert m.call_args.args[0] == "tg"
+        assert m.call_args.args[1] == 1.0        # fully grounded
+
+    def test_noop_when_no_rag_chunks(self):
+        from unittest.mock import patch
+        ctx = _Ctx(chunks=None)   # non-RAG request → attribute absent
+        with patch.object(Q, "record_grounding") as m:
+            Q.emit_grounding(ctx, _answer_resp("anything"))
+        m.assert_not_called()
+
+    def test_noop_on_tool_call_answer(self):
+        from unittest.mock import patch
+        ctx = _Ctx(chunks=["some context"])
+        tool_resp = {"choices": [{"message": {"role": "assistant", "content": None,
+                     "tool_calls": [{"id": "c1"}]}}]}
+        with patch.object(Q, "record_grounding") as m:
+            Q.emit_grounding(ctx, tool_resp)
+        m.assert_not_called()
+
+    def test_never_raises_on_malformed_response(self):
+        ctx = _Ctx(chunks=["ctx"])
+        Q.emit_grounding(ctx, {})              # no choices
+        Q.emit_grounding(ctx, {"choices": []})  # empty choices
+
+
 class TestPiiFreeLabels:
     def test_no_content_labels(self):
         # Every metric's labels must be tenant_id (+ a small enum), never content.

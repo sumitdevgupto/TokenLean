@@ -156,3 +156,31 @@ def grounding_coverage(answer: str, chunks: List[str], *, min_overlap: float = 0
         if len(toks & context) / len(toks) >= min_overlap:
             grounded += 1
     return (grounded / scored) if scored else 0.0
+
+
+def _first_answer_text(response: dict) -> Optional[str]:
+    """The first choice's assistant text, or None (tool-call / multimodal / empty)."""
+    try:
+        msg = (response.get("choices") or [{}])[0].get("message") or {}
+        content = msg.get("content")
+        return content if isinstance(content, str) else None
+    except Exception:
+        return None
+
+
+def emit_grounding(ctx, response: dict) -> None:
+    """Compute + emit grounding coverage for a RAG answer, if this request retrieved
+    context (G07 stashed `ctx.rag_chunk_texts`) AND produced a plain-text answer.
+
+    Called once on the response path. A no-op for non-RAG requests, tool-call answers,
+    or when nothing was retrieved. Never raises (metrics must not break a response)."""
+    def _do():
+        chunks = getattr(ctx, "rag_chunk_texts", None)
+        if not chunks:
+            return
+        answer = _first_answer_text(response)
+        if not answer:
+            return
+        cov = grounding_coverage(answer, chunks)
+        record_grounding(getattr(ctx, "tenant_id", "default"), cov)
+    _safe(_do)

@@ -307,6 +307,15 @@ class OptimisationPipeline:
             "G11-output-format-resp", ctx, self.g11.process_response(ctx, response)
         )
 
+        # Stage 5c — application-quality: grounding coverage (Task 11). Needs both the
+        # retrieved chunks (G07 stashed them) and the answer (now available). No-op for
+        # non-RAG / tool-call answers; never raises.
+        try:
+            from middleware.quality_metrics import emit_grounding
+            emit_grounding(ctx, response)
+        except Exception:
+            pass
+
         # Stage 6 — Across the Loop (observability)
         await self._run_timed("G18-observability", ctx, self.g18.record(ctx, response))
 

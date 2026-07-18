@@ -288,3 +288,5 @@ async def test_g07_emits_retrieval_metric(make_ctx):
         await G07Retrieval().process_request(ctx)
     rec.assert_called_once()
     assert rec.call_args.args[1] == 1   # (tenant_id, n_chunks, max_age) → 1 chunk (hit)
+    # G07 also stashes the injected chunk texts for response-path grounding coverage.
+    assert ctx.rag_chunk_texts == ["Paris is the capital of France."]

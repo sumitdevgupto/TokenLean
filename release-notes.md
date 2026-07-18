@@ -21,6 +21,15 @@ date changes.
 
 ## 2026-07-18
 
+### Grounding-coverage metric now emitted live (G07 → response path) — Enhancement (OSS + Enterprise)
+The grounding-coverage heuristic shipped earlier today is now **wired to emit**. G07 stashes the injected chunk texts, and once the answer is produced the pipeline computes the fraction of answer sentences supported by the retrieved context and records `token_opt_grounding_coverage{tenant_id}`. No-op for non-RAG requests and tool-call answers; never breaks the response path. This lights up the last dark metric in the application-quality surface. 5 tests.
+
+- **OSS:** the metric emits at `/metrics`.
+- **[Enterprise]:** grounding-coverage trends + low-grounding anomaly alerting in the context-quality dashboards — <https://tokenlean.cbeyond.cloud/>.
+
+### PII/PHI ingest masking now runs in the GCP doc-pipeline Job — Bug fix
+The opt-in ingest masking shipped earlier today worked locally but **silently no-op'd in the GCP Cloud Run Job** — that container's build context copies only `pipeline.py`, so the `guardrails` engine wasn't importable and the defensive import fell through. The build now stages the 3 public `guardrails` files into the doc-pipeline image (never the commercial `ruleset_feed.py`), so `INGEST_PII_MODE=mask` actually masks before embedding in production. Verified with a local image build. Default off → no behaviour change unless enabled.
+
 ### Output JSON-schema validation (G11) — Enhancement (OSS + Enterprise)
 When a request asks for **structured output** (OpenAI `response_format` `json_object`/`json_schema`, or a `json_schema` param), G11 now validates the answer is parseable JSON and schema-conformant — closing the malformed-JSON / missing-field gap on the response path. Opt-in via `groups.G11_output.validate_output`: `off` (default) / `flag` (record + annotate, non-mutating) / `repair` (one bounded re-ask — never loops; `repair_fallback: flag|block`) / `block` (withhold with a content-filter 200, not cached). Tool-call and multimodal answers are untouched. Emits `token_opt_output_schema_failures_total`; 11 tests.
 

@@ -108,6 +108,22 @@ steps:
       - 'src/finetune-pipeline'
     waitFor: [run-tests]
 
+  # Step 8a: Stage the OSS guardrails engine into the doc-pipeline build context so
+  # opt-in INGEST_PII_MODE masking can run in the Job. Copies ONLY the 3 public files —
+  # NEVER ruleset_feed.py (commercial/gitignored). Explicit list = no accidental leak.
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: stage-doc-pipeline-guardrails
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        mkdir -p src/doc-pipeline/guardrails
+        cp src/proxy/guardrails/__init__.py  src/doc-pipeline/guardrails/
+        cp src/proxy/guardrails/injection.py src/doc-pipeline/guardrails/
+        cp src/proxy/guardrails/pii.py       src/doc-pipeline/guardrails/
+    waitFor: ['-']
+
   # Step 8: Build doc-pipeline image
   - name: 'gcr.io/cloud-builders/docker'
     id: build-doc-pipeline
@@ -119,7 +135,7 @@ steps:
       - '-t'
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/doc-pipeline:latest'
       - 'src/doc-pipeline'
-    waitFor: [run-tests]
+    waitFor: [run-tests, stage-doc-pipeline-guardrails]
 
   # Step 9: Push all images
   - name: 'gcr.io/cloud-builders/docker'

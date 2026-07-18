@@ -299,6 +299,10 @@ class G07Retrieval:
             if ranked:
                 context_text = "\n\n".join(c["text"] for c in ranked)
                 ctx.messages = _inject_context(ctx.messages, context_text)
+                # Stash the injected chunk texts so the response path can compute
+                # grounding coverage (Task 11) — the answer isn't available until
+                # post-LLM. Request-scoped; already resident in ctx.messages.
+                ctx.rag_chunk_texts = [c["text"] for c in ranked]
                 tokens_after = count_messages_tokens(ctx.messages, ctx.model)
                 ctx.savings.add_step(
                     GROUP,
