@@ -62,6 +62,7 @@ class TestPipelineStageOrdering:
         pipeline.g04 = _make("G04")
         pipeline.g05 = _make("G05")
         pipeline.g06 = _make("G06")
+        pipeline.f2 = _make("F2")
         pipeline.g07 = _make("G07")
         pipeline.g08 = _make("G08")
         pipeline.g09 = _make("G09")
@@ -124,6 +125,7 @@ class TestPipelineStageOrdering:
         pipeline.g04 = _make("G04")
         pipeline.g05 = _make("G05")
         pipeline.g06 = _make("G06")
+        pipeline.f2 = _make("F2")
         pipeline.g07 = _make("G07")
         pipeline.g08 = _make("G08")
         pipeline.g09 = _make("G09")
@@ -163,6 +165,44 @@ class TestPipelineStageOrdering:
         g16_pos = call_log.index("G16")
         assert g10_pos < g22_pos < g16_pos, (
             f"Expected G10({g10_pos}) < G22({g22_pos}) < G16({g16_pos}), got: {call_log}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_f2_runs_after_g06_and_before_g01(self):
+        """F2 intent orchestration must run after G06 routing and before the Stage 3
+        prompt optimisations (G01) — so a dispatched request skips optimisations tuned for
+        the main LLM and short-circuits the LLM call."""
+        from middleware.pipeline import OptimisationPipeline
+
+        call_log = []
+        pipeline = OptimisationPipeline.__new__(OptimisationPipeline)
+
+        def _make(name):
+            return self._tracked_mock(call_log, name)
+
+        pipeline._tenant_config_loader = AsyncMock()
+        pipeline._tenant_config_loader.load = AsyncMock()
+        for _n in ("g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
+                   "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g24",
+                   "g25", "g27", "g28", "g29", "g30", "g31", "g15"):
+            setattr(pipeline, _n, _make(_n.upper()))
+        pipeline.f2 = _make("F2")
+        pipeline.g18 = MagicMock()
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+
+            ctx = _make_ctx()
+            await pipeline.process_request(ctx)
+
+        assert "F2" in call_log and "G06" in call_log and "G01" in call_log
+        g06_pos = call_log.index("G06")
+        f2_pos = call_log.index("F2")
+        g01_pos = call_log.index("G01")
+        assert g06_pos < f2_pos < g01_pos, (
+            f"Expected G06({g06_pos}) < F2({f2_pos}) < G01({g01_pos}), got: {call_log}"
         )
 
     @pytest.mark.asyncio
@@ -240,6 +280,7 @@ def _build_stubbed_pipeline(call_log):
               "g11", "g12", "g13", "g15", "g16", "g17", "g19", "g20", "g21", "g22",
               "g24", "g25", "g27", "g28", "g29", "g30", "g31"]:
         setattr(p, n, _mk(n.upper()))
+    p.f2 = _mk("F2")  # F2 intent orchestration stage
     p.g18 = MagicMock()
     return p
 

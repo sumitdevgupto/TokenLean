@@ -1304,6 +1304,19 @@ async def _serve_core(
         ctx, response_dict = await _pipeline.process_response(ctx, ctx.cascade_response)
         return _served_response(ctx, response_dict, _request_start)
 
+    # F2 Intent Orchestration — the request matched a registered downstream agent and
+    # IntentOrchestration already dispatched it there (its provider time is accumulated in
+    # ctx.llm_elapsed_ms). Serve the agent's answer directly; calling the LLM here would
+    # duplicate the round-trip. Mirrors the G06 cascade_response short-circuit above so the
+    # agent response still runs response-side groups + billing via process_response.
+    if ctx.agent_dispatched and ctx.agent_response is not None:
+        logger.info(
+            "[%s] Served by downstream agent '%s'; skipping main LLM call",
+            request_id, ctx.agent_id,
+        )
+        ctx, response_dict = await _pipeline.process_response(ctx, ctx.agent_response)
+        return _served_response(ctx, response_dict, _request_start)
+
     # Split-brain fix: resolve provider/adapter/entry from the TENANT-merged ctx.config
     # (the pipeline made it per-tenant), not the global cfg snapshot.
     eff_cfg = ctx.config or cfg

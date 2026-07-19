@@ -963,3 +963,26 @@ learning:
     skippable_groups: [G01, G20, G22]
     # Per-tenant overrides (Gate 2): tenants.<ID>.learning.signal_miner.{min_samples,
     # max_avg_saving_per_run, skippable_groups, ...} take precedence for that tenant's cohorts.
+
+# ── Intent-Based Multi-Agent Orchestration (F2) — engine OSS, console [Enterprise] ──
+# One proxy endpoint fans a request to the right DOWNSTREAM AGENT by semantic intent,
+# instead of always calling the same LLM. An agent is any OpenAI-compatible chat endpoint
+# (a service you run). When the last user turn matches an agent's `match` keywords, the
+# request is forwarded to that agent's URL and its answer is served (billing + response
+# groups still fire); no match → the normal LLM path runs. Default OFF / no-op (no agents).
+# The managed registry console + routing-decision audit + ML intent classifier are the
+# [Enterprise] layer — https://tokenlean.cbeyond.cloud/. Per-tenant override:
+# tenants.<ID>.orchestration.* (a tenant's `agents` list REPLACES the global one — never
+# merges — so agents never leak across tenants).
+orchestration:
+  enabled: false                     # master switch. false → no-op, byte-identical path.
+  confidence_threshold: 1            # min matched keywords to dispatch (else fall back to LLM)
+  agents: []                         # [] = disabled. Example entry:
+    # - id: billing
+    #   description: "Billing, invoices, refunds, charges"   # for the managed ML classifier
+    #   url: http://billing-agent:8000/v1                    # OpenAI-compatible endpoint
+    #   match: [refund, invoice, billing, charge, payment]   # heuristic intent keywords
+    #   model: gpt-4o-mini            # optional: model string sent to the agent (default: requested)
+    #   api_key_env: BILLING_AGENT_KEY # optional: env var holding the agent's API key
+    #   max_tokens: 1024              # optional: per-agent output budget (governance)
+    #   timeout_seconds: 60           # optional: dispatch timeout before fallback

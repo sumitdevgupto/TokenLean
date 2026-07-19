@@ -21,6 +21,11 @@ date changes.
 
 ## 2026-07-19
 
+### Intent-based multi-agent orchestration — one endpoint, every agent — Enhancement (OSS + Enterprise)
+Point one proxy endpoint at TokenLean and it routes each request to the right **downstream agent** by intent — "refund my invoice" → your billing agent, "the server is down" → your SRE agent — with no routing code in your app. An agent is any OpenAI-compatible chat endpoint you run; register it per tenant with intent keywords and TokenLean forwards matching requests there (its answer still runs response-side groups + billing), falling back to the normal LLM on no match. Opt-in / default-off (no agents registered → byte-identical path), per-tenant isolated (a tenant's agent list never leaks to another), with an optional per-agent output budget. First increment is single-agent routing; multi-intent fan-out follows.
+- **OSS:** the orchestration engine — config-driven agent registry, heuristic intent classifier, dispatch + short-circuit — ships in every tier (`orchestration.*`).
+- **[Enterprise]:** the managed registry console (declare/govern agents in the portal), routing-decision audit, and a managed ML intent classifier — <https://tokenlean.cbeyond.cloud/>
+
 ### Agentic learning loop — the proxy self-tunes per tenant — Enhancement [Enterprise]
 A managed background job mines your own `usage_events` ledger and, for each `(tenant, routed_model)`, finds savings-optimisation groups that keep running but realise ≈no tokens — then writes **per-tenant** adaptive-bypass rules into the very artifact G24 already hot-reloads. Within one reload cycle (~60 s) the proxy stops paying for that group for that cohort, with zero engineer effort; bills keep falling as more rules accrue. Conservative by design: opt-in / default-off, a minimum-sample floor, a hard **never-skip denylist** (cache, routing, rate-limit, observability, trust & safety), and any operator-authored rules are always preserved.
 - **OSS:** the G24 adaptive-bypass engine that consumes the rules ships in every tier.

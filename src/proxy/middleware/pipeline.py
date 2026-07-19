@@ -24,6 +24,7 @@ from middleware.g13_batch import G13Batch
 from middleware.g14_tool_output import G14ToolOutput
 from middleware.g15_server_compute import G15ServerCompute
 from middleware.g16_agent_arch import G16AgentArch
+from middleware.intent_orchestration import IntentOrchestration
 from middleware.g17_loop_control import G17LoopControl
 from middleware.g18_observability import G18Observability, STAGE_DURATION_MS
 from middleware.g19_headroom import G19Headroom
@@ -63,6 +64,7 @@ class OptimisationPipeline:
         self.g04 = G04Bypass()
         self.g05 = G05Cache()
         self.g06 = G06Routing()
+        self.f2 = IntentOrchestration()  # F2 intent-based downstream-agent dispatch
         self.g07 = G07Retrieval()
         self.g08 = G08ToolLoading()
         self.g09 = G09ContextSchema()
@@ -225,6 +227,18 @@ class OptimisationPipeline:
                 return ctx
 
         ctx = await self._run_timed("G06-routing", ctx, self.g06.process_request(ctx))
+
+        # F2 — Intent Orchestration. Classify the request's intent; if it matches a
+        # registered downstream agent, dispatch there (its OpenAI-compatible endpoint)
+        # INSTEAD of the normal LLM and short-circuit — mirrors the cache/cascade
+        # short-circuits. Runs after G06 (tenant/config/adapter resolved) and BEFORE the
+        # Stage 3 prompt optimisations, which are tuned for the main LLM, not a black-box
+        # agent service. Default off / no-op when no agents are registered (byte-identical).
+        ctx = await self._run_timed("F2-intent-orchestration", ctx, self.f2.process_request(ctx))
+        if ctx.agent_dispatched:
+            logger.info("[%s] F2 dispatched to downstream agent '%s'", ctx.request_id, ctx.agent_id)
+            otel.end_span(pipeline_span)
+            return ctx
 
         # Stage 3 — Into the LLM
         for _name, _mid, _group in [

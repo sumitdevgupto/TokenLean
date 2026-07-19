@@ -629,6 +629,12 @@ loop** — a managed job that mines your own usage to spot optimisations that st
 a given tenant/model and switches them off automatically, so your bill keeps falling with zero
 engineering effort (the OSS G24 adaptive-bypass engine that applies the rules ships in every tier).
 
+**Intent-based multi-agent orchestration** — point one endpoint at TokenLean and it routes each
+request to the right downstream agent by intent ("refund my invoice" → your billing agent, "server
+is down" → your SRE agent), with no routing code in your app. The orchestration engine (config-driven
+agent registry + intent classifier + dispatch) is OSS in every tier; the managed registry console,
+routing-decision audit, and ML intent classifier are the Enterprise layer.
+
 → <strong><a href="https://tokenlean.cbeyond.cloud/" target="_blank" rel="noopener">Explore the managed &amp; Enterprise offering at tokenlean.cbeyond.cloud</a></strong>
 
 ---

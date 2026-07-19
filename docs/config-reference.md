@@ -648,6 +648,39 @@ commercial dispatcher:
 | `webhooks.retry_base_delay` | `0.5` | Backoff base (seconds); attempt *n* waits `base × 2ⁿ` |
 | `rate_limit.spend_cap.warn_pct` | `0` | **(OSS)** >0 → emit a one-shot `budget.threshold` when spend first crosses this %% of the cap |
 
+### orchestration  *(F2 intent-based multi-agent orchestration — engine OSS, console [Enterprise])*
+
+Routes a request to a registered **downstream agent** (any OpenAI-compatible endpoint) by intent,
+instead of the normal LLM. Default **off / no-op** (no agents → byte-identical path). Runs after G06,
+before the Stage 3 optimisations; a match short-circuits the LLM call (the agent's answer still runs
+response-side groups + billing). Per-tenant override `tenants.<id>.orchestration.*` — a tenant's
+`agents` list **replaces** the global one (never merges) so agents never leak across tenants.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `orchestration.enabled` | `false` | Master switch; `false` → no-op |
+| `orchestration.confidence_threshold` | `1` | Min matched `match` keywords to dispatch (else fall back to the LLM) |
+| `orchestration.agents` | `[]` | List of `{id, url, match:[keywords], description?, model?, api_key_env?, max_tokens?, timeout_seconds?}`. `url` = the agent's OpenAI-compatible endpoint; `match` = heuristic intent keywords; `max_tokens` = optional per-agent output budget |
+
+The managed registry console (declare/govern agents in the portal), routing-decision audit, and a
+managed ML intent classifier are the **[Enterprise]** layer — <https://tokenlean.cbeyond.cloud/>.
+
+### learning  *(F1 agentic learning loop — [Enterprise] managed)*
+
+A managed background job that mines the OSS-core `usage_events` ledger and emits per-tenant G24
+adaptive-bypass rules for optimisation groups that run but realise ≈no tokens. No-op in OSS (the miner
+ships only in the commercial image). Default **off**. Per-tenant override under
+`tenants.<id>.learning.signal_miner.*`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `learning.signal_miner.enabled` | `false` | Master switch; `false` → total no-op |
+| `learning.signal_miner.interval_seconds` | `900` | Minutes between mining passes (min 60; hot-reloadable) |
+| `learning.signal_miner.window_hours` | `168` | Lookback window over `usage_events` |
+| `learning.signal_miner.min_samples` | `200` | Ignore cohorts thinner than this (noise floor) |
+| `learning.signal_miner.max_avg_saving_per_run` | `5.0` | Tokens/run at/below which a group is "unproductive" |
+| `learning.signal_miner.skippable_groups` | `[G01, G20, G22]` | Groups the loop may auto-skip (a hard code denylist protects cache/routing/safety/observability) |
+
 ## Appendix — knob coverage caveats
 
 A source audit (2026-07-03) found four classes of knob where the template surface and the code

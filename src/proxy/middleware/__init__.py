@@ -64,6 +64,16 @@ class RequestContext:
     # MUST NOT call the LLM again (avoids a duplicate provider call). None =
     # normal path (main.py makes the call).
     cascade_response: Optional[Dict] = None
+    # ── F2 Intent Orchestration (downstream-agent dispatch) ──────────────────
+    # Short-circuit pair (mirrors cascade_response): set by IntentOrchestration when the
+    # request's intent matches a registered downstream agent and the request was dispatched
+    # to that agent's OpenAI-compatible endpoint INSTEAD of the normal LLM. agent_response is
+    # the agent's OpenAI-shaped completion dict; main.py serves it through process_response so
+    # billing + response-side groups still fire. False/None = no agent matched → normal LLM
+    # path (fallback). agent_id records which registered agent handled it (observability only).
+    agent_dispatched: bool = False
+    agent_response: Optional[Dict] = None
+    agent_id: str = ""
     # Provider failover trail (#1 resilience). Each element is a
     # providers.resilience.Attempt recording one provider/model try and its
     # outcome (success | error | skipped_*). Populated by call_with_resilience;
