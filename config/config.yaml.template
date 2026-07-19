@@ -406,6 +406,11 @@ groups:
     kompress_enabled: true
     kompress_model: microsoft/Kompress-v2-base
     kompress_max_new_tokens: 256
+    # Deterministic regex prose fallback (zero-LLM, zero-latency; prose_compress).
+    # Engages ONLY when neither LLMLingua nor Kompress reduced a message — so a
+    # sidecar outage degrades to some savings instead of pass-through. Default off
+    # (keeps the reproducible baseline byte-identical). Protects code/paths/idents.
+    deterministic_fallback: false
   G2_template_registry:
     enabled: true
     # `budget` (singular) — global truncation policy applied when a prompt exceeds a template's
@@ -581,6 +586,12 @@ groups:
     enabled: true
     registry_path: gs://${CONFIG_GCS_BUCKET}/config/tool-registry.yaml
     max_tools_per_agent: 20
+    # Compress tool/function DESCRIPTION prose (deterministic regex, zero-LLM via
+    # prose_compress). Tool manifests ride every agentic request and descriptions
+    # are otherwise verbatim; code/paths/identifiers are preserved byte-for-byte.
+    # Default off → byte-identical baseline. Turn on for large-manifest agent tenants.
+    compress_descriptions: false
+    compress_description_fields: [description]
     registry_cache_ttl_seconds: 300
     mcp_manifest_cache_ttl_seconds: 300
     mcp_http_timeout_seconds: 10.0
@@ -664,8 +675,16 @@ groups:
       llama: 8192
     verbosity_steering:
       enabled: false
-      default_suffix: ''
-      per_tenant_suffix: {}
+      # Bundled terse-output preset appended to the system prompt: lite | full | ultra
+      # (adapted from caveman-shrink, MIT — see docs/oss-licenses.md). Steers the model
+      # toward shorter answers (the biggest uncovered savings axis — output tokens cost
+      # far more/token than input). Safety carve-outs keep security/destructive-action
+      # text in normal prose. Folded into the G05 cache key so terse/verbose never mix.
+      # Default off → byte-identical. SAVINGS feature: prove with a pitch-test-plan
+      # quality-gate run before enabling by default (LLM judge may penalise terseness).
+      level: ''
+      default_suffix: ''      # non-empty explicit suffix overrides the preset
+      per_tenant_suffix: {}   # {tenant_id: suffix} — highest-priority per-tenant override
     # Output JSON-schema validation (Task 4). Only acts when the request asked for
     # structured output (response_format json_object/json_schema or a json_schema param).
     validate_output: off        # off (default, no-op) | flag | repair | block

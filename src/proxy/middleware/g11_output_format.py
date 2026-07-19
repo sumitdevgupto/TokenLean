@@ -103,9 +103,39 @@ async def _record_max_tokens_pair(
 
 
 # ─── Verbosity steering (T20) ────────────────────────────────────────────────
-# Ships as a config-suffix-only no-op. The headroom.verbosity_model hook below
-# will activate once headroom ships a trained per-tenant model; until then the
-# try/except silently skips that path and falls through to the static suffix.
+# Steers the model toward terser answers via a system-prompt suffix — the biggest
+# uncovered savings axis (the 54.1% headline is input-only; output tokens cost far
+# more per token). Ships bundled preset rulesets (lite/full/ultra) selectable by
+# `level`, adapted from caveman-shrink's SKILL.md ruleset (github.com/JuliusBrussee/
+# caveman, MIT — attribution in docs/oss-licenses.md), with SAFETY carve-outs so
+# security warnings and destructive-action confirmations stay in normal prose.
+# Default off → byte-identical when disabled. The headroom.verbosity_model hook
+# (future, per-tenant trained model) still takes priority when it ships.
+
+# Bundled terse-output presets. Each is appended to the system message when
+# `verbosity_steering.level` selects it and no explicit suffix override is set.
+_VERBOSITY_PRESETS: Dict[str, str] = {
+    "lite": (
+        "Be concise. Drop filler, hedging, and pleasantries; keep full sentences and "
+        "technical accuracy. Preserve code, commands, API names, error strings, and "
+        "identifiers exactly."
+    ),
+    "full": (
+        "Answer tersely. Drop articles and filler; sentence fragments are fine. No "
+        "preamble, no closing pleasantries, no restating the question, no tool-call "
+        "narration. Preserve code blocks, commands, API names, and error strings "
+        "byte-for-byte. Use normal, complete prose for security warnings and for "
+        "confirming irreversible or destructive actions."
+    ),
+    "ultra": (
+        "Answer in the fewest words that stay unambiguous — one word when one word "
+        "suffices. Omit conjunctions where cause and effect stay clear. No preamble or "
+        "closing. Preserve code, commands, API names, and error strings exactly. Use "
+        "normal, complete prose only for security warnings and destructive-action "
+        "confirmations."
+    ),
+}
+
 
 def _get_verbosity_suffix(tenant_id: str, verbosity_cfg: Dict[str, Any]) -> Optional[str]:
     """Return the verbosity suffix to append, or None if nothing should be added.
@@ -113,7 +143,8 @@ def _get_verbosity_suffix(tenant_id: str, verbosity_cfg: Dict[str, Any]) -> Opti
     Priority:
     1. headroom.verbosity_model.predict(tenant_id) — future; no-op today
     2. verbosity_cfg["per_tenant_suffix"][tenant_id]  — static per-tenant override
-    3. verbosity_cfg["default_suffix"]                — global default
+    3. verbosity_cfg["default_suffix"] (non-empty)    — explicit global override
+    4. _VERBOSITY_PRESETS[verbosity_cfg["level"]]     — bundled lite/full/ultra preset
     """
     try:
         import headroom as _hm  # type: ignore
@@ -129,7 +160,30 @@ def _get_verbosity_suffix(tenant_id: str, verbosity_cfg: Dict[str, Any]) -> Opti
     if tenant_id in per_tenant:
         return per_tenant[tenant_id]
 
-    return verbosity_cfg.get("default_suffix")  # None if not configured
+    explicit = verbosity_cfg.get("default_suffix")
+    if explicit:  # non-empty explicit override wins over the bundled preset
+        return explicit
+
+    level = str(verbosity_cfg.get("level", "")).lower()
+    return _VERBOSITY_PRESETS.get(level)  # None when level unset/unknown
+
+
+def verbosity_cache_tag(ctx: RequestContext) -> str:
+    """Stable cache-scope tag for the active G11 verbosity suffix, or "" when
+    verbosity steering is off / unconfigured. G05 folds this into its key so a
+    terse-mode answer is never served to a request configured for verbose output
+    (or vice-versa). "" keeps cache keys byte-identical to the pre-feature default."""
+    try:
+        cfg = (getattr(ctx, "config", {}) or {}).get("groups", {}).get("G11_output", {})
+        vcfg = cfg.get("verbosity_steering", {})
+        if not cfg.get("enabled", False) or not vcfg.get("enabled", False):
+            return ""
+        suffix = _get_verbosity_suffix(getattr(ctx, "tenant_id", None) or "default", vcfg)
+        if not suffix:
+            return ""
+        return "vb" + hashlib.sha256(suffix.encode()).hexdigest()[:8]
+    except Exception:
+        return ""
 
 
 def _append_verbosity_suffix(messages: List[Dict], suffix: str) -> List[Dict]:
@@ -426,10 +480,11 @@ class G11OutputFormat:
                 notes.append("appended JSON instruction to satisfy response_format requirement")
                 changed = True
 
-        # 4. Verbosity steering — Headroom terse suffix (no-op until verbosity model trained)
-        #    When headroom ships a per-tenant verbosity model, this injects a
-        #    configurable suffix that steers the model toward shorter responses.
-        #    Until the model exists, the block resolves to a static config suffix only.
+        # 4. Verbosity steering — terse-output suffix (bundled lite/full/ultra presets,
+        #    or an explicit per-tenant/default suffix, or a future headroom model).
+        #    Appended to the system message to steer the model toward shorter answers;
+        #    default off. The suffix is folded into the G05 cache key (verbosity_cache_tag)
+        #    so a terse answer is never served to a verbose-configured request.
         verbosity_cfg = cfg.get("verbosity_steering", {})
         if verbosity_cfg.get("enabled", False) and not in_holdout:
             suffix = _get_verbosity_suffix(ctx.tenant_id, verbosity_cfg)

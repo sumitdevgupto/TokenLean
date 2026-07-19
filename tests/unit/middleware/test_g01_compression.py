@@ -435,3 +435,62 @@ async def test_call_llmlingua_payload_includes_force_reserve_digit():
     payload = mock_client.post.call_args.kwargs["json"]
     assert payload["ratio"] == 0.5
     assert payload["force_reserve_digit"] is False
+
+
+# ─── Deterministic regex prose fallback (Step 2c) ─────────────────────────────
+import pytest as _pytest
+from unittest.mock import AsyncMock as _AsyncMock, patch as _patch
+
+_FILLER_ASSISTANT = (
+    "You should really just basically run the tests before you push, and honestly "
+    "it is very simply a matter of checking the `RATE_LIMIT` constant at /etc/app/x.yaml "
+    "which is essentially the thing that actually matters here in this particular case."
+)
+
+
+def _g01_cfg(ctx, **extra):
+    ctx.config.setdefault("groups", {}).setdefault("G1_compression", {})
+    ctx.config["groups"]["G1_compression"].update({
+        "enabled": True,
+        "min_tokens_to_compress": 1,
+        "min_chars_to_compress": 50,
+        "layered_composition_enabled": False,
+        "selective_context_enabled": False,
+        "kompress_enabled": False,
+        **extra,
+    })
+
+
+@_pytest.mark.asyncio
+class TestG01DeterministicFallback:
+    async def _run(self, make_ctx, deterministic):
+        ctx = make_ctx([{"role": "assistant", "content": _FILLER_ASSISTANT}])
+        _g01_cfg(ctx, deterministic_fallback=deterministic)
+        from middleware.g01_compression import G01Compression
+        # Sidecar "down": _call_llmlingua returns the text UNCHANGED (no LLML2 reduction)
+        with _patch("middleware.g01_compression._call_llmlingua",
+                    new=_AsyncMock(side_effect=lambda url, text, *a, **k: text)):
+            return await G01Compression().process_request(ctx)
+
+    async def test_off_leaves_message_uncompressed(self, make_ctx):
+        ctx = await self._run(make_ctx, deterministic=False)
+        assert ctx.messages[0]["content"] == _FILLER_ASSISTANT  # pass-through when sidecar no-ops
+
+    async def test_on_compresses_when_sidecar_noop(self, make_ctx):
+        ctx = await self._run(make_ctx, deterministic=True)
+        out = ctx.messages[0]["content"]
+        assert out != _FILLER_ASSISTANT
+        assert len(out) < len(_FILLER_ASSISTANT)
+        assert "really" not in out.lower() and "basically" not in out.lower()
+        # protection holds even in the fallback path
+        assert "`RATE_LIMIT`" in out and "/etc/app/x.yaml" in out
+
+    async def test_does_not_double_compress_when_sidecar_reduced(self, make_ctx):
+        # If LLMLingua DID reduce, the deterministic path must NOT also run.
+        ctx = make_ctx([{"role": "assistant", "content": _FILLER_ASSISTANT}])
+        _g01_cfg(ctx, deterministic_fallback=True)
+        from middleware.g01_compression import G01Compression
+        with _patch("middleware.g01_compression._call_llmlingua",
+                    new=_AsyncMock(return_value="LLML2_SHORT_OUTPUT")):
+            ctx = await G01Compression().process_request(ctx)
+        assert ctx.messages[0]["content"] == "LLML2_SHORT_OUTPUT"  # DET did not re-run

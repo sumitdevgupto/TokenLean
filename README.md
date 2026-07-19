@@ -369,17 +369,17 @@ tests/                      # Unit and integration tests (pytest)
 
 | Group | Technique | Savings | Key Implementation |
 |-------|-----------|---------|-------------------|
-| **G1** | Prompt Compression | 20-50% | LLMLingua-2 sidecar with layered composition (base→role→task→dynamic) |
+| **G1** | Prompt Compression | 20-50% | LLMLingua-2 sidecar with layered composition (base→role→task→dynamic). Opt-in **deterministic regex fallback** (`deterministic_fallback`) keeps compressing when the sidecar is down — zero-LLM, zero-latency, code preserved byte-for-byte |
 | **G2** | Template Registry | 10-30% | Versioned templates with PR-diff token checks |
 | **G3** | Knowledge Strategy | 15-40% | RAG with OOD detection, fine-tuning pipeline with break-even detection. Opt-in **PII/PHI redaction at ingest** (`INGEST_PII_MODE`) so the vector store never holds raw personal data; **freshness metadata** (`ingested_at`/`source_date`) with a `max_age_days` stale-context filter |
 | **G4** | Rules-Based Bypass | 100% | PostgreSQL cache with exact/fuzzy matching (pg_trgm) |
 | **G5** | Response Caching | 30-80% | L1 Redis exact-match + L2 pgvector semantic + L3 GPTCache. `cache_scope`: `tenant` (default — reuse across providers) or `tenant+model` (isolate per requested model for deliberate multi-provider tenants) |
 | **G6** | Model Routing | 40-70% | Three-tier cascade (fast→confidence check→escalation→rollback) + opt-in strategies (canary / weighted / round-robin / least-latency) |
 | **G7** | Retrieval Optimisation | 20-35% | Hybrid RAG (dense + sparse) with reranking |
-| **G8** | Tool Loading | 10-20% | MCP lazy-load manifest protocol with scheduled pruning |
+| **G8** | Tool Loading | 10-20% | MCP lazy-load manifest protocol with scheduled pruning. Opt-in **tool-description compression** (`compress_descriptions`) trims the prose in tool schemas that ride every agentic request — code/paths/identifiers preserved byte-for-byte |
 | **G9** | Context Schema | 15-25% | Instructor library with timeout fallback to heuristic |
 | **G10** | Memory Management | 20-40% | Mem0 OSS integration for long-horizon conversation memory |
-| **G11** | Output Format | 10-25% | Auto max_tokens with Redis feedback loop (p95 tuning). Opt-in **output JSON-schema validation** (`validate_output`) — flag / one-shot repair / block a structured answer that isn't valid JSON or misses a schema field |
+| **G11** | Output Format | 10-25% | Auto max_tokens with Redis feedback loop (p95 tuning). Opt-in **output JSON-schema validation** (`validate_output`) — flag / one-shot repair / block a structured answer that isn't valid JSON or misses a schema field. Opt-in **terse-output steering** (`verbosity_steering.level`: lite/full/ultra) — a built-in "answer tersely" dial (safety carve-outs; cache-key-scoped) that subsumes the Caveman-style terseness prompt |
 | **G12** | Reasoning Budget | 10-30% | Low/medium/high effort suppression prompts |
 | **G13** | Batch/Compact | 25-60% | TOON (Token-Optimized Object Notation) + Kafka batching. Opt-in **provider-native async batch lane** (`provider_native`) claims the **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs |
 | **G14** | Tool Output | 15-30% | Dependency-aware parallel tool combining |

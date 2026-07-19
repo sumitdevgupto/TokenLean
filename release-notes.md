@@ -19,6 +19,12 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-20
+
+### Deterministic prose compression + terse-output steering — three new savings levers — Enhancement (OSS)
+Three opt-in, default-off savings features built on a new zero-LLM, zero-latency prose compressor (`prose_compress.py`) that strips filler/hedging/pleasantries while preserving code, URLs, paths, identifiers and version numbers **byte-for-byte** (regex engine ported from caveman-shrink, MIT — attribution in `docs/oss-licenses.md`). (1) **G08 tool-description compression** trims the prose in tool/function `description`s, which ride *every* agentic request and were previously passed verbatim (`G8_tools.compress_descriptions`). (2) **G01 deterministic fallback** engages only when the LLMLingua sidecar (and Kompress) reduced nothing — so a compression outage degrades to *some* savings instead of pass-through (`G1_compression.deterministic_fallback`). (3) **G11 terse-output steering** ships bundled `lite`/`full`/`ultra` presets that steer the model toward shorter answers — the biggest uncovered savings axis, since the 54.1% headline is input-only and output tokens cost far more per token — with safety carve-outs keeping security/destructive-action text in normal prose, and the active level folded into the G05 cache key so terse and verbose answers never mix (`G11_output.verbosity_steering.level`). Plus an offline `scripts/compress_prompts.py` to shrink prompt/memory files at rest. All default-off → the reproducible savings baseline stays byte-identical; each is a SAVINGS feature to be proven with a pitch-test-plan quality-gate run before enabling by default. 40+ unit tests (protection invariants, resolver priority, cache-scope, deep-copy isolation, fallback gating).
+- **OSS:** all three levers + the shared compressor + the offline script ship in every tier — one-word marketing: *"cut output tokens with a terseness dial, and shrink tool manifests for free."*
+
 ## 2026-07-19
 
 ### Savings headers now emitted on cache-hit / bypass responses — Bug fix

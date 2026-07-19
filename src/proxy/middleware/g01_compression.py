@@ -17,6 +17,7 @@ import httpx
 
 from middleware import RequestContext
 from middleware import langfuse_tracing
+from middleware.prose_compress import compress_text as _prose_compress_text
 from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -243,6 +244,10 @@ class G01Compression:
         kompress_enabled: bool = cfg.get("kompress_enabled", True)
         kompress_model: str = cfg.get("kompress_model", "microsoft/Kompress-v2-base")
         kompress_max_new_tokens: int = cfg.get("kompress_max_new_tokens", 256)
+        # Deterministic regex prose fallback (zero-LLM, zero-latency) — engages only
+        # when neither LLMLingua nor Kompress reduced anything (e.g. sidecar down), so
+        # a compression outage degrades to *some* savings instead of pass-through.
+        deterministic_fallback: bool = cfg.get("deterministic_fallback", False)
         
         # Check for layered composition in context
         use_layers = cfg.get("layered_composition_enabled", True)
@@ -316,6 +321,17 @@ class G01Compression:
                         if k_compressed and len(k_compressed) < len(compressed):
                             compressed = k_compressed
                             reduction_info.append("KMP")
+
+                    # Step 2c: deterministic prose fallback (regex, zero-LLM). Only when
+                    # the model-based paths reduced nothing — protects code/paths/idents
+                    # byte-for-byte via prose_compress; never touches an already-reduced msg.
+                    if deterministic_fallback and not any(
+                        t in reduction_info for t in ("LLML2", "KMP")
+                    ):
+                        det = _prose_compress_text(compressed)
+                        if det and len(det) < len(compressed):
+                            compressed = det
+                            reduction_info.append("DET")
 
                     if compressed != content:
                         compressed_messages.append({**msg, "content": compressed})

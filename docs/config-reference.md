@@ -203,7 +203,7 @@ Request throttling at the gate (token bucket). Lives at the top level, not under
 | `compress_user_messages` | `false` | ⚠ Opt-in: also apply compression to `role="user"` messages (default only compresses `system`/`assistant`) |
 | `compress_system_prompt` | `false` | ⚠ Opt-in: compress the system prompt (keep off — losing system policy/facts degrades answers) |
 
-Also in the template: `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates), and the Kompress-v2 fallback `kompress_enabled` (true) / `kompress_model` / `kompress_max_new_tokens` (256).
+Also in the template: `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates), the Kompress-v2 fallback `kompress_enabled` (true) / `kompress_model` / `kompress_max_new_tokens` (256), and `deterministic_fallback` (false — a zero-LLM regex prose compressor that engages only when neither LLMLingua nor Kompress reduced a message, e.g. sidecar down; protects code/paths/identifiers byte-for-byte).
 
 ### G2_template_registry
 Versioned prompt templates with per-template token budgets.
@@ -330,6 +330,8 @@ Lazy tool-definition loading + MCP manifest fetch + scheduled pruning.
 | `enabled` | `true` | Enable tool loading |
 | `max_tools_per_agent` | `20` | ⚠ Prune tools beyond this count (too low → the model loses a tool it needs) |
 | `registry_path` | `gs://<bucket>/config/tool-registry.yaml` | Tool registry location |
+| `compress_descriptions` | `false` | Opt-in: compress tool/function `description` prose (deterministic regex, zero-LLM; manifests ride every agentic request). Code/paths/identifiers preserved byte-for-byte. |
+| `compress_description_fields` | `[description]` | Which string fields to compress when `compress_descriptions` is on |
 | `mcp_servers` | `null` | MCP servers — **list of `{url, filter_tools}` dicts** (not URL strings) |
 | `pruning.{enabled, inactivity_threshold_days, dry_run_first, schedule}` | `true / 30 / true / 0 2 * * *` | Scheduled removal of unused tools |
 | `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days` | `300 / 300 / 10 / 90` | **Config-first, `TOOL_*` env fallback** (`TOOL_REGISTRY_CACHE_TTL_SECONDS` etc.) — see [appendix](#appendix--knob-coverage-caveats) |
@@ -365,7 +367,9 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | `default_max_tokens_multiplier` | `2.0` | ⚠ max_tokens = 2× estimated output (lower = tighter caps) |
 | `absolute_default_max_tokens` | `1024` | ⚠ Absolute cap on the heuristic max_tokens (raise if long answers get cut) |
 | `tighten_quantile` / `tighten_multiplier` | `0.95` / `1.2` | ⚠ Historical-p95 auto-tightening of max_tokens |
-| `verbosity_steering.enabled` | `false` | Append a terseness suffix to steer shorter output |
+| `verbosity_steering.enabled` | `false` | Append a terseness suffix to steer shorter output (biggest uncovered savings axis; folded into the G05 cache key so terse/verbose answers never mix) |
+| `verbosity_steering.level` | `''` | Bundled preset: `lite` \| `full` \| `ultra` (adapted from caveman-shrink, MIT). Safety carve-outs keep security/destructive-action text in normal prose. ⚠ SAVINGS feature — prove with a pitch-test-plan quality-gate run before enabling by default |
+| `verbosity_steering.default_suffix` / `per_tenant_suffix` | `''` / `{}` | Explicit suffix overrides (per-tenant wins > default_suffix > preset) |
 | `output_holdout.enabled` | `false` | A3 holdout: route a % of traffic to a control cohort that **skips** G11 shaping, so the real output-token reduction can be measured (treatment vs holdout) via the `g11_output_holdout_completion_tokens` metric. Opt-in — control traffic is intentionally un-optimised. |
 | `output_holdout.fraction` | `0.05` | Share of requests in the control cohort (0.0–1.0) |
 | `output_holdout.sticky_key` | `workflow_id` | Stable cohort key (sticky per conversation); falls back to `user_id` then `request_id` |

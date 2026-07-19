@@ -388,3 +388,53 @@ class TestMCPLazyLoadManifest:
         h2 = manifest.get_tool_hash()
         assert h1 == h2
         assert len(h1) == 16
+
+
+# ─── Tool-description compression (prose_compress via compress_descriptions) ───
+_TOOLS_WITH_DESC = [
+    {"function": {"name": "web_search", "description": "This tool will really just search the web for you."}},
+    {"function": {"name": "run_python", "description": "Please simply run the given Python code snippet."}},
+]
+
+
+@pytest.mark.asyncio
+class TestG08DescriptionCompression:
+    async def _run(self, make_ctx, cfg_extra):
+        ctx = make_ctx(
+            [{"role": "user", "content": "search and run code"}],
+            params={"tools": [dict(t, function=dict(t["function"])) for t in _TOOLS_WITH_DESC]},
+        )
+        ctx.config["groups"]["G8_tools"].update(cfg_extra)
+        # registry marks both tools "default" intent so NOTHING is pruned — isolates desc compression
+        reg = [{"name": "web_search", "intents": ["default"]},
+               {"name": "run_python", "intents": ["default"]}]
+        with patch("middleware.g08_tool_loading._load_registry", return_value=reg):
+            from middleware.g08_tool_loading import G08ToolLoading
+            return await G08ToolLoading().process_request(ctx)
+
+    async def test_off_by_default_descriptions_untouched(self, make_ctx):
+        ctx = await self._run(make_ctx, {"compress_descriptions": False})
+        descs = [t["function"]["description"] for t in ctx.params["tools"]]
+        assert "really just" in descs[0]  # verbatim, not compressed
+
+    async def test_on_compresses_descriptions(self, make_ctx):
+        ctx = await self._run(make_ctx, {"compress_descriptions": True})
+        descs = [t["function"]["description"].lower() for t in ctx.params["tools"]]
+        assert "really" not in descs[0] and "please" not in descs[1]
+        # names preserved
+        assert [t["function"]["name"] for t in ctx.params["tools"]] == ["web_search", "run_python"]
+
+    async def test_records_saving_step_when_only_descriptions_compressed(self, make_ctx):
+        ctx = await self._run(make_ctx, {"compress_descriptions": True})
+        assert any(s.group == "G08" for s in ctx.savings.step_savings)
+
+    async def test_does_not_mutate_original_tool_dicts(self, make_ctx):
+        # deep-copy guard: the caller's original tool objects must be untouched
+        original = [dict(t, function=dict(t["function"])) for t in _TOOLS_WITH_DESC]
+        ctx = make_ctx([{"role": "user", "content": "x"}], params={"tools": original})
+        ctx.config["groups"]["G8_tools"].update({"compress_descriptions": True})
+        reg = [{"name": "web_search", "intents": ["default"]}, {"name": "run_python", "intents": ["default"]}]
+        with patch("middleware.g08_tool_loading._load_registry", return_value=reg):
+            from middleware.g08_tool_loading import G08ToolLoading
+            await G08ToolLoading().process_request(ctx)
+        assert "really just" in original[0]["function"]["description"]  # original object intact

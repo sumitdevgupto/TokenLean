@@ -301,11 +301,29 @@ def _model_scope_tag(ctx) -> str:
     return getattr(ctx, "model", None) or ctx.params.get("model") or ""
 
 
+def _verbosity_scope_tag(ctx) -> str:
+    """G11 verbosity-steering tag folded into the cache key so a terse-mode answer
+    is never served to a request configured for verbose output. "" (the default,
+    steering off) keeps keys byte-identical to the pre-feature behaviour. Lazy import
+    of G11 avoids a module-load import cycle."""
+    try:
+        from middleware.g11_output_format import verbosity_cache_tag
+        return verbosity_cache_tag(ctx)
+    except Exception:
+        return ""
+
+
 def _apply_model_scope(text: str, ctx) -> str:
-    """Fold the model tag into a cache-key source string. No-op in "tenant" scope
-    (returns ``text`` unchanged → keys stay byte-identical to pre-feature)."""
+    """Fold the model + verbosity tags into a cache-key source string. No-op when
+    both are empty (tenant scope + verbosity steering off) → keys stay byte-identical
+    to pre-feature. Used by BOTH L1 lookup and store so the key matches."""
     tag = _model_scope_tag(ctx)
-    return f"model={tag}\n{text}" if tag else text
+    if tag:
+        text = f"model={tag}\n{text}"
+    vtag = _verbosity_scope_tag(ctx)
+    if vtag:
+        text = f"verbosity={vtag}\n{text}"
+    return text
 
 
 def _step_cache_key(step_name: str, inputs_hash: str, template_version: str, prefix: str = "") -> str:
@@ -855,7 +873,11 @@ async def _l2_store(ctx: "RequestContext", response: Dict, ttl: int, embedding_m
     # tenants — and, in tenant+model scope, different requested models — never
     # collide on the same row (the unique constraint is on query_hash alone).
     # model_scope="" keeps the hash byte-identical to the pre-feature behaviour.
-    _hash_prefix = f"{tenant_id}:{model_scope}" if model_scope else tenant_id
+    # Fold the G11 verbosity tag in too (same rationale as model_scope): a terse-mode
+    # answer must not be semantically served to a verbose-configured request. "" → no-op.
+    verbosity_scope = _verbosity_scope_tag(ctx)
+    _scope = ":".join(p for p in (model_scope, verbosity_scope) if p)
+    _hash_prefix = f"{tenant_id}:{_scope}" if _scope else tenant_id
     query_hash = hashlib.sha256(f"{_hash_prefix}:{query_text}".encode()).hexdigest()
 
     pool = await get_pg_pool(db_url)

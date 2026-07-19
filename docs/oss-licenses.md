@@ -49,6 +49,14 @@ Imported via `try/except` in middleware. Install only when the corresponding fea
 | zep-python | GitHub repo (`getzep/zep-python`) `license.spdx_id`: `Apache-2.0` |
 | All others | PyPI `license_expression` or `license` field, or OSI classifier |
 
+## Ported / Adapted Code (not a package dependency)
+
+| Source | SPDX | Used By | Notes |
+|---|---|---|---|
+| [caveman-shrink](https://github.com/JuliusBrussee/caveman) (`src/mcp-servers/caveman-shrink/compress.js`) | MIT | `src/proxy/middleware/prose_compress.py` (→ G01, G08, `scripts/compress_prompts.py`) | Regex prose-compression algorithm (filler/pleasantry/hedge/article stripping with byte-for-byte code/URL/path/identifier protection) ported JS→Python. G11 verbosity presets + `scripts/compress_prompts.py` adapt caveman's terse-output / `caveman-compress` rulesets. |
+
+> MIT permits use, modification and redistribution with attribution; the copyright and permission notice are retained here and in each ported/adapted file's module docstring. The port is original Python (no upstream code copied verbatim beyond the regex patterns), redistributed under this project's Apache-2.0 with the MIT attribution preserved.
+
 ## Compliance Notes
 
 - All **imported** Python dependencies are permissive (MIT, BSD-3-Clause, Apache-2.0). No GPL, LGPL, AGPL, or SSPL code is imported. (Two transitive deps — `certifi`, `tqdm` — carry MPL-2.0, a file-level weak copyleft that does not affect Apache-2.0 redistribution; see `THIRD_PARTY_LICENSES.md`.)

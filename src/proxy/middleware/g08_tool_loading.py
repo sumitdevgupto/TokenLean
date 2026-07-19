@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 import yaml
 
 from middleware import RequestContext
+from middleware.prose_compress import compress_descriptions_in_place
 from savings.calculator import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -446,21 +447,38 @@ class G08ToolLoading:
                 # Record usage for analytics
                 await self._get_pruning().record_tool_usage(tool_name, ctx)
 
-        if len(relevant) < len(existing_tools):
-            pruned = len(existing_tools) - len(relevant)
+        # Optional: compress tool/function DESCRIPTION prose (deterministic, zero-LLM,
+        # regex-only via prose_compress). Tool manifests ride EVERY agentic request and
+        # G08 otherwise passes descriptions verbatim, so this trims tokens on every
+        # tool-carrying call. Deep-copy first — never mutate the caller's tool dicts.
+        desc_saved_chars = 0
+        if cfg.get("compress_descriptions", False) and relevant:
+            import copy
+            fields = cfg.get("compress_description_fields", ["description"])
+            relevant = copy.deepcopy(relevant)
+            desc_saved_chars = compress_descriptions_in_place(relevant, fields)
+
+        pruned = len(existing_tools) - len(relevant)
+        if pruned > 0 or desc_saved_chars > 0:
             ctx.params["tools"] = relevant
             tokens_after = sum(estimate_tokens(str(t), ctx.model) for t in relevant)
+            notes: List[str] = []
+            if pruned > 0:
+                notes.append(f"pruned {pruned}/{len(existing_tools)} tools (intents={intents})")
+            if desc_saved_chars > 0:
+                notes.append(f"compressed descriptions (−{desc_saved_chars} chars)")
             ctx.savings.add_step(
                 GROUP,
-                f"Tool registry: pruned {pruned}/{len(existing_tools)} tools (intents={intents})",
+                "Tool registry: " + "; ".join(notes),
                 tokens_before,
                 tokens_after,
             )
             logger.debug(
-                "[%s] G08 pruned tools: %d → %d",
+                "[%s] G08 tools: %d → %d (%s)",
                 ctx.request_id,
                 len(existing_tools),
                 len(relevant),
+                "; ".join(notes),
             )
 
         return ctx

@@ -402,3 +402,101 @@ class TestG11OutputValidation:
             ctx, resp = await G11OutputFormat().process_response(ctx, resp_in)
         m.assert_not_called()
         assert resp["choices"][0]["message"].get("finish_reason") is None
+
+
+# ─── Verbosity steering — terse-output presets + cache scoping ────────────────
+from middleware.g11_output_format import (
+    _get_verbosity_suffix,
+    _VERBOSITY_PRESETS,
+    verbosity_cache_tag,
+)
+
+
+def _last_system(messages):
+    for m in reversed(messages):
+        if m.get("role") == "system":
+            return m["content"]
+    return None
+
+
+class TestVerbositySuffixResolver:
+    def test_level_selects_bundled_preset(self):
+        assert _get_verbosity_suffix("t", {"level": "full"}) == _VERBOSITY_PRESETS["full"]
+        assert _get_verbosity_suffix("t", {"level": "ultra"}) == _VERBOSITY_PRESETS["ultra"]
+        assert _get_verbosity_suffix("t", {"level": "lite"}) == _VERBOSITY_PRESETS["lite"]
+
+    def test_unset_or_unknown_level_returns_none(self):
+        assert _get_verbosity_suffix("t", {}) is None
+        assert _get_verbosity_suffix("t", {"level": "bogus"}) is None
+
+    def test_explicit_default_suffix_overrides_preset(self):
+        got = _get_verbosity_suffix("t", {"level": "full", "default_suffix": "TERSE."})
+        assert got == "TERSE."
+
+    def test_per_tenant_suffix_wins(self):
+        cfg = {"level": "ultra", "default_suffix": "X", "per_tenant_suffix": {"acme": "ACME"}}
+        assert _get_verbosity_suffix("acme", cfg) == "ACME"
+        assert _get_verbosity_suffix("other", cfg) == "X"
+
+    def test_presets_have_safety_carveout(self):
+        # full/ultra must keep security/destructive-action text in normal prose
+        for level in ("full", "ultra"):
+            low = _VERBOSITY_PRESETS[level].lower()
+            assert "security" in low and ("destructive" in low or "irreversible" in low)
+
+
+@pytest.mark.asyncio
+class TestVerbositySteeringInjection:
+    async def test_default_off_is_byte_identical(self, make_ctx):
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["verbosity_steering"] = {"enabled": False, "level": "full"}
+        before = list(ctx.messages)
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        assert ctx.messages == before  # nothing injected when steering disabled
+
+    async def test_enabled_injects_preset_into_system(self, make_ctx):
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["verbosity_steering"] = {"enabled": True, "level": "full"}
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        assert _VERBOSITY_PRESETS["full"] in (_last_system(ctx.messages) or "")
+
+    async def test_suffix_appended_at_end_of_existing_system(self, make_ctx):
+        ctx = make_ctx([
+            {"role": "system", "content": "BASE POLICY"},
+            {"role": "user", "content": "hi"},
+        ])
+        ctx.config["groups"]["G11_output"]["verbosity_steering"] = {"enabled": True, "level": "lite"}
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        sysmsg = _last_system(ctx.messages)
+        assert sysmsg.startswith("BASE POLICY")  # prefix preserved → G21 cache-safe
+        assert _VERBOSITY_PRESETS["lite"] in sysmsg
+
+
+class TestVerbosityCacheTag:
+    def _ctx(self, vs, enabled=True, tenant="t"):
+        class _C:
+            config = {"groups": {"G11_output": {"enabled": enabled, "verbosity_steering": vs}}}
+            tenant_id = tenant
+        return _C()
+
+    def test_off_returns_empty(self):
+        assert verbosity_cache_tag(self._ctx({"enabled": False})) == ""
+        assert verbosity_cache_tag(self._ctx({"enabled": True, "level": ""})) == ""
+
+    def test_on_returns_stable_nonempty(self):
+        c = self._ctx({"enabled": True, "level": "full"})
+        assert verbosity_cache_tag(c) and verbosity_cache_tag(c) == verbosity_cache_tag(c)
+
+    def test_different_levels_differ(self):
+        a = verbosity_cache_tag(self._ctx({"enabled": True, "level": "full"}))
+        b = verbosity_cache_tag(self._ctx({"enabled": True, "level": "ultra"}))
+        assert a != b
+
+    def test_group_disabled_returns_empty(self):
+        assert verbosity_cache_tag(self._ctx({"enabled": True, "level": "full"}, enabled=False)) == ""
