@@ -21,6 +21,11 @@ date changes.
 
 ## 2026-07-19
 
+### Agent Registry Console — declare & govern your orchestration agents from the portal — Enhancement [Enterprise]
+A portal **Agents** tab to manage intent-orchestration (F2) without editing config: declare downstream agents (id, OpenAI-compatible URL, intent keywords, optional model / key / output budget), toggle orchestration on/off, and set the match threshold — all self-serve, per-tenant, validated server-side, effective within ~60 s. Plus a **routing-decisions** view — which agent handled each request, joined to model, cost, and latency — for audit and change-control. Persisted in the existing per-tenant config store (no new table); routing decisions are backed by a new `agent_id` column on the usage ledger.
+- **OSS:** `usage_events.agent_id` (observability — which agent served a request; never billed) ships in every tier.
+- **[Enterprise]:** the portal registry console + routing-decisions audit view — <https://tokenlean.cbeyond.cloud/>
+
 ### Intent-based multi-agent orchestration — one endpoint, every agent — Enhancement (OSS + Enterprise)
 Point one proxy endpoint at TokenLean and it routes each request to the right **downstream agent** by intent — "refund my invoice" → your billing agent, "the server is down" → your SRE agent — with no routing code in your app. An agent is any OpenAI-compatible chat endpoint you run; register it per tenant with intent keywords and TokenLean forwards matching requests there (its answer still runs response-side groups + billing), falling back to the normal LLM on no match. Opt-in / default-off (no agents registered → byte-identical path), per-tenant isolated (a tenant's agent list never leaks to another), with an optional per-agent output budget. First increment is single-agent routing; multi-intent fan-out follows.
 - **OSS:** the orchestration engine — config-driven agent registry, heuristic intent classifier, dispatch + short-circuit — ships in every tier (`orchestration.*`).

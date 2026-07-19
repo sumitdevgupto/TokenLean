@@ -122,6 +122,8 @@ class UsageMeter:
             billable=bool(billable),
             total_duration_ms=max(0, int(total_duration_ms or 0)),
             llm_duration_ms=max(0, int(llm_duration_ms or 0)),
+            # F2/F3: which downstream agent handled this request (empty = normal LLM path).
+            agent_id=getattr(ctx, "agent_id", "") or "",
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -135,10 +137,11 @@ class UsageMeter:
                  proxy_optimised_tokens, provider_prompt_tokens, response_tokens,
                  user_id, cache_hit, cache_level, complexity_tier, bypassed,
                  cost_actual_usd, cost_baseline_usd, provider, protocol,
-                 group_savings, status_code, billable, total_duration_ms, llm_duration_ms)
+                 group_savings, status_code, billable, total_duration_ms, llm_duration_ms,
+                 agent_id)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                     $16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25::jsonb,$26,$27,$28,$29)
+                    $25::jsonb,$26,$27,$28,$29,$30)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -159,6 +162,7 @@ class UsageMeter:
                     json.dumps(event.group_savings or {}),
                     event.status_code, event.billable,
                     event.total_duration_ms, event.llm_duration_ms,
+                    event.agent_id,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

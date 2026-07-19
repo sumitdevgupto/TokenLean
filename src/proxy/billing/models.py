@@ -57,6 +57,10 @@ class UsageEvent:
     billable: bool = True
     total_duration_ms: int = 0
     llm_duration_ms: int = 0
+    # F2/F3 — the registered downstream agent this request was dispatched to by intent
+    # orchestration (empty = normal LLM path). Observability only, never billed; lets the
+    # portal's routing-decision view answer "which agent handled request X" joined to cost.
+    agent_id: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -96,7 +100,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
     status_code     SMALLINT    NOT NULL DEFAULT 0,
     billable        BOOLEAN     NOT NULL DEFAULT true,
     total_duration_ms INTEGER   NOT NULL DEFAULT 0,
-    llm_duration_ms INTEGER     NOT NULL DEFAULT 0
+    llm_duration_ms INTEGER     NOT NULL DEFAULT 0,
+    agent_id        TEXT        NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
@@ -138,6 +143,8 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS status_code SMALLINT NOT NULL 
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS billable BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_duration_ms INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS llm_duration_ms INTEGER NOT NULL DEFAULT 0;
+-- F2/F3: downstream agent this request was dispatched to (observability; never billed)
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_id, user_id);
 -- C2: keep the error-rate / latency-percentile queries index-only over the hot window.
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_status_idx

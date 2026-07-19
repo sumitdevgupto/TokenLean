@@ -113,6 +113,16 @@ class TestUsageMeterBuildsEvent:
         assert event.complexity_tier == "complex"
         assert event.bypassed is True
 
+    def test_build_event_carries_agent_id(self):
+        # F2/F3: usage_events.agent_id mirrors ctx.agent_id (which downstream agent handled
+        # the request); empty string on the normal LLM path.
+        meter = UsageMeter()
+        ctx = _make_ctx()
+        ctx.agent_id = "billing"
+        assert meter._build_event(ctx, {}).agent_id == "billing"
+        ctx2 = _make_ctx()  # no dispatch → default empty
+        assert meter._build_event(ctx2, {}).agent_id == ""
+
     def test_build_event_filter_fields_default_safely(self):
         # Empty params / falsy ctx flags → safe, non-null defaults.
         meter = UsageMeter()
@@ -209,9 +219,9 @@ class TestUsageMeterRecord:
         # First arg is the SQL, remaining are positional params
         assert "acme" in call_args  # tenant_id
         assert "req-meter" in call_args  # request_id
-        # C1/C2: SQL + 29 bound params (24 legacy + group_savings + status_code +
-        # billable + total_duration_ms + llm_duration_ms).
-        assert len(call_args) == 1 + 29
+        # C1/C2: SQL + 30 bound params (24 legacy + group_savings + status_code +
+        # billable + total_duration_ms + llm_duration_ms + agent_id [F3]).
+        assert len(call_args) == 1 + 30
         # group_savings is serialised to a JSON string for the ::jsonb bind.
         assert '"G01": 200' in call_args or '{"G01": 200}' in call_args
 
