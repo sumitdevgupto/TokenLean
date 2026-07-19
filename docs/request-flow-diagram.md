@@ -2,7 +2,9 @@
 
 ## Overview
 
-This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation slots (G0–G28); G26 is reserved, so 27 optimisation groups are fully operational** — plus two **trust & safety** groups, **G30 (injection guardrails)** and **G29 (PII redaction)**, that run unconditionally right after G24 (never skippable) — across the files in `src/proxy/middleware/`.
+This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation slots (G0–G28); G26 is reserved, so 27 optimisation groups are fully operational** — plus three **trust & safety** groups, **G30 (injection guardrails)** and **G29 (PII redaction)** that run unconditionally right after G24 (never skippable), and **G31 (context-trust — indirect/RAG injection)** that runs after retrieval/memory have assembled the context — across the files in `src/proxy/middleware/`.
+
+It also carries an **OSS-core F2 Intent Orchestration** stage (`middleware/intent_orchestration.py`) right after G06: it classifies the request's intent and, if it matches a registered downstream agent, dispatches to that agent's OpenAI-compatible endpoint INSTEAD of the LLM and short-circuits. Default off / byte-identical when no agents are registered.
 
 The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`OptimisationPipeline`). G24 runs **first** so it can populate `ctx.skip_groups`, letting every later stage skip itself per request.
 
@@ -41,6 +43,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G04 Bypass Rules     → DB-first PostgreSQL → confidence score → zero-cost response │       │
 │  │  G05 Cache            → L1 Redis → L2 pgvector → L3 headroom SemanticCache → cached  │       │
 │  │  G06 Routing          → cascade / heuristic / RouteLLM → ctx.routed_model           │       │
+│  │  F2 Intent Orchestr.  → intent match → dispatch to downstream agent (short-circuit) │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
 │             │                                                                                    │
 │             ▼                                                                                    │
@@ -58,6 +61,8 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G09 Schema        → prose detection → Instructor typed output → compact handoffs    │       │
 │  │  G10 Memory        → sliding window + Mem0 + Zep + Qdrant skills → injected recall │       │
 │  │  G22 Dedup         → collapse near-duplicate conversation turns (cosine / n-gram)    │       │
+│  │  G31 Context-Trust → re-scan assembled RAG/memory context → allow|flag|block|strip  │       │
+│  │                      (+ opt-in irreversible PII mask over retrieved content)         │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
 │             │                                                                                    │
 │             ▼                                                                                    │
@@ -84,6 +89,8 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  ┌─────────────────────────────────────────────────────────────────────────────────────┐       │
 │  │  STAGE 5 — RESPONSE OPTIMISATION                                                     │       │
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
+│  │  G29 PII (resp)     → mask/restore PII in the model output (runs first)              │       │
+│  │  G30 Guardrails(rsp)→ opt-in scan of model OUTPUT → flag | block (scan_response)     │       │
 │  │  G14 Tool Output    → field projection + truncation + parallel combining            │       │
 │  │  G28 CCR (resp)     → compress repeated response blocks for downstream reuse         │       │
 │  │  G23 Streaming Comp.→ collapse repeated n-grams → response["x_compressed_content"]  │       │
@@ -96,6 +103,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  STAGE 6 — FEEDBACK & OBSERVABILITY                                                  │       │
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
 │  │  G11 Feedback Loop → record output tokens → Redis p95 → auto-tighten future          │       │
+│  │  Quality metrics   → emit_grounding (RAG grounding coverage; no-op for non-RAG)      │       │
 │  │  G18 Observability → Prometheus counters + Langfuse trace + usage records           │       │
 │  │  G05 Store Cache   → save to L1 Redis + L2 pgvector (skip if bypass/cache-hit)    │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
@@ -124,14 +132,17 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 ## Pipeline Order (authoritative — `pipeline.py`)
 
 Request path:
-`G0 → G24 → G30 → G29 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
+`G0 → G24 → G30 → G29 → G4 → G5 → G6 → F2 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
 
 Response path:
-`G29(resp) → G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → G18 → G5(store)`
+`G29(resp) → G30(resp) → G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → emit_grounding → G18 → G5(store)`
 
 > **G24 runs first** to populate `ctx.skip_groups`. Every Stage-2/Stage-3 group is wrapped in a
 > `if _group in ctx.skip_groups: continue` guard, so G24 can disable any of them per request.
-> **G26 is a reserved slot** with no implementation.
+> **G30/G29 (after G24) and G31 (after G22) are NOT guarded by `ctx.skip_groups`** — trust & safety
+> must be non-bypassable. **F2 Intent Orchestration** runs right after G06 and, when an agent matches,
+> short-circuits the pipeline (`ctx.agent_dispatched`) like a cache hit. **G26 is a reserved slot**
+> with no implementation.
 
 ## End-to-End Flow
 
@@ -194,6 +205,17 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Optional true 3-tier cascade (cheap → confidence check → escalate) with cost-bounded escalation
 - Sets `ctx.routed_model` (may differ from the requested model)
 
+**F2: Intent Orchestration** (`middleware/intent_orchestration.py` — OSS core) — *runs right after G06*
+- Classifies the request's intent (heuristic keyword classifier) against the tenant's registered
+  downstream agents (config-driven `orchestration.agents`; a tenant's list *replaces* the global)
+- On a match: dispatches to that agent's OpenAI-compatible endpoint INSTEAD of the LLM, sets
+  `ctx.agent_dispatched=True` / `ctx.agent_response` / `ctx.agent_id`, and short-circuits — `main.py`
+  serves the agent response through `process_response` so billing + response-side groups still fire
+- Runs BEFORE the Stage 2/3 prompt optimisations (those are tuned for the main LLM, not a black-box
+  agent). **Default off / byte-identical when no agents are registered.** NON-savings (not in the pitch
+  `GROUPS` registry). The **F3 Agent Registry Console** (portal Agents tab, [Enterprise]) declares/edits
+  the registry and audits routing decisions via the OSS-core `usage_events.agent_id` column (never billed)
+
 **STAGE 2 — Token Reduction (Into the LLM)** *(every group honours `ctx.skip_groups`)*
 
 **G01: Compression** (`g01_compression.py`)
@@ -245,6 +267,16 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Collapses near-duplicate conversation turns by cosine similarity
 - Falls back to character n-gram similarity when sentence-transformers is unavailable
 
+**G31: Context-Trust** (`g31_context_trust.py` + `guardrails/injection.py` + `guardrails/pii.py`) — *trust & safety, NOT skippable* — *runs right after G07/G10/G22*
+- G30 scanned the untrusted USER prompt, but G07/G10/G28 inject retrieved docs + memories as
+  `system`/`tool` messages AFTER G30 ran; G31 re-scans that assembled context for indirect / RAG
+  injection (`allow | flag | block | strip`; block → OpenAI content-filter 200 like G30)
+- Opt-in **PII pass** (`pii_mode: off | flag | mask | block`) runs the same G29 `PiiDetector` over the
+  retrieved content — masking is **irreversible** (no vault; retrieved PII is never restored), recorded
+  on `context_trust_pii_*` + `source:"retrieved"` audit rows
+- Records `token_opt_context_trust_events_total` rather than `savings.add_step` — kept OUT of the pitch
+  `GROUPS` registry so the 54.1% baseline stays reproducible
+
 **STAGE 3 — Parameter Injection (Inside the LLM)** *(honours `ctx.skip_groups`)*
 
 **G16: Agent Architecture** (`g16_agent_arch.py` + `g16_langgraph_runtime.py` + `g16_temporal_runtime.py`)
@@ -293,6 +325,16 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 
 **STAGE 5 — After the Response**
 
+**G29: PII Redaction — response side** (`g29_pii_redaction.py`) — *runs first*
+- Masks PII found in the model's OUTPUT and, when `mask` + reversible, restores the caller's own
+  placeholders from the in-memory `pii_vault` — runs before observability, format shaping and the G05
+  cache store so every downstream consumer sees the redacted content (non-streaming only)
+
+**G30: Guardrails — response side** (`g30_guardrails.py`) — *opt-in (`scan_response`, default off)*
+- Scans the model's OUTPUT for injection / jailbreak echoes → `flag | block` (via `response_mode`);
+  block withholds the unsafe answer with a content-filter response. Verdict on
+  `ctx.guardrail_response_action` (kept separate from the request verdict). Non-streaming only
+
 **G14: Tool Output** (`g14_tool_output.py` + `g14_tool_combining.py`)
 - Field projection (whitelist) + truncation (`max_field_tokens`, `max_result_tokens`)
 - `ToolCallBatcher` runs independent tool calls in parallel with dependency-graph ordering
@@ -314,6 +356,11 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 
 **G11: Output Format** (`process_response()`)
 - Record actual output token count in a Redis ZSET; auto-tighten future `max_tokens` from p95
+
+**Application-quality: grounding coverage** (`middleware/quality_metrics.py:emit_grounding`)
+- Correlates the retrieved chunks (stashed by G07) with the produced answer to emit a RAG
+  grounding-coverage signal — a no-op for non-RAG / tool-call answers; never raises. Kept SEPARATE
+  from G18's ops/savings metrics
 
 **STAGE 6 — Observability + Cache Store**
 
@@ -510,10 +557,34 @@ class RequestContext:
     otel_span: Optional[Any] = None
     langfuse_trace: Optional[Any] = None
     provider_adapter: Optional[Any] = None
+    cascade_response: Optional[Dict] = None   # G06 cascade already produced the answer
+
+    # ── F2 Intent Orchestration (downstream-agent dispatch) ─────────────────
+    agent_dispatched: bool = False     # F2 short-circuit: served by a downstream agent
+    agent_response: Optional[Dict] = None
+    agent_id: str = ""                 # which registered agent handled it (observability)
+
+    # ── Trust & Safety (G29 PII / G30 injection / G31 context-trust) ────────
+    security_blocked: bool = False     # G30/G29/G31 hard block → content-filter 200
+    security_block_response: Optional[Dict] = None
+    guardrail_action: Optional[str] = None            # G30 request verdict: allow|flag|block
+    guardrail_response_action: Optional[str] = None   # G30 response-side verdict: flag|block
+    context_trust_action: Optional[str] = None        # G31: allow|flag|block|strip
+    context_trust_pii_action: Optional[str] = None    # G31 opt-in PII pass: flag|mask|block
+    pii_action: Optional[str] = None                  # G29: flag|mask|block
+    pii_vault: Dict[str, str] = {}     # in-memory reversible-mask store (never persisted)
+    no_cache: bool = False             # G29 masked PII → must not read/write shared cache
+
+    # ── Multi-protocol ingress (#4) ─────────────────────────────────────────
+    ingress_protocol: str = "openai"   # "openai" | "anthropic" | "gemini" → usage_events.protocol
 
     @property
     def current_token_count(self) -> int:
         return count_messages_tokens(self.messages, self.model)
+
+    @property
+    def current_request_token_count(self) -> int:   # tools-inclusive (matches baseline basis)
+        return count_request_tokens(self.messages, self.model, self.params.get("tools"))
 ```
 
 ### InterAgentState (`middleware/g17_loop_control.py`)
@@ -631,13 +702,19 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G26** | *(reserved — not implemented)* | — |
 | **G27** | `g27_multimodal_optimizer.py` | Multimodal image optimisation |
 | **G28** | `g28_ccr.py` | Context Compression & Reuse — request + response |
-| — | `pipeline.py` | Orchestrates the G0–G28 request/response pipeline |
+| **G29** | `g29_pii_redaction.py`, `guardrails/pii.py` | **Trust & Safety** — PII/PHI detection + redaction (request + response); modes off/flag/mask/block |
+| **G30** | `g30_guardrails.py`, `guardrails/injection.py` | **Trust & Safety** — prompt-injection / jailbreak guardrails over the user prompt (+ opt-in response scan); modes allow/flag/block |
+| **G31** | `g31_context_trust.py`, `guardrails/injection.py`, `guardrails/pii.py` | **Trust & Safety** — indirect / RAG-injection defence over the assembled context (+ opt-in irreversible PII pass); allow/flag/block/strip |
+| **F2** | `intent_orchestration.py` | Intent-based downstream-agent dispatch (OSS core; default off) |
+| — | `pipeline.py` | Orchestrates the G0–G28 + F2 + G29/G30/G31 request/response pipeline |
 | — | `__init__.py` | RequestContext dataclass definition |
 
-## Implementation Status: 27/28 slots implemented (G26 reserved)
+## Implementation Status: 27 optimisation groups (G0–G28, G26 reserved) + 3 trust & safety (G29/G30/G31) + F2
 
-All 28 slots are accounted for; **G26 is intentionally reserved**, leaving **27 groups fully
-operational**. Optional integrations (headroom, Mem0, Zep, Kafka, Temporal, Instructor) degrade
+All 28 optimisation slots are accounted for; **G26 is intentionally reserved**, leaving **27
+optimisation groups fully operational**, plus the three non-savings **trust & safety** groups
+(G29 PII, G30 injection, G31 context-trust) and the OSS-core **F2 Intent Orchestration** stage.
+Optional integrations (headroom, Mem0, Zep, Kafka, Temporal, Instructor, Presidio) degrade
 gracefully when their packages or backing services are absent.
 
 ---
