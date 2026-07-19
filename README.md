@@ -707,7 +707,7 @@ never gate the optimisations.
 | Native multi-protocol ingress + structural tool round-tripping | ✅ | ✅ |
 | Intent-orchestration **engine** (config-driven agent registry) | ✅ OSS | ✅ + **Agents console** (declare/govern agents from the portal) + routing-decision audit + ML intent classifier |
 | **Self-tuning learning loop** — auto-switches off optimisations that stop paying off per tenant | rule-**applying** engine (G24) ✅ | ✅ managed miner that **learns** the rules from your usage (with a safety denylist — cache/routing/safety are never skipped) |
-| Customer portal + billing dashboards + request-count invoicing | — | ✅ |
+| Managed self-service console + billing dashboards + request-count invoicing | — | ✅ |
 | Outbound **webhooks** (HMAC-signed, retried: spend-cap / budget / guardrail / PII events) | event **seam** ✅ OSS | ✅ managed delivery to Slack / PagerDuty / SIEM |
 | GDPR endpoints + audit attestation | audit **engine** ✅ OSS | ✅ |
 | Managed red-team guardrail ruleset feed | engines ✅ OSS | ✅ curated feed |
