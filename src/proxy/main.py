@@ -699,7 +699,8 @@ def _schedule_security_audit(ctx) -> None:
     audit must never block or break the response path."""
     if ctx is None or _audit_logger is None:
         return
-    if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)):
+    if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)
+            or getattr(ctx, "context_trust_pii_action", None)):
         return
     try:
         asyncio.create_task(_audit_logger.log_security_events(ctx))

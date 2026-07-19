@@ -21,6 +21,12 @@ date changes.
 
 ## 2026-07-19
 
+### G31 now scans retrieved context for PII, not just injection — Enhancement (OSS + Enterprise)
+G31 Context-Trust already re-scanned RAG/memory-injected `system`/`tool` context for indirect prompt-injection; it now optionally runs the **same G29 PII engine** over that assembled context too. This closes the gap where a poisoned or PII-laden retrieved document (an SSN in a support ticket, an email in a KB doc) reached the model or cache — G29 runs *before* retrieval, so it never saw it. Opt-in via `groups.G31_context_trust.pii_mode`: `off` (default) / `flag` / `mask` / `block`. Masking here is **irreversible** by design (`[EMAIL]`, no vault) — retrieved PII is never the caller's data to restore, and restoring it would let the model echo it back. Recorded on dedicated `context_trust_pii_*` fields + `token_opt_context_trust_events_total` (category `pii:<ENTITY>`) + a `source:"retrieved"` audit row, kept separate from G29's request-side redaction. DS20 gains a `ctxpii` block-proof; 8 tests.
+
+- **OSS:** the retrieved-context PII pass + `flag`/`mask`/`block` modes ship in every tier.
+- **[Enterprise]:** managed medical-NER / Presidio recognisers + the context-quality/trust-safety dashboards over retrieved-corpus PII — <https://tokenlean.cbeyond.cloud/>.
+
 ### Per-call savings exposed as `x-tokenlean-*` response headers — Enhancement (OSS + Enterprise)
 Every served 2xx response now carries a machine-readable header family so a customer's FinOps/observability pipeline can attribute cost per request **without parsing the body**: `x-tokenlean-routed-model`, `x-tokenlean-cache` (`miss`/`hit`/`hit:<level>`), `x-tokenlean-tokens-saved`, `x-tokenlean-pct-saved`, `x-tokenlean-cost-saved-usd`, `x-tokenlean-latency-ms`, and `x-tokenlean-request-id`. Emitted on the normal and G06 cascade short-circuit paths alike, and carried through unchanged to Anthropic/Gemini clients by the protocol egress passthru. The existing `x-savings-usd` is retained as a back-compat alias of the cost header. Streamed responses are unaffected (documented limitation). Always-on, no config. 6 tests.
 

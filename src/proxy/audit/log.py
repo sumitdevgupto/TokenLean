@@ -161,6 +161,20 @@ class AuditLogger:
                     "mode": p_action,
                 },
             ))
+        # G31 PII pass over RETRIEVED context — distinct `source` so a compliance reviewer
+        # can tell request-PII (G29) apart from retrieved-corpus PII (G31). PII-free: types +
+        # count only.
+        ct_action = getattr(ctx, "context_trust_pii_action", None)
+        if ct_action and int(getattr(ctx, "context_trust_pii_redactions", 0) or 0) > 0:
+            events.append((
+                "redaction.flagged" if ct_action == "flag" else "redaction.applied",
+                {
+                    "entities": list(getattr(ctx, "context_trust_pii_entities", []) or []),
+                    "count": int(getattr(ctx, "context_trust_pii_redactions", 0) or 0),
+                    "mode": ct_action,
+                    "source": "retrieved",
+                },
+            ))
         if not events:
             return
         tenant_id = getattr(ctx, "tenant_id", "default")

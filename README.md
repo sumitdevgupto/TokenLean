@@ -237,12 +237,13 @@ An outage on one upstream shouldn't take your app down. Every provider call runs
 
 Configure per provider under `providers.<name>.resilience` (fallbacks, `num_retries`, `cooldown_time`, breaker thresholds). The safe default is **retry-only** — add `fallbacks` to turn on cross-provider failover. Circuit-breaker state and failover rate surface on the **SLA dashboard** and the portal SLA view.
 
-### 🛡️ Trust & safety — G29 PII · G30 injection guardrails
+### 🛡️ Trust & safety — G29 PII · G30 injection guardrails · G31 context-trust
 Run **unconditionally right after G24** — before any optimisation spends tokens, and before any stage that persists content (cache / embeddings / memory / CCR), so they can't be bypassed and cover cache/bypass traffic too:
 - **G30 injection guardrails** — a precision-biased ruleset flags or blocks prompt-injection & jailbreak attempts (`allow | flag | block`). A block returns an OpenAI **content-filter 200**, not a 500.
 - **G29 PII redaction** — detects email / SSN / card / phone / IP (+ optional Presidio) and applies your policy (`off | flag | mask | block`) with **reversible masking** so downstream answers stay coherent.
+- **G31 context-trust** — G29/G30 scan the user prompt, but RAG retrieval (G07) and memory (G10) inject documents *afterwards*. G31 re-scans that assembled `system`/`tool` context for **indirect / RAG injection** (`allow | flag | block | strip`) and, opt-in, for **PII in retrieved content** (`pii_mode: off | flag | mask | block`) — so a poisoned or PII-laden retrieved document can't reach the model or cache.
 
-Per-tenant policy, **PII-free audit rows**, Prometheus counters, and a Trust & Safety dashboard. The managed red-team ruleset feed, portal Security tab, and compliance attestation are the commercial layer.
+Per-tenant policy, **PII-free audit rows**, Prometheus counters, and a Trust & Safety dashboard. The managed red-team ruleset feed, medical-NER recognisers, portal Security tab, and compliance attestation are the commercial layer.
 
 <p align="center">
   <img src="assets/screenshots/trust-safety.png" width="900" alt="Trust & Safety dashboard — G29 PII redaction and G30 injection guardrails"><br>

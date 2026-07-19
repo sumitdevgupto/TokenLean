@@ -100,6 +100,14 @@ class RequestContext:
     # attack classes. Consumed by the G18 context-trust metric + Security surface.
     context_trust_action: Optional[str] = None
     context_trust_categories: List[str] = field(default_factory=list)
+    # G31 PII pass over RETRIEVED context (system/tool spans injected by G07/G10),
+    # kept SEPARATE from G29's request-side pii_* so retrieved PII is never added to
+    # the reversible pii_vault (which would let the model echo a RAG doc's PII back and
+    # have G29's response path RESTORE it — a leak). action ∈ {None,"flag","mask","block"};
+    # entities are PII-free TYPES only; count is spans found in retrieved content.
+    context_trust_pii_action: Optional[str] = None
+    context_trust_pii_entities: List[str] = field(default_factory=list)
+    context_trust_pii_redactions: int = 0
     # G29 redaction summary. action ∈ {None,"flag","mask","block"}; entities are
     # PII-free entity TYPES only (e.g. "EMAIL","US_SSN") — never the matched text;
     # count is the number of spans redacted across request (+ non-stream response).
