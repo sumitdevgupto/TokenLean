@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 from middleware import RequestContext
 from cache.redis_pool import get_redis as _get_redis
+import events
 
 logger = logging.getLogger(__name__)
 GROUP = "G00"
@@ -159,18 +160,47 @@ class G00RateLimit:
             return  # unlimited
         grace = float(scfg.get("grace_pct", 0) or 0)
         ceiling = cap * (1 + grace / 100.0)
+        redis_prefix = getattr(ctx, "redis_prefix", f"t:{tenant_id}:")
         try:
-            spent = float(await redis.get(
-                self.spend_key(getattr(ctx, "redis_prefix", f"t:{tenant_id}:"))) or 0.0)
+            spent = float(await redis.get(self.spend_key(redis_prefix)) or 0.0)
         except Exception as exc:
             logger.warning("[%s] G00 spend check failed (fail-open): %s", ctx.request_id, exc)
             return
         if spent >= ceiling:
+            # Outbound event: the cap was hit (best-effort, PII-free, no-op in OSS).
+            events.schedule_event(tenant_id, events.SPEND_CAP_REACHED, {
+                "cap_usd": round(cap, 4), "spent_usd": round(spent, 4),
+                "tier": (getattr(ctx, "pricing_tier", "") or "free").lower(),
+            })
             raise RateLimitExceeded(
                 retry_after=86400,
                 limit_type="spend_cap_exceeded",
                 scope=f"tenant={tenant_id},cap_usd={cap:.4f},spent_usd={spent:.4f}",
             )
+        # Early-warning event: spend crossed `warn_pct`% of the cap (below the ceiling).
+        # De-duped once per tenant per month via a Redis SETNX flag so it fires on the
+        # crossing, not on every subsequent request.
+        await self._maybe_warn_budget(ctx, redis, scfg, tenant_id, redis_prefix, cap, spent)
+
+    async def _maybe_warn_budget(self, ctx, redis, scfg, tenant_id, redis_prefix,
+                                 cap: float, spent: float) -> None:
+        """Emit a one-shot ``budget.threshold`` event when spend first crosses
+        ``warn_pct``% of the cap this month. Best-effort; never breaks the request."""
+        warn_pct = float(scfg.get("warn_pct", 0) or 0)
+        if warn_pct <= 0 or spent < cap * (warn_pct / 100.0):
+            return
+        try:
+            month = time.strftime("%Y%m", time.gmtime())
+            first = await redis.set(f"{redis_prefix}budgetwarn:{month}", "1", nx=True, ex=2678400)
+            if not first:
+                return  # already warned this month
+        except Exception:
+            return  # dedup unavailable → skip the warning rather than spam
+        events.schedule_event(tenant_id, events.BUDGET_THRESHOLD, {
+            "cap_usd": round(cap, 4), "spent_usd": round(spent, 4),
+            "warn_pct": warn_pct,
+            "tier": (getattr(ctx, "pricing_tier", "") or "free").lower(),
+        })
 
     async def _check_token_bucket(
         self,

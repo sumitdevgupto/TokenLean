@@ -621,6 +621,11 @@ TokenLean as a **fully-managed SaaS** — hosted, auto-scaling, SLA-backed, with
 security and zero ops on your side. Everything in this open-source core, run and operated
 for you, so your team captures the savings on day one.
 
+Enterprise adds managed surfaces on top of the OSS core — the self-service portal, billing
+dashboards, and **outbound event webhooks**: register HTTPS endpoints to receive PII-free
+`spend_cap.reached` / `budget.threshold` / `guardrail.block` / `pii.detected` events (HMAC-signed,
+retried) straight into your Slack, PagerDuty, or SIEM.
+
 → <strong><a href="https://tokenlean.cbeyond.cloud/" target="_blank" rel="noopener">Explore the managed &amp; Enterprise offering at tokenlean.cbeyond.cloud</a></strong>
 
 ---

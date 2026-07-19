@@ -623,6 +623,28 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `metrics_enabled` | `true` | Emit the Prometheus counter |
 | `block_message` | *(built-in)* | Optional custom refusal text |
 
+### webhooks  *(#4 outbound events — [Enterprise])*
+
+Core signal sites emit **PII-free** events through the OSS `events.py` seam; the **[Enterprise]**
+delivery product delivers them to a tenant's registered HTTPS endpoints (portal `/portal/webhooks`).
+On an OSS/self-host deploy no dispatcher is installed, so emission is a no-op. Event types:
+`spend_cap.reached`, `budget.threshold`, `guardrail.block`, `pii.detected`. Delivery is
+HMAC-SHA256 signed (`X-TokenLean-Signature: sha256=<hex>` over the raw body, per-endpoint secret
+shown once at registration, stored Fernet-encrypted) with bounded exponential-backoff retry and a
+Redis dead-letter on final failure.
+
+The `budget.threshold` event is triggered by an **OSS** knob — `rate_limit.spend_cap.warn_pct`
+(default `0` = off): when >0, a one-shot event fires the first time monthly spend crosses that
+percentage of the cap (de-duped per tenant per month). The delivery-tuning block is read by the
+commercial dispatcher:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `webhooks.timeout_seconds` | `5` | Per-attempt HTTP timeout for a delivery POST |
+| `webhooks.max_attempts` | `3` | Total delivery attempts before dead-lettering (bounded exponential backoff) |
+| `webhooks.retry_base_delay` | `0.5` | Backoff base (seconds); attempt *n* waits `base × 2ⁿ` |
+| `rate_limit.spend_cap.warn_pct` | `0` | **(OSS)** >0 → emit a one-shot `budget.threshold` when spend first crosses this %% of the cap |
+
 ## Appendix — knob coverage caveats
 
 A source audit (2026-07-03) found four classes of knob where the template surface and the code

@@ -60,6 +60,7 @@ from middleware.g18_observability import (
     MODEL_LOCKOUT_STATE,
 )
 from protocols import OPENAI, ANTHROPIC, GEMINI
+import events
 from middleware import RequestContext
 from middleware.g00_rate_limit import RateLimitExceeded
 from middleware.g03_doc_pipeline import trigger_doc_ingestion
@@ -710,6 +711,37 @@ def _schedule_security_audit(ctx) -> None:
         logger.debug("[%s] security audit skipped: no loop", getattr(ctx, "request_id", "?"))
 
 
+def _schedule_notifications(ctx) -> None:
+    """Fire-and-forget outbound webhook events for security activity on this request
+    (guardrail block / PII detected). No-op in OSS (no dispatcher installed) and when
+    nothing was flagged — PII-free payloads (categories / entity TYPES + counts only)."""
+    if ctx is None or not events.dispatcher_installed():
+        return
+    tenant_id = getattr(ctx, "tenant_id", "default")
+    # G30 injection block or G31 context-injection block → guardrail.block
+    if getattr(ctx, "guardrail_action", None) == "block" \
+            or getattr(ctx, "context_trust_action", None) == "block":
+        events.schedule_event(tenant_id, events.GUARDRAIL_BLOCK, {
+            "request_id": getattr(ctx, "request_id", ""),
+            "categories": list(getattr(ctx, "guardrail_categories", []) or [])
+                          or list(getattr(ctx, "context_trust_categories", []) or []),
+            "source": "user" if getattr(ctx, "guardrail_action", None) == "block" else "retrieved",
+        })
+    # G29 request PII or G31 retrieved-context PII → pii.detected
+    pii_action = getattr(ctx, "pii_action", None)
+    ct_pii_action = getattr(ctx, "context_trust_pii_action", None)
+    if pii_action or ct_pii_action:
+        events.schedule_event(tenant_id, events.PII_DETECTED, {
+            "request_id": getattr(ctx, "request_id", ""),
+            "action": pii_action or ct_pii_action,
+            "entities": sorted(set(list(getattr(ctx, "pii_entities", []) or [])
+                                   + list(getattr(ctx, "context_trust_pii_entities", []) or []))),
+            "count": int(getattr(ctx, "pii_redactions", 0) or 0)
+                     + int(getattr(ctx, "context_trust_pii_redactions", 0) or 0),
+            "source": "retrieved" if (ct_pii_action and not pii_action) else "user",
+        })
+
+
 def _persist_all_outcomes() -> bool:
     """C2 config gate — persist observability-only rows for non-2xx outcomes so the
     in-dashboard error-rate / latency panels have data. Default true; disable via
@@ -794,6 +826,8 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
     # Trust & Safety: record any G29/G30 activity at every exit path (a flagged
     # request that later errors is still audited). PII-free; best-effort.
     _schedule_security_audit(ctx)
+    # Outbound webhook events for the same activity (no-op in OSS / when nothing flagged).
+    _schedule_notifications(ctx)
     # C1/C2: persist exactly one usage_events row per outcome. 2xx = billable unit
     # (billed + quota/spend bumped); non-2xx = observability-only row (billable=false,
     # excluded from invoices) so the reliability/latency panels have error data. The 202

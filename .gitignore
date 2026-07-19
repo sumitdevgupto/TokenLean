@@ -240,6 +240,9 @@ src/proxy/api/upload.py
 # Enterprise Docs RAG-chat endpoint + its shared cross-tenant answer cache (commercial).
 src/proxy/api/docs.py
 src/proxy/api/docs_cache.py
+# Outbound webhooks — delivery/dispatcher + portal CRUD (commercial). The OSS `events`
+# emit seam (src/proxy/events.py) stays in core; only this delivery product is gated.
+src/proxy/api/webhooks.py
 # Transient build-staging dir: the deploy scripts copy the docs-seeder + docs snapshot here
 # right before the commercial image build (Dockerfile.commercial COPYs it to /app/seed). Never
 # committed — it's regenerated each build.
@@ -298,6 +301,9 @@ tests/unit/api/test_upload.py
 # Enterprise Docs RAG-chat endpoint + shared answer cache (commercial).
 tests/unit/api/test_docs_chat.py
 tests/unit/api/test_docs_cache.py
+# Outbound webhooks — dispatcher + router tests (commercial). The OSS event-seam tests
+# (tests/unit/test_events.py) stay in core.
+tests/unit/api/test_webhooks.py
 # Docs seeder Phase-3 (--sync/--generate) tests — the seeder itself is commercial.
 tests/unit/scripts/test_seed_product_docs.py
 tests/unit/portal/

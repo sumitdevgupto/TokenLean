@@ -69,6 +69,10 @@ rate_limit:
     enabled: false
     grace_pct: 0
     exempt_tenants: [admin, default]
+    warn_pct: 0                   # 0 = off. When >0, emit a one-shot `budget.threshold`
+                                  # outbound webhook event the first time monthly spend
+                                  # crosses this %% of the cap (e.g. 80). Delivery is a
+                                  # commercial feature; the emit is a no-op without it.
 # WS25: periodic data-retention purge (default OFF — self-host keeps everything).
 # usage_days is clamped to a 400-day floor in code: usage_events is the billing
 # source of record and must outlive every invoice period.

@@ -21,6 +21,11 @@ date changes.
 
 ## 2026-07-19
 
+### Outbound event webhooks — push budget/security events to your Slack, PagerDuty, SIEM — Enhancement [Enterprise]
+Tenants can register HTTPS endpoints (portal `/portal/webhooks`) to receive **PII-free** TokenLean events in real time: `spend_cap.reached`, `budget.threshold` (a one-shot warning when monthly spend first crosses a configurable `warn_pct` of the cap), `guardrail.block` (G30/G31 injection), and `pii.detected` (G29/G31). Each delivery is **HMAC-SHA256 signed** (`X-TokenLean-Signature`) with a per-endpoint secret shown once at registration and stored Fernet-encrypted; delivery uses bounded exponential-backoff retry with a Redis dead-letter on final failure. The emit seam is OSS core (`events.py`, a no-op without a dispatcher) so the barricade holds; the delivery product + portal CRUD are commercial. Payloads carry event metadata only (counts / entity types / categories) — never content. 24 tests (8 core seam + 6 spend-emit + 10 delivery/CRUD).
+
+- **[Enterprise]:** endpoint registration, signed delivery, retry/dead-letter, and the portal Webhooks surface — <https://tokenlean.cbeyond.cloud/>.
+
 ### Per-model lockout — quarantine one degraded model without blacking out the provider — Enhancement (OSS + Enterprise)
 The resilience layer gains a third, finer gate alongside the per-provider circuit breaker and per-tenant cooldown: a **per-(provider,model) lockout**. When a single model racks up `model_failure_threshold` model-scoped 5xx/timeout failures, it's skipped on subsequent requests for `model_lockout_seconds` (then one probe re-tests) — so a deprecated or degraded model (e.g. `gpt-4o` flaking while `gpt-4o-mini` is fine) is quarantined and failover routes around **just that model**, not the whole provider. The threshold is deliberately lower than the provider breaker's, so a fallback model's success resets the provider breaker and the provider stays live. Opt-in via `resilience.model_lockout` (default off → provider-breaker behaviour byte-identical); gauge `token_opt_model_lockout_state{provider,model}`. 8 unit + 1 integration test.
 
