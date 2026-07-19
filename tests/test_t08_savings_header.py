@@ -69,6 +69,45 @@ class TestSavingsHeader:
         assert abs(header_val - body_val) < 1e-8
 
 
+class TestSavingsHeadersShortCircuit:
+    """Regression: the x-tokenlean-* headers must be BUILT for the cache-hit / bypass /
+    content-filter short-circuits too. Those served-200 paths previously returned a
+    header-less JSONResponse — silently breaking the advertised always-on attribution
+    (esp. x-tokenlean-cache on the highest-volume cache-hit traffic) and failing the
+    run-readiness header gate. This tests the exact header payload those paths now attach."""
+
+    def _ctx(self, *, cache_hit=False, cache_level=None):
+        import datetime
+        from savings.models import SavingsRecord
+        from middleware import RequestContext
+        sav = SavingsRecord(
+            request_id="r1", user_id="u",
+            timestamp=datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc),
+            model_requested="gpt-4o-mini", routed_model="gpt-4o-mini", baseline_tokens=100)
+        sav.cache_hit = cache_hit
+        sav.cache_level = cache_level
+        sav.final_tokens_sent = 0 if cache_hit else 60
+        return RequestContext(
+            request_id="r1", user_id="u", original_messages=[], messages=[],
+            model="gpt-4o-mini", routed_model="gpt-4o-mini", params={}, config={}, savings=sav)
+
+    def test_cache_hit_builds_hit_header(self):
+        import time
+        from main import _savings_headers
+        h = _savings_headers(self._ctx(cache_hit=True, cache_level="L2"), time.time() - 0.01)
+        assert h["x-tokenlean-cache"] == "hit:L2"       # the fix: present + reflects the hit
+        assert "x-savings-usd" in h
+        assert "x-tokenlean-cost-saved-usd" in h
+        assert "x-tokenlean-request-id" in h
+        assert h["x-tokenlean-cost-saved-usd"] == h["x-savings-usd"]  # alias holds
+
+    def test_miss_builds_miss_header(self):
+        import time
+        from main import _savings_headers
+        h = _savings_headers(self._ctx(cache_hit=False), time.time() - 0.01)
+        assert h["x-tokenlean-cache"] == "miss"
+
+
 @pytest.mark.asyncio
 class TestTokenLeanHeaderSuite:
     """The x-tokenlean-* machine-readable per-call header family (always-on)."""

@@ -1065,23 +1065,21 @@ def _apply_stream_g23(ctx, content: str) -> None:
         logger.debug("[%s] stream G23 failed: %s", ctx.request_id, exc)
 
 
-def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResponse:
-    """Finalise a served 2xx response: attach savings metadata + headers, record
-    SLA/billing (`_record_outcome`), and return the JSONResponse.
+def _savings_headers(ctx, request_start: float) -> Dict[str, str]:
+    """Build the per-call ``x-tokenlean-*`` savings/routing headers from ctx.savings so a
+    customer's FinOps/observability pipeline can attribute cost per request without parsing
+    the body. ``x-savings-usd`` is kept as a back-compat alias of the cost header.
 
-    Shared by the normal LLM path and the G06 cascade short-circuit so both bill
-    and surface headers identically.
+    Emitted on EVERY served 2xx — the normal LLM path + the G06 cascade / F2 agent
+    short-circuits (via ``_served_response``) AND the cache-hit / bypass / content-filter
+    short-circuits (which serve a raw JSONResponse). Attaching them on the cache/bypass
+    paths is not cosmetic: ``x-tokenlean-cache`` must be present exactly when a request WAS
+    served from cache — previously those (highest-volume) responses carried no headers at
+    all, silently breaking the advertised always-on attribution + failing the readiness
+    header gate. NOTE: streamed responses do not route through here (documented limitation,
+    matching ``_token_opt``/G23).
     """
     meta = ctx.savings.to_langfuse_metadata()
-    response_dict.setdefault("_token_opt", {}).update(meta)
-
-    # Per-call savings/routing surfaced as machine-readable response headers so a
-    # customer's FinOps/observability pipeline can attribute cost per request without
-    # parsing the body. Emitted on EVERY 2xx (normal + cascade short-circuit) and, for
-    # Anthropic/Gemini clients, carried through unchanged by ``_translate_response``'s
-    # x-* passthru. ``x-savings-usd`` is kept as a back-compat alias of the cost header.
-    # NOTE: streamed responses do not route through here, so they carry only what the
-    # streaming path sets (documented limitation, matching ``_token_opt``/G23).
     headers = {"x-savings-usd": f"{ctx.savings.cost_saving_usd:.6f}"}
     _cache_hit = bool(meta.get("cache_hit"))
     _cache_level = meta.get("cache_level")
@@ -1112,7 +1110,19 @@ def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResp
         headers["x-token-opt-state"] = base64.b64encode(
             json.dumps(token_budget_state, separators=(",", ":")).encode("utf-8")
         ).decode("utf-8")
+    return headers
 
+
+def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResponse:
+    """Finalise a served 2xx response: attach savings metadata + headers, record
+    SLA/billing (`_record_outcome`), and return the JSONResponse.
+
+    Shared by the normal LLM path and the G06 cascade short-circuit so both bill
+    and surface headers identically.
+    """
+    meta = ctx.savings.to_langfuse_metadata()
+    response_dict.setdefault("_token_opt", {}).update(meta)
+    headers = _savings_headers(ctx, request_start)
     # C1: SLA metrics + the billable usage_events row, centralised so every
     # 2xx-served path bills exactly once.
     _record_outcome(ctx, request_start, "200", response_dict)
@@ -1267,7 +1277,7 @@ async def _serve_core(
         response.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
         langfuse_tracing.finish_trace(ctx, response)
         _record_outcome(ctx, _request_start, "200", response)
-        return JSONResponse(content=response)
+        return JSONResponse(content=response, headers=_savings_headers(ctx, _request_start))
 
     # Short-circuit: bypass or cache hit
     if ctx.bypassed or ctx.cache_hit:
@@ -1275,7 +1285,9 @@ async def _serve_core(
         response.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
         langfuse_tracing.finish_trace(ctx, response)
         _record_outcome(ctx, _request_start, "200", response)  # C1: bill cache hit / bypass
-        return JSONResponse(content=response)
+        # Attach the x-tokenlean-* headers here too so cache hits / bypasses carry per-call
+        # attribution (esp. x-tokenlean-cache:hit) — they previously returned header-less.
+        return JSONResponse(content=response, headers=_savings_headers(ctx, _request_start))
 
     # Batch deferred — response delivered async
     if ctx.batch_deferred:

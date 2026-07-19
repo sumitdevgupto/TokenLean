@@ -21,6 +21,9 @@ date changes.
 
 ## 2026-07-19
 
+### Savings headers now emitted on cache-hit / bypass responses — Bug fix
+The per-call `x-tokenlean-*` attribution headers (and the `x-savings-usd` alias) were only attached on the full-LLM / cascade / agent responses — the cache-hit, bypass, and content-filter short-circuits returned a header-less response. That silently broke the advertised always-on FinOps attribution exactly where it matters most (`x-tokenlean-cache` was absent on the highest-volume cache-hit traffic) and failed the deployment-readiness header gate. The header builder is now shared and applied to every served 2xx path, so a cache hit returns `x-tokenlean-cache: hit:<level>`. Streamed responses remain a documented exception.
+
 ### Agent Registry Console — declare & govern your orchestration agents from the portal — Enhancement [Enterprise]
 A portal **Agents** tab to manage intent-orchestration (F2) without editing config: declare downstream agents (id, OpenAI-compatible URL, intent keywords, optional model / key / output budget), toggle orchestration on/off, and set the match threshold — all self-serve, per-tenant, validated server-side, effective within ~60 s. Plus a **routing-decisions** view — which agent handled each request, joined to model, cost, and latency — for audit and change-control. Persisted in the existing per-tenant config store (no new table); routing decisions are backed by a new `agent_id` column on the usage ledger.
 - **OSS:** `usage_events.agent_id` (observability — which agent served a request; never billed) ships in every tier.
