@@ -939,3 +939,27 @@ groups:
     # pii_phi: false           # convenience: also scan the PHI set
     # pii_use_presidio: false  # augment regex with Presidio recognisers when installed
     # pii_block_message: "Retrieved context contained personal data."
+
+# ── Agentic Learning Loop (F1) — [Enterprise] managed, opt-in ──────────────────
+# A managed background job (wired only by the commercial app) that periodically mines
+# the OSS-core usage_events ledger and, for each (tenant, routed_model), finds
+# savings-optimisation groups that run but realise ≈no tokens — then writes per-tenant
+# adaptive-bypass rules into the SAME artifact G24 hot-reloads
+# (config/adaptive_bypass_rules.yaml + the GCS mirror on GCP). Within one G24 reload
+# (~60s) the proxy stops paying for that group for that cohort — zero engineer effort.
+# No-op in OSS (the miner module ships only in the commercial image). Default OFF.
+learning:
+  signal_miner:
+    enabled: false                     # master switch (managed/opt-in). false → total no-op.
+    interval_seconds: 900              # minutes between mining passes (min 60). Hot-reloadable.
+    window_hours: 168                  # lookback over usage_events (default 7 days)
+    min_samples: 200                   # ignore a cohort thinner than this (noise floor)
+    max_avg_saving_per_run: 5.0        # tokens/run at/below which a group is "unproductive"
+    rules_file: config/adaptive_bypass_rules.yaml   # MUST match groups.G24_adaptive_bypass.rules_file
+    # Groups the loop may auto-skip. Conservative default = prompt-shaping optimisations whose
+    # absence only forfeits savings (never correctness/safety). A hard denylist (cache G05,
+    # routing G06, rate-limit G00, observability G18, trust&safety G29/G30/G31) is enforced in
+    # code regardless of what is listed here.
+    skippable_groups: [G01, G20, G22]
+    # Per-tenant overrides (Gate 2): tenants.<ID>.learning.signal_miner.{min_samples,
+    # max_avg_saving_per_run, skippable_groups, ...} take precedence for that tenant's cohorts.

@@ -261,6 +261,11 @@ tests/test_attestation.py
 # ruleset stay in core (guardrails/injection.py, guardrails/pii.py, guardrails/__init__.py).
 src/proxy/guardrails/ruleset_feed.py
 tests/test_ruleset_feed.py
+# Agentic learning loop (F1) — commercial. Mines the OSS-core usage_events ledger and
+# feeds G24 (adaptive-bypass rules) / G20 (templates) via config/Redis; core NEVER imports
+# it (barricade-safe, wired only by commercial_app.py — mirrors the ruleset feed).
+src/proxy/learning/
+tests/unit/learning/
 # Build-time artifact: ci/cloudbuild.yaml stages the OSS guardrails engine into the
 # doc-pipeline build context (3 public files, never ruleset_feed.py). Never committed —
 # it is regenerated on every build. Also ignored so a local build-verify can't stage it.

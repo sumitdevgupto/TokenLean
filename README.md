@@ -624,7 +624,10 @@ for you, so your team captures the savings on day one.
 Enterprise adds managed surfaces on top of the OSS core — the self-service portal, billing
 dashboards, and **outbound event webhooks**: register HTTPS endpoints to receive PII-free
 `spend_cap.reached` / `budget.threshold` / `guardrail.block` / `pii.detected` events (HMAC-signed,
-retried) straight into your Slack, PagerDuty, or SIEM.
+retried) straight into your Slack, PagerDuty, or SIEM. It also adds a **self-tuning learning
+loop** — a managed job that mines your own usage to spot optimisations that stop paying off for
+a given tenant/model and switches them off automatically, so your bill keeps falling with zero
+engineering effort (the OSS G24 adaptive-bypass engine that applies the rules ships in every tier).
 
 → <strong><a href="https://tokenlean.cbeyond.cloud/" target="_blank" rel="noopener">Explore the managed &amp; Enterprise offering at tokenlean.cbeyond.cloud</a></strong>
 

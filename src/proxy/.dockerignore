@@ -24,6 +24,8 @@ audit/attestation.py
 # Managed red-team ruleset feed (#3) — commercial; the OSS G30 scanner + default
 # ruleset stay in the image (guardrails/injection.py, guardrails/pii.py).
 guardrails/ruleset_feed.py
+# Agentic learning loop (F1) — commercial; feeds G24/G20 via config/Redis, core never imports it.
+learning/
 
 # ─── Build hygiene ────────────────────────────────────────────────────────────
 __pycache__/

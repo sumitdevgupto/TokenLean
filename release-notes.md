@@ -21,6 +21,11 @@ date changes.
 
 ## 2026-07-19
 
+### Agentic learning loop — the proxy self-tunes per tenant — Enhancement [Enterprise]
+A managed background job mines your own `usage_events` ledger and, for each `(tenant, routed_model)`, finds savings-optimisation groups that keep running but realise ≈no tokens — then writes **per-tenant** adaptive-bypass rules into the very artifact G24 already hot-reloads. Within one reload cycle (~60 s) the proxy stops paying for that group for that cohort, with zero engineer effort; bills keep falling as more rules accrue. Conservative by design: opt-in / default-off, a minimum-sample floor, a hard **never-skip denylist** (cache, routing, rate-limit, observability, trust & safety), and any operator-authored rules are always preserved.
+- **OSS:** the G24 adaptive-bypass engine that consumes the rules ships in every tier.
+- **[Enterprise]:** the managed miner that generates them per tenant, and the portal to review/override — <https://tokenlean.cbeyond.cloud/>
+
 ### G06 routing strategies — canary, weighted, round-robin, least-latency — Enhancement (OSS + Enterprise)
 G06 gains a `strategy` layer that picks **which model of a chosen tier's list** to use (the complexity classifier still picks the tier; the strategy picks within it). Options: `priority` (**default — the tier's first model, byte-identical to today, so the 54.1%% savings baseline is unchanged**), `round_robin`, `weighted` (`strategy_weights`), `least_latency` (routes to the tier model with the lowest observed served-latency EWMA, fed from real calls), and `canary` (`canary_pct`% to the tier's second model — ramp a new model 5→50→100% and compare cost/quality via the `x-tokenlean-routed-model` header). All strategies are **deterministic** (request-id hash / per-worker counter / EWMA, never random) so the ablation stays reproducible. Per-tenant, opt-in, default off. 14 tests.
 
