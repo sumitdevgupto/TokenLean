@@ -63,16 +63,17 @@ def _body():
     return {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
 
 
-def _drive(cfg, acompletion_mock, body=None):
+def _drive(cfg, acompletion_mock, body=None, store=None):
     """Post one chat request through the real endpoint with externals mocked.
 
     Single shared harness for every test in this file (incl. streaming — pass a
     body with stream=True): review K9 killed the copy-pasted patch dict. Resets
     the process resilience store so breaker/cooldown state never leaks across
-    tests (the store is a process singleton).
+    tests (the store is a process singleton). Pass ``store`` to use a pre-seeded
+    store instead (e.g. a model already locked out) — it is NOT reset.
     """
     from providers.resilience import ResilienceStore, set_resilience_store
-    set_resilience_store(ResilienceStore())
+    set_resilience_store(store if store is not None else ResilienceStore())
     patches = [
         patch("auth.api_key_manager._fetch_secret", return_value=_VALID_KEYS_JSON),
         patch("config_loader.load_config"),
@@ -111,6 +112,27 @@ def test_failover_to_fallback_returns_200_from_fallback():
     data = resp.json()
     assert data["choices"][0]["message"]["content"] == "hello-from-fallback"
     assert mock.await_count == 2  # primary failed, fallback served
+
+
+def test_locked_model_skipped_serves_from_fallback_without_calling_it():
+    """A model already locked out is SKIPPED entirely (no wasted primary call) — the
+    request goes straight to the fallback model. This is the value over plain failover:
+    a known-bad model isn't re-hammered on every request."""
+    from providers.resilience import ResilienceStore, ResilienceConfig
+    store = ResilienceStore()
+    lock_cfg = ResilienceConfig.resolve(
+        {"resilience": {"enabled": True, "model_lockout": True, "model_failure_threshold": 1}},
+        "openai")
+    store.record_model_failure("openai", "gpt-4o-mini", lock_cfg)   # gpt-4o-mini locked
+    # Only the FALLBACK is set up to be called — the primary must never be invoked.
+    mock = AsyncMock(side_effect=[_resp("claude-3-5-haiku", "from-fallback")])
+    cfg = _config({"enabled": True, "num_retries": 0, "retry_base_delay": 0,
+                   "model_lockout": True, "model_failure_threshold": 1,
+                   "fallbacks": {"gpt-4o-mini": ["claude-3-5-haiku"]}})
+    resp = _drive(cfg, mock, store=store)
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "from-fallback"
+    assert mock.await_count == 1  # primary SKIPPED (locked) — only the fallback was called
 
 
 def test_no_fallback_configured_still_raises_429():

@@ -31,7 +31,7 @@
 - 📉 **Broad reduction** — 27 stacked techniques from the Token Optimisation Playbook v7, not just caching
 - 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown **and machine-readable `x-tokenlean-*` headers** (routed model, cache hit, tokens/%/$ saved, latency) so your FinOps pipeline attributes cost per call without parsing the body; per-call → quarterly Grafana dashboards; plus a separate **application-quality** metrics surface (retrieval hit-rate, context freshness, grounding coverage) kept distinct from operational health
 - 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
-- 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII) run non-bypassably before any tokens are spent
+- 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown + optional **per-model lockout** that quarantines one degraded model while the provider's others keep serving) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII / G31 context-trust) run non-bypassably before any tokens are spent
 - ♻️ **Hot-reload config** — tune or A/B any technique without a redeploy
 - 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, Temporal
 

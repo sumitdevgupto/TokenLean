@@ -126,6 +126,9 @@ all provider traffic.
 | `failure_threshold` | `5` | Consecutive 5xx/timeout failures that trip a provider's circuit breaker (skipped in favour of fallbacks until cooldown elapses, then one half-open probe). |
 | `cooldown_seconds` | `30` | Breaker-open duration **and** per-tenant 429-cooldown TTL. |
 | `retry_base_delay` | `0.2` | Exponential-backoff base (seconds) between same-model retries. |
+| `model_lockout` | `false` | **Per-model lockout** — finer than the provider breaker: quarantine ONE degraded/deprecated model while the provider's other models keep serving. When on, a model that racks up `model_failure_threshold` model-scoped 5xx/timeout failures is skipped on subsequent requests for `model_lockout_seconds` (then one probe re-tests). Off → provider-breaker-only behaviour is unchanged. Gauge: `token_opt_model_lockout_state{provider,model}` (1=locked). |
+| `model_failure_threshold` | `3` | Model-scoped failures that lock one model. Deliberately **lower** than `failure_threshold` so a bad model is isolated before it can open the whole-provider breaker; a fallback model's success then resets the provider breaker, keeping the provider live. |
+| `model_lockout_seconds` | `cooldown_seconds` | Lock duration before a single probe re-tests the model (defaults to `cooldown_seconds` when unset). |
 | `fallbacks` | `{}` | Map of routed model → ordered list of fallback models, resolved **lazily** (zero per-request cost while the primary is healthy). A fallback whose provider is gated or whose key the tenant lacks is skipped; a fallback's own auth/config error moves on to the next fallback. Empty = retry-only. On failover the winning provider is pinned to the request so cost/provider attribution stays correct; provider-scoped cache params/markers from the primary are scrubbed before a cross-provider fallback call. |
 
 Per-tenant override: set a top-level `resilience:` block in the tenant's config (portal /

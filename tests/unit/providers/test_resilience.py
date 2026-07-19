@@ -480,3 +480,110 @@ def test_note_provider_outcome_feeds_breaker_from_external_paths():
         assert store.breaker_state("openai", cfg) is BreakerState.CLOSED
     finally:
         set_resilience_store(ResilienceStore())
+
+
+# ── Per-model lockout (item #3) ───────────────────────────────────────────────
+
+def test_config_resolve_model_lockout_defaults_and_override():
+    # Default off; lock duration defaults to cooldown_seconds when unset.
+    base = ResilienceConfig.resolve({"resilience": {"enabled": True, "cooldown_seconds": 45}})
+    assert base.model_lockout is False
+    assert base.model_failure_threshold == 3
+    assert base.model_lockout_seconds == 45
+    over = ResilienceConfig.resolve({"resilience": {
+        "enabled": True, "model_lockout": True,
+        "model_failure_threshold": 2, "model_lockout_seconds": 12}})
+    assert over.model_lockout is True
+    assert over.model_failure_threshold == 2
+    assert over.model_lockout_seconds == 12
+
+
+def test_store_model_lockout_trips_and_is_model_scoped():
+    clk = FakeClock()
+    store = ResilienceStore(clock=clk)
+    cfg = _cfg(model_lockout=True, model_failure_threshold=2, model_lockout_seconds=30)
+    assert store.allow_model("openai", "gpt-4o", cfg) is True
+    store.record_model_failure("openai", "gpt-4o", cfg)
+    state = store.record_model_failure("openai", "gpt-4o", cfg)
+    assert state is BreakerState.OPEN
+    assert store.allow_model("openai", "gpt-4o", cfg) is False       # gpt-4o locked
+    # A DIFFERENT model on the SAME provider is unaffected — this is the whole point.
+    assert store.allow_model("openai", "gpt-4o-mini", cfg) is True
+
+
+def test_store_model_lockout_probe_and_reset():
+    clk = FakeClock()
+    store = ResilienceStore(clock=clk)
+    cfg = _cfg(model_lockout=True, model_failure_threshold=1, model_lockout_seconds=20)
+    store.record_model_failure("openai", "gpt-4o", cfg)
+    assert store.allow_model("openai", "gpt-4o", cfg) is False
+    clk.advance(20)
+    assert store.allow_model("openai", "gpt-4o", cfg) is True        # cooldown → one probe
+    store.record_model_success("openai", "gpt-4o", cfg)
+    assert store.allow_model("openai", "gpt-4o", cfg) is True        # closed
+
+
+def test_peek_model_state_never_creates_breaker():
+    store = ResilienceStore(clock=FakeClock())
+    assert store.peek_model_state("openai", "never") is BreakerState.CLOSED
+    assert store.has_model_breaker("openai", "never") is False
+
+
+def test_locked_model_skipped_then_failover_to_other_model():
+    """A locked model is skipped with outcome 'skipped_model_lockout' and failover
+    routes to another model (same provider) that still serves."""
+    clk = FakeClock()
+    store = ResilienceStore(clock=clk)
+    cfg = _cfg(model_lockout=True, model_failure_threshold=1)
+    store.record_model_failure("openai", "gpt-4o", cfg)             # lock gpt-4o
+    assert store.allow_model("openai", "gpt-4o", cfg) is False
+    sink = []
+    t1 = _target("openai", "gpt-4o", result={"never": True})
+    t2 = _target("openai", "gpt-4o-mini", result={"ok": 9})
+    out = asyncio.run(call_with_resilience(
+        [t1, t2], store, cfg, attempts_sink=sink, sleep=_noop_sleep,
+    ))
+    assert out == {"ok": 9}
+    assert sink[0] == Attempt("openai", "gpt-4o", "skipped_model_lockout")
+    assert sink[1].outcome == "success"
+
+
+def test_model_lockout_off_does_not_gate():
+    """model_lockout=False → the model gate never fires (byte-identical to breaker-only)."""
+    store = ResilienceStore(clock=FakeClock())
+    cfg = _cfg(model_lockout=False, model_failure_threshold=1)
+    store.record_model_failure("openai", "gpt-4o", cfg)            # lock recorded but unused
+    sink = []
+    t1 = _target("openai", "gpt-4o", result={"ok": 1})
+    out = asyncio.run(call_with_resilience([t1], store, cfg, attempts_sink=sink, sleep=_noop_sleep))
+    assert out == {"ok": 1}
+    assert sink[0].outcome == "success"                           # NOT skipped
+
+
+def test_locked_model_failopen_when_no_alternative():
+    """Fail-open: a locked model with no viable alternative is still attempted."""
+    store = ResilienceStore(clock=FakeClock())
+    cfg = _cfg(model_lockout=True, model_failure_threshold=1)
+    store.record_model_failure("openai", "gpt-4o", cfg)
+    sink = []
+    t1 = _target("openai", "gpt-4o", result={"ok": 1})
+    out = asyncio.run(call_with_resilience([t1], store, cfg, attempts_sink=sink, sleep=_noop_sleep))
+    assert out == {"ok": 1}                                        # attempted, not blackholed
+    assert sink[0].outcome == "success"
+
+
+def test_model_failures_lock_model_while_fallback_keeps_provider_open():
+    """The elegance: model failures lock the bad model (lower threshold) but the
+    fallback model's success resets the provider breaker, so the provider stays live."""
+    store = ResilienceStore(clock=FakeClock())
+    # model locks at 2 model-failures; provider breaker would need 5.
+    cfg = _cfg(model_lockout=True, model_failure_threshold=2, failure_threshold=5, num_retries=0)
+    t1 = _target("openai", "gpt-4o", exc=_Err(503))
+    t2 = _target("openai", "gpt-4o-mini", result={"ok": 1})
+    for _ in range(3):
+        asyncio.run(call_with_resilience([t1, t2], store, cfg, sleep=_noop_sleep))
+    # gpt-4o is locked out…
+    assert store.allow_model("openai", "gpt-4o", cfg) is False
+    # …but the provider breaker never opened (fallback successes reset it).
+    assert store.breaker_state("openai", cfg) is BreakerState.CLOSED
+    assert store.allow_model("openai", "gpt-4o-mini", cfg) is True

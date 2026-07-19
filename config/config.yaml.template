@@ -243,6 +243,16 @@ resilience:
   failure_threshold: 5        # consecutive 5xx/timeout failures that trip a provider's breaker
   cooldown_seconds: 30        # breaker-open duration AND per-tenant 429-cooldown TTL
   retry_base_delay: 0.2       # exponential backoff base between retries (seconds)
+  # Per-model lockout (finer than the provider breaker): quarantine ONE degraded /
+  # deprecated model while the provider's OTHER models keep serving. Default off →
+  # provider-breaker-only behaviour is unchanged. When on, a model that racks up
+  # `model_failure_threshold` model-scoped 5xx/timeout failures is skipped on subsequent
+  # requests for `model_lockout_seconds` (then one probe re-tests). The threshold is
+  # deliberately lower than `failure_threshold` so a bad model is isolated before it can
+  # open the whole-provider breaker; a fallback model's success then resets the breaker.
+  model_lockout: false
+  model_failure_threshold: 3
+  # model_lockout_seconds: 30  # defaults to cooldown_seconds when unset
   # Failover chains: routed model → ordered list of fallback models, resolved lazily
   # (only when the primary actually fails — no per-request cost while healthy). A
   # fallback whose provider is gated or whose key the tenant lacks is skipped; a

@@ -45,6 +45,7 @@ from providers.resilience import (
     CallTarget,
     AllTargetsFailedError,
     BREAKER_STATE_CODE,
+    BreakerState,
     call_with_resilience,
     get_resilience_store,
 )
@@ -56,6 +57,7 @@ from middleware.g18_observability import (
     STAGE_DURATION_MS,
     CIRCUIT_BREAKER_STATE,
     FAILOVER_TOTAL,
+    MODEL_LOCKOUT_STATE,
 )
 from protocols import OPENAI, ANTHROPIC, GEMINI
 from middleware import RequestContext
@@ -1916,11 +1918,21 @@ def _emit_resilience_metrics(ctx) -> None:
     try:
         store = get_resilience_store()
         seen = set()
+        seen_models = set()
         for a in attempts:
             if a.provider and a.provider not in seen:
                 seen.add(a.provider)
                 CIRCUIT_BREAKER_STATE.labels(provider=a.provider).set(
                     BREAKER_STATE_CODE.get(store.peek_provider_state(a.provider), 0)
+                )
+            # Per-model lockout gauge — only for models actually tracked (feature on),
+            # so the series set stays empty when model_lockout is off. 1=locked (OPEN).
+            mk = (a.provider, a.model)
+            if a.provider and a.model and mk not in seen_models \
+                    and store.has_model_breaker(a.provider, a.model):
+                seen_models.add(mk)
+                MODEL_LOCKOUT_STATE.labels(provider=a.provider, model=a.model).set(
+                    1 if store.peek_model_state(a.provider, a.model) is BreakerState.OPEN else 0
                 )
         winner = next((a for a in attempts if a.outcome == "success"), None)
         first = attempts[0]

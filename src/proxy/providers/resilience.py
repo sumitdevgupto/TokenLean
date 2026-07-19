@@ -166,6 +166,15 @@ class ResilienceConfig:
     cooldown_seconds: float = 30.0     # breaker-open duration AND per-tenant cooldown TTL
     retry_base_delay: float = 0.2      # exponential backoff base (seconds)
     fallbacks: Dict[str, List[str]] = field(default_factory=dict)  # model → [fallback models]
+    # Per-model lockout (finer than the provider breaker): quarantine ONE degraded model
+    # while the provider's other models keep serving. Default off → byte-identical to the
+    # provider-breaker-only behaviour. Threshold is deliberately LOWER than the provider
+    # breaker's so a bad model is locked (and skipped on subsequent requests) BEFORE its
+    # failures accumulate enough to open the whole-provider breaker; a fallback model's
+    # success then resets the provider breaker, keeping the provider live.
+    model_lockout: bool = False
+    model_failure_threshold: int = 3   # model-scoped failures that lock one model
+    model_lockout_seconds: float = 30.0  # lock duration before a single probe re-tests
 
     @classmethod
     def resolve(cls, config: Dict[str, Any], provider: str = "") -> "ResilienceConfig":
@@ -176,13 +185,18 @@ class ResilienceConfig:
                 if p.get("name") == provider:
                     base.update(p.get("resilience", {}) or {})
                     break
+        cooldown = float(base.get("cooldown_seconds", 30.0))
         return cls(
             enabled=bool(base.get("enabled", False)),
             num_retries=int(base.get("num_retries", 1)),
             failure_threshold=int(base.get("failure_threshold", 5)),
-            cooldown_seconds=float(base.get("cooldown_seconds", 30.0)),
+            cooldown_seconds=cooldown,
             retry_base_delay=float(base.get("retry_base_delay", 0.2)),
             fallbacks=dict(base.get("fallbacks", {}) or {}),
+            model_lockout=bool(base.get("model_lockout", False)),
+            model_failure_threshold=int(base.get("model_failure_threshold", 3)),
+            # default the lock duration to the breaker cooldown unless overridden
+            model_lockout_seconds=float(base.get("model_lockout_seconds", cooldown)),
         )
 
 
@@ -199,6 +213,7 @@ class ResilienceStore:
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self._clock = clock
         self._breakers: Dict[str, CircuitBreaker] = {}
+        self._model_breakers: Dict[str, CircuitBreaker] = {}  # "provider|model" → breaker
         self._cooldowns: Dict[str, float] = {}   # key → expiry (monotonic)
 
     def _breaker(self, provider: str, cfg: ResilienceConfig) -> CircuitBreaker:
@@ -214,6 +229,22 @@ class ResilienceStore:
             # Refresh tunables every access so hot-reload / per-provider overrides
             # apply without a worker restart (frozen-config bug fix).
             cb.configure(cfg.failure_threshold, cfg.cooldown_seconds)
+        return cb
+
+    def _model_breaker(self, provider: str, model: str, cfg: ResilienceConfig) -> CircuitBreaker:
+        """Per-(provider,model) lockout, structurally a CircuitBreaker scoped to one
+        model and tuned with the model thresholds (lower than the provider breaker's)."""
+        key = f"{provider}|{model}"
+        cb = self._model_breakers.get(key)
+        if cb is None:
+            cb = CircuitBreaker(
+                failure_threshold=cfg.model_failure_threshold,
+                cooldown_seconds=cfg.model_lockout_seconds,
+                _clock=self._clock,
+            )
+            self._model_breakers[key] = cb
+        else:
+            cb.configure(cfg.model_failure_threshold, cfg.model_lockout_seconds)
         return cb
 
     # ── Circuit breaker (per provider, global; fed by 5xx/timeouts only) ─────
@@ -236,6 +267,28 @@ class ResilienceStore:
         cooldown as HALF_OPEN without mutating the machine (for metrics)."""
         cb = self._breakers.get(provider)
         return cb.peek_state() if cb is not None else BreakerState.CLOSED
+
+    # ── Per-model lockout (per provider+model; quarantines ONE degraded model) ──
+    def allow_model(self, provider: str, model: str, cfg: ResilienceConfig) -> bool:
+        return self._model_breaker(provider, model, cfg).allow_request()
+
+    def record_model_success(self, provider: str, model: str, cfg: ResilienceConfig) -> None:
+        self._model_breaker(provider, model, cfg).record_success()
+
+    def record_model_failure(self, provider: str, model: str, cfg: ResilienceConfig) -> BreakerState:
+        cb = self._model_breaker(provider, model, cfg)
+        cb.record_failure()
+        return cb.state
+
+    def peek_model_state(self, provider: str, model: str) -> BreakerState:
+        """Display-only lockout state (never creates a breaker); OPEN == locked."""
+        cb = self._model_breakers.get(f"{provider}|{model}")
+        return cb.peek_state() if cb is not None else BreakerState.CLOSED
+
+    def has_model_breaker(self, provider: str, model: str) -> bool:
+        """True if a model lockout has been tracked for this (provider, model) — lets
+        metrics skip emitting a flat-zero series when the feature is off/unused."""
+        return f"{provider}|{model}" in self._model_breakers
 
     # ── Per-tenant connection cooldown (fed by 429s on that tenant's key) ────
     def set_cooldown(self, redis_prefix: str, provider: str, ttl: float) -> None:
@@ -301,8 +354,8 @@ class Attempt:
 
     provider: str
     model: str
-    outcome: str        # "success" | "error" | "failopen_attempt" |
-                        # "skipped_breaker" | "skipped_cooldown" | "skipped_no_key"
+    outcome: str        # "success" | "error" | "failopen_attempt" | "skipped_breaker" |
+                        # "skipped_cooldown" | "skipped_no_key" | "skipped_model_lockout"
     error: str = ""
 
 
@@ -388,12 +441,21 @@ async def call_with_resilience(
         # skipping still leaves something (a later viable target, or an error already
         # collected from a real attempt). The last viable target is always attempted.
         if cfg.enabled:
-            gated = store.in_cooldown(redis_prefix, prov) or not store.allow_provider(prov, cfg)
+            # Evaluate lazily (short-circuit) so a skipped target never consumes a
+            # breaker/lockout HALF_OPEN probe: allow_provider only when not already in
+            # cooldown, allow_model only when neither cooldown nor breaker gated it.
+            in_cooldown = store.in_cooldown(redis_prefix, prov)
+            breaker_open = (not in_cooldown) and (not store.allow_provider(prov, cfg))
+            model_locked = ((not in_cooldown) and (not breaker_open)
+                            and cfg.model_lockout
+                            and (not store.allow_model(prov, target.model, cfg)))
+            gated = in_cooldown or breaker_open or model_locked
             if gated:
                 later_viable = any(t.has_key for t in targets[i + 1:])
                 if later_viable or last_error is not None:
-                    reason = "skipped_cooldown" if store.in_cooldown(redis_prefix, prov) \
-                        else "skipped_breaker"
+                    # Precedence for the recorded reason: cooldown → breaker → model lockout.
+                    reason = "skipped_cooldown" if in_cooldown else \
+                        "skipped_breaker" if breaker_open else "skipped_model_lockout"
                     attempts.append(Attempt(prov, target.model, reason))
                     continue
                 logger.info(
@@ -414,6 +476,11 @@ async def call_with_resilience(
                 # only this tenant's cooldown (set once, at target exhaustion below).
                 if cfg.enabled and retryable and not rate_limited:
                     store.record_provider_failure(prov, cfg)
+                    # Same signal also feeds this model's lockout (finer scope). Its
+                    # lower threshold locks the model first, so subsequent requests skip
+                    # it and a fallback model's success resets the provider breaker.
+                    if cfg.model_lockout:
+                        store.record_model_failure(prov, target.model, cfg)
                 if retryable and attempt_i < max_tries - 1:
                     await sleep(cfg.retry_base_delay * (2 ** attempt_i))
                     continue  # retry the SAME target
@@ -429,6 +496,8 @@ async def call_with_resilience(
             else:
                 if cfg.enabled:
                     store.record_provider_success(prov, cfg)
+                    if cfg.model_lockout:
+                        store.record_model_success(prov, target.model, cfg)
                 attempts.append(Attempt(prov, target.model, "success"))
                 if on_success is not None:
                     on_success(target)

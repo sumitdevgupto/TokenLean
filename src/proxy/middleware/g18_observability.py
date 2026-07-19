@@ -173,6 +173,15 @@ FAILOVER_TOTAL = Counter(
     "ultimately served (to_provider) and the reason the primary was abandoned",
     ["from_provider", "to_provider", "reason", "tenant_id"],
 )
+MODEL_LOCKOUT_STATE = Gauge(
+    "token_opt_model_lockout_state",
+    "Per-(provider,model) lockout state (0=available, 1=locked). Finer than the "
+    "circuit breaker: one degraded/deprecated model is quarantined and failover routes "
+    "around it while the provider's OTHER models keep serving. Locks after "
+    "`model_failure_threshold` model-scoped failures for `model_lockout_seconds`, then a "
+    "single probe re-tests. Labelled by provider+model (SLA resilience panel)",
+    ["provider", "model"],
+)
 # ── Trust & Safety (#2 PII redaction G29 / #3 injection guardrails G30) ────────
 # Emitted directly by the G29/G30 middleware (not here) so the count is recorded even
 # on the block short-circuit, which never reaches G18.record(). Labels carry entity
