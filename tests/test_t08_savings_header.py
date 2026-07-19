@@ -67,3 +67,73 @@ class TestSavingsHeader:
         header_val = float(response.headers["x-savings-usd"])
         body_val = response.json()["_token_opt"]["cost_saving_usd"]
         assert abs(header_val - body_val) < 1e-8
+
+
+@pytest.mark.asyncio
+class TestTokenLeanHeaderSuite:
+    """The x-tokenlean-* machine-readable per-call header family (always-on)."""
+
+    async def test_core_headers_present(self, client):
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_REQUEST,
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status_code == 200
+        for h in (
+            "x-tokenlean-request-id",
+            "x-tokenlean-routed-model",
+            "x-tokenlean-cache",
+            "x-tokenlean-tokens-saved",
+            "x-tokenlean-cost-saved-usd",
+            "x-tokenlean-latency-ms",
+        ):
+            assert h in response.headers, f"missing {h}"
+
+    async def test_cache_header_hit_or_miss(self, client):
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_REQUEST,
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status_code == 200
+        cache = response.headers["x-tokenlean-cache"]
+        assert cache == "miss" or cache == "hit" or cache.startswith("hit:")
+
+    async def test_numeric_headers_parse(self, client):
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_REQUEST,
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status_code == 200
+        int(response.headers["x-tokenlean-tokens-saved"])
+        float(response.headers["x-tokenlean-cost-saved-usd"])
+        float(response.headers["x-tokenlean-latency-ms"])
+        if "x-tokenlean-pct-saved" in response.headers:
+            float(response.headers["x-tokenlean-pct-saved"])
+
+    async def test_cost_header_aliases_x_savings_usd(self, client):
+        """x-tokenlean-cost-saved-usd must equal the back-compat x-savings-usd alias."""
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_REQUEST,
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status_code == 200
+        assert (
+            response.headers["x-tokenlean-cost-saved-usd"]
+            == response.headers["x-savings-usd"]
+        )
+
+    async def test_routed_model_matches_body(self, client):
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_REQUEST,
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status_code == 200
+        meta = response.json()["_token_opt"]
+        expected = meta.get("routed_model") or meta.get("model_requested")
+        if expected is not None:
+            assert response.headers["x-tokenlean-routed-model"] == str(expected)

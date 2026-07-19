@@ -126,6 +126,55 @@ Every response includes a `_token_opt` object:
 > counterfactual ("what you would have sent unoptimised"). Treat them as **directional, not
 > invoice-grade**. Token counts (`baseline_tokens` / `final_tokens_sent` / `*_abs_saving`) are exact.
 
+## Consuming the headers in your FinOps pipeline
+
+Every served response also carries the same per-call savings as **machine-readable response
+headers**, so your cost-attribution tooling can read them **without parsing the body**. These are
+emitted on every 2xx (including cache hits and the cascade short-circuit) and are carried through
+unchanged to Anthropic and Gemini clients.
+
+| Header | Example | Use |
+|---|---|---|
+| `x-tokenlean-routed-model` | `gpt-4o-mini` | cost by the model *actually* used (after G06 routing), not the one requested |
+| `x-tokenlean-cache` | `miss` / `hit` / `hit:L2` | cache-hit rate and cache-driven savings |
+| `x-tokenlean-tokens-saved` | `230` | tokens avoided vs the unoptimised baseline |
+| `x-tokenlean-pct-saved` | `51.10` | savings % for the call |
+| `x-tokenlean-cost-saved-usd` | `0.002217` | headline $ saved (alias of the legacy `x-savings-usd`) |
+| `x-tokenlean-latency-ms` | `812.4` | end-to-end proxy latency, to chart cost against latency |
+| `x-tokenlean-request-id` | `a1b2…` | join key to your traces/logs |
+
+Pick **one** capture point — whichever your org already runs. No application or SDK change is
+required for the first two:
+
+- **APM / observability agent** (Datadog, New Relic, Grafana Agent, OTel Collector) — add a rule to
+  lift the `x-tokenlean-*` response headers onto the HTTP span as tags, then chart
+  `sum(x-tokenlean-cost-saved-usd) by x-tokenlean-routed-model`.
+- **Log pipeline** — enable the `x-tokenlean-*` response-header fields in your gateway/ingress or
+  app access log and ship them to your log store (Splunk / ELK / BigQuery); build the dashboard as a
+  query.
+- **Application code** — if you want the values in your own DB, read them off the response:
+  ```python
+  resp = client.chat.completions.with_raw_response.create(
+      model="gpt-4o-mini",
+      messages=[{"role": "user", "content": "..."}],
+  )
+  h = resp.headers                                   # raw HTTP headers
+  cost_saved = float(h["x-tokenlean-cost-saved-usd"])
+  routed     = h["x-tokenlean-routed-model"]
+  req_id     = h["x-tokenlean-request-id"]           # joins to your traces
+  answer     = resp.parse()                          # the usual ChatCompletion object
+  ```
+
+> **Two caveats.** (1) **Streamed** responses (`stream=True`) do not carry the full header set — they
+> do not pass through the response-finaliser; use the non-streaming path for FinOps reporting, or
+> read `_token_opt` server-side. (2) The savings/cost values are the same **disclosed estimate** as
+> `_token_opt` above — a value metric, **never the billed amount** (billing is request-count). Label
+> them as such on your dashboard so no one reconciles them against the invoice.
+
+> **Enterprise:** the managed portal already renders these per-call fields as cost-attribution
+> dashboards — the capture options above are for teams that want the data inside their *own* FinOps
+> stack. See <https://tokenlean.cbeyond.cloud/>.
+
 ## Optional optimisation hints
 
 Pass these in `extra_body` (Python) or `putAdditionalBodyProperty` (Java) for extra savings:

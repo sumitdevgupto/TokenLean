@@ -1029,9 +1029,37 @@ def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResp
     Shared by the normal LLM path and the G06 cascade short-circuit so both bill
     and surface headers identically.
     """
-    response_dict.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
+    meta = ctx.savings.to_langfuse_metadata()
+    response_dict.setdefault("_token_opt", {}).update(meta)
 
+    # Per-call savings/routing surfaced as machine-readable response headers so a
+    # customer's FinOps/observability pipeline can attribute cost per request without
+    # parsing the body. Emitted on EVERY 2xx (normal + cascade short-circuit) and, for
+    # Anthropic/Gemini clients, carried through unchanged by ``_translate_response``'s
+    # x-* passthru. ``x-savings-usd`` is kept as a back-compat alias of the cost header.
+    # NOTE: streamed responses do not route through here, so they carry only what the
+    # streaming path sets (documented limitation, matching ``_token_opt``/G23).
     headers = {"x-savings-usd": f"{ctx.savings.cost_saving_usd:.6f}"}
+    _cache_hit = bool(meta.get("cache_hit"))
+    _cache_level = meta.get("cache_level")
+    header_fields = {
+        "x-tokenlean-request-id": meta.get("request_id"),
+        "x-tokenlean-routed-model": meta.get("routed_model") or meta.get("model_requested"),
+        "x-tokenlean-cache": (
+            f"hit:{_cache_level}" if (_cache_hit and _cache_level) else "hit" if _cache_hit else "miss"
+        ),
+        "x-tokenlean-tokens-saved": meta.get("total_abs_saving"),
+        "x-tokenlean-pct-saved": (
+            None if meta.get("total_pct_saving") is None
+            else f"{meta.get('total_pct_saving'):.2f}"
+        ),
+        "x-tokenlean-cost-saved-usd": f"{ctx.savings.cost_saving_usd:.6f}",
+        "x-tokenlean-latency-ms": f"{(time.time() - request_start) * 1000:.1f}",
+    }
+    for _k, _v in header_fields.items():
+        if _v is not None:
+            headers[_k] = str(_v)
+
     # G17: expose InterAgentState via x-token-opt-state header for downstream agents
     token_budget_state = ctx.params.get("_token_budget")
     if token_budget_state:

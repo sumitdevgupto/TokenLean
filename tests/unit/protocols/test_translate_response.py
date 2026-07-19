@@ -85,6 +85,32 @@ async def test_stream_error_not_masked_by_finish_F4():
     assert '"finishReason":"STOP"' not in out
 
 
+@pytest.mark.asyncio
+async def test_tokenlean_headers_pass_through_to_native_protocol():
+    """The x-tokenlean-* per-call header family set in _served_response must survive
+    translation to a non-OpenAI (Anthropic/Gemini) client — _translate_response forwards
+    every x-* header via its passthru, so FinOps attribution works for all ingress shapes."""
+    resp = JSONResponse(
+        content={
+            "id": "chatcmpl-1", "object": "chat.completion", "model": "gpt-4o-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        },
+        headers={
+            "x-tokenlean-routed-model": "gpt-4o-mini",
+            "x-tokenlean-cache": "miss",
+            "x-tokenlean-cost-saved-usd": "0.001234",
+            "x-savings-usd": "0.001234",
+        },
+    )
+    out_resp = await main._translate_response(ANTHROPIC, resp)
+    assert out_resp.headers.get("x-tokenlean-routed-model") == "gpt-4o-mini"
+    assert out_resp.headers.get("x-tokenlean-cache") == "miss"
+    assert out_resp.headers.get("x-tokenlean-cost-saved-usd") == "0.001234"
+    assert out_resp.headers.get("x-savings-usd") == "0.001234"
+
+
 def test_completion_to_stream_chunk_maps_message_to_delta():
     body = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "x"},
                          "finish_reason": "stop"}]}

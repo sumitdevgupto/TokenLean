@@ -19,6 +19,14 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-19
+
+### Per-call savings exposed as `x-tokenlean-*` response headers — Enhancement (OSS + Enterprise)
+Every served 2xx response now carries a machine-readable header family so a customer's FinOps/observability pipeline can attribute cost per request **without parsing the body**: `x-tokenlean-routed-model`, `x-tokenlean-cache` (`miss`/`hit`/`hit:<level>`), `x-tokenlean-tokens-saved`, `x-tokenlean-pct-saved`, `x-tokenlean-cost-saved-usd`, `x-tokenlean-latency-ms`, and `x-tokenlean-request-id`. Emitted on the normal and G06 cascade short-circuit paths alike, and carried through unchanged to Anthropic/Gemini clients by the protocol egress passthru. The existing `x-savings-usd` is retained as a back-compat alias of the cost header. Streamed responses are unaffected (documented limitation). Always-on, no config. 6 tests.
+
+- **OSS:** the full `x-tokenlean-*` header suite ships in every tier.
+- **[Enterprise]:** portal/dashboard drill-down and FinOps cost-attribution built on the same per-call fields — <https://tokenlean.cbeyond.cloud/>.
+
 ## 2026-07-18
 
 ### Grounding-coverage metric now emitted live (G07 → response path) — Enhancement (OSS + Enterprise)
