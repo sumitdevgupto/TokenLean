@@ -258,6 +258,9 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `enabled` | `true` | Enable model routing |
 | `classifier` | `cascade` | Complexity classifier: `cascade` (default), `heuristic`, `llm_judge`, or `routellm` |
 | `cascade_execution` | `false` | When `classifier: cascade`, run the true tier1→tier2→tier3 execution cascade (call cheap model, escalate only if its answer is inadequate) instead of classify-then-route |
+| `strategy` | `priority` | Which model of a chosen tier's list to use (the classifier picks the tier; this picks *within* it). `priority` = the tier's first model (**default — byte-identical to historical behaviour; the savings baseline is unchanged**). `round_robin` = rotate across the tier's models (per worker). `weighted` = deterministic split by `strategy_weights`. `least_latency` = the tier model with the lowest observed served-latency EWMA (fed from real calls; falls back to the first model until measured). `canary` = `canary_pct`% to the tier's **second** model, the rest to the first. All strategies are deterministic (request-id hash / counter / EWMA), never random |
+| `strategy_weights` | `{}` | For `strategy: weighted` — `{model: weight}` map; models absent from the map default to weight 1 |
+| `canary_pct` | `0` | For `strategy: canary` — percentage of traffic routed to the tier's second (candidate) model |
 | `on_unreachable_tier` | `fallback` | When a routed tier model's provider has **no usable credential** (key or ambient creds): `fallback` serves the caller's own requested model (cost-routing no-ops); `error` returns a clean 503 |
 | `cascade_confidence_threshold` | `0.70` | Escalate to the next tier when the current tier's confidence is below this (see *Tuning the cascade threshold* below) |
 | `judge_model` | `""` (empty) | Optional model that scores each tier's response for confidence. Empty → a cheap no-LLM response-adequacy heuristic (`response_confidence.*`) is used instead |

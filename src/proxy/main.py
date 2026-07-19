@@ -821,6 +821,12 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
         )
         if llm_ms > 0:
             LLM_DURATION_MS.labels(tenant_id=tenant_id).observe(llm_ms)
+            # Feed the served model's latency into G06's least_latency strategy EWMA
+            # (no-op unless that strategy is configured; best-effort).
+            _served_model = getattr(ctx, "routed_model", None) or getattr(ctx, "model", None)
+            if _served_model:
+                from middleware.g06_routing import record_model_latency
+                record_model_latency(_served_model, llm_ms)
     except Exception as exc:  # never let metrics break the response
         logger.debug("SLA metric record failed: %s", exc)
     # Trust & Safety: record any G29/G30 activity at every exit path (a flagged

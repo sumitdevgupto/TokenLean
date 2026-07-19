@@ -494,6 +494,18 @@ groups:
     enabled: true
     classifier: cascade
     cascade_execution: false
+    # Routing STRATEGY — picks WHICH model of a chosen tier's list to use (the classifier
+    # picks the tier; this picks within it). Default `priority` = the tier's first model,
+    # byte-identical to the historical behaviour (the 54.1%% savings baseline is unchanged
+    # until a tenant opts into a non-default strategy). Options:
+    #   priority       — always the first model of the tier (default)
+    #   round_robin    — rotate across the tier's models (per worker)
+    #   weighted       — deterministic split by `strategy_weights` (model → weight)
+    #   least_latency  — the tier model with the lowest observed served-latency EWMA
+    #   canary         — `canary_pct`%% of traffic to the SECOND model, rest to the first
+    strategy: priority
+    strategy_weights: {}       # e.g. {gpt-4o-mini: 9, gpt-4o: 1} for the `weighted` strategy
+    canary_pct: 0              # % to the canary (2nd model) when strategy: canary
     # When a routed tier model's provider has no usable credential (e.g. an OpenAI-free
     # deployment left the default gpt-4o tiers): `fallback` (default) serves the caller's
     # own requested model — cost-routing simply no-ops; `error` returns a clean 503.

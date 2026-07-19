@@ -7,6 +7,7 @@ Technique: Classify request complexity → route to cheapest capable model tier.
            User can override complexity tier per-request via params.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -206,6 +207,95 @@ _SIMPLE_KEYWORDS = re.compile(
 # Escalation order for the execution cascade's classified-tier cap.
 _TIER_ORDER = {"simple": 0, "medium": 1, "complex": 2}
 
+# ── Routing strategies (opt-in; pick WITHIN a tier's candidate list) ───────────
+# The classifier picks the complexity TIER; the strategy picks which model of that
+# tier's candidate list to use. Default `priority` == models[0] — byte-identical to the
+# historical behaviour, so the published savings baseline is unchanged unless a tenant
+# opts into a non-default strategy. All strategies are DETERMINISTIC (request-id hash /
+# per-process counter / observed-latency EWMA), never `random`, so tests + the ablation
+# stay reproducible.
+_VALID_STRATEGIES = ("priority", "cascade", "weighted", "round_robin", "least_latency", "canary")
+_RR_COUNTERS: Dict[str, int] = {}                 # tier-key → rotating index (per worker)
+_MODEL_LATENCY_EWMA: Dict[str, float] = {}        # model → EWMA of served LLM latency (ms)
+
+
+def record_model_latency(model: str, ms: float, alpha: float = 0.3) -> None:
+    """Feed one served-call latency into the per-model EWMA that `least_latency` reads.
+    Called from main.py after the real LLM call. Never raises."""
+    try:
+        if not model or ms is None or ms <= 0:
+            return
+        prev = _MODEL_LATENCY_EWMA.get(model)
+        _MODEL_LATENCY_EWMA[model] = ms if prev is None else (alpha * ms + (1 - alpha) * prev)
+    except Exception:  # pragma: no cover - observability must never break a call
+        pass
+
+
+def _stable_bucket(request_id: str, mod: int) -> int:
+    """Deterministic 0..mod-1 bucket from the request id (uniform, seed-free)."""
+    if mod <= 1:
+        return 0
+    h = hashlib.sha256((request_id or "").encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % mod
+
+
+def _select_from_tier(models: List[str], cfg: Dict[str, Any], ctx, tier_label: str = "") -> Optional[str]:
+    """Pick one model from a tier's candidate list per `G6_routing.strategy`.
+
+    Default (`priority`/`cascade`) returns models[0] — the historical pick. A single-model
+    tier always returns that model regardless of strategy. Unreachable-model + cost-floor
+    guards downstream still apply to whatever this returns."""
+    if not models:
+        return None
+    if len(models) == 1:
+        return models[0]
+    strategy = str(cfg.get("strategy", "priority")).lower()
+    if strategy not in _VALID_STRATEGIES:
+        strategy = "priority"
+    rid = getattr(ctx, "request_id", "") or ""
+
+    if strategy in ("priority", "cascade"):
+        return models[0]
+
+    if strategy == "round_robin":
+        key = tier_label or ",".join(models)
+        idx = _RR_COUNTERS.get(key, 0)
+        _RR_COUNTERS[key] = (idx + 1) % len(models)
+        return models[idx % len(models)]
+
+    if strategy == "canary":
+        # canary_pct of traffic goes to the SECOND model (the candidate); the rest stays
+        # on models[0] (the incumbent). Deterministic per request id.
+        pct = max(0.0, min(100.0, float(cfg.get("canary_pct", 0) or 0)))
+        if pct <= 0:
+            return models[0]
+        return models[1] if _stable_bucket(rid, 100) < pct else models[0]
+
+    if strategy == "weighted":
+        # Deterministic weighted split across the candidates. Weights from
+        # strategy_weights (model→weight); missing models default to weight 1.
+        weights = cfg.get("strategy_weights") or {}
+        w = [max(0.0, float(weights.get(m, 1) or 0)) for m in models]
+        total = sum(w)
+        if total <= 0:
+            return models[0]
+        point = _stable_bucket(rid, 10_000) / 10_000.0 * total
+        acc = 0.0
+        for m, wi in zip(models, w):
+            acc += wi
+            if point < acc:
+                return m
+        return models[-1]
+
+    if strategy == "least_latency":
+        # Pick the candidate with the lowest observed EWMA latency. An unmeasured model
+        # sorts first (EWMA 0) so it gets bootstrapped, then the split converges to the
+        # fastest. Falls back to models[0] when nothing is measured yet.
+        best = min(models, key=lambda m: _MODEL_LATENCY_EWMA.get(m, 0.0))
+        return best
+
+    return models[0]
+
 # Refusal markers for the no-judge response-confidence heuristic. Anchored to the
 # start of the response so a mid-answer quote ("the bot said 'I can't…'") doesn't
 # false-positive; checked against the first ~200 chars only.
@@ -383,7 +473,7 @@ async def _execute_three_tier_cascade(
     requested_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, ctx.model)
 
     # Tier 1: Try cheap model
-    tier1_model = simple_models[0]
+    tier1_model = _select_from_tier(simple_models, cfg, ctx, "simple")
     tier1_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier1_model)
 
     try:
@@ -439,7 +529,7 @@ async def _execute_three_tier_cascade(
 
         # Tier 2: Escalate to medium model (only if the request classifies at/above medium)
         if medium_models and max_tier_idx >= 1:
-            tier2_model = medium_models[0]
+            tier2_model = _select_from_tier(medium_models, cfg, ctx, "medium")
             tier2_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier2_model)
 
             block_reason = _escalation_block_reason(
@@ -479,7 +569,7 @@ async def _execute_three_tier_cascade(
 
         # Tier 3: Escalate to complex model (only if the request classifies complex)
         if complex_models and max_tier_idx >= 2:
-            tier3_model = complex_models[0]
+            tier3_model = _select_from_tier(complex_models, cfg, ctx, "complex")
             tier3_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier3_model)
 
             block_reason = _escalation_block_reason(
@@ -795,7 +885,7 @@ class G06Routing:
         if isinstance(user_complexity, str) and user_complexity in ("simple", "medium", "complex"):
             candidates = tiers.get(user_complexity, [])
             if candidates:
-                selected_model = candidates[0]
+                selected_model = _select_from_tier(candidates, cfg, ctx, user_complexity)
                 ctx.savings.routing_mode = "user_override"
                 user_override = True
                 logger.debug(
@@ -826,13 +916,13 @@ class G06Routing:
                     complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, cfg))
                     candidates = tiers.get(complexity, tiers.get("medium", []))
                     if candidates:
-                        selected_model = candidates[0]
+                        selected_model = _select_from_tier(candidates, cfg, ctx, complexity)
                     ctx.savings.routing_mode = f"{classifier}_fallback"
             else:
                 complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, cfg))
                 candidates = tiers.get(complexity, tiers.get("medium", []))
                 if candidates:
-                    selected_model = candidates[0]
+                    selected_model = _select_from_tier(candidates, cfg, ctx, complexity)
                 ctx.savings.routing_mode = classifier
 
         # 2b. Reachability guard (P8 hardening): never hand main.py a routed tier model whose
