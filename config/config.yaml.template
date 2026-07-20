@@ -494,6 +494,18 @@ groups:
       backend_url: ''
   G5_cache:
     enabled: true
+    # tenant (default) | tenant+model | tenant+system | tenant+model+system
+    #   tenant        — tenant-only isolation (keys byte-identical to pre-feature)
+    #   +model        — also key on the REQUESTED model, so a multi-provider tenant
+    #                   never gets one model's answer served for another
+    #   +system       — also key on a fingerprint of the SYSTEM PROMPT. The L2
+    #                   semantic key embeds user turns ONLY (a long system prompt
+    #                   would dominate/truncate the embedding window), so without
+    #                   this the key is blind to the system prompt: the same user
+    #                   question under a RESTRICTIVE prompt can be served an answer
+    #                   cached under a laxer one, bypassing the scope/persona/format
+    #                   constraint. Enable if one tenant runs several personas, apps,
+    #                   or agents through the same key. Costs some hit-rate.
     cache_scope: tenant
     l1_ttl_seconds: 3600
     # 384-dim local model, pre-baked into the proxy image and pinned to an immutable

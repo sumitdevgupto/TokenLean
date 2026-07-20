@@ -116,6 +116,21 @@ def _l3_scope_query(query: str, tenant_id: str) -> str:
     return f"tenant:{tenant_id}|{query}"
 
 
+def _l3_query(ctx) -> str:
+    """The query text BOTH L3 call sites (lookup + store) must use.
+
+    Folds `_scope_value(ctx)` (model/verbosity/system tags per `cache_scope`) into
+    the semantic query so L3 honours the same isolation contract as L1/L2 — without
+    this, a `tenant+system` operator would be protected on L1/L2 but still collide
+    across system prompts the moment the L3 rewrite lands (`_semantic_cache` is
+    currently None, so this is future-proofing the contract, not a live fix). The
+    scope tags are memoised on ctx.params, so lookup (request) and store (response,
+    after G01/G19 mutate messages) always agree."""
+    scope = _scope_value(ctx)
+    query = _semantic_query_text(ctx.messages)
+    return f"scope:{scope}|{query}" if scope else query
+
+
 async def _l3_lookup(query: str, threshold: float, tenant_id: str = "default") -> Tuple[Optional[Dict], float]:
     """Search headroom.SemanticCache with similarity threshold, scoped to tenant.
 
@@ -272,11 +287,40 @@ def _cache_key(normalised: str, prefix: str = "") -> str:
 # Resolved per request; default keeps keys byte-identical to the pre-feature
 # behaviour, so enabling/leaving it never invalidates existing caches.
 
+# Exact-match allowlist for cache_scope — spelling → canonical scope. Substring
+# matching is deliberately NOT used: a typo must fail closed to "tenant" (with a
+# warning), never silently activate a scope component. Legacy spellings kept from
+# the original tenant+model rollout.
+_CACHE_SCOPE_CANONICAL: Dict[str, str] = {
+    "tenant": "tenant",
+    "tenant+model": "tenant+model",
+    "tenant_model": "tenant+model",          # legacy spelling
+    "model": "tenant+model",                 # legacy spelling
+    "tenant+system": "tenant+system",
+    "tenant_system": "tenant+system",
+    "system": "tenant+system",
+    "tenant+model+system": "tenant+model+system",
+    "tenant+system+model": "tenant+model+system",
+    "tenant_model_system": "tenant+model+system",
+    "model+system": "tenant+model+system",
+    "system+model": "tenant+model+system",
+}
+_warned_cache_scopes: set = set()
+
+
 def _resolve_cache_scope(ctx) -> str:
-    """Return "tenant" (default) or "tenant+model".
+    """Return the normalised cache scope — "tenant" (default), optionally with
+    "+model" and/or "+system" components (canonical order, regardless of how the
+    config spells them).
 
     Per-tenant override (``tenants.<id>.groups.G5_cache.cache_scope``) wins over
-    the global ``G5_cache.cache_scope``. Any value other than "tenant+model" → "tenant".
+    the global ``G5_cache.cache_scope``. Recognised components:
+      * ``tenant``               — default; tenant-only isolation (byte-identical keys)
+      * ``tenant+model``         — also key on the REQUESTED model
+      * ``tenant+system``        — also key on a fingerprint of the system prompt
+      * ``tenant+model+system``  — both
+    Anything unrecognised fails CLOSED to "tenant" (the safe, pre-feature default)
+    and logs a one-time warning naming the valid values — see _CACHE_SCOPE_CANONICAL.
     """
     base = ctx.config.get("groups", {}).get("G5_cache", {}).get("cache_scope", "tenant")
     tenant_cfg = (
@@ -285,20 +329,84 @@ def _resolve_cache_scope(ctx) -> str:
         .get("groups", {})
         .get("G5_cache", {})
     )
-    scope = str(tenant_cfg.get("cache_scope", base)).lower()
-    return "tenant+model" if scope in ("tenant+model", "tenant_model", "model") else "tenant"
+    raw = str(tenant_cfg.get("cache_scope", base)).lower().strip()
+    canonical = _CACHE_SCOPE_CANONICAL.get(raw)
+    if canonical is None:
+        # Fail CLOSED to "tenant" (safe, pre-feature keys) but say so once — a typo
+        # like "tenant+sytem" silently losing system isolation, or a stray value
+        # accidentally activating a scope, must be visible, not guessed at.
+        if raw not in _warned_cache_scopes:
+            _warned_cache_scopes.add(raw)
+            logger.warning(
+                "G05 unrecognised cache_scope %r — using 'tenant'. Valid: %s",
+                raw, sorted(set(_CACHE_SCOPE_CANONICAL.values())),
+            )
+        return "tenant"
+    return canonical
 
 
 def _model_scope_tag(ctx) -> str:
-    """Model component of the cache key when scope == "tenant+model", else "".
+    """Model component of the cache key when the scope includes "+model", else "".
 
     Uses the *requested* model (``ctx.model`` / ``params["model"]``): G05 runs
     before G06 routing, and the caller chose this model deliberately, so the
     requested model is the stable, correct key (identical at lookup and store).
     """
-    if _resolve_cache_scope(ctx) != "tenant+model":
+    if "+model" not in _resolve_cache_scope(ctx):
         return ""
     return getattr(ctx, "model", None) or ctx.params.get("model") or ""
+
+
+def _system_scope_tag(ctx) -> str:
+    """System-prompt fingerprint folded into the cache key when the scope includes
+    "+system", else "" (the default → keys stay byte-identical to pre-feature).
+
+    WHY THIS EXISTS: the L2 semantic key embeds **user turns only** (see
+    :func:`_semantic_query_text` — the system prompt is deliberately excluded so a
+    long prompt can't dominate and truncate the ~512-token embedding window). That
+    makes the key blind to the system prompt, so two requests with the SAME user
+    question but DIFFERENT system prompts collide — a restrictive prompt ("only
+    answer Northwind questions") can be served an answer generated under a laxer
+    one, silently bypassing the scope/persona/format constraint it encodes.
+
+    Observed 2026-07-20 (pitch-test-plan DS8): the baseline correctly declined
+    off-topic geography questions, while the optimised arm returned cached "Rome."
+    / "The capital of Egypt is Cairo." at 0.95-0.96 similarity with
+    final_tokens_sent=0. Isolation is per-tenant either way (``tenant_id`` is in the
+    L2 WHERE clause), so this is a WITHIN-tenant collision — it bites a tenant
+    running several personas/apps/agents on one key.
+
+    Fingerprinting rather than embedding keeps the vector keyed on query intent
+    (no truncation regression) while making the KEY system-prompt-aware. Mirrors
+    :func:`_verbosity_scope_tag`, which solves the same class of bug for G11 terse
+    vs verbose output. Computed once per request and stashed on ``ctx.params`` so
+    every path (L1 lookup/store, L2 lookup/store) reads the SAME value — L1 and L2
+    can never disagree on scope within one request.
+    """
+    params = getattr(ctx, "params", None)
+    if isinstance(params, dict) and "_g05_system_tag" in params:
+        return params["_g05_system_tag"]
+    tag = ""
+    if "+system" in _resolve_cache_scope(ctx):
+        parts: List[str] = []
+        for msg in (getattr(ctx, "messages", None) or []):
+            if not isinstance(msg, dict) or msg.get("role") != "system":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):      # OpenAI multimodal list-of-parts
+                for p in content:
+                    if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
+                        parts.append(p["text"])
+        # Normalise whitespace so cosmetic reformatting doesn't split the cache.
+        joined = re.sub(r"\s+", " ", "\n".join(parts)).strip()
+        # Hash even when empty-but-scoped so "no system prompt" is its OWN bucket and
+        # can't be served an answer produced under one.
+        tag = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+    if isinstance(params, dict):
+        params["_g05_system_tag"] = tag
+    return tag
 
 
 def _verbosity_scope_tag(ctx) -> str:
@@ -333,6 +441,9 @@ def _apply_model_scope(text: str, ctx) -> str:
     vtag = _verbosity_scope_tag(ctx)
     if vtag:
         text = f"verbosity={vtag}\n{text}"
+    stag = _system_scope_tag(ctx)
+    if stag:
+        text = f"system={stag}\n{text}"
     return text
 
 
@@ -343,7 +454,9 @@ def _scope_value(ctx) -> str:
     this is what makes verbosity/model isolation actually enforced on L2's READ path
     (unlike folding a tag into query_hash alone, which only dedupes the INSERT and is
     never consulted by SELECT)."""
-    return ":".join(p for p in (_model_scope_tag(ctx), _verbosity_scope_tag(ctx)) if p)
+    return ":".join(
+        p for p in (_model_scope_tag(ctx), _verbosity_scope_tag(ctx), _system_scope_tag(ctx)) if p
+    )
 
 
 def _step_cache_key(step_name: str, inputs_hash: str, template_version: str, prefix: str = "") -> str:
@@ -493,7 +606,7 @@ class G05Cache:
             l3_threshold = cfg.get("l3_similarity_threshold", cfg.get("gptcache_similarity_threshold", 0.85))
             try:
                 cached_response, score = await _l3_lookup(
-                    _semantic_query_text(ctx.messages), l3_threshold,
+                    _l3_query(ctx), l3_threshold,
                     tenant_id=getattr(ctx, "tenant_id", "default"),
                 )
                 if cached_response:
@@ -626,7 +739,7 @@ class G05Cache:
         if l3_enabled and _semantic_cache is not None and not _semantic_cache_disabled(ctx):
             try:
                 await _l3_store(
-                    _semantic_query_text(ctx.messages), response, l2_ttl,
+                    _l3_query(ctx), response, l2_ttl,
                     tenant_id=getattr(ctx, "tenant_id", "default"),
                 )
             except Exception as exc:

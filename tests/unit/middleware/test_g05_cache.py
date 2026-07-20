@@ -592,6 +592,174 @@ class TestG05CacheScope:
         assert _cache_key(_apply_model_scope(norm, a)) != _cache_key(_apply_model_scope(norm, b))
 
 
+class TestG05SystemPromptScope:
+    """Durable contract for the "+system" cache-scope component.
+
+    Regression lock for the DS8 finding (pitch-test-plan, 2026-07-20): the L2
+    semantic key embeds USER TURNS ONLY (a long system prompt would dominate and
+    truncate the embedding window), so the key was blind to the system prompt. A
+    request whose system prompt scoped the assistant to one domain was served a
+    cached answer produced under a different prompt — the baseline correctly
+    declined off-topic geography questions while the optimised arm returned cached
+    "Rome." / "Cairo" at 0.95-0.96 similarity. Fingerprinting the system prompt into
+    the KEY (not the embedding) fixes it without reintroducing truncation."""
+
+    @staticmethod
+    def _scope(ctx, scope):
+        ctx.config["groups"]["G5_cache"]["cache_scope"] = scope
+
+    SYS_STRICT = {"role": "system", "content": "Only answer Northwind Cloud Services questions."}
+    SYS_LAX = {"role": "system", "content": "You are a helpful general assistant."}
+    USER = {"role": "user", "content": "What is the capital of Egypt?"}
+
+    # ── scope resolution ────────────────────────────────────────────────────
+    def test_resolve_tenant_system(self, make_ctx):
+        from middleware.g05_cache import _resolve_cache_scope
+        ctx = make_ctx(); self._scope(ctx, "tenant+system")
+        assert _resolve_cache_scope(ctx) == "tenant+system"
+
+    def test_resolve_tenant_model_system_is_compositional(self, make_ctx):
+        from middleware.g05_cache import _resolve_cache_scope
+        ctx = make_ctx(); self._scope(ctx, "tenant+model+system")
+        assert _resolve_cache_scope(ctx) == "tenant+model+system"
+
+    def test_resolve_reversed_spelling_normalises(self, make_ctx):
+        from middleware.g05_cache import _resolve_cache_scope
+        ctx = make_ctx(); self._scope(ctx, "tenant+system+model")
+        assert _resolve_cache_scope(ctx) == "tenant+model+system"
+
+    def test_resolve_legacy_spellings_unchanged(self, make_ctx):
+        """The original rollout accepted tenant_model / model — must keep resolving."""
+        from middleware.g05_cache import _resolve_cache_scope
+        for legacy in ("tenant_model", "model"):
+            ctx = make_ctx(); self._scope(ctx, legacy)
+            assert _resolve_cache_scope(ctx) == "tenant+model", legacy
+
+    def test_typo_fails_closed_to_tenant_and_warns(self, make_ctx, caplog):
+        """A misspelled scope must NOT silently activate or drop isolation — it
+        fails closed to "tenant" and logs a warning naming the valid values, so
+        an operator who thinks they closed the DS8 hole finds out they didn't."""
+        import logging
+        from middleware.g05_cache import _resolve_cache_scope, _warned_cache_scopes
+        _warned_cache_scopes.discard("tenant+sytem")     # warn-once: reset for test
+        ctx = make_ctx(); self._scope(ctx, "tenant+sytem")   # typo
+        with caplog.at_level(logging.WARNING, logger="middleware.g05_cache"):
+            assert _resolve_cache_scope(ctx) == "tenant"
+        assert any("unrecognised cache_scope" in r.message for r in caplog.records)
+
+    def test_substring_lookalikes_do_not_activate_scopes(self, make_ctx):
+        """Values merely CONTAINING "model"/"system" (e.g. "ecosystem") must not
+        switch scoping on — that would be a silent full cache invalidation."""
+        from middleware.g05_cache import _resolve_cache_scope
+        for garbage in ("ecosystem", "supermodel", "no-model", "system: disabled"):
+            ctx = make_ctx(); self._scope(ctx, garbage)
+            assert _resolve_cache_scope(ctx) == "tenant", garbage
+
+    def test_model_tag_still_applies_alongside_system(self, make_ctx):
+        """Adding "+system" must not disable the pre-existing "+model" component."""
+        from middleware.g05_cache import _model_scope_tag
+        ctx = make_ctx(model="gpt-4o"); self._scope(ctx, "tenant+model+system")
+        assert _model_scope_tag(ctx) == "gpt-4o"
+
+    # ── tag behaviour ───────────────────────────────────────────────────────
+    def test_system_tag_empty_by_default(self, make_ctx):
+        """Default scope → no tag → keys byte-identical to pre-feature."""
+        from middleware.g05_cache import _system_scope_tag
+        ctx = make_ctx(messages=[self.SYS_STRICT, self.USER])
+        assert _system_scope_tag(ctx) == ""
+
+    def test_system_tag_differs_for_different_system_prompts(self, make_ctx):
+        from middleware.g05_cache import _system_scope_tag
+        a = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(a, "tenant+system")
+        b = make_ctx(messages=[self.SYS_LAX, self.USER]); self._scope(b, "tenant+system")
+        assert _system_scope_tag(a) != _system_scope_tag(b)
+
+    def test_system_tag_stable_for_identical_prompt(self, make_ctx):
+        from middleware.g05_cache import _system_scope_tag
+        a = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(a, "tenant+system")
+        b = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(b, "tenant+system")
+        assert _system_scope_tag(a) == _system_scope_tag(b)
+
+    def test_system_tag_ignores_cosmetic_whitespace(self, make_ctx):
+        """Reformatting a prompt must not needlessly split the cache."""
+        from middleware.g05_cache import _system_scope_tag
+        a = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(a, "tenant+system")
+        spaced = {"role": "system", "content": "Only  answer\n\nNorthwind Cloud Services   questions."}
+        b = make_ctx(messages=[spaced, self.USER]); self._scope(b, "tenant+system")
+        assert _system_scope_tag(a) == _system_scope_tag(b)
+
+    def test_absent_system_prompt_is_its_own_bucket(self, make_ctx):
+        """No-system-prompt must not be served an answer cached under one."""
+        from middleware.g05_cache import _system_scope_tag
+        a = make_ctx(messages=[self.USER]); self._scope(a, "tenant+system")
+        b = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(b, "tenant+system")
+        assert _system_scope_tag(a) != _system_scope_tag(b)
+
+    def test_system_tag_handles_multimodal_content(self, make_ctx):
+        from middleware.g05_cache import _system_scope_tag
+        multimodal = {"role": "system", "content": [{"type": "text", "text": "Only answer Northwind Cloud Services questions."}]}
+        a = make_ctx(messages=[multimodal, self.USER]); self._scope(a, "tenant+system")
+        b = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(b, "tenant+system")
+        assert _system_scope_tag(a) == _system_scope_tag(b)  # same text, either shape
+
+    # ── the actual DS8 regression, on both cache layers ─────────────────────
+    def test_L1_key_isolates_across_system_prompts(self, make_ctx):
+        """THE DS8 REGRESSION (L1): same user question, different system prompts →
+        different keys, so the strict prompt can't be served the lax prompt's answer."""
+        from middleware.g05_cache import _normalise, _cache_key, _apply_model_scope
+        msgs_a = [self.SYS_STRICT, self.USER]
+        msgs_b = [self.SYS_LAX, self.USER]
+        a = make_ctx(messages=msgs_a); self._scope(a, "tenant+system")
+        b = make_ctx(messages=msgs_b); self._scope(b, "tenant+system")
+        ka = _cache_key(_apply_model_scope(_normalise(msgs_a), a))
+        kb = _cache_key(_apply_model_scope(_normalise(msgs_b), b))
+        assert ka != kb
+
+    def test_L2_scope_value_isolates_across_system_prompts(self, make_ctx):
+        """THE DS8 REGRESSION (L2): _scope_value feeds the L2 WHERE filter, which is
+        the layer that actually served "Rome."/"Cairo". User turns embed identically,
+        so the scope value is the ONLY thing keeping them apart."""
+        from middleware.g05_cache import _scope_value
+        a = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(a, "tenant+system")
+        b = make_ctx(messages=[self.SYS_LAX, self.USER]); self._scope(b, "tenant+system")
+        assert _scope_value(a) != _scope_value(b)
+
+    def test_default_scope_still_collides_documenting_opt_in(self, make_ctx):
+        """Documents that the fix is OPT-IN: under the default scope the keys still
+        match (pre-feature behaviour preserved, no cache invalidation on upgrade).
+        Flip cache_scope to tenant+system to get the isolation."""
+        from middleware.g05_cache import _scope_value
+        a = make_ctx(messages=[self.SYS_STRICT, self.USER])
+        b = make_ctx(messages=[self.SYS_LAX, self.USER])
+        assert _scope_value(a) == _scope_value(b) == ""
+
+    def test_lookup_and_store_read_identical_tag(self, make_ctx):
+        """L1 and L2 must never disagree within a request — the tag is memoised on
+        ctx.params, so a second read returns the same value."""
+        from middleware.g05_cache import _system_scope_tag
+        ctx = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(ctx, "tenant+system")
+        first = _system_scope_tag(ctx)
+        ctx.messages = [self.SYS_LAX, self.USER]      # mutate after first read
+        assert _system_scope_tag(ctx) == first        # memoised → store matches lookup
+
+    # ── L3 honours the same contract (future-proofing: L3 is currently inert) ──
+    def test_L3_query_isolates_across_system_prompts(self, make_ctx):
+        """The L3 semantic query must fold the scope tags like L1/L2 do — else a
+        tenant+system operator is protected on L1/L2 but collides on L3 the moment
+        the L3 rewrite lands."""
+        from middleware.g05_cache import _l3_query
+        a = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(a, "tenant+system")
+        b = make_ctx(messages=[self.SYS_LAX, self.USER]); self._scope(b, "tenant+system")
+        assert _l3_query(a) != _l3_query(b)
+
+    def test_L3_query_unchanged_under_default_scope(self, make_ctx):
+        """Default scope → L3 query byte-identical to the pre-feature user-turns
+        text (no invalidation of any existing L3 store)."""
+        from middleware.g05_cache import _l3_query, _semantic_query_text
+        ctx = make_ctx(messages=[self.SYS_STRICT, self.USER])
+        assert _l3_query(ctx) == _semantic_query_text(ctx.messages)
+
+
 # ── M2: L2 embedding-window truncation guard ─────────────────────────────────
 class TestG05L2EmbedWindowGuard:
     def test_helper_flags_over_window(self):

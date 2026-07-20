@@ -250,7 +250,7 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable L1+L2 caching |
-| `cache_scope` | `tenant` | `tenant` = key cache by tenant + request content (an answer is reused across providers within a tenant — max savings). `tenant+model` = also key on the **requested** model, so a tenant using several providers never gets one model's cached answer served to another. Per-tenant override: `tenants.<id>.groups.G5_cache.cache_scope`. Default keeps keys byte-identical to prior behaviour (no cache invalidation). |
+| `cache_scope` | `tenant` | `tenant` = key cache by tenant + request content (an answer is reused across providers within a tenant — max savings). `tenant+model` = also key on the **requested** model, so a tenant using several providers never gets one model's cached answer served to another. `tenant+system` = also key on a fingerprint of the **system prompt** — the semantic (L2) key embeds user turns only, so without this the same user question under a *restrictive* system prompt can be served an answer cached under a *laxer* one, bypassing the scope/persona/format constraint it encodes; enable when one tenant runs several personas, apps, or agents through one key (costs some hit-rate). `tenant+model+system` = both. Unrecognised values fail closed to `tenant` with a logged warning. Per-tenant override: `tenants.<id>.groups.G5_cache.cache_scope`. Default keeps keys byte-identical to prior behaviour (no cache invalidation). |
 | `l1_ttl_seconds` | `3600` | Redis exact-match TTL |
 | `l2_similarity_threshold` | `0.90` | Semantic similarity threshold (0.88–0.92 range) |
 | `l2_ttl_seconds` | `86400` | pgvector semantic cache TTL |
