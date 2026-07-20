@@ -170,14 +170,27 @@ def _get_verbosity_suffix(tenant_id: str, verbosity_cfg: Dict[str, Any]) -> Opti
 
 def verbosity_cache_tag(ctx: RequestContext) -> str:
     """Stable cache-scope tag for the active G11 verbosity suffix, or "" when
-    verbosity steering is off / unconfigured. G05 folds this into its key so a
-    terse-mode answer is never served to a request configured for verbose output
-    (or vice-versa). "" keeps cache keys byte-identical to the pre-feature default."""
+    verbosity steering is off / unconfigured / this request is in the A3 holdout
+    cohort. G05 folds this into its key so a terse-mode answer is never served to
+    a request configured for verbose output (or vice-versa). "" keeps cache keys
+    byte-identical to the pre-feature default.
+
+    G05 (cache) runs before G11 (output-format) in the pipeline, so this must
+    independently re-derive whether THIS request would land in the A3 holdout
+    cohort — ``_assign_cohort`` is a pure function of stable request/tenant state,
+    so it returns the same verdict here as it will later inside G11.process_request.
+    Skipping this check would let a holdout (unshaped) request and a treatment
+    (suffix-shaped) request collide on the same cache key despite receiving
+    different prompts — corrupting both the cache and the A3 measurement itself.
+    """
     try:
         cfg = (getattr(ctx, "config", {}) or {}).get("groups", {}).get("G11_output", {})
         vcfg = cfg.get("verbosity_steering", {})
         if not cfg.get("enabled", False) or not vcfg.get("enabled", False):
             return ""
+        holdout_cfg = cfg.get("output_holdout", {})
+        if holdout_cfg.get("enabled", False) and _assign_cohort(ctx, holdout_cfg) == "holdout":
+            return ""  # this request won't get the suffix — tag it like steering is off
         suffix = _get_verbosity_suffix(getattr(ctx, "tenant_id", None) or "default", vcfg)
         if not suffix:
             return ""
@@ -222,7 +235,8 @@ def _assign_cohort(ctx: RequestContext, holdout_cfg: Dict[str, Any]) -> str:
         or getattr(ctx, "user_id", None)
         or ctx.request_id
     )
-    bucket = int(hashlib.sha256(str(stable).encode()).hexdigest()[:8], 16) % _HOLDOUT_BUCKETS
+    from middleware.g06_routing import stable_bucket
+    bucket = stable_bucket(stable, _HOLDOUT_BUCKETS)
     return "holdout" if bucket < fraction * _HOLDOUT_BUCKETS else "treatment"
 
 

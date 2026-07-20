@@ -87,6 +87,9 @@ class _SecCtx:
         self.pii_action = kw.get("pii_action")
         self.pii_entities = kw.get("pii_entities", [])
         self.pii_redactions = kw.get("pii_redactions", 0)
+        self.context_trust_pii_action = kw.get("context_trust_pii_action")
+        self.context_trust_pii_entities = kw.get("context_trust_pii_entities", [])
+        self.context_trust_pii_redactions = kw.get("context_trust_pii_redactions", 0)
 
 
 async def test_security_events_guardrail_flag_row():
@@ -121,6 +124,53 @@ async def test_security_events_pii_flag_action_name():
     await AuditLogger(_Pool(conn)).log_security_events(
         _SecCtx(pii_action="flag", pii_entities=["PHONE"], pii_redactions=1))
     assert conn.calls[0][1][3] == "redaction.flagged"
+
+
+async def test_security_events_pii_block_is_not_mislabeled_applied():
+    """Regression (2026-07-20 code-review finding): a G29 block refuses the request —
+    nothing was masked/served — so it must NOT be recorded as 'redaction.applied' (which
+    implies content was redacted and the response still went out)."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(pii_action="block", pii_entities=["US_SSN"], pii_redactions=1))
+    _, args = conn.calls[0]
+    assert args[3] == "redaction.blocked"
+    assert args[3] != "redaction.applied"
+
+
+async def test_security_events_g31_pii_block_is_not_mislabeled_applied():
+    """Same fix, G31 (retrieved-context PII) branch — mirrors the G29 case above."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(context_trust_pii_action="block",
+                context_trust_pii_entities=["EMAIL"],
+                context_trust_pii_redactions=2))
+    _, args = conn.calls[0]
+    assert args[3] == "redaction.blocked"
+    assert '"source": "retrieved"' in args[5]
+
+
+async def test_security_events_g31_pii_flag_and_mask_still_correct():
+    """The fix must not disturb the two modes that were already correct."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(context_trust_pii_action="flag", context_trust_pii_entities=["EMAIL"],
+                context_trust_pii_redactions=1))
+    assert conn.calls[0][1][3] == "redaction.flagged"
+
+    conn2 = _Conn()
+    await AuditLogger(_Pool(conn2)).log_security_events(
+        _SecCtx(context_trust_pii_action="mask", context_trust_pii_entities=["EMAIL"],
+                context_trust_pii_redactions=1))
+    assert conn2.calls[0][1][3] == "redaction.applied"
+
+
+def test_redaction_action_helper_maps_all_modes():
+    from audit.log import _redaction_action
+    assert _redaction_action("flag") == "redaction.flagged"
+    assert _redaction_action("mask") == "redaction.applied"
+    assert _redaction_action("block") == "redaction.blocked"
+    assert _redaction_action("off") == "redaction.flagged"   # safe default, never reached
 
 
 async def test_security_events_writes_two_rows_when_both():

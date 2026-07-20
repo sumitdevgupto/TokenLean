@@ -107,11 +107,14 @@ def _compress_text_file(path: str, write: bool, backup: bool, min_chars: int) ->
 
 
 def _compress_structured_file(
-    path: str, fields: List[str], write: bool, backup: bool
+    path: str, fields: List[str], write: bool, backup: bool, min_chars: int = 0
 ) -> Tuple[int, int]:
     """Compress named string fields inside a JSON/YAML doc (e.g. tool descriptions)."""
     with open(path, "r", encoding="utf-8") as fh:
         raw = fh.read()
+    if len(raw) < min_chars:
+        logger.info("  skip %s (%d chars < min %d)", path, len(raw), min_chars)
+        return len(raw), len(raw)
     is_json = path.endswith(".json")
     try:
         if is_json:
@@ -151,7 +154,7 @@ def main() -> int:
     ap.add_argument("--fields", default="description",
                     help="Comma-separated string fields to compress in JSON/YAML files (default: description).")
     ap.add_argument("--min-chars", type=int, default=200,
-                    help="Skip prose files smaller than this many chars (default: 200).")
+                    help="Skip files (prose or structured) smaller than this many raw chars (default: 200).")
     ap.add_argument("--force-code", action="store_true",
                     help="Allow compressing files with source-code extensions (unsafe; off by default).")
     args = ap.parse_args()
@@ -170,7 +173,7 @@ def main() -> int:
             logger.warning("  REFUSE %s — source-code file (use --force-code to override)", path)
             continue
         if ext in _STRUCTURED_EXTENSIONS:
-            b, a = _compress_structured_file(path, fields, args.write, not args.no_backup)
+            b, a = _compress_structured_file(path, fields, args.write, not args.no_backup, args.min_chars)
         else:
             b, a = _compress_text_file(path, args.write, not args.no_backup, args.min_chars)
         total_before += b

@@ -39,7 +39,12 @@ _LEADERS = re.compile(
     r"^(?:i'?ll|i will|i can|i'?d|you can|we will|we can|let me|let'?s)\s+",
     re.IGNORECASE | re.MULTILINE,
 )
-_ARTICLES = re.compile(r"\b(?:a|an|the)\s+(?=[a-z])", re.IGNORECASE)
+# Scoped (?i:...) so ONLY the alternation is case-insensitive (matches "A"/"The" at a
+# sentence start too) — the trailing lookahead stays case-SENSITIVE lowercase-only, so
+# an article before a genuinely-capitalized unprotected word (e.g. "the API") is kept.
+# A bare top-level re.IGNORECASE would apply to the whole pattern including the
+# lookahead's [a-z] class, silently defeating that protection.
+_ARTICLES = re.compile(r"\b(?i:a|an|the)\s+(?=[a-z])")
 
 # ─── Protection patterns (byte-for-byte preserved) ────────────────────────────
 _PROTECTED_PATTERNS: List[re.Pattern] = [
@@ -106,6 +111,13 @@ def compress(text: Optional[str]) -> Dict[str, Any]:
     if not isinstance(text, str) or len(text) == 0:
         return {"compressed": text, "before": 0, "after": 0}
     before = len(text)
+    # Strip any pre-existing NUL bytes first: the protection mechanism below uses NUL
+    # as its sentinel delimiter, and NUL has no legitimate place in prompt/description
+    # text. A NUL surviving from the caller's input (reachable via an ordinary JSON
+    # unicode escape for codepoint zero -- nothing upstream sanitizes it) could
+    # otherwise collide with a real sentinel and substitute unrelated protected
+    # content, or leak a raw sentinel into the LLM-bound text.
+    text = text.replace(_SENTINEL, "")
     compressed = _with_protected_segments(text, _compress_prose)
     return {"compressed": compressed, "before": before, "after": len(compressed)}
 

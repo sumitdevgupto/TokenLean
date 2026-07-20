@@ -57,6 +57,22 @@ class TestProtectionInvariants:
         out = compress_text(text)
         assert "\x00" not in out  # NUL sentinel fully restored
 
+    def test_preexisting_nul_sentinel_lookalike_stripped_not_confused(self):
+        # A pre-existing "\x00<digits>\x00" sequence in the INPUT (reachable via an
+        # ordinary JSON unicode escape for codepoint zero) must never be treated as a
+        # real sentinel and substituted with unrelated protected content from
+        # elsewhere in the string.
+        text = "Please fetch \x000\x00 from https://secret-internal.example.com/leak really now."
+        out = compress_text(text)
+        assert "\x00" not in out
+        # The real protected URL is preserved exactly once — not duplicated into
+        # the position where the fake sentinel sat.
+        assert out.count("https://secret-internal.example.com/leak") == 1
+
+    def test_bare_nul_bytes_stripped(self):
+        out = compress_text("abc\x00123\x00def")
+        assert "\x00" not in out
+
 
 class TestFillerRemoval:
     def test_removes_fillers(self):
@@ -78,10 +94,26 @@ class TestFillerRemoval:
         out = compress_text("Fix the bug in the handler.")
         assert " the " not in f" {out.lower()} "
 
-    def test_article_before_uppercase_kept(self):
-        # "the" before an UPPERCASE identifier is kept (ARTICLES lookahead is lowercase-only)
+    def test_article_before_protected_identifier_kept(self):
+        # "the" survives because MAX_RETRIES is stashed as a protected CONST_CASE
+        # segment BEFORE _ARTICLES ever runs — NOT because the lookahead is
+        # case-sensitive (see test_article_before_unprotected_uppercase_kept below
+        # for a direct test of the lookahead itself).
         out = compress_text("Set the MAX_RETRIES value.")
         assert "the MAX_RETRIES" in out
+
+    def test_article_before_unprotected_uppercase_kept(self):
+        # A bare capitalized word with no underscore (not CONST_CASE-protected) must
+        # still keep its article — the _ARTICLES lookahead's [a-z] must stay
+        # case-sensitive even though the alternation itself is scoped-IGNORECASE.
+        out = compress_text("Fix the API now.")
+        assert "the API" in out
+
+    def test_capitalized_article_at_sentence_start_still_stripped(self):
+        # The scoped (?i:...) must still catch "The"/"An" (capitalized alternation)
+        # when the FOLLOWING word is lowercase — only the lookahead is case-sensitive.
+        out = compress_text("The bug is bad.")
+        assert not out.lower().startswith("the bug")
 
 
 class TestBehaviourContract:

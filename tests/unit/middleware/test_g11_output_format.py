@@ -231,6 +231,21 @@ class TestG11OutputHoldout:
         assert first in ("holdout", "treatment")
         assert all(_assign_cohort(ctx, cfg) == first for _ in range(5))  # sticky/deterministic
 
+    async def test_cohort_bucket_matches_shared_stable_bucket_helper(self, make_ctx):
+        """Regression (2026-07-20 code-review reuse finding): the holdout bucket must be
+        computed via g06_routing.stable_bucket, not a second, independently-maintained
+        copy of the same hash formula — assert the two never diverge."""
+        import hashlib
+        from middleware.g11_output_format import _assign_cohort, _HOLDOUT_BUCKETS
+        from middleware.g06_routing import stable_bucket
+        cfg = {"enabled": True, "fraction": 0.5, "sticky_key": "workflow_id"}
+        ctx = make_ctx()
+        ctx.params["workflow_id"] = "wf-shared-bucket-check"
+        cohort = _assign_cohort(ctx, cfg)
+        expected_bucket = stable_bucket("wf-shared-bucket-check", _HOLDOUT_BUCKETS)
+        expected_cohort = "holdout" if expected_bucket < 0.5 * _HOLDOUT_BUCKETS else "treatment"
+        assert cohort == expected_cohort
+
     async def test_holdout_preserves_structured_output(self, make_ctx):
         """Even in the control cohort, correctness (JSON response_format) is NOT skipped."""
         ctx = make_ctx(model="gpt-4o")
@@ -500,3 +515,52 @@ class TestVerbosityCacheTag:
 
     def test_group_disabled_returns_empty(self):
         assert verbosity_cache_tag(self._ctx({"enabled": True, "level": "full"}, enabled=False)) == ""
+
+
+class TestVerbosityCacheTagHoldout:
+    """Regression coverage: G05 caches BEFORE G11 decides the A3 holdout cohort, so
+    verbosity_cache_tag must independently re-derive the cohort — otherwise a holdout
+    (unshaped) request and a treatment (suffix-shaped) request compute the same cache
+    key despite receiving different prompts."""
+
+    def _ctx(self, holdout_fraction, request_id="req-1", user_id=None, level="full"):
+        class _C:
+            config = {
+                "groups": {
+                    "G11_output": {
+                        "enabled": True,
+                        "verbosity_steering": {"enabled": True, "level": level},
+                        "output_holdout": {"enabled": True, "fraction": holdout_fraction},
+                    }
+                }
+            }
+            tenant_id = "t"
+            params = {}
+        _C.user_id = user_id
+        _C.request_id = request_id
+        return _C()
+
+    def test_holdout_cohort_returns_empty_tag(self):
+        # fraction=1.0 → _assign_cohort deterministically returns "holdout" regardless
+        # of request_id, matching G11's later skip-the-suffix decision.
+        c = self._ctx(holdout_fraction=1.0)
+        assert verbosity_cache_tag(c) == ""
+
+    def test_treatment_cohort_returns_nonempty_tag(self):
+        # fraction=0.0 → deterministically "treatment" → suffix will be injected.
+        c = self._ctx(holdout_fraction=0.0)
+        assert verbosity_cache_tag(c) != ""
+
+    def test_holdout_and_treatment_tags_differ_for_same_question(self):
+        # The actual bug scenario: two requests, same tenant/level, one drawn into
+        # holdout and one into treatment, must NOT collide on the same cache tag.
+        holdout_tag = verbosity_cache_tag(self._ctx(holdout_fraction=1.0, request_id="req-A"))
+        treatment_tag = verbosity_cache_tag(self._ctx(holdout_fraction=0.0, request_id="req-B"))
+        assert holdout_tag != treatment_tag
+        assert holdout_tag == ""
+
+    def test_holdout_disabled_ignores_cohort(self):
+        # output_holdout.enabled=False → cohort logic never runs; tag reflects level only.
+        c = self._ctx(holdout_fraction=1.0)
+        c.config["groups"]["G11_output"]["output_holdout"]["enabled"] = False
+        assert verbosity_cache_tag(c) != ""

@@ -11,6 +11,22 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+# G29/G31 PII modes map to a 3-way audit action, mirroring the (already correct) binary
+# guardrail.flagged/guardrail.blocked split above. A `block` MUST NOT collapse into
+# "redaction.applied" — that action name means content was masked and still served,
+# which is false for a refused request (nothing was redacted; the request never reached
+# the model). `mask` is the only mode that genuinely "applies" a redaction.
+_REDACTION_ACTION = {
+    "flag": "redaction.flagged",
+    "mask": "redaction.applied",
+    "block": "redaction.blocked",
+}
+
+
+def _redaction_action(mode: str) -> str:
+    return _REDACTION_ACTION.get(mode, "redaction.flagged")
+
+
 # Mirrors the Terraform heredoc (infra/main.tf audit_events_schema_migration) so local /
 # self-host deployments get the table without Terraform; the ALTER back-fills `details`
 # on GCP databases created at schema_version=1. All statements are idempotent.
@@ -154,7 +170,7 @@ class AuditLogger:
         p_action = getattr(ctx, "pii_action", None)
         if p_action and int(getattr(ctx, "pii_redactions", 0) or 0) > 0:
             events.append((
-                "redaction.flagged" if p_action == "flag" else "redaction.applied",
+                _redaction_action(p_action),
                 {
                     "entities": list(getattr(ctx, "pii_entities", []) or []),
                     "count": int(getattr(ctx, "pii_redactions", 0) or 0),
@@ -167,7 +183,7 @@ class AuditLogger:
         ct_action = getattr(ctx, "context_trust_pii_action", None)
         if ct_action and int(getattr(ctx, "context_trust_pii_redactions", 0) or 0) > 0:
             events.append((
-                "redaction.flagged" if ct_action == "flag" else "redaction.applied",
+                _redaction_action(ct_action),
                 {
                     "entities": list(getattr(ctx, "context_trust_pii_entities", []) or []),
                     "count": int(getattr(ctx, "context_trust_pii_redactions", 0) or 0),

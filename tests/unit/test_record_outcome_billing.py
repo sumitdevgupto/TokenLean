@@ -94,6 +94,74 @@ async def test_meter_none_is_safe(monkeypatch):
     await asyncio.sleep(0)
 
 
+# ─── least_latency EWMA success-gating (2026-07-20 code review) ─────────────────
+# Regression: record_model_latency must only fire on a genuine SUCCESS (status=="200").
+# Before the fix it fired whenever llm_ms > 0 regardless of outcome, so a model that
+# fails FAST looked "fast" to the EWMA and got preferentially routed to by
+# strategy=least_latency — directly undermining the sibling per-model-lockout feature.
+
+def _latency_ctx(routed_model="gpt-4o-mini", llm_ms=250.0, config=None):
+    return SimpleNamespace(
+        tenant_id="t1", request_id="r1", redis_prefix="t:t1:",
+        routed_model=routed_model, model=routed_model,
+        llm_elapsed_ms=llm_ms, config=config or {},
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_ewma():
+    from middleware.g06_routing import _MODEL_LATENCY_EWMA
+    _MODEL_LATENCY_EWMA.clear()
+    yield
+    _MODEL_LATENCY_EWMA.clear()
+
+
+def test_success_feeds_the_ewma(monkeypatch):
+    from middleware.g06_routing import _MODEL_LATENCY_EWMA
+    monkeypatch.setattr(main, "_usage_meter", None)
+    main._record_outcome(_latency_ctx(llm_ms=250.0), time.time(), "200", {"id": "resp"})
+    assert _MODEL_LATENCY_EWMA.get("gpt-4o-mini") == 250.0
+
+
+@pytest.mark.parametrize("status", ["401", "402", "429", "502", "503"])
+def test_failure_never_feeds_the_ewma(monkeypatch, status):
+    """The exact bug: a model that fails fast (immediate 4xx/5xx) must NOT look 'fast'
+    to least_latency — only a real, successful call may inform the estimate."""
+    from middleware.g06_routing import _MODEL_LATENCY_EWMA
+    monkeypatch.setattr(main, "_usage_meter", None)
+    main._record_outcome(_latency_ctx(llm_ms=5.0), time.time(), status, None)
+    assert "gpt-4o-mini" not in _MODEL_LATENCY_EWMA
+
+
+def test_zero_llm_ms_never_feeds_the_ewma_even_on_success(monkeypatch):
+    # Cache hit / bypass: llm_ms==0, no LLM call happened — nothing to attribute.
+    from middleware.g06_routing import _MODEL_LATENCY_EWMA
+    monkeypatch.setattr(main, "_usage_meter", None)
+    main._record_outcome(_latency_ctx(llm_ms=0.0), time.time(), "200", {"id": "resp"})
+    assert _MODEL_LATENCY_EWMA == {}
+
+
+def test_alpha_read_from_g6_routing_config(monkeypatch):
+    """The EWMA smoothing factor is config-driven (groups.G6_routing.least_latency_alpha),
+    not a hardcoded constant — a tenant can hot-reload-tune it without a redeploy."""
+    from middleware.g06_routing import _MODEL_LATENCY_EWMA
+    monkeypatch.setattr(main, "_usage_meter", None)
+    cfg = {"groups": {"G6_routing": {"least_latency_alpha": 1.0}}}  # alpha=1 → no smoothing
+    main._record_outcome(_latency_ctx(llm_ms=100.0, config=cfg), time.time(), "200", None)
+    main._record_outcome(_latency_ctx(llm_ms=300.0, config=cfg), time.time(), "200", None)
+    # alpha=1.0 means each new observation FULLY replaces the running EWMA.
+    assert _MODEL_LATENCY_EWMA["gpt-4o-mini"] == 300.0
+
+
+def test_alpha_defaults_to_point_three_when_unset(monkeypatch):
+    from middleware.g06_routing import _MODEL_LATENCY_EWMA
+    monkeypatch.setattr(main, "_usage_meter", None)
+    main._record_outcome(_latency_ctx(llm_ms=100.0), time.time(), "200", None)
+    main._record_outcome(_latency_ctx(llm_ms=200.0), time.time(), "200", None)
+    # default alpha=0.3: 0.3*200 + 0.7*100 = 130
+    assert _MODEL_LATENCY_EWMA["gpt-4o-mini"] == pytest.approx(130.0)
+
+
 # ─── C1b — _schedule_billing primitive (shared by 2xx hook + batch defer) ────────
 
 @pytest.mark.asyncio

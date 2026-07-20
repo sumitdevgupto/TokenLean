@@ -511,6 +511,8 @@ groups:
     strategy: priority
     strategy_weights: {}       # e.g. {gpt-4o-mini: 9, gpt-4o: 1} for the `weighted` strategy
     canary_pct: 0              # % to the canary (2nd model) when strategy: canary
+    least_latency_alpha: 0.3   # EWMA smoothing for `least_latency` (0-1; higher = reacts
+                               # faster to recent calls, lower = smoother/slower to react)
     # When a routed tier model's provider has no usable credential (e.g. an OpenAI-free
     # deployment left the default gpt-4o tiers): `fallback` (default) serves the caller's
     # own requested model — cost-routing simply no-ops; `error` returns a clean 503.

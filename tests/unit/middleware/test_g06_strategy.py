@@ -13,8 +13,10 @@ import middleware.g06_routing as g6
 
 
 class _Ctx:
-    def __init__(self, request_id="r1"):
+    def __init__(self, request_id="r1", tenant_id=None):
         self.request_id = request_id
+        if tenant_id is not None:
+            self.tenant_id = tenant_id
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +62,56 @@ def test_round_robin_counters_are_per_tier():
     b1 = g6._select_from_tier(["b1", "b2"], cfg, _Ctx(), "medium")
     a2 = g6._select_from_tier(["a1", "a2"], cfg, _Ctx(), "simple")
     assert a1 == "a1" and b1 == "b1" and a2 == "a2"   # independent counters
+
+
+def test_round_robin_counters_are_per_tenant():
+    """Regression (2026-07-20 code review): two tenants configured differently for the
+    SAME tier label must rotate independently — an unscoped counter would let one
+    tenant's request volume perturb another tenant's rotation index, violating the
+    codebase's tenant-isolation invariant."""
+    cfg = {"strategy": "round_robin"}
+    models = ["a", "b", "c"]
+    # Tenant A makes 2 requests, advancing its counter to index 2.
+    a1 = g6._select_from_tier(models, cfg, _Ctx(tenant_id="tenant-A"), "medium")
+    a2 = g6._select_from_tier(models, cfg, _Ctx(tenant_id="tenant-A"), "medium")
+    assert [a1, a2] == ["a", "b"]
+    # Tenant B's FIRST request on the same tier label must start fresh at index 0 —
+    # NOT be perturbed by tenant A's two prior requests.
+    b1 = g6._select_from_tier(models, cfg, _Ctx(tenant_id="tenant-B"), "medium")
+    assert b1 == "a"
+    # Tenant A's next request continues its OWN sequence, unaffected by tenant B.
+    a3 = g6._select_from_tier(models, cfg, _Ctx(tenant_id="tenant-A"), "medium")
+    assert a3 == "c"
+
+
+def test_round_robin_missing_tenant_id_falls_back_to_default():
+    """A ctx with no tenant_id attribute at all (e.g. a bare test double) must not crash
+    — it falls back to a stable 'default' key, matching pre-fix single-tenant behaviour."""
+    cfg = {"strategy": "round_robin"}
+    picks = [g6._select_from_tier(["x", "y"], cfg, _Ctx(), "simple") for _ in range(3)]
+    assert picks == ["x", "y", "x"]
+
+
+# ─── stable_bucket (shared with g11_output_format.py's A3 holdout) ──────────────
+
+def test_stable_bucket_exported_for_reuse():
+    """g11_output_format.py imports this rather than reimplementing the hash-bucket
+    formula (2026-07-20 code-review reuse finding) — must stay public (no leading _)."""
+    assert hasattr(g6, "stable_bucket")
+    assert callable(g6.stable_bucket)
+
+
+def test_stable_bucket_deterministic_and_bounded():
+    for mod in (1, 10, 100, 10_000):
+        b = g6.stable_bucket("some-stable-key", mod)
+        assert 0 <= b < max(mod, 1)
+        assert b == g6.stable_bucket("some-stable-key", mod)  # deterministic
+
+
+def test_stable_bucket_handles_non_string_keys():
+    # g11's sticky_key can resolve to a non-string param value; must not raise.
+    assert isinstance(g6.stable_bucket(12345, 100), int)
+    assert isinstance(g6.stable_bucket(None, 100), int)
 
 
 def test_canary_zero_pct_stays_on_incumbent():

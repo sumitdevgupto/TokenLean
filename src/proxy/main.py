@@ -719,31 +719,54 @@ def _schedule_security_audit(ctx) -> None:
 def _schedule_notifications(ctx) -> None:
     """Fire-and-forget outbound webhook events for security activity on this request
     (guardrail block / PII detected). No-op in OSS (no dispatcher installed) and when
-    nothing was flagged — PII-free payloads (categories / entity TYPES + counts only)."""
+    nothing was flagged — PII-free payloads (categories / entity TYPES + counts only).
+
+    Attribution note: G30 (user prompt) and G31 (retrieved context) are independent
+    guardrails that can each be configured differently per tenant (e.g. G30 in `flag`
+    mode alongside G31 in `block` mode). The payload fields below are built from
+    WHICHEVER guardrail(s) actually blocked/acted — never picked by "whichever value
+    happens to be non-empty" — so a non-blocking G30 flag can never mask a G31 block
+    (or vice versa) in the category/action reported to the tenant's webhook consumer."""
     if ctx is None or not events.dispatcher_installed():
         return
     tenant_id = getattr(ctx, "tenant_id", "default")
-    # G30 injection block or G31 context-injection block → guardrail.block
-    if getattr(ctx, "guardrail_action", None) == "block" \
-            or getattr(ctx, "context_trust_action", None) == "block":
+    guardrail_blocked = getattr(ctx, "guardrail_action", None) == "block"
+    context_trust_blocked = getattr(ctx, "context_trust_action", None) == "block"
+    if guardrail_blocked or context_trust_blocked:
+        categories = []
+        sources = []
+        if guardrail_blocked:
+            categories += list(getattr(ctx, "guardrail_categories", []) or [])
+            sources.append("user")
+        if context_trust_blocked:
+            categories += list(getattr(ctx, "context_trust_categories", []) or [])
+            sources.append("retrieved")
         events.schedule_event(tenant_id, events.GUARDRAIL_BLOCK, {
             "request_id": getattr(ctx, "request_id", ""),
-            "categories": list(getattr(ctx, "guardrail_categories", []) or [])
-                          or list(getattr(ctx, "context_trust_categories", []) or []),
-            "source": "user" if getattr(ctx, "guardrail_action", None) == "block" else "retrieved",
+            "categories": list(dict.fromkeys(categories)),  # de-dup, preserve order
+            "source": "+".join(sources),
         })
-    # G29 request PII or G31 retrieved-context PII → pii.detected
+    # G29 (request PII) and G31 (retrieved-context PII) can each independently flag/mask/
+    # block; `action` reports the MOST SEVERE outcome across both (block > mask > flag),
+    # never "whichever ran" — a non-blocking G29 flag must never hide a G31 block.
     pii_action = getattr(ctx, "pii_action", None)
     ct_pii_action = getattr(ctx, "context_trust_pii_action", None)
     if pii_action or ct_pii_action:
+        severity = {"block": 3, "mask": 2, "flag": 1}
+        action = max((pii_action, ct_pii_action), key=lambda a: severity.get(a, 0))
+        sources = []
+        if pii_action:
+            sources.append("user")
+        if ct_pii_action:
+            sources.append("retrieved")
         events.schedule_event(tenant_id, events.PII_DETECTED, {
             "request_id": getattr(ctx, "request_id", ""),
-            "action": pii_action or ct_pii_action,
+            "action": action,
             "entities": sorted(set(list(getattr(ctx, "pii_entities", []) or [])
                                    + list(getattr(ctx, "context_trust_pii_entities", []) or []))),
             "count": int(getattr(ctx, "pii_redactions", 0) or 0)
                      + int(getattr(ctx, "context_trust_pii_redactions", 0) or 0),
-            "source": "retrieved" if (ct_pii_action and not pii_action) else "user",
+            "source": "+".join(sources),
         })
 
 
@@ -826,12 +849,27 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
         )
         if llm_ms > 0:
             LLM_DURATION_MS.labels(tenant_id=tenant_id).observe(llm_ms)
-            # Feed the served model's latency into G06's least_latency strategy EWMA
-            # (no-op unless that strategy is configured; best-effort).
-            _served_model = getattr(ctx, "routed_model", None) or getattr(ctx, "model", None)
-            if _served_model:
-                from middleware.g06_routing import record_model_latency
-                record_model_latency(_served_model, llm_ms)
+            # Feed the served model's latency into G06's least_latency strategy EWMA —
+            # gated on a genuine SUCCESS (status == "200"), never on a failed/errored exit.
+            # Without this, a model that fails FAST (immediate 4xx/5xx) would look "fast"
+            # to the EWMA and get preferentially routed to by least_latency — the opposite
+            # of intended, and directly undermining the sibling per-model-lockout feature
+            # (a model being locked out for failing should not simultaneously look
+            # attractive to the latency strategy). Known residual limitation: on a
+            # failover/cascade escalation, llm_elapsed_ms is cumulative across every
+            # attempt in the request, so a multi-tier escalation still attributes combined
+            # latency to the final winning model — fixing that needs per-attempt timing
+            # plumbed through ctx.provider_attempts, deferred as a separate improvement.
+            if status == "200":
+                _served_model = getattr(ctx, "routed_model", None) or getattr(ctx, "model", None)
+                if _served_model:
+                    from middleware.g06_routing import record_model_latency
+                    _g6_cfg = (getattr(ctx, "config", None) or {}).get("groups", {}) \
+                        .get("G6_routing", {}) or {}
+                    record_model_latency(
+                        _served_model, llm_ms,
+                        alpha=float(_g6_cfg.get("least_latency_alpha", 0.3) or 0.3),
+                    )
     except Exception as exc:  # never let metrics break the response
         logger.debug("SLA metric record failed: %s", exc)
     # Trust & Safety: record any G29/G30 activity at every exit path (a flagged

@@ -305,12 +305,22 @@ def _verbosity_scope_tag(ctx) -> str:
     """G11 verbosity-steering tag folded into the cache key so a terse-mode answer
     is never served to a request configured for verbose output. "" (the default,
     steering off) keeps keys byte-identical to the pre-feature behaviour. Lazy import
-    of G11 avoids a module-load import cycle."""
+    of G11 avoids a module-load import cycle.
+
+    Computed once per request and stashed on ``ctx.params`` — every G05 cache path
+    (L1 lookup/store, L2 lookup/store) reads the SAME cached value, so L1 and L2
+    can never disagree on scope within one request."""
+    params = getattr(ctx, "params", None)
+    if isinstance(params, dict) and "_g05_verbosity_tag" in params:
+        return params["_g05_verbosity_tag"]
     try:
         from middleware.g11_output_format import verbosity_cache_tag
-        return verbosity_cache_tag(ctx)
+        tag = verbosity_cache_tag(ctx)
     except Exception:
-        return ""
+        tag = ""
+    if isinstance(params, dict):
+        params["_g05_verbosity_tag"] = tag
+    return tag
 
 
 def _apply_model_scope(text: str, ctx) -> str:
@@ -324,6 +334,16 @@ def _apply_model_scope(text: str, ctx) -> str:
     if vtag:
         text = f"verbosity={vtag}\n{text}"
     return text
+
+
+def _scope_value(ctx) -> str:
+    """Combined model+verbosity scope for L2 (colon-joined; "" when both are unscoped
+    → byte-identical to pre-feature). Shared by L2's lookup WHERE filter AND store
+    INSERT so a row's stored scope always matches what a later lookup searches for —
+    this is what makes verbosity/model isolation actually enforced on L2's READ path
+    (unlike folding a tag into query_hash alone, which only dedupes the INSERT and is
+    never consulted by SELECT)."""
+    return ":".join(p for p in (_model_scope_tag(ctx), _verbosity_scope_tag(ctx)) if p)
 
 
 def _step_cache_key(step_name: str, inputs_hash: str, template_version: str, prefix: str = "") -> str:
@@ -808,7 +828,11 @@ async def _l2_lookup(ctx: "RequestContext", threshold: float, embedding_model: s
         return None, 0.0
 
     tenant_id = getattr(ctx, "tenant_id", "default")
-    model_scope = _model_scope_tag(ctx)  # "" in tenant scope; requested model in tenant+model
+    # Combined model+verbosity scope — MUST match _l2_store's INSERT value exactly, or
+    # a terse-steered answer can be semantically served to a verbose-configured request
+    # (and vice versa). Stored in the `model_scope` column (no migration needed — it's
+    # a bare TEXT column; the DB column name predates verbosity scoping).
+    scope_value = _scope_value(ctx)
     query_text = _semantic_query_text(ctx.messages)
 
     # M2: skip the semantic layer for over-window queries (truncation → collisions).
@@ -839,7 +863,7 @@ async def _l2_lookup(ctx: "RequestContext", threshold: float, embedding_model: s
             ORDER BY similarity DESC
             LIMIT 1
             """,
-            embedding_str, threshold, tenant_id, model_scope,
+            embedding_str, threshold, tenant_id, scope_value,
         )
         if row:
             return json.loads(row["response_json"]), row["similarity"]
@@ -874,16 +898,12 @@ async def _l2_store(ctx: "RequestContext", response: Dict, ttl: int, embedding_m
     # asyncpg has no built-in pgvector codec — pass embedding as a string
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-    model_scope = _model_scope_tag(ctx)  # "" in tenant scope; requested model in tenant+model
-    # query_hash includes tenant_id (and model_scope when scoped) so different
-    # tenants — and, in tenant+model scope, different requested models — never
-    # collide on the same row (the unique constraint is on query_hash alone).
-    # model_scope="" keeps the hash byte-identical to the pre-feature behaviour.
-    # Fold the G11 verbosity tag in too (same rationale as model_scope): a terse-mode
-    # answer must not be semantically served to a verbose-configured request. "" → no-op.
-    verbosity_scope = _verbosity_scope_tag(ctx)
-    _scope = ":".join(p for p in (model_scope, verbosity_scope) if p)
-    _hash_prefix = f"{tenant_id}:{_scope}" if _scope else tenant_id
+    # Combined model+verbosity scope — MUST match _l2_lookup's WHERE filter exactly;
+    # this is what actually enforces isolation on the READ path (query_hash below only
+    # dedupes the INSERT and is never consulted by SELECT). "" (unscoped) keeps both
+    # the stored column value and the hash byte-identical to the pre-feature behaviour.
+    scope_value = _scope_value(ctx)
+    _hash_prefix = f"{tenant_id}:{scope_value}" if scope_value else tenant_id
     query_hash = hashlib.sha256(f"{_hash_prefix}:{query_text}".encode()).hexdigest()
 
     pool = await get_pg_pool(db_url)
@@ -906,5 +926,5 @@ async def _l2_store(ctx: "RequestContext", response: Dict, ttl: int, embedding_m
             json.dumps(response),
             ttl,
             tenant_id,
-            model_scope,
+            scope_value,
         )

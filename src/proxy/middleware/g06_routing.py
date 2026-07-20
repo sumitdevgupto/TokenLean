@@ -231,11 +231,15 @@ def record_model_latency(model: str, ms: float, alpha: float = 0.3) -> None:
         pass
 
 
-def _stable_bucket(request_id: str, mod: int) -> int:
-    """Deterministic 0..mod-1 bucket from the request id (uniform, seed-free)."""
+def stable_bucket(key: Any, mod: int) -> int:
+    """Deterministic 0..mod-1 bucket from a stable key (uniform, seed-free, hash-based —
+    no randomness, so callers stay reproducible/testable). Shared by G06's canary/weighted
+    routing strategies and G11's A3 output-savings holdout cohort assignment
+    (g11_output_format.py imports this rather than reimplementing the formula) — keep any
+    future change to the hashing scheme here so both stay in sync."""
     if mod <= 1:
         return 0
-    h = hashlib.sha256((request_id or "").encode("utf-8")).hexdigest()
+    h = hashlib.sha256(str(key or "").encode("utf-8")).hexdigest()
     return int(h[:8], 16) % mod
 
 
@@ -258,7 +262,15 @@ def _select_from_tier(models: List[str], cfg: Dict[str, Any], ctx, tier_label: s
         return models[0]
 
     if strategy == "round_robin":
-        key = tier_label or ",".join(models)
+        # Tenant-scoped: two tenants configured differently for the same tier label (e.g.
+        # both using "medium" round_robin with different model lists) must rotate
+        # independently — an unscoped key would let one tenant's request volume perturb
+        # another's rotation index, violating this codebase's tenant-isolation invariant
+        # (resilience.py: "one tenant can never black out another"). Unlike
+        # _MODEL_LATENCY_EWMA (a physical fact about a model, safe to share), rotation
+        # fairness is a per-tenant traffic-shaping concern and must not be shared.
+        tenant_id = getattr(ctx, "tenant_id", None) or "default"
+        key = (tenant_id, tier_label or ",".join(models))
         idx = _RR_COUNTERS.get(key, 0)
         _RR_COUNTERS[key] = (idx + 1) % len(models)
         return models[idx % len(models)]
@@ -269,7 +281,7 @@ def _select_from_tier(models: List[str], cfg: Dict[str, Any], ctx, tier_label: s
         pct = max(0.0, min(100.0, float(cfg.get("canary_pct", 0) or 0)))
         if pct <= 0:
             return models[0]
-        return models[1] if _stable_bucket(rid, 100) < pct else models[0]
+        return models[1] if stable_bucket(rid, 100) < pct else models[0]
 
     if strategy == "weighted":
         # Deterministic weighted split across the candidates. Weights from
@@ -279,7 +291,7 @@ def _select_from_tier(models: List[str], cfg: Dict[str, Any], ctx, tier_label: s
         total = sum(w)
         if total <= 0:
             return models[0]
-        point = _stable_bucket(rid, 10_000) / 10_000.0 * total
+        point = stable_bucket(rid, 10_000) / 10_000.0 * total
         acc = 0.0
         for m, wi in zip(models, w):
             acc += wi
