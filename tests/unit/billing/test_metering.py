@@ -123,6 +123,19 @@ class TestUsageMeterBuildsEvent:
         ctx2 = _make_ctx()  # no dispatch → default empty
         assert meter._build_event(ctx2, {}).agent_id == ""
 
+    def test_build_event_trial_flag_from_config(self):
+        # Free trial: rows served during an active trial are flagged so invoicing can
+        # exclude them. Read from the tenant-merged ctx.config at write time.
+        meter = UsageMeter()
+        ctx = _make_ctx()
+        ctx.config = {"groups": {}, "trial": {"status": "active"}}
+        assert meter._build_event(ctx, {}).trial is True
+        # Non-active (converted/cancelled/none) → not a trial row → billed normally.
+        for status in ("converted", "cancelled", None):
+            c = _make_ctx()
+            c.config = {"groups": {}, "trial": {"status": status}} if status else {"groups": {}}
+            assert meter._build_event(c, {}).trial is False
+
     def test_build_event_filter_fields_default_safely(self):
         # Empty params / falsy ctx flags → safe, non-null defaults.
         meter = UsageMeter()
@@ -219,9 +232,9 @@ class TestUsageMeterRecord:
         # First arg is the SQL, remaining are positional params
         assert "acme" in call_args  # tenant_id
         assert "req-meter" in call_args  # request_id
-        # C1/C2: SQL + 30 bound params (24 legacy + group_savings + status_code +
-        # billable + total_duration_ms + llm_duration_ms + agent_id [F3]).
-        assert len(call_args) == 1 + 30
+        # C1/C2: SQL + 31 bound params (24 legacy + group_savings + status_code +
+        # billable + total_duration_ms + llm_duration_ms + agent_id [F3] + trial).
+        assert len(call_args) == 1 + 31
         # group_savings is serialised to a JSON string for the ::jsonb bind.
         assert '"G01": 200' in call_args or '{"G01": 200}' in call_args
 

@@ -103,4 +103,5 @@ def test_schedule_event_no_running_loop_is_safe():
 def test_all_event_types_are_stable_strings():
     assert events.ALL_EVENT_TYPES == (
         "spend_cap.reached", "budget.threshold", "guardrail.block", "pii.detected",
+        "trial.threshold", "trial.expired",
     )

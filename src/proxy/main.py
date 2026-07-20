@@ -895,6 +895,7 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
         )
         _bump_quota_counter(ctx)
         _bump_spend_counter(ctx)
+        _bump_trial_counter(ctx)
     elif status_code != 202 and _persist_all_outcomes():
         # Observability-only error row. ctx may be None for very-early failures — skip then.
         _schedule_billing(
@@ -924,6 +925,37 @@ def _bump_quota_counter(ctx) -> None:
                 await r.expire(key, 40 * 86400)
         except Exception as exc:
             logger.debug("quota counter bump failed: %s", exc)
+
+    try:
+        asyncio.create_task(_bump())
+    except RuntimeError:
+        pass
+
+
+def _bump_trial_counter(ctx) -> None:
+    """Fire-and-forget lifetime free-trial served-2xx counter (G00 trial gate reads it).
+
+    Bumped for every served 2xx while the tenant's trial is ``active`` — the counting
+    basis is the billable unit exactly (cache hits + bypasses + content-filter 200s all
+    reach this path). Tenant-prefixed (`t:<id>:trial_used`) with **no TTL** — a trial
+    spans arbitrary calendar time; the counter is reset (DEL) by the admin console's
+    start/convert/cancel actions, never by expiry. No-op unless a trial is active, so
+    OSS/non-trial traffic is untouched. Documented asymmetry (matches the quota
+    counter): the 202 batch-defer path bills at defer but does not bump this counter."""
+    if ctx is None:
+        return
+    if ((getattr(ctx, "config", None) or {}).get("trial") or {}).get("status") != "active":
+        return
+    prefix = getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
+
+    async def _bump() -> None:
+        try:
+            from cache.redis_pool import get_redis
+            from middleware.g00_rate_limit import G00RateLimit
+            r = get_redis()
+            await r.incr(G00RateLimit.trial_key(prefix))
+        except Exception as exc:
+            logger.debug("trial counter bump failed: %s", exc)
 
     try:
         asyncio.create_task(_bump())
@@ -1317,6 +1349,26 @@ async def _serve_core(
             exc.retry_after,
         )
         langfuse_tracing.finish_trace(ctx, None)
+        # Free-trial expiry is a distinct, billing-relevant refusal — surface it as a
+        # 402 (payment required), NOT a 429. Routed through _record_outcome as a "402"
+        # so the rejection is never billed and never consumes trial allowance (mirrors
+        # the BYOK provider_key_missing 402 path).
+        if exc.limit_type == "trial_expired":
+            _record_outcome(ctx, _request_start, "402")
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "error": {
+                        "message": (
+                            f"Free trial ended ({exc.scope}). Contact your account owner "
+                            "to convert to a paid plan or extend the trial."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "trial_expired",
+                    }
+                },
+                headers={"Retry-After": str(exc.retry_after)},
+            )
         _record_outcome(ctx, _request_start, "429")
         return JSONResponse(
             status_code=429,

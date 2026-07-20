@@ -124,6 +124,9 @@ class UsageMeter:
             llm_duration_ms=max(0, int(llm_duration_ms or 0)),
             # F2/F3: which downstream agent handled this request (empty = normal LLM path).
             agent_id=getattr(ctx, "agent_id", "") or "",
+            # Free trial: flag rows served while the tenant's trial is active so invoicing
+            # can exclude them. Read from the tenant-merged ctx.config at write time.
+            trial=(((getattr(ctx, "config", None) or {}).get("trial") or {}).get("status") == "active"),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -138,10 +141,10 @@ class UsageMeter:
                  user_id, cache_hit, cache_level, complexity_tier, bypassed,
                  cost_actual_usd, cost_baseline_usd, provider, protocol,
                  group_savings, status_code, billable, total_duration_ms, llm_duration_ms,
-                 agent_id)
+                 agent_id, trial)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                     $16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25::jsonb,$26,$27,$28,$29,$30)
+                    $25::jsonb,$26,$27,$28,$29,$30,$31)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -162,7 +165,7 @@ class UsageMeter:
                     json.dumps(event.group_savings or {}),
                     event.status_code, event.billable,
                     event.total_duration_ms, event.llm_duration_ms,
-                    event.agent_id,
+                    event.agent_id, event.trial,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

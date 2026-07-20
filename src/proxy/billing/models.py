@@ -61,6 +61,10 @@ class UsageEvent:
     # orchestration (empty = normal LLM path). Observability only, never billed; lets the
     # portal's routing-decision view answer "which agent handled request X" joined to cost.
     agent_id: str = ""
+    # Free-trial: True when this served 2xx was made while the tenant's trial was active.
+    # Persisted for usage visibility but EXCLUDED from invoices (a trial-only period bills
+    # $0). Set at write time from ctx.config so it is robust to a later trial-state edit.
+    trial: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -101,7 +105,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
     billable        BOOLEAN     NOT NULL DEFAULT true,
     total_duration_ms INTEGER   NOT NULL DEFAULT 0,
     llm_duration_ms INTEGER     NOT NULL DEFAULT 0,
-    agent_id        TEXT        NOT NULL DEFAULT ''
+    agent_id        TEXT        NOT NULL DEFAULT '',
+    trial           BOOLEAN     NOT NULL DEFAULT false
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
@@ -145,6 +150,9 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_duration_ms INTEGER NOT 
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS llm_duration_ms INTEGER NOT NULL DEFAULT 0;
 -- F2/F3: downstream agent this request was dispatched to (observability; never billed)
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT '';
+-- Free trial: flags a served 2xx made during an active trial; EXCLUDED from invoices
+-- (invoice/usage-agg SQL filters `AND NOT COALESCE(trial, false)`) but kept for visibility.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS trial BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_id, user_id);
 -- C2: keep the error-rate / latency-percentile queries index-only over the hot window.
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_status_idx

@@ -49,6 +49,9 @@ behaviour is unchanged.
 | `quota.enabled` | `false` | Monthly request-quota gate from `billing.rate_card.<tier>.included_requests` — 429 `quota_exceeded` past the cap. OSS default OFF |
 | `quota.grace_pct` | `10` | Allowance past `included_requests` before rejecting |
 | `quota.exempt_tenants` | `[admin, default]` | Never quota-gated |
+| `trial.enabled` | `false` | Per-tenant free-trial gate (N days AND M served-2xx requests, whichever first). Expiry → **402 `trial_expired`**. OSS default OFF; per-tenant state (`status`/`started_at`/`days`/`max_requests`/`generation`) lives in `tenant_configs.config_overrides.trial`, set at runtime by the admin console. Trial requests are flagged on `usage_events` and excluded from invoices |
+| `trial.exempt_tenants` | `[admin, default]` | Never trial-gated |
+| `trial.warn_pcts` | `[80, 90]` | %% of the driving dimension at which a one-shot `trial.threshold` webhook fires (per trial generation); exhaustion fires one `trial.expired` |
 
 ### retention
 

@@ -6,10 +6,12 @@ Technique: Token bucket algorithm with Redis backend for distributed limiting
 """
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from middleware import RequestContext
 from cache.redis_pool import get_redis as _get_redis
+from trial import trial_summary
 import events
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,120 @@ class G00RateLimit:
         denial-of-wallet ceiling, not the request-count billing gate."""
         month = time.strftime("%Y%m", time.gmtime(now if now is not None else time.time()))
         return f"{redis_prefix}spend:{month}"
+
+    @staticmethod
+    def trial_key(redis_prefix: str) -> str:
+        """Lifetime free-trial served-2xx counter key (tenant-prefixed). Unlike the
+        monthly ``quota_key``/``spend_key`` this carries **no month suffix and no
+        TTL** — a trial spans arbitrary calendar time. It is reset (DEL) by the admin
+        console's trial ``start``/``convert``/``cancel`` actions, never by time; main
+        bumps it by 1 on every served 2xx while the trial is active."""
+        return f"{redis_prefix}trial_used"
+
+    async def _check_trial(self, ctx, redis, rl_cfg: Dict[str, Any]) -> None:
+        """Per-tenant free-trial gate: N days AND M served-2xx requests, whichever is
+        hit first.
+
+        Enforced only when ``rate_limit.trial.enabled`` (OSS/self-host default OFF)
+        AND the tenant carries a ``trial`` block in ``config_overrides`` with status
+        ``active``/``cancelled``. Expiry (days elapsed OR requests exhausted) or a
+        ``cancelled`` trial raises ``RateLimitExceeded(limit_type="trial_expired")``
+        which main maps to a **402** (not billed, doesn't consume allowance). Runs at
+        the very top of ``process_request`` — before quota/spend and before the cache
+        — so an expired tenant can't be served from cache. Fires a one-shot
+        ``trial.threshold`` event at each configured warn %% and a one-shot
+        ``trial.expired`` event on exhaustion (both PII-free, no-op in OSS). Fail-open
+        on Redis errors (request dimension only — the day dimension is config-only and
+        still enforced) and on a malformed ``started_at``."""
+        tcfg = rl_cfg.get("trial") or {}
+        if not tcfg.get("enabled", False):
+            return
+        tenant_id = getattr(ctx, "tenant_id", "default")
+        if tenant_id in set(tcfg.get("exempt_tenants") or ["admin", "default"]):
+            return
+        trial = ctx.config.get("trial") or {}
+        status = trial.get("status")
+        if status not in ("active", "cancelled"):
+            return  # none / converted → not gated
+
+        redis_prefix = getattr(ctx, "redis_prefix", f"t:{tenant_id}:")
+        requests_used = 0
+        try:
+            max_requests = int(trial.get("max_requests") or 0)
+        except (TypeError, ValueError):
+            max_requests = 0
+        if status == "active" and max_requests > 0:
+            try:
+                requests_used = int(await redis.get(self.trial_key(redis_prefix)) or 0)
+            except Exception as exc:
+                # Fail open on the request dimension only; days still enforced below.
+                logger.warning("[%s] G00 trial counter read failed (fail-open on requests): %s",
+                               ctx.request_id, exc)
+                requests_used = 0
+
+        summary = trial_summary(trial, requests_used, enforced=True,
+                                now=datetime.now(timezone.utc))
+        try:
+            generation = int(trial.get("generation") or 0)
+        except (TypeError, ValueError):
+            generation = 0
+        effective = summary.get("status")
+
+        if effective in ("expired", "cancelled"):
+            reason = "cancelled" if effective == "cancelled" else "exhausted"
+            try:
+                first = await redis.set(f"{redis_prefix}trialexpired:{generation}", "1",
+                                        nx=True, ex=8640000)  # 100 days
+            except Exception:
+                first = True  # dedup unavailable → still emit once (best-effort)
+            if first:
+                events.schedule_event(tenant_id, events.TRIAL_EXPIRED, {
+                    "reason": reason,
+                    "dimension": summary.get("dimension"),
+                    "days": summary.get("days"),
+                    "max_requests": summary.get("max_requests"),
+                    "requests_used": summary.get("requests_used"),
+                    "generation": generation,
+                })
+            raise RateLimitExceeded(
+                retry_after=86400,
+                limit_type="trial_expired",
+                scope=f"tenant={tenant_id},reason={reason},"
+                      f"dimension={summary.get('dimension')},used={summary.get('requests_used')}",
+            )
+
+        if effective == "active" and summary.get("valid"):
+            await self._maybe_warn_trial(ctx, redis, tcfg, tenant_id, redis_prefix,
+                                         generation, summary)
+
+    async def _maybe_warn_trial(self, ctx, redis, tcfg, tenant_id, redis_prefix,
+                                generation: int, summary: Dict[str, Any]) -> None:
+        """Emit a one-shot ``trial.threshold`` event the first time ``pct_used``
+        crosses each configured warn %% (``rate_limit.trial.warn_pcts``, default
+        80/90) for this trial generation. De-duped per (generation, pct) via Redis
+        SETNX so a bumped generation (extend/set) re-arms the warnings. Best-effort;
+        never breaks the request."""
+        pct_used = float(summary.get("pct_used") or 0.0)
+        warn_pcts = sorted({int(p) for p in (tcfg.get("warn_pcts") or [80, 90]) if int(p) > 0})
+        for threshold in warn_pcts:
+            if pct_used < threshold:
+                continue
+            try:
+                first = await redis.set(f"{redis_prefix}trialwarn:{generation}:{threshold}",
+                                        "1", nx=True, ex=8640000)
+                if not first:
+                    continue  # already warned at this threshold for this generation
+            except Exception:
+                continue  # dedup unavailable → skip rather than spam
+            events.schedule_event(tenant_id, events.TRIAL_THRESHOLD, {
+                "pct": threshold,
+                "dimension": summary.get("dimension"),
+                "pct_days": summary.get("pct_days"),
+                "pct_requests": summary.get("pct_requests"),
+                "days_remaining": summary.get("days_remaining"),
+                "requests_remaining": summary.get("requests_remaining"),
+                "generation": generation,
+            })
 
     async def _check_quota(self, ctx, redis, rl_cfg: Dict[str, Any]) -> None:
         """WS23 monthly request-quota gate from the billing rate card.
@@ -254,6 +370,16 @@ class G00RateLimit:
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         """Check rate limits before processing the request."""
         cfg = ctx.config.get("rate_limit", {})
+        # Free-trial gate runs FIRST — before quota/spend and before the cache — so an
+        # expired trial can never be served from cache. Independent switch; a deployment
+        # may run trials without the rps/rph limiter or the quota/spend gates.
+        if cfg.get("trial", {}).get("enabled", False):
+            try:
+                await self._check_trial(ctx, _get_redis(), cfg)
+            except RateLimitExceeded:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] G00 trial gate error (fail-open): %s", ctx.request_id, exc)
         # WS23: the monthly quota gate is independent of the rps/rph limiter switch —
         # a deployment may enforce quotas without token-bucket limiting.
         if cfg.get("quota", {}).get("enabled", False):

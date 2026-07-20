@@ -30,9 +30,18 @@ SPEND_CAP_REACHED = "spend_cap.reached"      # monthly USD cap hit → request r
 BUDGET_THRESHOLD = "budget.threshold"         # spend crossed a warn %% of the cap
 GUARDRAIL_BLOCK = "guardrail.block"           # G30/G31 injection block (content-filter)
 PII_DETECTED = "pii.detected"                 # G29/G31 PII flagged / masked / blocked
+TRIAL_THRESHOLD = "trial.threshold"           # free trial crossed a warn %% (days/requests)
+TRIAL_EXPIRED = "trial.expired"               # free trial exhausted → requests now 402
 
 # All event types a tenant may subscribe a webhook endpoint to.
-ALL_EVENT_TYPES = (SPEND_CAP_REACHED, BUDGET_THRESHOLD, GUARDRAIL_BLOCK, PII_DETECTED)
+ALL_EVENT_TYPES = (
+    SPEND_CAP_REACHED,
+    BUDGET_THRESHOLD,
+    GUARDRAIL_BLOCK,
+    PII_DETECTED,
+    TRIAL_THRESHOLD,
+    TRIAL_EXPIRED,
+)
 
 
 async def _default_dispatch(tenant_id: str, event: str, payload: Dict[str, Any]) -> None:

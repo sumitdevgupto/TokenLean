@@ -73,6 +73,24 @@ rate_limit:
                                   # outbound webhook event the first time monthly spend
                                   # crosses this %% of the cap (e.g. 80). Delivery is a
                                   # commercial feature; the emit is a no-op without it.
+  # Per-tenant FREE TRIAL gate: N days AND M served-2xx requests, whichever is hit
+  # first. OFF by default — OSS/self-host never enforces trials; the managed SaaS
+  # enables it. Per-tenant state lives in tenant_configs.config_overrides under
+  # `trial:` {status: active|converted|cancelled, started_at (UTC ISO), days,
+  # max_requests, generation} — written by the admin console at runtime and merged
+  # into ctx.config per request (no redeploy). Expiry (days elapsed OR requests
+  # exhausted) → HTTP 402 code=trial_expired until an operator converts or extends;
+  # the 402 is not billed and does not consume trial allowance. Counting basis = the
+  # billable unit (every served 2xx, incl. cache hits/bypasses). Trial requests are
+  # flagged on usage_events and excluded from invoices. Warn %%s fire a one-shot
+  # `trial.threshold` webhook per crossing (per trial generation); exhaustion fires
+  # one `trial.expired` (delivery is commercial; no-op without a dispatcher).
+  # Exempt tenants are never gated. Fail-open on Redis error (request dimension) and
+  # on malformed trial state.
+  trial:
+    enabled: false
+    exempt_tenants: [admin, default]
+    warn_pcts: [80, 90]
 # WS25: periodic data-retention purge (default OFF — self-host keeps everything).
 # usage_days is clamped to a 400-day floor in code: usage_events is the billing
 # source of record and must outlive every invoice period.
