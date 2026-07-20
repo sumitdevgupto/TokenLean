@@ -25,6 +25,7 @@ Technique:
   API lives under ``headroom.image`` and operates on the message list.
 """
 import base64
+import inspect
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +34,44 @@ from middleware import langfuse_tracing
 
 logger = logging.getLogger(__name__)
 GROUP = "G27"
+
+# Optional tuning knobs forwarded to headroom.image.compress_images — passed ONLY when the
+# installed function's signature accepts them.
+_G27_TUNABLES = ("quality", "min_bytes")
+
+# Last-seen (fn, supported-names) — `_compress_images_fn` is a module-level singleton resolved
+# once at import and never reassigned in production, so its signature is invariant for the life
+# of the process; a single-slot `is`-keyed cache avoids re-introspecting it on every request that
+# fires G27, while still recomputing correctly when tests `patch.object` in a different callable.
+_sig_cache_fn: Any = None
+_sig_cache_supported: frozenset = frozenset()
+
+
+def _supported_kwarg_names(fn) -> frozenset:
+    global _sig_cache_fn, _sig_cache_supported
+    if fn is _sig_cache_fn:
+        return _sig_cache_supported
+    try:
+        params = inspect.signature(fn).parameters
+        has_var_kw = any(p.kind == p.VAR_KEYWORD for p in params.values())
+        supported = frozenset(n for n in _G27_TUNABLES if has_var_kw or n in params)
+    except (TypeError, ValueError):
+        supported = frozenset()
+    _sig_cache_fn, _sig_cache_supported = fn, supported
+    return supported
+
+
+def _supported_kwargs(fn, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """The subset of {quality, min_bytes} that `fn` accepts AND the tenant has configured.
+
+    Returns {} when the optimiser takes neither (behaviour identical to the prior call), so the
+    portal knobs are honoured where supported and harmlessly ignored otherwise."""
+    out: Dict[str, Any] = {}
+    for name in _supported_kwarg_names(fn):
+        val = cfg.get(name)
+        if val is not None:
+            out[name] = val
+    return out
 
 # ─── Optional headroom.image import ───────────────────────────────────────────
 _compress_images_fn = None
@@ -106,8 +145,12 @@ class G27MultimodalOptimizer:
             return ctx  # no inline images to compress
 
         provider = _resolve_provider(ctx, cfg)
+        # Pass the tenant's quality/min_bytes knobs THROUGH to the optimiser, but only the kwargs
+        # its installed signature actually accepts (the [image] extra's API may vary) — otherwise
+        # behave exactly as before. Prevents exposing dead portal knobs.
+        extra_kwargs = _supported_kwargs(_compress_images_fn, cfg)
         try:
-            new_messages = _compress_images_fn(ctx.messages, provider=provider)
+            new_messages = _compress_images_fn(ctx.messages, provider=provider, **extra_kwargs)
         except Exception as exc:
             logger.debug("[%s] G27 headroom.image compression failed: %s", ctx.request_id, exc)
             return ctx

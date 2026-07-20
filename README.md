@@ -411,6 +411,8 @@ See [docs/request-flow-diagram.md](docs/request-flow-diagram.md) for the full pi
 
 **Savings never come at the cost of quality by default.** Every group is config-driven (`groups.<G>` in [config/config.yaml.template](config/config.yaml.template)), and each ships a **quality-safe default**. The knobs below are the ones that trade token savings against output quality — turn them up for more savings, or leave them at (or below) the default to protect quality. Every knob is per-tenant overridable and hot-reloaded (~60s, no redeploy). This table lists the highest-impact knob(s) per group; the **complete parameter list with every default lives in [docs/config-reference.md](docs/config-reference.md).**
 
+On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **every** step — G00–G31, including rate limiting (G00) and context trust (G31) — has an enable toggle and its key knobs in the self-service **Optimisation Settings** tab (whitelisted + clamped server-side). Trust & safety (G29/G30/G31) are **operator-safe**: tenants tune the policy mode/threshold, but the hard enable/disable is operator-only. Self-host tenants set the same knobs directly in `config.yaml`.
+
 | Group | Key quality knob(s) — default | Turn **up** savings → | Protect **quality** ← |
 |-------|-------------------------------|------------------------|------------------------|
 | **G1** Compression | `compression_ratio_target` 0.5; `min_tokens_to_compress` 200; `compress_user_messages`/`compress_system_prompt` false | lower ratio, lower min, enable user/system compression | keep user/system **off**; raise min; ratio ≥ 0.5 |

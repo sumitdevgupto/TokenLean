@@ -472,8 +472,10 @@ Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and 
 | `compression_strategies.logs` | `{dedupe_lines, truncate_long_lines: 200}` | Dedupe repeated log lines, truncate long lines |
 | `compression_strategies.text` | `{dedupe_sentences, max_sentence_len: 0}` | Collapse duplicate sentences (`0` = no truncation) |
 
-### G20_prompt_optimization
+### g20_prompt_optimizer
 Inline application of prompts tuned by the offline optimiser (`scripts/run_prompt_optimization.py`). The heavy optimisation runs out-of-band; the middleware applies the learned templates.
+
+> **Key casing note:** the inline middleware reads this block at `groups.g20_prompt_optimizer` (lowercase). `config/config.yaml.template` still ships the block under the older `G20_prompt_optimization` key, which the middleware never reads — so `enabled: true` there is currently a no-op. That template fix is deliberately deferred (flipping the real key on is a savings-affecting behavior change that needs pitch-test-plan validation, not a docs-only change); until then, set `groups.g20_prompt_optimizer.enabled: true` explicitly to actually turn G20 on in a self-hosted deployment. The portal catalog already uses the correct key.
 
 | Parameter | Default | Description |
 |---|---|---|

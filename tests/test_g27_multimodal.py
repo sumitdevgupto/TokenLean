@@ -244,3 +244,68 @@ class TestG27MultimodalOptimizer:
         g = G27MultimodalOptimizer()
         assert hasattr(g, "process_request")
         assert hasattr(g, "process_response")
+
+
+# ─── quality / min_bytes knob pass-through (portal-tunable) ───────────────────
+
+class TestSupportedKwargs:
+    def test_only_signature_supported_kwargs_pass(self):
+        from middleware.g27_multimodal_optimizer import _supported_kwargs
+        cfg = {"quality": 40, "min_bytes": 1024}
+
+        def takes_quality(messages, provider="openai", quality=None):
+            return messages
+
+        def takes_none(messages, provider="openai"):
+            return messages
+
+        def takes_var_kw(messages, provider="openai", **kw):
+            return messages
+
+        assert _supported_kwargs(takes_quality, cfg) == {"quality": 40}
+        assert _supported_kwargs(takes_none, cfg) == {}
+        assert _supported_kwargs(takes_var_kw, cfg) == {"quality": 40, "min_bytes": 1024}
+
+    def test_unset_knobs_omitted(self):
+        from middleware.g27_multimodal_optimizer import _supported_kwargs
+
+        def takes_both(messages, provider="openai", quality=None, min_bytes=None):
+            return messages
+
+        assert _supported_kwargs(takes_both, {"quality": 50}) == {"quality": 50}
+
+
+class TestKnobForwarding:
+    @pytest.mark.asyncio
+    async def test_quality_and_min_bytes_forwarded(self):
+        from middleware.g27_multimodal_optimizer import G27MultimodalOptimizer
+        import middleware.g27_multimodal_optimizer as mod
+
+        received = {}
+
+        def _recording(messages, provider="openai", quality=None, min_bytes=None):
+            received["quality"] = quality
+            received["min_bytes"] = min_bytes
+            return _fake_compress_images(_make_jpeg_bytes(1024))(messages, provider=provider)
+
+        ctx = _make_ctx([_make_vision_message(_make_jpeg_bytes(8192))],
+                        cfg_extra={"quality": 33, "min_bytes": 2048})
+        with patch.object(mod, "_compress_images_fn", _recording):
+            await G27MultimodalOptimizer().process_request(ctx)
+
+        assert received == {"quality": 33, "min_bytes": 2048}
+
+    @pytest.mark.asyncio
+    async def test_legacy_compressor_signature_still_works(self):
+        # A compressor that predates the knobs (no quality/min_bytes) must NOT get them
+        # and must still compress — behaviour identical to before this change.
+        from middleware.g27_multimodal_optimizer import G27MultimodalOptimizer
+        import middleware.g27_multimodal_optimizer as mod
+
+        ctx = _make_ctx([_make_vision_message(_make_jpeg_bytes(8192))],
+                        cfg_extra={"quality": 33, "min_bytes": 2048})
+        with patch.object(mod, "_compress_images_fn",
+                          _fake_compress_images(_make_jpeg_bytes(3000))):
+            ctx = await G27MultimodalOptimizer().process_request(ctx)
+
+        assert len(ctx.savings.step_savings) == 1  # still compressed, no TypeError
