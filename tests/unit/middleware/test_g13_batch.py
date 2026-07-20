@@ -2,7 +2,9 @@
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
+import json
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 @pytest.mark.asyncio
@@ -65,6 +67,63 @@ class TestG13Batch:
         from middleware.g13_batch import G13Batch
         ctx = await G13Batch().process_request(ctx)
         assert ctx.messages[-1]["content"] == original_content
+
+
+@pytest.mark.asyncio
+class TestBatchBaselineTokensAttribution:
+    """Regression: /v1/batch/results has no RequestContext at poll time, so
+    baseline_tokens must be captured at accumulate-time and threaded through the flush
+    lane to _store_batch_result for the poller's x-tokenlean-* headers to be accurate."""
+
+    async def test_accumulate_includes_baseline_tokens(self, make_ctx):
+        from middleware.g13_batch import _accumulate
+        ctx = make_ctx([{"role": "user", "content": "hi"}])
+        ctx.savings.baseline_tokens = 77
+        mock_redis = AsyncMock()
+        mock_redis.xadd = AsyncMock()
+        with patch("middleware.g13_batch._get_redis", return_value=mock_redis):
+            await _accumulate(ctx, "topic1")
+        _stream, fields = mock_redis.xadd.await_args.args
+        payload = json.loads(fields["payload"])
+        assert payload["baseline_tokens"] == 77
+
+    async def test_flush_loop_threads_baseline_tokens_into_stored_result(self):
+        from middleware import g13_batch
+        items = [{"request_id": "r0", "messages": [{"role": "user", "content": "hi"}],
+                  "params": {}, "model": "gpt-4o-mini", "baseline_tokens": 500,
+                  "tenant_id": "acme"}]
+        fake_resp = MagicMock()
+        fake_resp.model_dump.return_value = {"id": "c0", "usage": {"prompt_tokens": 120}}
+        with patch("config_loader.get_provider_model_prefixes", return_value={"gpt-4o-mini": "openai"}), \
+             patch("config_loader.get_providers", return_value=[]), \
+             patch("providers.build_litellm_call", return_value=("gpt-4o-mini", {})), \
+             patch("providers.key_resolver.resolve_provider_key",
+                   new=AsyncMock(return_value="sk-test")), \
+             patch("litellm.acompletion", new=AsyncMock(return_value=fake_resp)), \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()) as store:
+            await g13_batch._flush_batch_loop("topic1", items, {})
+        store.assert_awaited_once()
+        request_id_arg, stored = store.await_args.args
+        assert request_id_arg == "r0"
+        assert stored["status"] == "completed"
+        assert stored["baseline_tokens"] == 500
+
+    async def test_flush_loop_missing_baseline_tokens_defaults_to_zero(self):
+        from middleware import g13_batch
+        items = [{"request_id": "r0", "messages": [{"role": "user", "content": "hi"}],
+                  "params": {}, "model": "gpt-4o-mini", "tenant_id": "acme"}]
+        fake_resp = MagicMock()
+        fake_resp.model_dump.return_value = {"id": "c0"}
+        with patch("config_loader.get_provider_model_prefixes", return_value={"gpt-4o-mini": "openai"}), \
+             patch("config_loader.get_providers", return_value=[]), \
+             patch("providers.build_litellm_call", return_value=("gpt-4o-mini", {})), \
+             patch("providers.key_resolver.resolve_provider_key",
+                   new=AsyncMock(return_value="sk-test")), \
+             patch("litellm.acompletion", new=AsyncMock(return_value=fake_resp)), \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()) as store:
+            await g13_batch._flush_batch_loop("topic1", items, {})
+        stored = store.await_args.args[1]
+        assert stored["baseline_tokens"] == 0
 
 
 class TestCompactJsonToToon:

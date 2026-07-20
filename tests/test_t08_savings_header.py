@@ -108,6 +108,54 @@ class TestSavingsHeadersShortCircuit:
         assert h["x-tokenlean-cache"] == "miss"
 
 
+class TestBatchResultHeaders:
+    """Regression: the G13 batch-results poller (GET /v1/batch/results/{id}) has no
+    RequestContext at poll time, so it builds its own smaller header set from the
+    baseline_tokens persisted at accumulate-time vs. the provider's actual reported usage,
+    rather than going through _savings_headers."""
+
+    def test_completed_result_with_usage_builds_headers(self):
+        from main import _batch_result_headers
+        stored = {
+            "status": "completed",
+            "baseline_tokens": 500,
+            "response": {"model": "gpt-4o-mini", "usage": {"prompt_tokens": 300}},
+        }
+        h = _batch_result_headers("req-1", stored)
+        assert h["x-tokenlean-request-id"] == "req-1"
+        assert h["x-tokenlean-routed-model"] == "gpt-4o-mini"
+        assert h["x-tokenlean-tokens-saved"] == "200"
+        assert float(h["x-tokenlean-cost-saved-usd"]) >= 0.0
+        assert h["x-savings-usd"] == h["x-tokenlean-cost-saved-usd"]
+        assert h["x-tokenlean-pct-saved"] == "40.00"
+
+    def test_missing_baseline_tokens_omits_savings_fields(self):
+        """A job recorded before this fix (no baseline_tokens) must not crash — it just
+        omits the tokens-saved/cost-saved fields it can't compute."""
+        from main import _batch_result_headers
+        stored = {"status": "completed",
+                  "response": {"model": "gpt-4o-mini", "usage": {"prompt_tokens": 300}}}
+        h = _batch_result_headers("req-1", stored)
+        assert h["x-tokenlean-request-id"] == "req-1"
+        assert "x-tokenlean-tokens-saved" not in h
+
+    def test_missing_usage_omits_savings_fields(self):
+        from main import _batch_result_headers
+        stored = {"status": "completed", "baseline_tokens": 500,
+                  "response": {"model": "gpt-4o-mini"}}
+        h = _batch_result_headers("req-1", stored)
+        assert "x-tokenlean-tokens-saved" not in h
+
+    def test_zero_actual_tokens_saved_never_negative(self):
+        """A degenerate case (actual >= baseline) must clamp to 0, never report negative
+        savings."""
+        from main import _batch_result_headers
+        stored = {"status": "completed", "baseline_tokens": 100,
+                  "response": {"model": "gpt-4o-mini", "usage": {"prompt_tokens": 400}}}
+        h = _batch_result_headers("req-1", stored)
+        assert h["x-tokenlean-tokens-saved"] == "0"
+
+
 @pytest.mark.asyncio
 class TestTokenLeanHeaderSuite:
     """The x-tokenlean-* machine-readable per-call header family (always-on)."""

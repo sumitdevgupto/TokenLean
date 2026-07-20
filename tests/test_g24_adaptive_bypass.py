@@ -2,7 +2,7 @@
 import json
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -241,3 +241,115 @@ class TestG24AdaptiveBypass:
         sample_context.skip_groups = []  # Reset for second call
         await g24.process_request(sample_context)
         assert g24._last_loaded == first_load_time  # Same timestamp = cache hit
+
+
+class TestG24PostRoutingReevaluation:
+    """Regression: a rule scoped to the POST-routing model (e.g. a learned F1 rule keyed
+    on usage_events.routed_model) can never match at process_request's evaluation point —
+    that pass runs BEFORE G06, so ctx.model/ctx.routed_model still both hold the
+    pre-routing requested label. reevaluate_post_routing is the second pass, run by
+    pipeline.py right after G06, that re-checks unmatched rules once routing is final."""
+
+    def _routed_model_rule(self):
+        return {
+            "adaptive_bypass": {"enabled": True, "rules": [{
+                "group": "G01", "enabled": True,
+                "reason": "unproductive for the routed model",
+                "conditions": {"models": ["gpt-4o-mini"]},
+            }]},
+        }
+
+    def _rules_path(self, rules):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(rules, f)
+            return f.name
+
+    @pytest.mark.asyncio
+    async def test_pre_routing_pass_misses_routed_model_rule(self, sample_context):
+        """Sanity check establishing the bug this fix closes: BEFORE G06 has run,
+        ctx.model == ctx.routed_model == the requested label, so a rule scoped to the
+        model G06 would later route to cannot match in the first pass."""
+        path = self._rules_path(self._routed_model_rule())
+        sample_context.config["groups"]["G24_adaptive_bypass"]["rules_file"] = path
+        sample_context.model = "gpt-4-cascade"
+        sample_context.routed_model = "gpt-4-cascade"  # not yet routed
+        g24 = G24AdaptiveBypass()
+        ctx = await g24.process_request(sample_context)
+        assert "G01" not in ctx.skip_groups
+
+    @pytest.mark.asyncio
+    async def test_reevaluate_matches_after_routing(self, sample_context):
+        """Once ctx.routed_model is updated (simulating G06 having run), the second pass
+        catches the rule the first pass missed."""
+        path = self._rules_path(self._routed_model_rule())
+        sample_context.config["groups"]["G24_adaptive_bypass"]["rules_file"] = path
+        sample_context.model = "gpt-4-cascade"
+        sample_context.routed_model = "gpt-4-cascade"
+        g24 = G24AdaptiveBypass()
+        ctx = await g24.process_request(sample_context)
+        assert "G01" not in ctx.skip_groups  # pre-routing pass: no match
+
+        ctx.routed_model = "gpt-4o-mini"  # G06 has now routed
+        ctx = await g24.reevaluate_post_routing(ctx)
+        assert "G01" in ctx.skip_groups  # post-routing pass: matches
+
+    @pytest.mark.asyncio
+    async def test_reevaluate_does_not_duplicate_already_matched_group(self, sample_context, rules_file):
+        """A group matched in the pre-routing pass must not be re-processed (no duplicate
+        savings.add_step) by the post-routing pass."""
+        sample_context.config["groups"]["G24_adaptive_bypass"]["rules_file"] = rules_file
+        g24 = G24AdaptiveBypass()
+        ctx = await g24.process_request(sample_context)
+        assert "G01" in ctx.skip_groups
+        pre_count = len(ctx.savings.step_savings)
+
+        ctx = await g24.reevaluate_post_routing(ctx)
+        assert ctx.skip_groups.count("G01") == 1
+        assert len(ctx.savings.step_savings) == pre_count  # no new step recorded
+
+    @pytest.mark.asyncio
+    async def test_reevaluate_disabled_is_noop(self, sample_context):
+        sample_context.config["groups"]["G24_adaptive_bypass"]["enabled"] = False
+        g24 = G24AdaptiveBypass()
+        ctx = await g24.reevaluate_post_routing(sample_context)
+        assert ctx.skip_groups == []
+
+    @pytest.mark.asyncio
+    async def test_reevaluate_no_rules_is_noop(self, sample_context):
+        g24 = G24AdaptiveBypass()
+        ctx = await g24.reevaluate_post_routing(sample_context)
+        assert ctx.skip_groups == []
+
+
+class TestG24GcsBlobNameUsesConfiguredPath:
+    """Regression: the GCS fallback must derive the blob name from the operator-configured
+    rules_file, not a hardcoded literal — otherwise a customised path silently desyncs from
+    what the miner uploads to."""
+
+    @pytest.mark.asyncio
+    async def test_gcs_blob_name_matches_configured_rules_file(self, sample_context, tmp_path):
+        # No local file present, so _load_rules falls through to the GCS branch.
+        missing_path = str(tmp_path / "custom" / "my_rules.yaml")
+        sample_context.config["groups"]["G24_adaptive_bypass"]["rules_file"] = missing_path
+
+        mock_blob = MagicMock()
+        mock_blob.download_as_text.return_value = yaml.dump(
+            {"adaptive_bypass": {"enabled": True, "rules": []}})
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        mock_gcs_module = MagicMock()
+        mock_gcs_module.Client.return_value = mock_client
+
+        with patch.dict(
+            "sys.modules",
+            {"google.cloud.storage": mock_gcs_module,
+             "google.cloud": MagicMock(storage=mock_gcs_module),
+             "google": MagicMock()},
+        ), patch.dict(os.environ, {"CONFIG_GCS_BUCKET": "my-bucket"}):
+            g24 = G24AdaptiveBypass()
+            await g24.process_request(sample_context)
+
+        mock_client.bucket.assert_called_once_with("my-bucket")
+        mock_bucket.blob.assert_called_once_with(missing_path)

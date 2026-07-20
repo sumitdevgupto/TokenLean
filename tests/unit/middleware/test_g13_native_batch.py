@@ -78,7 +78,12 @@ class TestFlushNative:
         adapter.submit_batch.assert_awaited_once()
         submitted_items = adapter.submit_batch.await_args.args[0]
         assert [it["request_id"] for it in submitted_items] == ["r0", "r1"]
-        rec.assert_awaited_once_with("batch-1", "openai", ["r0", "r1"])
+        # _record_batch_job now receives the full items (not just ids) so it can carry
+        # each item's baseline_tokens through to the poller for header attribution.
+        rec.assert_awaited_once()
+        job_id_arg, provider_arg, items_arg = rec.await_args.args
+        assert job_id_arg == "batch-1" and provider_arg == "openai"
+        assert [it["request_id"] for it in items_arg] == ["r0", "r1"]
         loop.assert_not_awaited()
 
     async def test_falls_back_when_provider_not_native(self):
@@ -207,6 +212,67 @@ class TestPollBatchJobs:
         redis = self._redis({})
         with patch.object(g13_batch, "_get_redis", return_value=redis):
             assert await g13_batch.poll_batch_jobs({}) == 0
+
+
+@pytest.mark.asyncio
+class TestBaselineTokensAttribution:
+    """Regression: /v1/batch/results needs baseline_tokens to build x-tokenlean-* headers
+    on completion, but it has no RequestContext at poll time — baseline_tokens has to be
+    threaded through from _accumulate → the flush lane → _store_batch_result."""
+
+    async def test_record_batch_job_carries_baseline_tokens_map(self):
+        redis = MagicMock()
+        redis.hset = AsyncMock()
+        items = [
+            {"request_id": "r0", "baseline_tokens": 120},
+            {"request_id": "r1", "baseline_tokens": 340},
+        ]
+        with patch.object(g13_batch, "_get_redis", return_value=redis):
+            await g13_batch._record_batch_job("job-1", "openai", items)
+        stored = json.loads(redis.hset.await_args.args[2])
+        assert stored["request_ids"] == ["r0", "r1"]
+        assert stored["baseline_tokens"] == {"r0": 120, "r1": 340}
+
+    async def test_poll_completed_native_job_stores_baseline_tokens(self):
+        jobs = {"batch-1": json.dumps({
+            "provider": "openai", "request_ids": ["r0"],
+            "baseline_tokens": {"r0": 250},
+        })}
+        redis = MagicMock()
+        redis.hgetall = AsyncMock(return_value=jobs)
+        redis.hdel = AsyncMock()
+        adapter = MagicMock()
+        adapter.poll_batch = AsyncMock(return_value="completed")
+        adapter.fetch_batch_results = AsyncMock(return_value=[
+            {"request_id": "r0", "response": {"id": "c0", "usage": {"prompt_tokens": 100}}},
+        ])
+        with patch.object(g13_batch, "_get_redis", return_value=redis), \
+             patch("providers.get_adapter_by_name", return_value=adapter), \
+             patch("auth.api_key_manager.get_llm_provider_key", return_value="sk-test"), \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()) as store:
+            await g13_batch.poll_batch_jobs({})
+        stored = {c.args[0]: c.args[1] for c in store.await_args_list}
+        assert stored["r0"]["baseline_tokens"] == 250
+
+    async def test_poll_missing_baseline_tokens_map_defaults_to_zero(self):
+        """Backward compatible: a job recorded before this fix (no baseline_tokens key)
+        must not crash the poller."""
+        jobs = {"batch-1": json.dumps({"provider": "openai", "request_ids": ["r0"]})}
+        redis = MagicMock()
+        redis.hgetall = AsyncMock(return_value=jobs)
+        redis.hdel = AsyncMock()
+        adapter = MagicMock()
+        adapter.poll_batch = AsyncMock(return_value="completed")
+        adapter.fetch_batch_results = AsyncMock(return_value=[
+            {"request_id": "r0", "response": {"id": "c0"}},
+        ])
+        with patch.object(g13_batch, "_get_redis", return_value=redis), \
+             patch("providers.get_adapter_by_name", return_value=adapter), \
+             patch("auth.api_key_manager.get_llm_provider_key", return_value="sk-test"), \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()) as store:
+            await g13_batch.poll_batch_jobs({})
+        stored = {c.args[0]: c.args[1] for c in store.await_args_list}
+        assert stored["r0"]["baseline_tokens"] == 0
 
 
 @pytest.mark.asyncio

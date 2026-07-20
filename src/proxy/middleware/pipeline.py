@@ -228,6 +228,16 @@ class OptimisationPipeline:
 
         ctx = await self._run_timed("G06-routing", ctx, self.g06.process_request(ctx))
 
+        # G24 post-routing re-evaluation — a second, narrower pass now that
+        # ctx.routed_model is final. G24's first pass (Stage 1b) runs before G06, so a
+        # rule scoped to the post-routing model (e.g. a learned F1 rule keyed on
+        # usage_events.routed_model) can never match a tenant using G06 tiered/cascade
+        # routing at that point. Safe to always run: only adds NEW skip_groups entries,
+        # never re-processes an already-matched group, and every group it can add
+        # (Stage 3/4) still hasn't executed yet.
+        ctx = await self._run_timed(
+            "G24-adaptive-bypass-post-routing", ctx, self.g24.reevaluate_post_routing(ctx))
+
         # F2 — Intent Orchestration. Classify the request's intent; if it matches a
         # registered downstream agent, dispatch there (its OpenAI-compatible endpoint)
         # INSTEAD of the normal LLM and short-circuit — mirrors the cache/cascade

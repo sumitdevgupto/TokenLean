@@ -23,16 +23,26 @@ and the pipeline returns early; `main.py` serves the agent's answer through
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from middleware import RequestContext
 
 logger = logging.getLogger(__name__)
 GROUP = "F2"
+
+# Hard ceiling on a per-agent dispatch timeout regardless of config — a tenant-registered
+# agent must never be able to tie up a request coroutine indefinitely (portal-side
+# validation also enforces this on save; this is defense-in-depth for statically
+# config-authored agents that bypass the portal).
+MAX_AGENT_TIMEOUT_SECONDS = 300
+
+_BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata", "localhost"}
 
 try:  # Prometheus is always present in the proxy image; degrade gracefully in bare tests.
     from prometheus_client import Counter as _Counter
@@ -81,6 +91,40 @@ def _last_user_text(messages: List[Dict[str, Any]]) -> str:
                     if isinstance(p, dict) and p.get("type") == "text"
                 )
     return ""
+
+
+def validate_outbound_url(url: str) -> None:
+    """Raise ValueError if `url` could route the proxy's own server-side request to an
+    internal/private/link-local/reserved network or the cloud metadata service (SSRF).
+
+    Agent URLs are tenant-supplied — via the F3 portal console (which also calls this at
+    save time) or static config — so this proxy process must never be tricked into calling
+    its own cloud metadata endpoint or internal infrastructure on a tenant's behalf.
+
+    Deliberately does NOT resolve hostnames via DNS: this runs on every dispatch (the
+    request path), and a live DNS lookup there would add network latency to every agent
+    call and make tests depend on real DNS resolution. Instead it rejects (a) disallowed
+    scheme, (b) a handful of known-dangerous literal hostnames, and (c) a literal IP
+    address (e.g. the exact `http://169.254.169.254/...` metadata-service exploit) that
+    resolves to a private/loopback/link-local/reserved/multicast network. A hostname that
+    DNS-rebinds to an internal address after registration is a known residual gap —
+    deployments with a stricter threat model should also enforce an egress allowlist at
+    the network layer."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"agent url scheme must be http/https, got {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("agent url has no host")
+    if host.lower() in _BLOCKED_HOSTNAMES:
+        raise ValueError(f"agent url host {host!r} is not allowed")
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return  # a hostname, not a literal IP — DNS-rebind protection is out of scope here
+    if (addr.is_private or addr.is_loopback or addr.is_link_local
+            or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+        raise ValueError(f"agent url host {host!r} is a disallowed address ({addr})")
 
 
 def classify_intent(
@@ -153,6 +197,15 @@ class IntentOrchestration:
         ctx.agent_dispatched = True
         ctx.agent_response = response
         ctx.agent_id = agent_id
+        # B1-equivalent for the agent-dispatch short-circuit: pipeline.py's own B1 step
+        # (recording proxy_optimised_tokens/final_tokens_sent) sits AFTER Stage 3-5, which
+        # this short-circuit skips entirely — without this, both fields stay at their
+        # dataclass default of 0, so an agent response lacking a `usage` block would make
+        # G18 report the request as ~100% savings regardless of what the agent actually
+        # consumed. Same estimate-until-overwritten contract as pipeline.py: G18 still
+        # overwrites this with the agent's real prompt_tokens when present.
+        ctx.savings.proxy_optimised_tokens = ctx.current_request_token_count
+        ctx.savings.final_tokens_sent = ctx.savings.proxy_optimised_tokens
         logger.info("[%s] F2: intent matched (score=%d) → dispatched to agent '%s'",
                     ctx.request_id, score, agent_id)
         if AGENT_DISPATCH_TOTAL is not None:
@@ -169,6 +222,7 @@ class IntentOrchestration:
         url = agent.get("url")
         if not url:
             raise ValueError(f"agent '{agent.get('id')}' has no url")
+        validate_outbound_url(url)
         # Keyless agents are allowed; litellm still wants a non-empty key placeholder.
         api_key = os.environ.get(agent.get("api_key_env", ""), "") or "no-key"
         model = agent.get("model") or ctx.model
@@ -178,7 +232,7 @@ class IntentOrchestration:
         max_tokens = agent.get("max_tokens")
         if max_tokens:
             params["max_tokens"] = int(max_tokens)
-        timeout = agent.get("timeout_seconds", 60)
+        timeout = min(int(agent.get("timeout_seconds", 60)), MAX_AGENT_TIMEOUT_SECONDS)
 
         started = time.perf_counter()
         resp = await litellm.acompletion(
@@ -192,4 +246,9 @@ class IntentOrchestration:
         )
         # Accumulate the agent's provider time into the SLA split (mirrors G06 cascade).
         ctx.llm_elapsed_ms += (time.perf_counter() - started) * 1000.0
+        # The agent — not whatever G06 picked for the now-skipped main LLM call — served
+        # this request; billing/cost pricing (G18) and the x-tokenlean-routed-model header
+        # must reflect that, exactly like the G06 cascade path writes back its own pick.
+        ctx.routed_model = model
+        ctx.savings.routed_model = model
         return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)

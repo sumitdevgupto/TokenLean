@@ -335,6 +335,9 @@ async def _accumulate(ctx: RequestContext, topic: str) -> None:
         "params": ctx.params,
         "model": ctx.model,
         "timestamp": time.time(),
+        # So the /v1/batch/results poller can attach x-tokenlean-* savings headers on
+        # completion (it has no RequestContext to read ctx.savings from at poll time).
+        "baseline_tokens": getattr(ctx.savings, "baseline_tokens", 0),
     })
     try:
         await redis.xadd(stream, {"payload": payload})
@@ -417,14 +420,26 @@ _BATCH_JOBS_KEY = "tok_opt:batch_jobs"
 _NATIVE_BATCH_UNSUPPORTED: set = set()
 
 
-async def _record_batch_job(job_id: str, provider: str, request_ids: List[str]) -> None:
-    """Persist an outstanding native-batch job so the background poller can finish it."""
+async def _record_batch_job(job_id: str, provider: str, items: List[Dict]) -> None:
+    """Persist an outstanding native-batch job so the background poller can finish it.
+
+    Carries each item's baseline_tokens (keyed by request_id) alongside the job so
+    ``poll_batch_jobs`` can pass it through to ``_store_batch_result`` on completion —
+    the same attribution the per-item loop lane (``_flush_batch_loop``) stores, so
+    ``/v1/batch/results`` can emit x-tokenlean-* headers for native-batch requests too."""
     redis = _get_redis()
+    request_ids = [it.get("request_id") for it in items]
+    baseline_tokens = {it.get("request_id"): it.get("baseline_tokens", 0) for it in items}
     try:
         await redis.hset(
             _BATCH_JOBS_KEY,
             job_id,
-            json.dumps({"provider": provider, "request_ids": request_ids, "created": time.time()}),
+            json.dumps({
+                "provider": provider,
+                "request_ids": request_ids,
+                "baseline_tokens": baseline_tokens,
+                "created": time.time(),
+            }),
         )
     except Exception as exc:
         logger.warning("G13 record batch job %s failed: %s", job_id, exc)
@@ -457,6 +472,7 @@ async def poll_batch_jobs(cfg: Dict[str, Any]) -> int:
 
         provider = meta.get("provider", "")
         request_ids = meta.get("request_ids", [])
+        baseline_map = meta.get("baseline_tokens", {}) or {}
         try:
             adapter = get_adapter_by_name(provider)
         except Exception:
@@ -490,7 +506,11 @@ async def poll_batch_jobs(cfg: Dict[str, Any]) -> int:
                 if "response" in r:
                     resp = dict(r["response"])
                     resp["_batch_request_id"] = rid
-                    await _store_batch_result(rid, {"status": "completed", "response": resp})
+                    await _store_batch_result(rid, {
+                        "status": "completed",
+                        "response": resp,
+                        "baseline_tokens": baseline_map.get(rid, 0),
+                    })
                 else:
                     await _store_batch_result(
                         rid, {"status": "failed", "error": r.get("error", "batch item error")}
@@ -583,7 +603,7 @@ async def _flush_batch_native(
             continue
         try:
             job_id = await adapter.submit_batch(group_items, api_key, batch_cfg)
-            await _record_batch_job(job_id, pname, [it.get("request_id") for it in group_items])
+            await _record_batch_job(job_id, pname, group_items)
             logger.info(
                 "G13 native batch submitted provider=%s job=%s items=%d", pname, job_id, len(group_items)
             )
@@ -614,6 +634,7 @@ async def _flush_batch_loop(
             messages = item.get("messages", [])
             params = item.get("params", {})
             model = item.get("model", cfg.get("default_model", "gpt-4o-mini"))
+            baseline_tokens = item.get("baseline_tokens", 0)
 
             # Resolve provider
             model_lower = model.lower()
@@ -664,7 +685,11 @@ async def _flush_batch_loop(
                     else dict(response)
                 )
                 response_dict["_batch_request_id"] = request_id
-                await _store_batch_result(request_id, {"status": "completed", "response": response_dict})
+                await _store_batch_result(request_id, {
+                    "status": "completed",
+                    "response": response_dict,
+                    "baseline_tokens": baseline_tokens,
+                })
                 logger.info("G13 batch item %s processed successfully", request_id)
                 _note_batch_provider_outcome(provider, None)
             except Exception as exc:

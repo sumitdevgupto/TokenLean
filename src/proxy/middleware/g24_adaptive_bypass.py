@@ -48,7 +48,11 @@ class G24AdaptiveBypass:
 
         # Determine rules file path
         g24_cfg = config.get("groups", {}).get("G24_adaptive_bypass", {})
-        rules_path = g24_cfg.get("rules_file", "config/adaptive_bypass_rules.yaml")
+        # Captured BEFORE local-path resolution mangles `rules_path` below (e.g. an
+        # "/app/" container prefix) — GCS is a flat namespace, so the GCS fallback must use
+        # the operator-configured value as-written, not a local filesystem artifact.
+        configured_rules_file = g24_cfg.get("rules_file", "config/adaptive_bypass_rules.yaml")
+        rules_path = configured_rules_file
 
         # Resolve relative to project root or absolute
         if not os.path.isabs(rules_path):
@@ -69,7 +73,10 @@ class G24AdaptiveBypass:
             if gcs_bucket:
                 try:
                     from google.cloud import storage as _gcs  # type: ignore
-                    blob_name = "config/adaptive_bypass_rules.yaml"
+                    # Same object signal_miner.write_rules() uploads to when a custom
+                    # rules_file is configured — both sides must derive the blob name from
+                    # the SAME configured value, or a custom path silently desyncs them.
+                    blob_name = configured_rules_file
                     content = _gcs.Client().bucket(gcs_bucket).blob(blob_name).download_as_text()
                     data = yaml.safe_load(content) or {}
                     adaptive_bypass = data.get("adaptive_bypass", {})
@@ -148,6 +155,58 @@ class G24AdaptiveBypass:
             ctx.savings.add_step(
                 group=GROUP,
                 description=f"Adaptive bypass: skipping {', '.join(groups_skipped)}",
+                tokens_before=ctx.current_token_count,
+                tokens_after=ctx.current_token_count,
+            )
+
+        return ctx
+
+    async def reevaluate_post_routing(self, ctx: RequestContext) -> RequestContext:
+        """Re-run rule matching after G06 routing has set `ctx.routed_model`.
+
+        The main `process_request` pass runs BEFORE G06 (Stage 1b), so a rule whose
+        `models` condition is scoped to the POST-routing model — e.g. a learned rule from
+        the F1 signal miner, keyed on `usage_events.routed_model` — can never match at that
+        point for a tenant using G06 tiered/cascade routing: `ctx.model` and
+        `ctx.routed_model` are still identical (both the originally-requested label) until
+        G06 reassigns `routed_model`. This narrower second pass re-checks only rules not
+        already matched, now that routing is final and before any Stage 3/4 group (all of
+        which run after G06) has executed — so a late match still fully takes effect.
+        """
+        cfg = ctx.config.get("groups", {}).get("G24_adaptive_bypass", {})
+        if not cfg.get("enabled", True):
+            return ctx
+
+        self._load_rules(ctx.config)
+        if not self._rules:
+            return ctx
+
+        if not hasattr(ctx, "skip_groups"):
+            ctx.skip_groups = []
+
+        newly_matched = []
+        for rule in self._rules:
+            if not rule.get("enabled", True):
+                continue
+            group = rule.get("group", "")
+            if not group or group in ctx.skip_groups:
+                continue  # already matched in the pre-routing pass
+            if self._matches(ctx, rule):
+                ctx.skip_groups.append(group)
+                newly_matched.append(rule)
+
+        if newly_matched:
+            reasons = [r.get("reason", "adaptive bypass") for r in newly_matched]
+            groups_skipped = [r.get("group") for r in newly_matched]
+            logger.info(
+                "[%s] G24: Bypassing %s post-routing — %s",
+                ctx.request_id,
+                ", ".join(groups_skipped),
+                "; ".join(reasons),
+            )
+            ctx.savings.add_step(
+                group=GROUP,
+                description=f"Adaptive bypass (post-routing): skipping {', '.join(groups_skipped)}",
                 tokens_before=ctx.current_token_count,
                 tokens_after=ctx.current_token_count,
             )

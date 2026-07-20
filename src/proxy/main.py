@@ -526,7 +526,12 @@ async def batch_results(request_id: str, request: Request):
         raw = await r.get(key)
         if raw is None:
             return JSONResponse(status_code=202, content={"status": "pending", "request_id": request_id})
-        return JSONResponse(content=json.loads(raw))
+        stored = json.loads(raw)
+        headers = (
+            _batch_result_headers(request_id, stored)
+            if stored.get("status") == "completed" else None
+        )
+        return JSONResponse(content=stored, headers=headers)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1076,8 +1081,10 @@ def _savings_headers(ctx, request_start: float) -> Dict[str, str]:
     paths is not cosmetic: ``x-tokenlean-cache`` must be present exactly when a request WAS
     served from cache — previously those (highest-volume) responses carried no headers at
     all, silently breaking the advertised always-on attribution + failing the readiness
-    header gate. NOTE: streamed responses do not route through here (documented limitation,
-    matching ``_token_opt``/G23).
+    header gate. NOTE: two paths are disclosed exceptions, not covered by this helper —
+    streamed responses (matching ``_token_opt``/G23) and the G13 batch-results poller
+    (``GET /v1/batch/results/{request_id}``), which has no RequestContext at poll time and
+    builds its own smaller header set from the stored baseline/actual token counts instead.
     """
     meta = ctx.savings.to_langfuse_metadata()
     headers = {"x-savings-usd": f"{ctx.savings.cost_saving_usd:.6f}"}
@@ -1110,6 +1117,38 @@ def _savings_headers(ctx, request_start: float) -> Dict[str, str]:
         headers["x-token-opt-state"] = base64.b64encode(
             json.dumps(token_budget_state, separators=(",", ":")).encode("utf-8")
         ).decode("utf-8")
+    return headers
+
+
+def _batch_result_headers(request_id: str, stored: Dict) -> Dict[str, str]:
+    """Best-effort x-tokenlean-* headers for a completed G13 batch result.
+
+    No RequestContext exists at poll time (the flush loop calls litellm directly, outside
+    the pipeline), so this is deliberately smaller than ``_savings_headers``: it compares
+    the baseline token count persisted at accumulate-time (``ctx.savings.baseline_tokens``)
+    against the provider's actual reported ``usage.prompt_tokens`` for this response —
+    real numbers, not the full per-group savings breakdown a normal response gets.
+    """
+    headers = {"x-tokenlean-request-id": request_id}
+    response = stored.get("response") or {}
+    model = response.get("model")
+    if model:
+        headers["x-tokenlean-routed-model"] = str(model)
+    baseline_tokens = stored.get("baseline_tokens")
+    actual_tokens = (response.get("usage") or {}).get("prompt_tokens")
+    if baseline_tokens is not None and actual_tokens is not None:
+        try:
+            from savings.calculator import estimate_cost
+            tokens_saved = max(0, int(baseline_tokens) - int(actual_tokens))
+            cost_saved = max(0.0, estimate_cost(int(baseline_tokens), 0, model or "") -
+                              estimate_cost(int(actual_tokens), 0, model or ""))
+            headers["x-tokenlean-tokens-saved"] = str(tokens_saved)
+            headers["x-tokenlean-cost-saved-usd"] = f"{cost_saved:.6f}"
+            headers["x-savings-usd"] = f"{cost_saved:.6f}"
+            if baseline_tokens:
+                headers["x-tokenlean-pct-saved"] = f"{(tokens_saved / baseline_tokens) * 100:.2f}"
+        except Exception as exc:
+            logger.debug("[%s] batch result header cost estimate failed: %s", request_id, exc)
     return headers
 
 

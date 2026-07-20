@@ -558,7 +558,13 @@ class G05Cache:
         self, ctx: "RequestContext", response: Dict[str, Any]
     ) -> None:
         """Store the LLM response in L1, L2, L3, and step caches after a successful call."""
-        if ctx.cache_hit or ctx.bypassed or getattr(ctx, "no_cache", False):
+        # F2-dispatched answers come from a tenant-registered downstream agent, not the
+        # main LLM — caching them would let a later matching prompt be served straight
+        # from cache (G05's lookup runs BEFORE F2 in the pipeline), bypassing intent
+        # classification entirely and replaying a stale agent answer even after the
+        # operator disables orchestration or edits/removes that agent.
+        if ctx.cache_hit or ctx.bypassed or getattr(ctx, "no_cache", False) \
+                or getattr(ctx, "agent_dispatched", False):
             return
 
         cfg = ctx.config.get("groups", {}).get("G5_cache", {})

@@ -6,9 +6,11 @@ import pytest
 
 from middleware import RequestContext
 from middleware.intent_orchestration import (
+    MAX_AGENT_TIMEOUT_SECONDS,
     IntentOrchestration,
     _orchestration_cfg,
     classify_intent,
+    validate_outbound_url,
 )
 from savings.models import SavingsRecord
 
@@ -184,6 +186,103 @@ async def test_dispatch_error_falls_back_gracefully():
         out = await IntentOrchestration().process_request(ctx)
     assert out.agent_dispatched is False       # fell back, did not crash
     assert out.agent_response is None
+
+
+# ── SSRF guard (validate_outbound_url) ─────────────────────────────────────────────────
+@pytest.mark.parametrize("url", [
+    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+    "http://127.0.0.1:8080/",
+    "http://10.0.0.5/",
+    "http://192.168.1.1/",
+    "http://172.16.0.1/",
+    "http://0.0.0.0/",
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://metadata/computeMetadata/v1/",
+    "http://localhost:9000/",
+])
+def test_validate_outbound_url_rejects_ssrf_targets(url):
+    with pytest.raises(ValueError):
+        validate_outbound_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://billing.internal.example.com/v1",
+    "https://agent.acme.example.com:8443/v1",
+    "http://8.8.8.8/v1",  # public IP literal — allowed
+])
+def test_validate_outbound_url_allows_normal_hosts(url):
+    validate_outbound_url(url)  # must not raise
+
+
+def test_validate_outbound_url_rejects_bad_scheme():
+    with pytest.raises(ValueError):
+        validate_outbound_url("ftp://example.com/v1")
+
+
+def test_validate_outbound_url_rejects_empty_host():
+    with pytest.raises(ValueError):
+        validate_outbound_url("http:///no-host")
+
+
+async def test_dispatch_ssrf_url_falls_back_to_llm():
+    """An agent registered with a metadata/private-IP url never reaches litellm — the
+    dispatch fails validation and falls back to the normal LLM, same as any other
+    dispatch error."""
+    cfg = _cfg(agents=[{"id": "evil", "url": "http://169.254.169.254/latest/meta-data/",
+                         "match": ["refund"]}])
+    ctx = _ctx(config=cfg)
+    with patch("litellm.acompletion", new=AsyncMock()) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is False
+    m.assert_not_called()
+
+
+# ── timeout cap ──────────────────────────────────────────────────────────────────────
+async def test_dispatch_timeout_capped():
+    cfg = _cfg(agents=[{"id": "billing", "url": "http://billing/v1", "match": ["refund"],
+                         "timeout_seconds": 999999}])
+    ctx = _ctx(config=cfg)
+    with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
+        await IntentOrchestration().process_request(ctx)
+    assert m.call_args.kwargs["timeout"] == MAX_AGENT_TIMEOUT_SECONDS
+
+
+# ── savings/billing attribution on dispatch ─────────────────────────────────────────────
+async def test_dispatch_sets_final_tokens_sent():
+    """Regression: the F2 short-circuit skips pipeline.py's own B1 token-accounting step —
+    without an equivalent here, an agent response lacking a usage block would report the
+    request as ~100% savings regardless of what the agent actually consumed."""
+    ctx = _ctx(config=_cfg())
+    assert ctx.savings.final_tokens_sent == 0  # dataclass default, pre-dispatch
+    with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))):
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.savings.final_tokens_sent > 0
+    assert out.savings.proxy_optimised_tokens == out.savings.final_tokens_sent
+
+
+async def test_dispatch_updates_routed_model():
+    """Regression: routed_model must reflect the agent's own model, not whatever G06 last
+    picked for the now-skipped main LLM call — otherwise billing/cost pricing (G18) and the
+    x-tokenlean-routed-model header mislabel the request."""
+    cfg = _cfg(agents=[{"id": "billing", "url": "http://billing/v1", "match": ["refund"],
+                         "model": "internal-billing-llm-v2"}])
+    ctx = _ctx(config=cfg, model="gpt-4o-mini")
+    ctx.routed_model = "gpt-4o-mini"  # simulate G06 having already routed
+    with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))):
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.routed_model == "internal-billing-llm-v2"
+    assert out.savings.routed_model == "internal-billing-llm-v2"
+
+
+async def test_dispatch_failure_does_not_corrupt_routed_model():
+    """A failed dispatch must fall back to the LLM using whatever routed_model G06 already
+    picked — it must not be overwritten with the (never-called) agent's model."""
+    ctx = _ctx(config=_cfg(), model="gpt-4o-mini")
+    ctx.routed_model = "gpt-4o-mini"
+    with patch("litellm.acompletion", new=AsyncMock(side_effect=RuntimeError("agent down"))):
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is False
+    assert out.routed_model == "gpt-4o-mini"
 
 
 async def test_openai_only_no_provider_specific_fields():

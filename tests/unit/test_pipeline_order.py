@@ -77,6 +77,7 @@ class TestPipelineStageOrdering:
         pipeline.g21 = _make("G21")
         pipeline.g22 = _make("G22")
         pipeline.g24 = _make("G24")
+        pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
         pipeline.g25 = _make("G25")
         pipeline.g27 = _make("G27")
         pipeline.g28 = _make("G28")
@@ -140,6 +141,7 @@ class TestPipelineStageOrdering:
         pipeline.g21 = _make("G21")
         pipeline.g22 = _make("G22")
         pipeline.g24 = _make("G24")
+        pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
         pipeline.g25 = _make("G25")
         pipeline.g27 = _make("G27")
         pipeline.g28 = _make("G28")
@@ -186,6 +188,7 @@ class TestPipelineStageOrdering:
                    "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g24",
                    "g25", "g27", "g28", "g29", "g30", "g31", "g15"):
             setattr(pipeline, _n, _make(_n.upper()))
+        pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
         pipeline.f2 = _make("F2")
         pipeline.g18 = MagicMock()
 
@@ -204,6 +207,45 @@ class TestPipelineStageOrdering:
         assert g06_pos < f2_pos < g01_pos, (
             f"Expected G06({g06_pos}) < F2({f2_pos}) < G01({g01_pos}), got: {call_log}"
         )
+
+    @pytest.mark.asyncio
+    async def test_g24_post_routing_reevaluation_runs_after_g06_before_f2(self):
+        """G24's second pass (reevaluate_post_routing) must run after G06 has set
+        ctx.routed_model and before F2/G01 — it exists specifically so a rule scoped to the
+        POST-routing model (unmatchable at G24's pre-routing first pass) still takes effect
+        before any Stage 3/4 group runs."""
+        from middleware.pipeline import OptimisationPipeline
+
+        call_log = []
+        pipeline = OptimisationPipeline.__new__(OptimisationPipeline)
+
+        def _make(name):
+            return self._tracked_mock(call_log, name)
+
+        pipeline._tenant_config_loader = AsyncMock()
+        pipeline._tenant_config_loader.load = AsyncMock()
+        for _n in ("g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
+                   "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g24",
+                   "g25", "g27", "g28", "g29", "g30", "g31", "g15"):
+            setattr(pipeline, _n, _make(_n.upper()))
+
+        async def _reeval_side(ctx):
+            call_log.append("G24-POST")
+            return ctx
+        pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=_reeval_side)
+        pipeline.f2 = _make("F2")
+        pipeline.g18 = MagicMock()
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(_make_ctx())
+
+        for g in ("G06", "G24-POST", "F2", "G01"):
+            assert g in call_log, f"{g} did not run: {call_log}"
+        assert (call_log.index("G06") < call_log.index("G24-POST")
+                < call_log.index("F2") < call_log.index("G01")), call_log
 
     @pytest.mark.asyncio
     async def test_g23_runs_after_g14_in_response_path(self):
@@ -280,6 +322,7 @@ def _build_stubbed_pipeline(call_log):
               "g11", "g12", "g13", "g15", "g16", "g17", "g19", "g20", "g21", "g22",
               "g24", "g25", "g27", "g28", "g29", "g30", "g31"]:
         setattr(p, n, _mk(n.upper()))
+    p.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
     p.f2 = _mk("F2")  # F2 intent orchestration stage
     p.g18 = MagicMock()
     return p
