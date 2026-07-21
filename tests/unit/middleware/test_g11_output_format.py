@@ -246,6 +246,32 @@ class TestG11OutputHoldout:
         expected_cohort = "holdout" if expected_bucket < 0.5 * _HOLDOUT_BUCKETS else "treatment"
         assert cohort == expected_cohort
 
+    async def test_cohort_ignores_harness_arm_scope_suffix(self, make_ctx):
+        """Backlog #10: the pitch harness scopes workflow_id per arm as
+        '<id>::<arm>::<token>'. The cohort must key on the ORIGINAL id so a workflow
+        stays in ONE cohort across arms (else the A3 treatment-vs-holdout comparison
+        fragments). All scoped variants of one id → the same cohort as the bare id."""
+        from middleware.g11_output_format import _assign_cohort
+        cfg = {"enabled": True, "fraction": 0.5, "sticky_key": "workflow_id"}
+        base = make_ctx(); base.params["workflow_id"] = "ds3-workflow-1"
+        bare = _assign_cohort(base, cfg)
+        for scoped in ("ds3-workflow-1::all-off::a1b2c3d4",
+                       "ds3-workflow-1::only-G17::99887766",
+                       "ds3-workflow-1::all-on::deadbeef"):
+            ctx = make_ctx(); ctx.params["workflow_id"] = scoped
+            assert _assign_cohort(ctx, cfg) == bare, scoped
+
+    async def test_cohort_distinct_workflows_still_differ_under_scoping(self, make_ctx):
+        """Stripping the suffix must not collapse DISTINCT workflows onto one key."""
+        from middleware.g11_output_format import _assign_cohort, _HOLDOUT_BUCKETS
+        from middleware.g06_routing import stable_bucket
+        cfg = {"enabled": True, "fraction": 0.5, "sticky_key": "workflow_id"}
+        ctx = make_ctx(); ctx.params["workflow_id"] = "ds3-workflow-2::all-on::tok"
+        cohort = _assign_cohort(ctx, cfg)
+        # keyed on the stripped original 'ds3-workflow-2', not the scoped string
+        expected_bucket = stable_bucket("ds3-workflow-2", _HOLDOUT_BUCKETS)
+        assert cohort == ("holdout" if expected_bucket < 0.5 * _HOLDOUT_BUCKETS else "treatment")
+
     async def test_holdout_preserves_structured_output(self, make_ctx):
         """Even in the control cohort, correctness (JSON response_format) is NOT skipped."""
         ctx = make_ctx(model="gpt-4o")

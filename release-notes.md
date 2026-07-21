@@ -19,6 +19,11 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-21
+
+### A3 output-holdout cohort stayed stable across measurement arms — Bug fix
+The G11 output-shaping A/B holdout assigns each workflow a sticky cohort (treatment vs. control) keyed on `workflow_id`. The ablation harness scopes that id per measurement arm (`<id>::<arm>::<token>`), which would have let one workflow drift between cohorts across arms and corrupt the treatment-vs-control comparison. `_assign_cohort` now keys on the original id by stripping the harness suffix — a no-op for production traffic, where `workflow_id` never contains `::`. Latent until now (the holdout is off by default); fixed ahead of enabling it.
+
 ## 2026-07-20
 
 ### Semantic cache could serve an answer produced under a different system prompt — Bug fix

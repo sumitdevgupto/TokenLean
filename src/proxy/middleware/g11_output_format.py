@@ -235,6 +235,15 @@ def _assign_cohort(ctx: RequestContext, holdout_cfg: Dict[str, Any]) -> str:
         or getattr(ctx, "user_id", None)
         or ctx.request_id
     )
+    # The pitch-test-plan harness scopes workflow_id per ablation arm+process as
+    # "<id>::<arm>::<token>" (run_roi_pitch._scope_workflow_id) so G17 budgets don't
+    # bleed across arms. That scoping would fragment THIS cohort — the same workflow
+    # could land in 'holdout' in one arm and 'treatment' in another, corrupting the A3
+    # treatment-vs-holdout comparison. Key on the ORIGINAL id by stripping the harness
+    # suffix. Production workflow_ids never contain "::", so this is a no-op for real
+    # traffic (backlog #10).
+    if isinstance(stable, str) and "::" in stable:
+        stable = stable.split("::", 1)[0]
     from middleware.g06_routing import stable_bucket
     bucket = stable_bucket(stable, _HOLDOUT_BUCKETS)
     return "holdout" if bucket < fraction * _HOLDOUT_BUCKETS else "treatment"
