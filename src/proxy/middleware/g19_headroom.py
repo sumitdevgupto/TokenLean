@@ -432,10 +432,28 @@ def _compress_text(text: str, strategy: Dict[str, Any]) -> Optional[str]:
 
 
 def _compress_logs(text: str, strategy: Dict[str, Any]) -> Optional[str]:
-    """Deduplicate repeated log lines and truncate long lines."""
+    """Deduplicate repeated log lines and truncate long lines.
+
+    Severity-aware dedup (2026-07-23): lines matching `always_keep_severities`
+    (default ERROR/FATAL/CRITICAL/PANIC) are NEVER folded into the dedup count —
+    every occurrence survives verbatim with its own timestamp. A recurring error
+    is itself diagnostic signal (is this a one-off or is it flapping?), not noise;
+    only low-severity boilerplate (INFO/DEBUG/WARN heartbeat lines) is collapsed.
+    Previously the dedup stripped timestamps before comparing ANY line, so a real
+    second occurrence of an ERROR (identical text, different timestamp) landed in
+    the same bucket as repeated INFO noise and silently vanished behind an opaque
+    "[N duplicate log patterns suppressed]" footer that named no pattern — proven
+    on DS7 ds7-03 (pitch-test-plan quality gate): the optimised answer omitted a
+    genuine ERROR recurrence at 10:51:01Z that the unoptimised baseline reported.
+    """
     lines = text.split("\n")
     max_line_len = strategy.get("truncate_long_lines", 200)
     dedupe = strategy.get("dedupe_lines", True)
+    always_keep = strategy.get("always_keep_severities", ["ERROR", "FATAL", "CRITICAL", "PANIC"])
+    always_keep_re = (
+        re.compile(r"\b(?:" + "|".join(re.escape(s) for s in always_keep) + r")\b", re.IGNORECASE)
+        if always_keep else None
+    )
 
     result = []
     seen: Dict[str, int] = {}
@@ -445,11 +463,14 @@ def _compress_logs(text: str, strategy: Dict[str, Any]) -> Optional[str]:
         if not stripped:
             continue
 
-        # Truncate long lines
+        is_high_severity = bool(always_keep_re and always_keep_re.search(stripped))
+
+        # Truncate long lines (after severity detection, so a marker near the
+        # start of a long line is never missed because of the later cut).
         if len(stripped) > max_line_len:
             stripped = stripped[:max_line_len] + "...[truncated]"
 
-        if dedupe:
+        if dedupe and not is_high_severity:
             # Normalise: remove timestamps for dedup comparison
             normalised = re.sub(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[\.\d]*", "<TS>", stripped)
             if normalised in seen:

@@ -476,7 +476,7 @@ Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and 
 | `min_length_to_compress` | `50` | Skip content shorter than this (chars) |
 | `compression_strategies.json` | `{remove_empty, dedupe_keys}` | Drop null/empty fields, dedupe repeated array structures |
 | `compression_strategies.code` | `{strip_comments, strip_whitespace, compress_imports}` | Remove comments/blank lines, collapse import blocks |
-| `compression_strategies.logs` | `{dedupe_lines, truncate_long_lines: 200}` | Dedupe repeated log lines, truncate long lines |
+| `compression_strategies.logs` | `{dedupe_lines, truncate_long_lines: 200, always_keep_severities: [ERROR, FATAL, CRITICAL, PANIC]}` | Dedupe repeated log lines, truncate long lines. Lines matching an `always_keep_severities` entry (whole-word, case-insensitive) are never folded into the dedup count — every occurrence survives verbatim (a recurring error is diagnostic signal, not noise); empty list reverts to timestamp-blind dedup of every line |
 | `compression_strategies.text` | `{dedupe_sentences, max_sentence_len: 0}` | Collapse duplicate sentences (`0` = no truncation) |
 
 ### g20_prompt_optimizer

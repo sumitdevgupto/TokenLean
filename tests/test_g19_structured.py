@@ -227,6 +227,94 @@ def test_logs_truncate_long_lines():
     assert len(lines[0]) <= 115  # 100 + "[truncated]" suffix
 
 
+# ─── Log compression — severity-aware dedup (2026-07-23) ────────────────────
+# A recurring ERROR is diagnostic signal (is this flapping or a one-off?), not
+# noise — the old timestamp-blind dedup silently collapsed a genuine second
+# occurrence into the same bucket as repeated INFO/DEBUG boilerplate (proven on
+# pitch-test-plan DS7 ds7-03: the optimised answer omitted a real ERROR
+# recurrence the baseline reported). Default always_keep_severities preserves
+# every ERROR/FATAL/CRITICAL/PANIC line verbatim; only lower severities dedupe.
+
+def test_recurring_error_is_never_deduped_by_default():
+    logs = """2024-06-01T10:50:00Z [ERROR] connection refused to upstream payments service
+2024-06-01T10:51:01Z [ERROR] connection refused to upstream payments service
+2024-06-01T10:52:02Z [FATAL] pod restarted after crash
+"""
+    result = _compress_logs(logs, {"dedupe_lines": True, "truncate_long_lines": 200})
+    assert "10:50:00" in result and "10:51:01" in result and "10:52:02" in result
+    # neither ERROR nor FATAL counted as a dedup — no suppression footer at all
+    assert "suppressed" not in result.lower()
+
+
+def test_boilerplate_still_dedupes_alongside_preserved_errors():
+    logs = """2024-06-01T10:00:00Z [INFO] health check ok
+2024-06-01T10:01:00Z [INFO] health check ok
+2024-06-01T10:02:00Z [INFO] health check ok
+2024-06-01T10:50:00Z [ERROR] connection refused
+2024-06-01T10:51:01Z [ERROR] connection refused
+"""
+    result = _compress_logs(logs, {"dedupe_lines": True, "truncate_long_lines": 200})
+    lines = result.strip().split("\n")
+    assert sum(1 for l in lines if "health check ok" in l) == 1        # collapsed
+    assert sum(1 for l in lines if "connection refused" in l) == 2     # both kept
+    assert any("1 duplicate log patterns suppressed" in l for l in lines)  # only INFO counted
+
+
+def test_always_keep_severities_is_whole_word_and_case_insensitive():
+    # "ERRORS" must not match the whole-word "ERROR" pattern (no false-positive
+    # widening); lowercase "error" must still match (case-insensitive).
+    logs = """2024-06-01T10:00:00Z [errors_summary] nothing to see
+2024-06-01T10:01:00Z [errors_summary] nothing to see
+2024-06-01T10:50:00Z [error] real failure
+2024-06-01T10:51:01Z [error] real failure
+"""
+    result = _compress_logs(logs, {"dedupe_lines": True, "truncate_long_lines": 200})
+    lines = result.strip().split("\n")
+    assert sum(1 for l in lines if "errors_summary" in l) == 1   # NOT a whole-word "ERROR" match -> deduped
+    assert sum(1 for l in lines if "real failure" in l) == 2     # lowercase "error" matched -> both kept
+
+
+def test_empty_always_keep_severities_reverts_to_old_behaviour():
+    logs = """2024-06-01T10:50:00Z [ERROR] connection refused
+2024-06-01T10:51:01Z [ERROR] connection refused
+"""
+    result = _compress_logs(logs, {"dedupe_lines": True, "truncate_long_lines": 200,
+                                   "always_keep_severities": []})
+    lines = result.strip().split("\n")
+    assert sum(1 for l in lines if "connection refused" in l) == 1  # back to timestamp-blind dedup
+    assert any("1 duplicate log patterns suppressed" in l for l in lines)
+
+
+def test_custom_always_keep_severities_list():
+    logs = """2024-06-01T10:00:00Z [NOTICE] recurring but not in the default list
+2024-06-01T10:01:00Z [NOTICE] recurring but not in the default list
+"""
+    default_result = _compress_logs(logs, {"dedupe_lines": True, "truncate_long_lines": 200})
+    assert default_result.strip().count("NOTICE") == 1  # NOTICE not protected by default -> deduped
+
+    custom_result = _compress_logs(logs, {
+        "dedupe_lines": True, "truncate_long_lines": 200,
+        "always_keep_severities": ["NOTICE"],
+    })
+    assert custom_result.strip().count("NOTICE") == 2  # operator opted NOTICE into the keep-list
+
+
+def test_high_severity_lines_still_truncate_when_long():
+    long_error = "2024-06-01T10:50:00Z [ERROR] " + "x" * 500
+    result = _compress_logs(long_error, {"dedupe_lines": True, "truncate_long_lines": 100})
+    lines = result.strip().split("\n")
+    assert len(lines[0]) <= 115
+    assert lines[0].endswith("...[truncated]")
+
+
+def test_dedupe_disabled_keeps_every_line_including_errors():
+    logs = """2024-06-01T10:50:00Z [ERROR] connection refused
+2024-06-01T10:51:01Z [ERROR] connection refused
+"""
+    result = _compress_logs(logs, {"dedupe_lines": False, "truncate_long_lines": 200})
+    assert result.strip().count("connection refused") == 2
+
+
 # ─── Middleware integration ──────────────────────────────────────────────────
 
 @pytest.mark.asyncio

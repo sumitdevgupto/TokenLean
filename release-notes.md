@@ -33,6 +33,18 @@ tier-1 answer truncated by the injected cap is retried once uncapped before serv
 (`cascade_retry_uncapped_on_truncation`). Cost estimates also externalised
 (`expected_output_tokens_estimate`).
 
+### G19 log compression could silently drop a recurring error — dedup is now severity-aware — Bug fix
+G19's log compressor stripped timestamps before comparing lines for duplication, so a genuine
+*second occurrence* of the same error (identical text, different timestamp — e.g. an alert firing
+twice 61 seconds apart) landed in the same bucket as repeated INFO/DEBUG heartbeat noise and was
+silently collapsed behind an opaque "[N duplicate log patterns suppressed]" footer that named no
+pattern. For log-heavy incident-investigation workloads, that erased exactly the signal an SRE
+cares about (is this a one-off or is it flapping?). Fixed: lines matching a configurable severity
+list (`always_keep_severities`, default `ERROR, FATAL, CRITICAL, PANIC`) are now never folded into
+the dedup count — every occurrence survives verbatim with its own timestamp; only lower-severity
+boilerplate still collapses. Found via the pitch-test-plan quality gate's stronger-judge escalation
+(2026-07-23 mode-100 pre-flight) on a DevOps incident-response dataset.
+
 ## 2026-07-22
 
 ### Docs-chat corpus refresh is now a 3-step publish loop — generate, review, apply — Enhancement [Enterprise]

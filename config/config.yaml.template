@@ -857,6 +857,13 @@ groups:
       logs:
         dedupe_lines: true
         truncate_long_lines: 200
+        # Lines matching one of these (whole-word, case-insensitive) are NEVER
+        # folded into the dedup count — every occurrence survives verbatim with
+        # its own timestamp. A recurring error is itself diagnostic signal (is
+        # this a one-off or is it flapping?), not noise; only low-severity
+        # boilerplate (INFO/DEBUG/WARN heartbeat lines) gets collapsed. Empty
+        # list = dedupe everything (the old, timestamp-blind behaviour).
+        always_keep_severities: [ERROR, FATAL, CRITICAL, PANIC]
       text:
         dedupe_sentences: true
         max_sentence_len: 0
