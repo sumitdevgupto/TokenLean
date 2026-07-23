@@ -821,7 +821,10 @@ class TestG06CascadeOverEscalationGuards:
             return _mk_resp(m, "weak...", "length")
         ctx = await self._run(ctx, mock)
         assert ctx.routed_model == "gpt-4o-mini"
-        assert calls == 1
+        # 2 calls, both tier1: the capped probe + the uncapped truncation retry
+        # (a self-truncated final answer is retried without the injected cap — not
+        # an escalation; the mock raises on any non-mini model).
+        assert calls == 2
 
     async def test_cascade_cap_disabled_restores_full_escalation(self, make_ctx):
         """cap off + allow-above + generous budget → medium query can reach the complex tier."""
@@ -905,7 +908,9 @@ class TestG06CascadeOverEscalationGuards:
             return _mk_resp(m, "weak...", "length")
         ctx = await self._run(ctx, mock, cost_fn=_faithful_cost)
         assert ctx.routed_model == "gpt-4o-mini"
-        assert calls == 1
+        # 2 calls, both tier1: capped probe + uncapped truncation retry (the mock
+        # raises on any non-mini model, so above-requested escalation stays blocked).
+        assert calls == 2
 
     async def test_allow_escalation_above_requested_true_permits_escalation(self, make_ctx):
         """With the knob on, escalation above the requested model is allowed."""
@@ -1041,3 +1046,172 @@ class TestG06UnreachableTierGuard:
                    side_effect=lambda m: m == "claude-haiku-4-5"):
             ctx = await G06Routing().process_request(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+class TestG06CascadeTier1CapAndTruncation:
+    """cascade_tier1_max_tokens externalisation + the never-serve-a-self-truncated-answer
+    guard (DS18 ds18-02: tier-1 stopped at exactly the hardcoded 512 with finish_reason
+    'length' and was served as final)."""
+
+    def _cascade_cfg(self, ctx, **overrides):
+        g = ctx.config["groups"]["G6_routing"]
+        g["enabled"] = True
+        g["classifier"] = "cascade"
+        g["cascade_execution"] = True
+        g["cascade_confidence_threshold"] = 0.70
+        g["judge_model"] = ""
+        g["tiers"] = {"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["gpt-4-5"]}
+        g.update(overrides)
+        return g
+
+    async def test_tier1_cap_knob_honoured(self, make_ctx):
+        """cascade_tier1_max_tokens is what tier-1 receives when the caller sent none."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cascade_cfg(ctx, cascade_tier1_max_tokens=256)
+        seen = {}
+
+        async def mock_acompletion(*args, **kwargs):
+            seen.update(kwargs)
+            return _mk_resp("gpt-4o-mini", content="4")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert seen.get("max_tokens") == 256
+        assert ctx.routed_model == "gpt-4o-mini"
+
+    async def test_tier1_cap_zero_means_no_injection(self, make_ctx):
+        """cascade_tier1_max_tokens: 0 -> no max_tokens sent to tier-1 at all."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cascade_cfg(ctx, cascade_tier1_max_tokens=0)
+        seen = {}
+
+        async def mock_acompletion(*args, **kwargs):
+            seen.update(kwargs)
+            return _mk_resp("gpt-4o-mini", content="4")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert "max_tokens" not in seen
+
+    async def test_caller_max_tokens_always_wins_and_no_retry(self, make_ctx):
+        """A caller-supplied max_tokens is forwarded verbatim; a length-stop under the
+        CALLER's cap is respected -- no uncapped retry (the truncation is theirs)."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        ctx.params["max_tokens"] = 777
+        self._cascade_cfg(ctx)
+        calls = []
+
+        async def mock_acompletion(*args, **kwargs):
+            calls.append(kwargs)
+            return _mk_resp("gpt-4o-mini", content="truncated by caller cap", finish_reason="length")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert len(calls) == 1
+        assert calls[0].get("max_tokens") == 777
+
+    async def test_truncated_tier1_retried_uncapped(self, make_ctx):
+        """No caller cap + injected cap truncates tier-1 + no escalation available
+        (simple-classified prompt caps the cascade at tier-1) -> one uncapped retry,
+        and the RETRY is what gets served."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cascade_cfg(ctx)
+        calls = []
+
+        async def mock_acompletion(*args, **kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                return _mk_resp("gpt-4o-mini", content="truncated mid-", finish_reason="length")
+            return _mk_resp("gpt-4o-mini", content="the complete answer")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert len(calls) == 2
+        assert calls[0].get("max_tokens") == 512          # injected default cap
+        assert "max_tokens" not in calls[1]                # retry is uncapped
+        served = ctx.cascade_response["choices"][0]["message"]["content"]
+        assert served == "the complete answer"
+
+    async def test_truncation_retry_disabled_serves_capped(self, make_ctx):
+        """cascade_retry_uncapped_on_truncation: false -> the capped response is served as-is."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cascade_cfg(ctx, cascade_retry_uncapped_on_truncation=False)
+        calls = []
+
+        async def mock_acompletion(*args, **kwargs):
+            calls.append(kwargs)
+            return _mk_resp("gpt-4o-mini", content="truncated mid-", finish_reason="length")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert len(calls) == 1
+
+    async def test_blocked_tier2_still_considers_tier3(self, make_ctx):
+        """A cost-blocked tier-2 hop must not abort the cascade -- tier-3 (often the
+        caller's own model) is still evaluated against the guards (DS18: tier-2 gpt-4o
+        blocked as above-requested o4-mini -> tier-3 == the requested model was never
+        tried and a truncated tier-1 probe was served)."""
+        ctx = make_ctx(
+            [{"role": "user", "content": "Analyze and architect a strategy for this complex system."}],
+            model="gpt-4-5",
+        )
+        self._cascade_cfg(ctx, judge_model="judge-model")
+        models_called = []
+
+        async def mock_acompletion(*args, **kwargs):
+            models_called.append(kwargs.get("model", ""))
+            return _mk_resp(kwargs.get("model", ""), content="Answer from " + str(kwargs.get("model")))
+
+        async def mock_judge(*args, **kwargs):
+            return 0.50  # tier-1 inadequate -> escalate
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._evaluate_response_confidence", mock_judge), \
+             patch("middleware.g06_routing._escalation_block_reason",
+                   side_effect=["tier2 too pricey", None]), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        # tier-2 was blocked (never called); tier-3 ran and was served
+        assert not any(m == "gpt-4o" for m in models_called)
+        assert any("4-5" in m for m in models_called)
+        assert ctx.routed_model == "gpt-4-5"
+
+    async def test_expected_output_estimate_knob_used(self, make_ctx):
+        """expected_output_tokens_estimate feeds the cost guards when the request has no
+        max_tokens -- verified via the estimate_cost call arguments."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cascade_cfg(ctx, expected_output_tokens_estimate=2048)
+        seen_outputs = []
+
+        def spy_estimate(input_tokens, output_tokens, model):
+            seen_outputs.append(output_tokens)
+            return _faithful_cost(input_tokens, output_tokens, model)
+
+        async def mock_acompletion(*args, **kwargs):
+            return _mk_resp("gpt-4o-mini", content="4")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing.estimate_cost", side_effect=spy_estimate), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert 2048 in seen_outputs

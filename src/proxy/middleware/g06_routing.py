@@ -481,7 +481,9 @@ async def _execute_three_tier_cascade(
     # Cost is judged as input + expected output (0-output undercounts reasoning tiers,
     # whose output tokens dominate cost), as a delta vs the previous tier and against
     # the caller's own model.
-    expected_output_tokens = int(ctx.params.get("max_tokens") or 512)
+    expected_output_tokens = int(
+        ctx.params.get("max_tokens") or cfg.get("expected_output_tokens_estimate", 512)
+    )
     requested_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, ctx.model)
 
     # Tier 1: Try cheap model
@@ -499,10 +501,22 @@ async def _execute_three_tier_cascade(
         # temperature; a tool-requiring request that short-circuited at tier1 silently
         # lost its tool calls — it only ever worked because such requests always escalated
         # to a tier that did forward them.
-        tier1_max_tokens = ctx.params.get("max_tokens") or 512
+        #
+        # Output cap: only when the CALLER sent no max_tokens do we inject the
+        # configurable tier-1 probe cap (cascade_tier1_max_tokens; 0 disables the
+        # injection entirely, leaving the provider default). ``injected_cap`` records
+        # that the cap is ours, not the caller's — a response truncated by OUR cap
+        # must never be served as the final answer (see _serve below).
+        caller_max_tokens = ctx.params.get("max_tokens")
+        _cap_cfg = int(cfg.get("cascade_tier1_max_tokens", 512) or 0)
+        injected_cap: Optional[int] = None
         tier1_temperature = ctx.params.get("temperature", 0.0)
         _t1_passthrough = {k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")}
-        _t1_passthrough.setdefault("max_tokens", tier1_max_tokens)
+        if caller_max_tokens:
+            _t1_passthrough.setdefault("max_tokens", caller_max_tokens)
+        elif _cap_cfg > 0:
+            injected_cap = _cap_cfg
+            _t1_passthrough.setdefault("max_tokens", _cap_cfg)
         _t1_passthrough.setdefault("temperature", tier1_temperature)
         _t1_model, _t1_kwargs = build_litellm_call(tier1_model, get_providers(), provider_key)
         tier1_response = await _timed_llm(ctx, litellm.acompletion(
@@ -511,6 +525,45 @@ async def _execute_three_tier_cascade(
             **_t1_kwargs,
             **_t1_passthrough,
         ), model=tier1_model)
+
+        def _dump(resp: Any) -> Dict[str, Any]:
+            return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+
+        async def _serve(final_model: str, final_response: Any) -> Tuple[str, Dict[str, Any]]:
+            """Final-answer guard: if the cascade settled on the tier-1 probe and that
+            probe was truncated by OUR injected cap (finish_reason == "length"), retry
+            it once without the cap before serving — a self-inflicted truncation must
+            not become the customer's answer (DS18 ds18-02: completion stopped at
+            exactly the 512 cap mid-proof). Caller-supplied caps are always respected.
+            """
+            if (
+                final_model == tier1_model
+                and injected_cap is not None
+                and cfg.get("cascade_retry_uncapped_on_truncation", True)
+            ):
+                rd = _dump(final_response)
+                _choices = rd.get("choices") or []
+                _fr = (_choices[0] or {}).get("finish_reason") if _choices else None
+                if _fr == "length":
+                    try:
+                        _retry_pt = dict(_t1_passthrough)
+                        _retry_pt.pop("max_tokens", None)
+                        retry_response = await _timed_llm(ctx, litellm.acompletion(
+                            model=_t1_model,
+                            messages=ctx.messages,
+                            **_t1_kwargs,
+                            **_retry_pt,
+                        ), model=tier1_model)
+                        logger.info(
+                            "G06 cascade: tier1 response truncated by injected %st cap — retried uncapped",
+                            injected_cap,
+                        )
+                        return final_model, _dump(retry_response)
+                    except Exception as exc:
+                        logger.warning(
+                            "G06 cascade: uncapped tier1 retry failed (%s) — serving capped response", exc
+                        )
+            return final_model, _dump(final_response)
 
         # Evaluate confidence from the RESPONSE — via judge model, or a cheap
         # response-quality heuristic when no judge is configured. (The old no-judge
@@ -531,7 +584,7 @@ async def _execute_three_tier_cascade(
         # If confidence is high, return tier1 result
         if confidence >= confidence_threshold:
             logger.info("G06 cascade: using tier1 model %s (confidence %.2f)", tier1_model, confidence)
-            return tier1_model, tier1_response.model_dump() if hasattr(tier1_response, "model_dump") else dict(tier1_response)
+            return await _serve(tier1_model, tier1_response)
 
         # Track best response so far — an escalation block or tier3 failure falls back
         # to this, not always tier1. best_cost drives the per-step cost-delta guard.
@@ -548,36 +601,41 @@ async def _execute_three_tier_cascade(
                 tier2_cost, best_cost, requested_cost, max_escalation_cost, allow_above_requested
             )
             if block_reason:
+                # A blocked MIDDLE hop must not abort the cascade: the guards are
+                # per-hop, and tier3 is often the caller's own (allowed) model.
+                # Early-returning here served a low-confidence tier1 probe as final
+                # even when tier3 would have passed the guards (DS18 ds18-02: tier2
+                # gpt-4o blocked as above-requested o4-mini → truncated tier1 served,
+                # tier3 == the requested model never considered).
                 logger.warning(
-                    "G06 cascade: tier2 escalation blocked (%s), using %s", block_reason, best_model
+                    "G06 cascade: tier2 escalation blocked (%s), considering tier3", block_reason
                 )
-                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
-
-            try:
-                tier2_provider_key = await _resolve_provider_key(tier2_model, ctx.tenant_id)
-                _t2_model, _t2_kwargs = build_litellm_call(tier2_model, get_providers(), tier2_provider_key)
-                tier2_response = await _timed_llm(ctx, litellm.acompletion(
-                    model=_t2_model,
-                    messages=ctx.messages,
-                    **_t2_kwargs,
-                    **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
-                ), model=tier2_model)
-                logger.info("G06 cascade: escalated to tier2 model %s", tier2_model)
-                # Tier2 succeeded — promote it as the best fallback before confidence check
-                best_model = tier2_model
-                best_response = tier2_response
-                best_cost = tier2_cost
-                # Re-evaluate confidence after tier2; if still low, try tier3
-                if judge_model:
-                    confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model, ctx.tenant_id))
-                else:
-                    confidence2 = _heuristic_response_confidence(tier2_response, cfg)
-                if confidence2 >= confidence_threshold:
-                    logger.info("G06 cascade: using tier2 model %s (confidence %.2f)", tier2_model, confidence2)
-                    return tier2_model, tier2_response.model_dump() if hasattr(tier2_response, "model_dump") else dict(tier2_response)
-            except Exception as exc:
-                logger.warning("G06 cascade tier2 failed: %s, rolling back to %s", exc, best_model)
-                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
+            else:
+                try:
+                    tier2_provider_key = await _resolve_provider_key(tier2_model, ctx.tenant_id)
+                    _t2_model, _t2_kwargs = build_litellm_call(tier2_model, get_providers(), tier2_provider_key)
+                    tier2_response = await _timed_llm(ctx, litellm.acompletion(
+                        model=_t2_model,
+                        messages=ctx.messages,
+                        **_t2_kwargs,
+                        **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
+                    ), model=tier2_model)
+                    logger.info("G06 cascade: escalated to tier2 model %s", tier2_model)
+                    # Tier2 succeeded — promote it as the best fallback before confidence check
+                    best_model = tier2_model
+                    best_response = tier2_response
+                    best_cost = tier2_cost
+                    # Re-evaluate confidence after tier2; if still low, try tier3
+                    if judge_model:
+                        confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model, ctx.tenant_id))
+                    else:
+                        confidence2 = _heuristic_response_confidence(tier2_response, cfg)
+                    if confidence2 >= confidence_threshold:
+                        logger.info("G06 cascade: using tier2 model %s (confidence %.2f)", tier2_model, confidence2)
+                        return await _serve(tier2_model, tier2_response)
+                except Exception as exc:
+                    logger.warning("G06 cascade tier2 failed: %s, rolling back to %s", exc, best_model)
+                    return await _serve(best_model, best_response)
 
         # Tier 3: Escalate to complex model (only if the request classifies complex)
         if complex_models and max_tier_idx >= 2:
@@ -591,7 +649,7 @@ async def _execute_three_tier_cascade(
                 logger.warning(
                     "G06 cascade: tier3 escalation blocked (%s), using %s", block_reason, best_model
                 )
-                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
+                return await _serve(best_model, best_response)
 
             try:
                 tier3_provider_key = await _resolve_provider_key(tier3_model, ctx.tenant_id)
@@ -603,14 +661,14 @@ async def _execute_three_tier_cascade(
                     **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
                 ), model=tier3_model)
                 logger.info("G06 cascade: escalated to tier3 model %s", tier3_model)
-                return tier3_model, tier3_response.model_dump() if hasattr(tier3_response, "model_dump") else dict(tier3_response)
+                return await _serve(tier3_model, tier3_response)
             except Exception as exc:
                 logger.warning("G06 cascade tier3 failed: %s, rolling back to best tier (%s)", exc, best_model)
-                return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
+                return await _serve(best_model, best_response)
 
         # No further escalation available (tiers exhausted or capped) — return the best
         # response produced so far (tier2 if it ran, else tier1), not always tier1.
-        return best_model, best_response.model_dump() if hasattr(best_response, "model_dump") else dict(best_response)
+        return await _serve(best_model, best_response)
 
     except Exception as exc:
         logger.error("G06 cascade tier1 failed: %s", exc)
@@ -978,7 +1036,7 @@ class G06Routing:
                 and not user_override
                 and ctx.savings.routing_mode != "cascade_execution"
                 and not cfg.get("allow_escalation_above_requested", False)):
-            _out = int(ctx.params.get("max_tokens") or 512)
+            _out = int(ctx.params.get("max_tokens") or cfg.get("expected_output_tokens_estimate", 512))
             _req_cost = estimate_cost(ctx.current_token_count, _out, model_requested)
             _sel_cost = estimate_cost(ctx.current_token_count, _out, selected_model)
             if _sel_cost > _req_cost:

@@ -7,7 +7,12 @@
 # run stays under the $100 LLM-spend ceiling.
 #
 # Purpose: publishable spend-weighted headline + confidence intervals — every
-# dataset at full samples with N=3 median and the widest gpt-4.5 exposure.
+# dataset at full samples with 3 INDEPENDENT COLD repeats (the harness flushes
+# the G05 cache between repeats — 2026-07-23; without that, repeats 2-3 were
+# byte-identical cache replays that inflated the summed headline to 81.9%) and
+# the widest gpt-4.5 exposure. Repeats feed the majority-across-repeats quality
+# gate and the per-repeat savings spread; savings are the pooled sum over the
+# cold repeats (NOT a median, despite older docs).
 #
 # The cap is LLM API spend only (identical across all four deployment targets:
 # OSS/commercial x local/GCP). GCP infra cost, if any, is separate/out-of-band.
@@ -22,7 +27,10 @@ spend_cap_usd: 100.0
 
 # ── Ablation sizing (Phase A — per-group attribution) ────────────────────────
 sample_size: 18
-repeats: 3              # N=3 median — the publishable configuration
+repeats: 3              # 3 independent COLD repeats (between-repeat flush) — the
+                        # publishable configuration. Actual spend now approaches the
+                        # estimate (~+20-30% vs pre-flush runs, where cache-enabled
+                        # arms got repeats 2-3 free as cache hits).
 
 # ── Dataset selection ────────────────────────────────────────────────────────
 dataset_subset: all

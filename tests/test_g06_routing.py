@@ -56,14 +56,17 @@ def _make_ctx(messages=None, params=None):
     return ctx
 
 
-def _fake_response(content="OK"):
-    """Minimal litellm-style response object."""
+def _fake_response(content="OK", finish_reason=None):
+    """Minimal litellm-style response object. Default (no finish_reason, real content)
+    scores 'ok' (0.85) on the response-adequacy heuristic; pass finish_reason='length'
+    to build an inadequate/truncated answer that forces escalation."""
     resp = MagicMock()
     resp.choices = [MagicMock()]
     resp.choices[0].message.content = content
-    resp.model_dump.return_value = {
-        "choices": [{"message": {"content": content}}]
-    }
+    choice = {"message": {"content": content}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    resp.model_dump.return_value = {"choices": [choice]}
     return resp
 
 
@@ -183,9 +186,14 @@ class TestExecuteThreeTierCascade:
 
     @pytest.mark.asyncio
     async def test_tier1_low_confidence_escalates_to_tier2(self):
-        """Tier1 confidence below threshold → escalate to tier2."""
+        """Tier1 answer inadequate (truncated) → escalate to tier2. (The no-judge path
+        scores the RESPONSE: an adequate tier1 answer is accepted, so a truncated one
+        is the way to force escalation.)"""
         ctx = _make_ctx()
-        responses = [_fake_response("Tier1 response"), _fake_response("Better tier2 response")]
+        responses = [
+            _fake_response("Tier1 response", finish_reason="length"),
+            _fake_response("Better tier2 response"),
+        ]
         call_count = {"n": 0}
 
         async def side_effect(**kwargs):
@@ -244,7 +252,9 @@ class TestExecuteThreeTierCascade:
 
     @pytest.mark.asyncio
     async def test_tier3_failure_rolls_back_to_tier2(self):
-        """If tier3 raises after tier2 succeeded, return tier2 response."""
+        """If tier3 raises after tier2 succeeded, return tier2 response. Request must
+        classify complex (tier cap) and tier1+tier2 answers must be inadequate
+        (truncated) so the cascade actually reaches tier3."""
         ctx = _make_ctx()
         call_count = {"n": 0}
 
@@ -253,11 +263,11 @@ class TestExecuteThreeTierCascade:
             model = kwargs.get("model", "")
             if "gpt-4-5" in model:
                 raise RuntimeError("Tier3 unavailable")
-            return _fake_response(f"Response from {model}")
+            return _fake_response(f"Response from {model}", finish_reason="length")
 
         with patch("middleware.g06_routing._resolve_provider_key", new_callable=AsyncMock, return_value="key"), \
              patch("middleware.g06_routing.litellm.acompletion", side_effect=acompletion_side), \
-             patch("middleware.g06_routing._classify_heuristic", return_value=("medium", 0.40)), \
+             patch("middleware.g06_routing._classify_heuristic", return_value=("complex", 0.40)), \
              patch("middleware.g06_routing.estimate_cost", return_value=0.0):
             model, response = await _execute_three_tier_cascade(ctx, self._tiers(), self._cfg(threshold=0.70))
 

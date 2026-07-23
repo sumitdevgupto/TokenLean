@@ -19,6 +19,26 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-23
+
+### Cost-routing cascade could serve a truncated answer — cap externalised, truncation now retried — Bug fix
+The G06 execution cascade's cheap-tier probe injected a hardcoded 512-token output cap on
+requests that carried no `max_tokens`, and three compounding paths could then serve that
+truncated answer as final: a length-stopped probe scored low confidence but a cost-blocked
+tier-2 hop aborted the whole cascade (never considering tier-3 — often the caller's own
+model), so the mid-sentence answer shipped. Fixed: the cap is now configurable
+(`cascade_tier1_max_tokens`, `0` = don't inject; caller-supplied `max_tokens` always wins),
+a blocked tier-2 hop falls through to evaluate tier-3 against the same cost guards, and a
+tier-1 answer truncated by the injected cap is retried once uncapped before serving
+(`cascade_retry_uncapped_on_truncation`). Cost estimates also externalised
+(`expected_output_tokens_estimate`).
+
+## 2026-07-22
+
+### Docs-chat corpus refresh is now a 3-step publish loop — generate, review, apply — Enhancement [Enterprise]
+Keeping the portal chatbot's knowledge base current after a feature push is now one command per step. `--generate` drafts doc updates from the feature diff (review-gated, as before, and now records new-doc titles for the publish step). After the operator reviews the drafts — editing accepted ones in place and deleting rejected ones — a new **`--apply`** mode publishes everything that survived review in one shot: copies drafts over the live docs, registers new docs in the manifest with the recorded title (H1 fallback), bumps `docs_version` so every tenant's cached chat answer invalidates atomically, cleans up the draft directory, and immediately runs the delta-sync ingest into the vector store. Replaces the previous manual step (hand-copying files, editing the manifest, bumping the version, running `--sync` separately). Marketing: *"Refresh your support chatbot's knowledge base after every release with a generate → review → publish loop — drafts stay human-gated, publishing is one command."*
+- **[Enterprise]:** the docs-chat corpus tooling ships with the managed portal — <https://tokenlean.cbeyond.cloud/>
+
 ## 2026-07-21
 
 ### A3 output-holdout cohort stayed stable across measurement arms — Bug fix

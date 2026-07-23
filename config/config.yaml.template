@@ -580,6 +580,18 @@ groups:
       truncated: 0.30
       refusal: 0.40
       empty: 0.0
+    # Output cap injected on the tier-1 probe ONLY when the caller sent no max_tokens
+    # (a caller-supplied max_tokens always wins). 0 = never inject; the provider's
+    # default applies. Bounds the cost of the cheap probe call.
+    cascade_tier1_max_tokens: 512
+    # If the cascade settles on the tier-1 probe as the FINAL answer but that answer
+    # was truncated by the injected cap above (finish_reason == "length"), retry the
+    # tier-1 model once without the cap before serving. A self-inflicted truncation
+    # must never be the customer's answer. No-op when the caller set max_tokens.
+    cascade_retry_uncapped_on_truncation: true
+    # Expected output tokens used ONLY for cost estimates (escalation guards +
+    # cost-floor) when the request carries no max_tokens.
+    expected_output_tokens_estimate: 512
     routellm:
       url: http://routellm-svc:8081
       router: mf
