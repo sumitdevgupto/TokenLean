@@ -19,6 +19,7 @@ import litellm
 
 from middleware import RequestContext
 from middleware import langfuse_tracing
+from middleware.g06_rules import effective_cfg, match_for_ctx
 from savings.calculator import count_messages_tokens, estimate_cost
 from config_loader import get_default_model, get_known_models, get_providers
 from providers import build_litellm_call
@@ -948,11 +949,25 @@ class G06Routing:
         model_requested = ctx.model  # snapshot before any mutation
         selected_model = ctx.model
         user_override = False
+        user_override_attempted = False
+        rule_pinned = False
+        matched_rule_id = ""
+        # Per-rule knob overrides route through eff_cfg; defaults to cfg (identity) so the
+        # no-rule path is byte-identical to the classifier-only behaviour.
+        eff_cfg = cfg
         complexity = ""  # populated when a classifier runs
 
-        # 1. User override: bypass classifier entirely
+        # 1. User override: an explicit, valid x_complexity is caller intent and outranks
+        # both tenant rules and the classifier. "Attempted" (a valid tier string was sent)
+        # gates the lower-precedence stages even when that tier's list is empty — preserving
+        # the historical behaviour of serving the caller's own model rather than falling
+        # through to classification.
         user_complexity = ctx.params.get("complexity") or ctx.params.get("x_complexity")
-        if isinstance(user_complexity, str) and user_complexity in ("simple", "medium", "complex"):
+        user_override_attempted = (
+            isinstance(user_complexity, str)
+            and user_complexity in ("simple", "medium", "complex")
+        )
+        if user_override_attempted:
             candidates = tiers.get(user_complexity, [])
             if candidates:
                 selected_model = _select_from_tier(candidates, cfg, ctx, user_complexity)
@@ -965,13 +980,43 @@ class G06Routing:
                     selected_model,
                 )
 
-        # 2. Classifier dispatch
-        else:
-            classifier = cfg.get("classifier", "cascade")
+        # 1.5 Tenant routing rules: deterministic per-tenant policy, BELOW the caller
+        # override and ABOVE the classifier. A rule may pin a specific model or a tier (the
+        # strategy layer then picks within it) and/or override strategy/knobs for the matched
+        # traffic via eff_cfg. Default off — no `rules` configured skips this entirely
+        # (byte-identical classifier behaviour). Assigning selected_model here (before the
+        # reachability + cost-floor guards below) means a rule-pinned model inherits both
+        # guards automatically.
+        if not user_override_attempted and cfg.get("rules"):
+            rule = match_for_ctx(ctx, cfg)
+            if rule:
+                eff_cfg = effective_cfg(cfg, rule)
+                matched_rule_id = str(rule.get("id", "?"))
+                action = rule.get("action") if isinstance(rule.get("action"), dict) else {}
+                if action.get("model"):
+                    selected_model = action["model"]
+                    rule_pinned = True
+                elif action.get("tier") in tiers and tiers.get(action.get("tier")):
+                    selected_model = _select_from_tier(
+                        tiers[action["tier"]], eff_cfg, ctx, action["tier"]
+                    )
+                    rule_pinned = True
+                if rule_pinned:
+                    ctx.savings.routing_mode = f"rules:{matched_rule_id}"
+                    logger.debug(
+                        "[%s] G06 routing rule %r → %s",
+                        ctx.request_id, matched_rule_id, selected_model,
+                    )
+                # An overrides-only rule (no tier/model) does NOT pin — the classifier below
+                # still runs, but under eff_cfg so the rule's knob overrides take effect.
+
+        # 2. Classifier dispatch (skipped when the caller overrode or a rule pinned a model)
+        if not user_override_attempted and not rule_pinned:
+            classifier = eff_cfg.get("classifier", "cascade")
             
             # Use true 3-tier cascade when classifier=cascade and cascade_execution=true
-            if classifier == "cascade" and cfg.get("cascade_execution", False):
-                cascade_model, cascade_response = await _execute_three_tier_cascade(ctx, tiers, cfg)
+            if classifier == "cascade" and eff_cfg.get("cascade_execution", False):
+                cascade_model, cascade_response = await _execute_three_tier_cascade(ctx, tiers, eff_cfg)
                 if cascade_model and "error" not in cascade_response:
                     selected_model = cascade_model
                     ctx.savings.routing_mode = "cascade_execution"
@@ -983,16 +1028,16 @@ class G06Routing:
                     )
                 else:
                     # Fallback to standard classification
-                    complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, cfg))
+                    complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, eff_cfg))
                     candidates = tiers.get(complexity, tiers.get("medium", []))
                     if candidates:
-                        selected_model = _select_from_tier(candidates, cfg, ctx, complexity)
+                        selected_model = _select_from_tier(candidates, eff_cfg, ctx, complexity)
                     ctx.savings.routing_mode = f"{classifier}_fallback"
             else:
-                complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, cfg))
+                complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, eff_cfg))
                 candidates = tiers.get(complexity, tiers.get("medium", []))
                 if candidates:
-                    selected_model = _select_from_tier(candidates, cfg, ctx, complexity)
+                    selected_model = _select_from_tier(candidates, eff_cfg, ctx, complexity)
                 ctx.savings.routing_mode = classifier
 
         # 2b. Reachability guard (P8 hardening): never hand main.py a routed tier model whose
@@ -1035,8 +1080,8 @@ class G06Routing:
         if (selected_model and selected_model != model_requested
                 and not user_override
                 and ctx.savings.routing_mode != "cascade_execution"
-                and not cfg.get("allow_escalation_above_requested", False)):
-            _out = int(ctx.params.get("max_tokens") or cfg.get("expected_output_tokens_estimate", 512))
+                and not eff_cfg.get("allow_escalation_above_requested", False)):
+            _out = int(ctx.params.get("max_tokens") or eff_cfg.get("expected_output_tokens_estimate", 512))
             _req_cost = estimate_cost(ctx.current_token_count, _out, model_requested)
             _sel_cost = estimate_cost(ctx.current_token_count, _out, selected_model)
             if _sel_cost > _req_cost:
@@ -1066,6 +1111,8 @@ class G06Routing:
 
             if user_override:
                 routing_detail = "user_override"
+            elif rule_pinned:
+                routing_detail = f"rule={matched_rule_id}"
             else:
                 routing_detail = f"classifier={cfg.get('classifier', 'cascade')}, complexity={complexity}"
 
@@ -1093,6 +1140,7 @@ class G06Routing:
                 "routing_mode": ctx.savings.routing_mode,
                 "complexity": complexity if not user_override else "user_override",
                 "user_override": user_override,
+                "matched_rule": matched_rule_id or None,
                 "routellm_confidence": ctx.savings.routellm_confidence,
             },
         )

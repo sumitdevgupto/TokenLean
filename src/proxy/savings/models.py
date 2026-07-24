@@ -39,7 +39,10 @@ class SavingsRecord:
     cost_actual_usd: float = 0.0
     effective_token_et: Optional[float] = None
     # G6 routing-specific fields
-    routing_mode: Optional[str] = None  # "heuristic" | "routellm" | "custom" | "heuristic_fallback"
+    # "heuristic" | "routellm" | "cascade" | "llm_judge" | "user_override" |
+    # "cascade_execution" | "<classifier>_fallback" | "rules:<rule_id>" (tenant routing
+    # rule hit; may carry "+cost_floor"/"+tier_unreachable_fallback" suffixes)
+    routing_mode: Optional[str] = None
     routellm_router_used: Optional[str] = None  # e.g., "mf"
     routellm_threshold: Optional[float] = None
     routellm_confidence: Optional[float] = None

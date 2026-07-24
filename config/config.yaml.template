@@ -602,6 +602,39 @@ groups:
       model_map:
         weak: simple
         strong: complex
+    # ── Declarative routing rules (default off) ────────────────────────────────
+    # Deterministic, in-proxy per-tenant policy evaluated BELOW the caller's
+    # x_complexity override and ABOVE the classifier. First matching rule (by
+    # `priority` desc) wins. Empty/absent = no-op → the classifier decides as usual
+    # (byte-identical, protects the savings baseline). Per-tenant overrides REPLACE
+    # this list wholesale (they never append). Authorable from the [Enterprise]
+    # portal "Routing" tab; see docs/config-reference.md for the full schema.
+    rules: []
+    # Example (uncomment + adapt):
+    # rules:
+    #   - id: contracts-to-strong        # unique, ^[A-Za-z0-9._-]{1,64}$
+    #     description: "Legal review → the strong model"
+    #     enabled: true
+    #     priority: 100                  # higher evaluated first; ties keep list order
+    #     match:                         # every PRESENT key must pass (AND); any-of within a list
+    #       keywords: [contract, nda, "legal review"]   # case-insensitive substring
+    #       patterns: ['\bMSA-\d+\b']    # regex (IGNORECASE, <=512 chars each)
+    #       min_prompt_tokens: 0         # 0/absent = no floor
+    #       max_prompt_tokens: 0         # 0/absent = no cap
+    #       models: [gpt-4o-mini]        # match the REQUESTED model
+    #       has_tools: true              # match on presence of tools
+    #       params: {x_team: [legal]}    # X-Team header → x_team param; AND across keys
+    #       user_ids: [alice@acme.test]  # matches ctx.user_id (X-User-ID), NOT a param
+    #     action:                        # need >=1 of tier | model | overrides
+    #       tier: complex                # pin a tier (strategy layer then picks the model)
+    #       model: gpt-4-5               # OR pin an exact model (wins over tier)
+    #       allow_escalation: false      # true = opt this rule out of the cost-floor
+    #       overrides:                   # whitelisted knob overrides for matched traffic
+    #         strategy: canary
+    #         canary_pct: 10
+    #         max_escalation_cost_usd: 0.02
+    #         cascade_confidence_threshold: 0.7
+    #         expected_output_tokens_estimate: 512
   G7_retrieval:
     enabled: true
     chunk_size_tokens: 256

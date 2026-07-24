@@ -34,6 +34,7 @@
 - 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
 - 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown + optional **per-model lockout** that quarantines one degraded model while the provider's others keep serving) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII / G31 context-trust) run non-bypassably before any tokens are spent
 - 🧭 **Agent-aware** — a configurable **intent-orchestration** layer can route each request to the right downstream agent ("refund my invoice" → billing agent, "server is down" → SRE agent) with **no routing code in your app**; off by default (byte-identical when off) and isolated per tenant
+- 🧩 **Route by policy** — declarative **per-tenant routing rules** pin any traffic segment (matched on keywords/regex, prompt size, requested model, tools, header tags, or user id) to a tier or specific model, with a portal **dry-run tester**; deterministic, cost-floor-protected, off by default (byte-identical when off)
 - ♻️ **Hot-reload + self-tuning** — tune or A/B any technique without a redeploy; the proxy can also **learn per-tenant** which optimisations stop paying off and switch them off automatically (managed on Enterprise; the applying engine ships OSS)
 - 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, Temporal
 

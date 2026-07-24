@@ -286,6 +286,46 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `tiers.simple` | `[gemini-flash-lite, ...]` | Simple task models (heuristic mode) |
 | `tiers.medium` | `[gemini-flash, ...]` | Medium task models (heuristic mode) |
 | `tiers.complex` | `[gemini-pro, ...]` | Complex task models (heuristic mode) |
+| `rules` | `[]` | Declarative per-tenant routing rules (see below). Default empty = no-op → the classifier decides as usual (byte-identical, protects the savings baseline) |
+
+**Declarative routing rules (`rules`)**
+
+Deterministic, in-proxy policy for routing a matched traffic segment to a chosen
+tier or model — evaluated **below** the caller's `x_complexity` override and
+**above** the classifier. No LLM calls; adds no latency. **Precedence:**
+`x_complexity` caller override → **rules** → classifier. Rules are ordered by
+`priority` descending (stable on ties = authoring order) and the **first match
+wins**. A rule-selected model still passes G6's **reachability** and **cost-floor**
+guards (never routes above the caller's requested model) unless the rule opts out
+with `allow_escalation: true`. Per-tenant overrides **replace** this list wholesale
+(they never append); authorable from the [Enterprise] portal "Routing" tab.
+
+Each rule: `{id, description?, enabled?, priority?, match, action}`.
+
+| Rule field | Description |
+|---|---|
+| `id` | Required, unique; `^[A-Za-z0-9._-]{1,64}$`. Surfaces in `routing_mode` as `rules:<id>` |
+| `enabled` | Default `true`. `false` skips the rule |
+| `priority` | Integer, higher first (ties keep list order) |
+| `match.keywords` | Any-of, case-insensitive substring over the non-system prompt text |
+| `match.patterns` | Any-of regex (`re.search`, IGNORECASE, ≤512 chars each; invalid/over-long patterns are skipped, never match-all) |
+| `match.min_prompt_tokens` / `max_prompt_tokens` | Prompt-token bounds; `0`/absent = no bound |
+| `match.models` | Exact any-of vs the **requested** model |
+| `match.has_tools` | `true`/`false` vs whether the request carries tools |
+| `match.params` | `{param: [values]}` — AND across keys, any-of within. `X-*` headers arrive as `x_*` params (e.g. `X-Team` → `x_team`) |
+| `match.user_ids` | Any-of vs `ctx.user_id` (the `X-User-ID` header — **not** a `params` entry; only allow-listed user ids populate it) |
+| `action.tier` | Pin `simple`/`medium`/`complex` — the tier list + `strategy` layer then pick the model |
+| `action.model` | Pin an exact configured model (wins over `tier` if both are set) |
+| `action.allow_escalation` | `true` opts this rule out of the cost-floor (audit-visible: `rules:<id>` without a `+cost_floor` revert) |
+| `action.overrides` | Whitelisted per-rule knob overrides for the matched traffic: `strategy`, `strategy_weights`, `canary_pct`, `max_escalation_cost_usd`, `cascade_confidence_threshold`, `expected_output_tokens_estimate`. (Unknown keys are dropped. `least_latency_alpha` is **not** overridable — it is a latency-feed default, not a routing-time read.) |
+
+Matchers are AND-ed: **every present** `match` key must pass. A rule with only
+`action.overrides` (no `tier`/`model`) does **not** pin — the classifier still runs,
+but under the overridden knobs. `routing_mode` reflects a hit as `rules:<id>`, with
+`+cost_floor` or `+tier_unreachable_fallback` appended if a guard fired. (`rules`
+matches the normalized OpenAI-shaped messages, so it applies identically to
+Anthropic and Gemini ingress traffic. If a G24 rule skips G06 for a request,
+routing rules are skipped with it.)
 
 **RouteLLM Configuration Notes:**
 - The `mf` and `sw_ranking` routers require an OpenAI API key for embeddings (stored in Secret Manager as `routellm-openai-key`)

@@ -19,6 +19,22 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-24
+
+### Declarative per-tenant routing rules for G06 — Enhancement (OSS + Enterprise)
+G06 now supports **declarative routing rules**: deterministic, in-proxy policy that pins a
+matched traffic segment to a tier or specific model — evaluated below a caller's per-request
+`x_complexity` override and above the complexity classifier, first-match-wins by `priority`.
+Rules match on keywords/regex, prompt-token size, requested model, tool presence, header tags
+(`X-Team` → `x_team`), or user id, and can pin a tier/model and/or override strategy knobs for
+just that traffic. A rule-selected model still passes the existing cost-floor (never routes
+above the caller's model) unless the rule sets `allow_escalation`. Default is empty (`rules: []`)
+— a no-op that leaves the classifier and the published savings baseline byte-identical.
+Marketing: *"Route by policy, not just heuristics — pin any traffic segment to a tier or model
+with deterministic, per-tenant routing rules, and dry-run them before they go live."*
+- **OSS:** the rules engine + config authoring (`groups.G6_routing.rules`, per-tenant via config), evaluated in-proxy with cost-floor protection by default.
+- **[Enterprise]:** a portal **Routing** tab (structured editor, server-side validation, atomic per-tenant saves, a rerouted-traffic audit, and a no-LLM dry-run tester) — <https://tokenlean.cbeyond.cloud/>
+
 ## 2026-07-23
 
 ### Cost-routing cascade could serve a truncated answer — cap externalised, truncation now retried — Bug fix
