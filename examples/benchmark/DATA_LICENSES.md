@@ -13,11 +13,11 @@ Face before publishing any headline number.
 
 | Profile | Dataset | Hugging Face id | Revision | License | Grading |
 |---------|---------|-----------------|----------|---------|---------|
-| `rag` | SQuAD v2 | `rajpurkar/squad_v2` | *pin before publish* | CC BY-SA 4.0 | gold-answer facts |
-| `chat` | MT-Bench | `lm-sys/FastChat` (`…/mt_bench/question.jsonl`) | *pin before publish* | Apache-2.0 | LLM judge |
-| `swe` | SWE-bench Lite | `princeton-nlp/SWE-bench_Lite` | *pin before publish* | permissive research use | gold-patch paths/symbols facts |
-| `code` | HumanEval | `openai_humaneval` | *pin before publish* | MIT | judge / opt-in exec pass@1 |
-| `reason` | GSM8K | `gsm8k` (`main`) | *pin before publish* | MIT | final-numeric-answer facts |
+| `rag` | SQuAD v2 | `rajpurkar/squad_v2` | `main` (*pin a sha before publish*) | CC BY-SA 4.0 | gold-answer facts |
+| `chat` | MT-Bench | `HuggingFaceH4/mt_bench_prompts` | `main` (*pin a sha before publish*) | Apache-2.0 | LLM judge |
+| `swe` | SWE-bench Lite | `princeton-nlp/SWE-bench_Lite` | `main` (*pin a sha before publish*) | permissive research use | gold-patch paths/symbols facts |
+| `code` | HumanEval | `openai/openai_humaneval` | `main` (*pin a sha before publish*) | MIT | judge / opt-in exec pass@1 |
+| `reason` | GSM8K | `openai/gsm8k` (`main` config) | `main` (*pin a sha before publish*) | MIT | final-numeric-answer facts |
 
 > Replace *"pin before publish"* with the actual commit sha printed by `datasets` at
 > build time, and mirror it into `build_public_dataset.py:PINNED` + `public_dataset.meta.json`.

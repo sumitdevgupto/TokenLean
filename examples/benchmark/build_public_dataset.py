@@ -53,11 +53,11 @@ DEFAULT_FIXTURE = REPO / "tests" / "data" / "ab_corpus_fixture.json"
 # DATA_LICENSES.md whenever these move. MT-Bench is not a HF `datasets` set; its
 # question.jsonl ships in the FastChat repo at the pinned tag below.
 PINNED = {
-    "rag":    {"repo": "rajpurkar/squad_v2",         "revision": "main",   "license": "CC BY-SA 4.0"},
-    "chat":   {"repo": "lm-sys/FastChat",            "revision": "main",   "license": "Apache-2.0"},
-    "swe":    {"repo": "princeton-nlp/SWE-bench_Lite","revision": "main",   "license": "SWE-bench (permissive research)"},
-    "code":   {"repo": "openai_humaneval",           "revision": "main",   "license": "MIT"},
-    "reason": {"repo": "gsm8k",                       "revision": "main",   "license": "MIT"},
+    "rag":    {"repo": "rajpurkar/squad_v2",          "revision": "main",  "license": "CC BY-SA 4.0"},
+    "chat":   {"repo": "HuggingFaceH4/mt_bench_prompts","revision": "main", "license": "Apache-2.0 (MT-Bench)"},
+    "swe":    {"repo": "princeton-nlp/SWE-bench_Lite", "revision": "main",  "license": "SWE-bench (permissive research)"},
+    "code":   {"repo": "openai/openai_humaneval",      "revision": "main",  "license": "MIT"},
+    "reason": {"repo": "openai/gsm8k",                 "revision": "main",  "license": "MIT"},
 }
 
 DEFAULT_COUNTS = {"rag": 30, "chat": 20, "swe": 20, "code": 15, "reason": 15}
@@ -135,8 +135,8 @@ def build_rag(raw, rng, count):
     out = []
     for n, r in enumerate(pool[:count], 1):
         ctx, q = r["context"], r["question"]
-        golds = [t for t in r["answers"]["text"] if t.strip()]
-        facts = [golds] if len(golds) > 1 else golds[:1]  # OR-group when multiple
+        golds = list(dict.fromkeys(t.strip() for t in r["answers"]["text"] if t.strip()))
+        facts = [golds] if len(golds) > 1 else golds[:1]  # OR-group when multiple distinct golds
         msgs = [
             {"role": "system", "content": "Answer the question using ONLY the context. Be concise."},
             {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {q}"},
@@ -273,18 +273,20 @@ def load_from_hf():  # pragma: no cover - requires network + `datasets`
     raw = {}
     raw["rag"] = [dict(r) for r in load_dataset(
         PINNED["rag"]["repo"], split="validation", revision=PINNED["rag"]["revision"])]
-    raw["swe"] = [dict(r) for r in load_dataset(
-        PINNED["swe"]["repo"], split="test", revision=PINNED["swe"]["revision"])]
+    # SWE-bench Lite: no bundled code context column; fall back to hints_text.
+    raw["swe"] = [{"instance_id": r["instance_id"], "problem_statement": r["problem_statement"],
+                   "text_context": r.get("hints_text", ""), "patch": r["patch"]}
+                  for r in load_dataset(PINNED["swe"]["repo"], split="test",
+                                        revision=PINNED["swe"]["revision"])]
     raw["code"] = [dict(r) for r in load_dataset(
         PINNED["code"]["repo"], split="test", revision=PINNED["code"]["revision"])]
     raw["reason"] = [dict(r) for r in load_dataset(
         PINNED["reason"]["repo"], "main", split="test", revision=PINNED["reason"]["revision"])]
-    # MT-Bench question.jsonl lives in the FastChat repo, not the datasets hub.
-    from huggingface_hub import hf_hub_download
-    qpath = hf_hub_download(repo_id=PINNED["chat"]["repo"], repo_type="space",
-                            filename="fastchat/llm_judge/data/mt_bench/question.jsonl",
-                            revision=PINNED["chat"]["revision"])
-    raw["chat"] = [json.loads(ln) for ln in Path(qpath).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    # MT-Bench prompts as a proper HF dataset (prompt_id, category, prompt=[turns]).
+    raw["chat"] = [{"question_id": r["prompt_id"], "category": r.get("category", ""),
+                    "turns": r["prompt"]}
+                   for r in load_dataset(PINNED["chat"]["repo"], split="train",
+                                         revision=PINNED["chat"]["revision"])]
     return raw
 
 

@@ -1,23 +1,23 @@
 {
-  "build_source": "fixture",
+  "build_source": "huggingface",
   "counts": {
-    "chat": 5,
-    "code": 3,
-    "rag": 5,
-    "reason": 5,
-    "swe": 3
+    "chat": 20,
+    "code": 15,
+    "rag": 30,
+    "reason": 15,
+    "swe": 20
   },
-  "dataset_sha256": "5d25b3ab4efb4834f51eced912ba163eb60bbee695af87a4e3f2a88d126e9ecc",
-  "note": "STRUCTURAL PLACEHOLDER built from the offline fixture. Regenerate with `python build_public_dataset.py --hf` (needs `pip install datasets huggingface_hub`) to pull the recognized-standard items verbatim before publishing any headline number.",
+  "dataset_sha256": "4603ddb2819f156599008dc615d165575009a88dc1db53b2553547d536ef72d7",
+  "note": "Built from Hugging Face at the pinned revisions above.",
   "pinned": {
     "chat": {
-      "license": "Apache-2.0",
-      "repo": "lm-sys/FastChat",
+      "license": "Apache-2.0 (MT-Bench)",
+      "repo": "HuggingFaceH4/mt_bench_prompts",
       "revision": "main"
     },
     "code": {
       "license": "MIT",
-      "repo": "openai_humaneval",
+      "repo": "openai/openai_humaneval",
       "revision": "main"
     },
     "rag": {
@@ -27,7 +27,7 @@
     },
     "reason": {
       "license": "MIT",
-      "repo": "gsm8k",
+      "repo": "openai/gsm8k",
       "revision": "main"
     },
     "swe": {
@@ -37,10 +37,10 @@
     }
   },
   "replay_counts": {
-    "originals": 21,
-    "paraphrases": 2,
-    "repeats": 5
+    "originals": 100,
+    "paraphrases": 12,
+    "repeats": 21
   },
   "seed": 42,
-  "total_items": 21
+  "total_items": 100
 }
