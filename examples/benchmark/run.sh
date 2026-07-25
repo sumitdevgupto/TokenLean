@@ -176,7 +176,20 @@ fi
 
 # 7. Run (under the dedicated benchmark tenant) --------------------------------
 if [ "$RUN_AB" = 1 ]; then
-  # The A/B direct arm calls providers via litellm, which reads native env vars.
+  # The A/B direct arm (arm A) calls providers via litellm, which reads keys from
+  # the process environment. Load EVERY provider credential in .env so
+  # `--ab --providers all` can reach each provider's direct arm — not just OpenAI.
+  #   * LLM_KEY_<PROVIDER>  -> run_ab.py mirrors these to the native litellm vars
+  #   * AZURE_/AWS_ extras  -> passed through as-is (azure endpoint, bedrock region)
+  # Only these allow-listed names are exported; the rest of .env is left untouched.
+  while IFS='=' read -r _name _value; do
+    _name="$(printf '%s' "$_name" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]*$//')"
+    case "$_name" in
+      LLM_KEY_*|AZURE_API_BASE|AZURE_API_VERSION|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_REGION_NAME|AWS_SESSION_TOKEN)
+        _value="$(printf '%s' "$_value" | tr -d '\r' | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
+        export "$_name=$_value" ;;
+    esac
+  done < .env
   # Mirror the proxy's LLM_KEY_OPENAI to OPENAI_API_KEY so arm A can authenticate.
   export OPENAI_API_KEY="${OPENAI_API_KEY:-$openai}"
   info "running A/B benchmark (proxy vs direct)..."

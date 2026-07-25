@@ -228,3 +228,18 @@ def test_cache_hit_contributes_zero_arm_b_tokens():
 # --------------------------------------------------------------------------- #
 def test_run_ab_has_main():
     assert callable(getattr(run_ab, "main", None))
+
+
+def test_run_ab_doc_present():
+    doc = (BENCH / "run_ab.md").read_text(encoding="utf-8")
+    assert "--providers" in doc and "run.sh --ab" in doc, "run_ab.md must document usage"
+
+
+def test_launchers_autoexport_env_keys():
+    """Guard the multi-key .env auto-export in both launchers so a multi-provider
+    `--ab --providers all` keeps working from a .env (regression guard)."""
+    sh = (BENCH / "run.sh").read_text(encoding="utf-8")
+    ps = (BENCH / "run.ps1").read_text(encoding="utf-8")
+    for text in (sh, ps):
+        assert "LLM_KEY_" in text and "AWS_REGION_NAME" in text, \
+            "launcher must export LLM_KEY_* (+ azure/bedrock extras) from .env in --ab mode"

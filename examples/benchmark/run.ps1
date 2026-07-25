@@ -102,7 +102,17 @@ if (-not $keepCache) {
 
 # 7. Run (under the dedicated benchmark tenant) --------------------------------
 if ($runAb) {
-    # The A/B direct arm calls providers via litellm, which reads native env vars.
+    # The A/B direct arm (arm A) calls providers via litellm, which reads keys from
+    # the process environment. Load EVERY provider credential in .env so
+    # `--ab --providers all` can reach each provider's direct arm - not just OpenAI.
+    #   LLM_KEY_<PROVIDER> -> run_ab.py mirrors these to native litellm vars
+    #   AZURE_/AWS_ extras -> passed through (azure endpoint, bedrock region)
+    foreach ($line in (Get-Content ".env")) {
+        if ($line -match '^\s*(?:export\s+)?(LLM_KEY_[A-Z0-9_]+|AZURE_API_BASE|AZURE_API_VERSION|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_REGION_NAME|AWS_SESSION_TOKEN)\s*=\s*(.*)$') {
+            $n = $matches[1]; $v = $matches[2].Trim().Trim('"').Trim("'")
+            Set-Item -Path "Env:$n" -Value $v
+        }
+    }
     # Mirror the proxy's LLM_KEY_OPENAI to OPENAI_API_KEY so arm A can authenticate.
     if (-not $env:OPENAI_API_KEY) { $env:OPENAI_API_KEY = $openai }
     Info "running A/B benchmark (proxy vs direct)..."
