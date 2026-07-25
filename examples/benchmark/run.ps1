@@ -50,6 +50,8 @@ if (-not $openai) { Die "LLM_KEY_OPENAI is empty in .env - the proxy needs it fo
 
 # 4. Proxy API key: env -> .env ROI_PROXY_API_KEY_* -> generate (first run) -----
 $key = $env:PROXY_API_KEY
+# Set PROXY_API_KEY=tok-... in .env to run with a fixed key and pass nothing at the CLI.
+if (-not $key) { $key = [regex]::Match($envtext, '(?m)^\s*(?:export\s+)?PROXY_API_KEY=(.+)$').Groups[1].Value.Trim().Trim('"').Trim("'") }
 if (-not $key) { $key = [regex]::Match($envtext, '(?m)^\s*(?:export\s+)?ROI_PROXY_API_KEY_\w+=(tok-\S+)\s*$').Groups[1].Value }
 if ((-not $key) -and (-not (Test-Path "config/local-keys.json"))) {
     Info "no proxy key found - generating a local one"

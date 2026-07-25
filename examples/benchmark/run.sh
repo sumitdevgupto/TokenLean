@@ -58,8 +58,11 @@ fi
 openai="$(grep -E '^[[:space:]]*LLM_KEY_OPENAI=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
 [ -n "$openai" ] || die "LLM_KEY_OPENAI is empty in .env - the proxy needs it for real OpenAI calls. Set LLM_KEY_OPENAI=sk-... (you can reuse your OPENAI_API_KEY value)."
 
-# 4. Proxy API key: env -> .env ROI_PROXY_API_KEY_* -> generate (first run) -----
+# 4. Proxy API key: env $PROXY_API_KEY -> .env PROXY_API_KEY= -> .env
+#    ROI_PROXY_API_KEY_* -> generate (first run). Set PROXY_API_KEY=tok-... in .env
+#    to run with a fixed key and pass nothing at the command line.
 key="${PROXY_API_KEY:-}"
+[ -n "$key" ] || key="$(grep -E '^[[:space:]]*(export[[:space:]]+)?PROXY_API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]' | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)"
 [ -n "$key" ] || key="$(grep -hoE 'ROI_PROXY_API_KEY_[A-Z_]+=tok-[A-Za-z0-9]+' .env 2>/dev/null | grep -oE 'tok-[A-Za-z0-9]+' | head -1 || true)"
 if [ -z "$key" ] && [ ! -f config/local-keys.json ]; then
   info "no proxy key found - generating a local one"

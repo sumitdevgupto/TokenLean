@@ -82,6 +82,12 @@ known-good config, finds a proxy key, loads `.env` credentials, and runs:
 ./examples/benchmark/run.sh --ab --judge --providers all
 ```
 
+The launcher discovers the proxy key in this order: `$PROXY_API_KEY` in the shell → a
+`PROXY_API_KEY=tok-…` line in `.env` → the first `ROI_PROXY_API_KEY_*` in `.env` → a generated
+local key. **Set `PROXY_API_KEY=tok-…` in `.env` to run with a fixed key and pass nothing at the
+command line.** Against an **already-running** proxy (e.g. a commercial deploy), add
+`--no-pin-config` so the launcher measures the live config and does not rewrite/restart it.
+
 Or call the script directly against an already-running local proxy:
 
 ```bash

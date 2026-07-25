@@ -36,7 +36,7 @@ bundled public dataset is sent). Non-savings measurement tooling → the pitch-t
 calibrated single-arm 57.1% path are untouched. Marketing: *"Don't take our word for the savings —
 run a true A/B against real provider bills over standard public datasets, across 10 providers, for
 under a dollar; onboarded tenants can preview it against their own live proxy in one command."*
-- **OSS:** `run_ab.py` + `build_public_dataset.py` + `verify.sh`/`verify.ps1` + `--ab` launcher mode + checked-in dataset/prices + unit tests; root README "Verify it yourself" + `docs/client-onboarding.md` "Verify your savings before going live". `run.sh`/`run.ps1 --ab` auto-export every `LLM_KEY_*` (+ azure/bedrock extras) from `.env` so `--providers all` fans out across a multi-key `.env`; full CLI/keys/local-vs-GCP reference in `examples/benchmark/run_ab.md`.
+- **OSS:** `run_ab.py` + `build_public_dataset.py` + `verify.sh`/`verify.ps1` + `--ab` launcher mode + checked-in dataset/prices + unit tests; root README "Verify it yourself" + `docs/client-onboarding.md` "Verify your savings before going live". `run.sh`/`run.ps1 --ab` auto-export every `LLM_KEY_*` (+ azure/bedrock extras) from `.env` so `--providers all` fans out across a multi-key `.env`, and read a fixed `PROXY_API_KEY=tok-…` from `.env` (nothing passed at runtime); full CLI/keys/local-vs-GCP reference in `examples/benchmark/run_ab.md`.
 
 ## 2026-07-24
 

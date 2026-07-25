@@ -243,3 +243,5 @@ def test_launchers_autoexport_env_keys():
     for text in (sh, ps):
         assert "LLM_KEY_" in text and "AWS_REGION_NAME" in text, \
             "launcher must export LLM_KEY_* (+ azure/bedrock extras) from .env in --ab mode"
+        assert "PROXY_API_KEY=" in text, \
+            "launcher must read a fixed PROXY_API_KEY from .env (no runtime key needed)"
