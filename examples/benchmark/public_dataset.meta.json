@@ -1,0 +1,46 @@
+{
+  "build_source": "fixture",
+  "counts": {
+    "chat": 5,
+    "code": 3,
+    "rag": 5,
+    "reason": 5,
+    "swe": 3
+  },
+  "dataset_sha256": "5d25b3ab4efb4834f51eced912ba163eb60bbee695af87a4e3f2a88d126e9ecc",
+  "note": "STRUCTURAL PLACEHOLDER built from the offline fixture. Regenerate with `python build_public_dataset.py --hf` (needs `pip install datasets huggingface_hub`) to pull the recognized-standard items verbatim before publishing any headline number.",
+  "pinned": {
+    "chat": {
+      "license": "Apache-2.0",
+      "repo": "lm-sys/FastChat",
+      "revision": "main"
+    },
+    "code": {
+      "license": "MIT",
+      "repo": "openai_humaneval",
+      "revision": "main"
+    },
+    "rag": {
+      "license": "CC BY-SA 4.0",
+      "repo": "rajpurkar/squad_v2",
+      "revision": "main"
+    },
+    "reason": {
+      "license": "MIT",
+      "repo": "gsm8k",
+      "revision": "main"
+    },
+    "swe": {
+      "license": "SWE-bench (permissive research)",
+      "repo": "princeton-nlp/SWE-bench_Lite",
+      "revision": "main"
+    }
+  },
+  "replay_counts": {
+    "originals": 21,
+    "paraphrases": 2,
+    "repeats": 5
+  },
+  "seed": 42,
+  "total_items": 21
+}

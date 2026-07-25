@@ -14,6 +14,31 @@ Contact your platform team to receive:
 
 > **You will never receive LLM provider keys.** The proxy handles all provider authentication securely via GCP Secret Manager.
 
+## Verify your savings before going live
+
+Want to see what the proxy will save you *before* sending real traffic? Run a **true A/B**
+against your live proxy with one command — every request is fired once **direct to the
+provider** and once **through your proxy**, compared on the **provider's own billed usage**
+over a bundled set of **recognized public datasets** (SQuAD v2 / MT-Bench / SWE-bench Lite /
+HumanEval / GSM8K). It prints a cold-floor + realistic-replay savings table at the end.
+
+```bash
+git clone https://github.com/sumitdevgupto/TokenLean.git
+cd TokenLean/examples/benchmark
+./verify.sh --proxy-url "$PROXY_ENDPOINT" --api-key "$PROXY_API_KEY" --provider-key sk-...
+```
+
+(Windows: `.\verify.ps1 ...`.) The launcher makes its own throwaway Python venv — no Docker,
+no local stack.
+
+- **A provider key is required.** This flow always does the true side-by-side, so it needs your
+  own provider key for the direct arm (`--provider-key` for OpenAI, or set `LLM_KEY_<PROVIDER>`
+  and pass `--providers`). BYOK tenants already have theirs; the proxy still never hands one out.
+- **Only the bundled public dataset is sent** to the provider — never your data.
+- **Cost is capped** (`--max-spend-per-provider`, default $1) and spends your own provider budget.
+- The result is **workload-dependent** and will differ from any published headline; it's a preview
+  of the proxy's effect on a standard mix, not a guarantee for your specific traffic.
+
 ## Integration (one-line change)
 
 ### Python

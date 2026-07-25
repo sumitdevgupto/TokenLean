@@ -169,6 +169,11 @@ optimized/
 examples/benchmark/last_run.json
 examples/benchmark/run_output*.txt
 examples/benchmark/*.out
+# A/B harness run outputs (the harness + built dataset ship; per-run results do not)
+examples/benchmark/ab_results.json
+examples/benchmark/ab_cost_log.jsonl
+examples/benchmark/ab_tokens.csv
+examples/benchmark/.venv-verify/
 .gptcache/
 
 # ─── Scratch / debugging output ───────────────────────────────────────────────

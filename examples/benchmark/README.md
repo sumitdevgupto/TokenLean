@@ -210,3 +210,95 @@ which the proxy reads and strips before the upstream call — so they never reac
 > table — directional, not invoice-grade (no negotiated discounts, provider-side
 > caching, or batch/reasoning surcharges). **Token-count savings are measured;
 > dollar figures are estimated.**
+
+---
+
+## A/B: proxy vs direct — the independently verifiable number
+
+The single-arm run above uses the proxy's *own* `_token_opt` counterfactual. `run_ab.py`
+answers the skeptic's objection ("the proxy grades its own homework") with a **true A/B**:
+every request is fired **twice** — once **direct to the provider** (via `litellm`, the same
+library the proxy uses) and once **through the proxy** — and we compare the **provider's own
+billed usage** on both arms, priced from a checked-in dated `prices.json` applied identically.
+Nothing is self-reported: a proxy cache hit shows as **0 provider tokens** (that's the product
+working), and quality is gated on both arms.
+
+### Recognized-standard datasets, verbatim
+
+We invent no question content. Items come verbatim (pinned revision + citation) from public,
+clean-licensed datasets — see [`DATA_LICENSES.md`](DATA_LICENSES.md):
+
+| Profile | Dataset | License | Grading |
+|---------|---------|---------|---------|
+| `rag` | SQuAD v2 | CC BY-SA 4.0 | gold-answer facts |
+| `chat` | MT-Bench | Apache-2.0 | LLM judge |
+| `swe` | SWE-bench Lite | permissive research | gold-patch paths/symbols facts |
+| `code` | HumanEval | MIT | judge / opt-in exec pass@1 |
+| `reason` | GSM8K | MIT | final-numeric-answer facts |
+
+`public_dataset.jsonl` (the canonical items) + `replay_schedule.json` are **checked in**, so
+you need no Hugging Face account. Regenerate them from source with
+`python build_public_dataset.py --hf` (needs `pip install datasets huggingface_hub`); the
+shipped copy may be a **structural placeholder** built from the offline fixture (see
+`build_source` in `public_dataset.meta.json`) — regenerate before publishing any headline number.
+
+### Two numbers from one pass (the credibility spine)
+
+No recognized capability benchmark has repeat/traffic structure — they run each item once. So
+we report **two numbers on the same standard items**, from a single pass (no cache
+cross-contamination, because every original precedes its repeats):
+
+- **cold** — the first-occurrence items with a cold cache. Savings come only from the
+  *stateless* optimisations (compression, routing, pruning, lazy tools, schema). The
+  **indisputable floor** — nobody can claim we shaped the data.
+- **replay** — the same items plus a **disclosed** repeat/paraphrase schedule that models
+  production traffic and exercises the cache/dedup lever. The **realistic ceiling**.
+
+### All 10 providers, auto-detected
+
+The harness swaps the `model` per provider and runs the A/B for **every provider whose
+credentials are configured** (`LLM_KEY_<PROVIDER>` / the native var; Azure/Bedrock also need
+endpoint/region). Default `--providers openai` stays **under $1**; `--providers all` runs the
+full sweep (each provider its own spend sub-cap).
+
+```bash
+# local (boots the stack), OpenAI only, both modes, quality-gated:
+./examples/benchmark/run.sh --ab --judge
+
+# a specific set / all configured providers:
+./examples/benchmark/run.sh --ab --providers openai,anthropic
+./examples/benchmark/run.sh --ab --providers all
+```
+
+Fairness: same body both arms (provider's mapped model, `temperature: 0`, same `max_tokens`);
+proxy `x_*` controls stripped from the direct arm; arm B tokens = `_token_opt.tokens_provider_billed`
+(the real provider prompt tokens; 0 on a cache hit); token savings and cost savings reported
+**separately** (routing changes cost without always cutting input tokens); the facts gate is
+**relative** (a record fails only if the proxy drops a fact the direct arm had). Spend is capped
+per provider (`--max-spend-per-provider`, default $1) with an overall ceiling; a tripped cap
+stops that provider and exits non-zero. Results: `ab_results.json` (per provider → cold/replay →
+per dataset + total) + `ab_cost_log.jsonl`.
+
+### Tenant self-verify (live GCP, no Docker)
+
+Already onboarded on a live TokenLean proxy and want to preview *your* savings before first
+prod traffic? Use `verify.sh` (no Docker; it makes its own venv). This flow always does the true
+A/B, so it **requires your own provider key** (onboarding never gives you one — BYOK tenants
+already have theirs). Only the bundled **public** dataset is sent to the provider — never your data.
+
+```bash
+git clone https://github.com/sumitdevgupto/TokenLean.git
+cd TokenLean/examples/benchmark
+./verify.sh --proxy-url https://<your-proxy>.run.app --api-key tok-... --provider-key sk-...
+```
+
+(Windows: `.\verify.ps1 ...`.) See also `docs/client-onboarding.md`.
+
+### Optional: agentic resolution-rate (heavy, ~$100s, Docker)
+
+The `swe` profile above measures **token savings on developer-shaped long-context traffic**, not
+issue-**resolution rate**. For a true agentic-resolution number, run the proxy in front of a coding
+agent (e.g. SWE-agent) on SWE-bench Lite and diff resolution-rate + per-instance cost against a
+direct baseline. That needs the SWE-bench Docker evaluation harness (≥120 GB, a few hundred dollars
+of compute) and is **not** part of this under-$1 harness — it is a separate, deliberately heavy
+exercise. No code for it ships here.

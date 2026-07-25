@@ -27,14 +27,17 @@ cd "$REPO"
 info() { printf '\033[36m[benchmark]\033[0m %s\n' "$1"; }
 die()  { printf '\033[31m[benchmark] ERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
-# Separate launcher-only flags (--rebuild, --keep-cache, --no-pin-config) from
-# run_benchmark.py args.
-REBUILD=0; KEEP_CACHE=0; PIN_CONFIG=1; ARGS=()
+# Separate launcher-only flags (--rebuild, --keep-cache, --no-pin-config, --ab)
+# from the runner's pass-through args.
+#   --ab  run the true A/B harness (run_ab.py: proxy vs direct-to-provider on
+#         provider-billed tokens) instead of the single-arm counterfactual.
+REBUILD=0; KEEP_CACHE=0; PIN_CONFIG=1; RUN_AB=0; ARGS=()
 for a in "$@"; do
   case "$a" in
     --rebuild)        REBUILD=1 ;;
     --keep-cache)     KEEP_CACHE=1 ;;
     --no-pin-config)  PIN_CONFIG=0 ;;
+    --ab)             RUN_AB=1 ;;
     *)                ARGS+=("$a") ;;
   esac
 done
@@ -172,5 +175,13 @@ else
 fi
 
 # 7. Run (under the dedicated benchmark tenant) --------------------------------
-info "running benchmark..."
-python examples/benchmark/run_benchmark.py --api-key "$key" --tenant "$BENCH_TENANT" ${ARGS[@]+"${ARGS[@]}"}
+if [ "$RUN_AB" = 1 ]; then
+  # The A/B direct arm calls providers via litellm, which reads native env vars.
+  # Mirror the proxy's LLM_KEY_OPENAI to OPENAI_API_KEY so arm A can authenticate.
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-$openai}"
+  info "running A/B benchmark (proxy vs direct)..."
+  python examples/benchmark/run_ab.py --api-key "$key" --tenant "$BENCH_TENANT" ${ARGS[@]+"${ARGS[@]}"}
+else
+  info "running benchmark..."
+  python examples/benchmark/run_benchmark.py --api-key "$key" --tenant "$BENCH_TENANT" ${ARGS[@]+"${ARGS[@]}"}
+fi

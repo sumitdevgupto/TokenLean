@@ -1,0 +1,124 @@
+{
+  "counts": {
+    "originals": 21,
+    "paraphrases": 2,
+    "repeats": 5
+  },
+  "entries": [
+    {
+      "kind": "original",
+      "ref": "swe-0002"
+    },
+    {
+      "kind": "original",
+      "ref": "code-0002"
+    },
+    {
+      "kind": "original",
+      "ref": "swe-0001"
+    },
+    {
+      "kind": "original",
+      "ref": "chat-0004"
+    },
+    {
+      "kind": "original",
+      "ref": "code-0003"
+    },
+    {
+      "kind": "original",
+      "ref": "rag-0002"
+    },
+    {
+      "kind": "original",
+      "ref": "swe-0003"
+    },
+    {
+      "kind": "original",
+      "ref": "chat-0001"
+    },
+    {
+      "kind": "original",
+      "ref": "reason-0004"
+    },
+    {
+      "kind": "original",
+      "ref": "rag-0003"
+    },
+    {
+      "kind": "original",
+      "ref": "reason-0003"
+    },
+    {
+      "kind": "original",
+      "ref": "rag-0005"
+    },
+    {
+      "kind": "original",
+      "ref": "chat-0005"
+    },
+    {
+      "kind": "original",
+      "ref": "reason-0005"
+    },
+    {
+      "kind": "original",
+      "ref": "rag-0004"
+    },
+    {
+      "kind": "original",
+      "ref": "code-0001"
+    },
+    {
+      "kind": "original",
+      "ref": "chat-0002"
+    },
+    {
+      "kind": "original",
+      "ref": "reason-0002"
+    },
+    {
+      "kind": "original",
+      "ref": "rag-0001"
+    },
+    {
+      "kind": "original",
+      "ref": "reason-0001"
+    },
+    {
+      "kind": "original",
+      "ref": "chat-0003"
+    },
+    {
+      "kind": "repeat",
+      "ref": "swe-0001"
+    },
+    {
+      "kind": "repeat",
+      "ref": "chat-0004"
+    },
+    {
+      "kind": "repeat",
+      "ref": "rag-0001"
+    },
+    {
+      "kind": "paraphrase",
+      "prefix": "Hey, ",
+      "ref": "chat-0004"
+    },
+    {
+      "kind": "repeat",
+      "ref": "chat-0003"
+    },
+    {
+      "kind": "repeat",
+      "ref": "rag-0004"
+    },
+    {
+      "kind": "paraphrase",
+      "prefix": "Quick question - ",
+      "ref": "rag-0004"
+    }
+  ],
+  "seed": 42
+}

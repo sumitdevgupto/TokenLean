@@ -19,6 +19,25 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-25
+
+### Publicly-verifiable A/B benchmark + tenant self-verify (proxy vs direct, 10 providers, recognized datasets) — Enhancement (OSS)
+The public `examples/benchmark/` measured the proxy's *own* `_token_opt` counterfactual — easy to
+dismiss as "the proxy grades its own homework." Added `run_ab.py`, a **true A/B**: every request is
+fired once **direct to the provider** (via litellm) and once **through the proxy**, compared on the
+**provider's own billed usage**, priced identically from a checked-in dated `prices.json`. Dataset is
+**recognized public standards used verbatim** (SQuAD v2 / MT-Bench / SWE-bench Lite / HumanEval /
+GSM8K; `build_public_dataset.py`, licenses in `DATA_LICENSES.md`), reported as **two numbers** — a
+cold standard-order **floor** and a realistic-replay **ceiling** — across **all 10 first-class
+providers** (auto-detected by configured keys, per-provider spend caps, OpenAI-only default under $1).
+Onboarded tenants can preview savings against their **live** proxy with one command via `verify.sh`
+(remote, no Docker, auto-venv; always a true A/B so it needs the tenant's own provider key; only the
+bundled public dataset is sent). Non-savings measurement tooling → the pitch-test-plan harness and the
+calibrated single-arm 57.1% path are untouched. Marketing: *"Don't take our word for the savings —
+run a true A/B against real provider bills over standard public datasets, across 10 providers, for
+under a dollar; onboarded tenants can preview it against their own live proxy in one command."*
+- **OSS:** `run_ab.py` + `build_public_dataset.py` + `verify.sh`/`verify.ps1` + `--ab` launcher mode + checked-in dataset/prices + unit tests; root README "Verify it yourself" + `docs/client-onboarding.md` "Verify your savings before going live".
+
 ## 2026-07-24
 
 ### Operator Console redesign — tabbed layout, per-tenant drawer, invoices & trust-safety surfaced — Enhancement [Enterprise]

@@ -27,6 +27,17 @@
 
 > 💵 **Cost savings** run **~70%** on the same gated workloads (config-priced estimate — **directional, not invoice-grade**, and run-variable). Reported separately from the token metric on purpose: routing swaps models (a cost lever) without always cutting input tokens, and dollar figures come from a static price table, not real invoices.
 
+### Verify it yourself
+
+The **54.1%** figure comes from our internal quality-gated ablation (temperature-0, 12 PASS datasets; methodology in `pitch-test-plan/`, not shipped). The **independently runnable proof** is [`examples/benchmark/`](examples/benchmark/) — a **true A/B**: every request is fired once **direct to the provider** and once **through the proxy**, and we compare the **provider's own billed usage** (not the proxy's self-report), over **recognized public datasets** used verbatim (SQuAD v2 · MT-Bench · SWE-bench Lite · HumanEval · GSM8K). It reports **two numbers** — a **cold standard-order floor** (each item once, zero shaping) and a **realistic-replay ceiling** (disclosed repeats that exercise caching) — across **all 10 providers** (auto-detected by your keys). OpenAI-only stays **under $1**:
+
+```bash
+./examples/benchmark/run.sh --ab            # local, boots the stack
+./examples/benchmark/run.sh --ab --providers all   # full 10-provider sweep
+```
+
+The number is **workload-dependent** and will differ from 54.1% — we publish the calibrated A/B result with its repeat-rate disclosure rather than claiming the headline transfers. Already on a managed proxy? A tenant can preview savings against their **live** deployment with one command — see [`docs/client-onboarding.md`](docs/client-onboarding.md).
+
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation
 - 📉 **Broad reduction** — 27 stacked techniques from the Token Optimisation Playbook v7, not just caching
