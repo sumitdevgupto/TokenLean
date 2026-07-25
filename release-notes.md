@@ -21,6 +21,24 @@ date changes.
 
 ## 2026-07-24
 
+### Operator Console redesign — tabbed layout, per-tenant drawer, invoices & trust-safety surfaced — Enhancement [Enterprise]
+The operator console (`/adminconsole`) was one long vertical page: clicking a tenant's Users /
+Trial / Inspect opened a panel appended far below the fold, so an action looked like it "did
+nothing," and any failure surfaced only in a top-of-page banner the operator had scrolled past.
+Redesigned into three top-level tabs (**Tenants · Observability · Billing**); each tenant row is
+now a single **Manage** button that opens a right-side **drawer** with sub-tabs (Overview / Users
+/ Trial / Security / Audit / **Danger zone**), keeping the table in view and showing errors next
+to the action. Destructive actions are disambiguated — **Revoke keys** (keeps data) vs
+**Offboard** (irreversible GDPR erase) — and the two independent holds (contract vs key
+suspension) are grouped with plain-language help. Three operator capabilities that previously had
+no console surface are now exposed so customers aren't impacted: the **all-tenant invoice run**
+(Billing), the **cross-tenant trust-&-safety summary** (Observability), and **BYOK key
+re-encryption** after a master-key rotation (Billing). No backend/API changes — all endpoints
+already existed. Marketing: *"A faster operator console: manage any tenant from one focused panel,
+run invoices and trust-&-safety reports in a click, and rotate encryption keys without a customer
+outage."*
+- **[Enterprise]:** operator-console UX + newly surfaced invoice / trust-safety / BYOK-rotation controls — <https://tokenlean.cbeyond.cloud/>
+
 ### Declarative per-tenant routing rules for G06 — Enhancement (OSS + Enterprise)
 G06 now supports **declarative routing rules**: deterministic, in-proxy policy that pins a
 matched traffic segment to a tier or specific model — evaluated below a caller's per-request
