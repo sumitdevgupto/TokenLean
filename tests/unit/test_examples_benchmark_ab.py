@@ -168,6 +168,140 @@ def test_render_shows_per_profile(capsys):
 
 
 # --------------------------------------------------------------------------- #
+# Multi-turn agentic engine (Phase 2)
+# --------------------------------------------------------------------------- #
+def _scripted_arm(turns_script):
+    """Build an arm_fn that returns each dict in turns_script on successive calls,
+    recording the convo roles it saw each turn."""
+    seen = []
+    it = iter(turns_script)
+
+    def arm(convo, tools):
+        seen.append([m.get("role") for m in convo])
+        return next(it)
+    arm.seen = seen
+    return arm
+
+
+def _turn(content="", pt=100, ct=10, tool=None):
+    tcs = ([{"id": "call_0", "function": {"name": tool, "arguments": "{}"}}] if tool else [])
+    return {"content": content, "prompt_tokens": pt, "completion_tokens": ct, "cache_hit": False,
+            "routed_model": "gpt-4o-mini", "tool_calls": tcs,
+            "assistant_msg": {"role": "assistant", "content": content or None,
+                              **({"tool_calls": [{"id": "call_0", "type": "function",
+                                                  "function": {"name": tool, "arguments": "{}"}}]} if tool else {})}}
+
+
+def test_run_episode_tool_loop():
+    """Two-turn episode: tool_call → local exec (tool result injected) → final answer.
+    Provider-billed tokens are summed across the whole episode."""
+    arm = _scripted_arm([_turn(tool="list_logs", pt=100, ct=20),
+                         _turn(content="Done: 3 errors", pt=150, ct=10)])
+    ep = run_ab.run_episode(arm, [{"role": "user", "content": "check logs"}],
+                            tools=[{"type": "function", "function": {"name": "list_logs"}}],
+                            tool_results={"list_logs": {"errors": 3}})
+    assert ep["turns"] == 2
+    assert ep["prompt_tokens"] == 250 and ep["completion_tokens"] == 30, "tokens summed per episode"
+    assert ep["content"] == "Done: 3 errors"
+    assert [t["function"]["name"] for t in ep["tool_calls"]] == ["list_logs"]
+    assert arm.seen[1] == ["user", "assistant", "tool"], "tool result injected before turn 2"
+
+
+def test_run_episode_max_turns():
+    """An arm that never stops calling tools is bounded by max_turns (no infinite loop)."""
+    arm = _scripted_arm([_turn(tool="loop") for _ in range(20)])
+    ep = run_ab.run_episode(arm, [{"role": "user", "content": "go"}],
+                            tools=[{"type": "function", "function": {"name": "loop"}}],
+                            tool_results={"loop": {}}, max_turns=4)
+    assert ep["turns"] == 4, "episode stops at max_turns"
+
+
+def test_norm_tool_calls_dicts_and_objects():
+    class _Fn:  # SDK-like object
+        name, arguments = "get_health", '{"svc":"api"}'
+
+    class _TC:
+        id, function = "call_9", _Fn()
+    got = run_ab._norm_tool_calls([_TC(),
+                                   {"id": "call_1", "function": {"name": "list", "arguments": "{}"}}])
+    assert got[0] == {"id": "call_9", "function": {"name": "get_health", "arguments": '{"svc":"api"}'}}
+    assert got[1]["function"]["name"] == "list"
+    # missing id gets a synthesised one
+    assert run_ab._norm_tool_calls([{"function": {"name": "x", "arguments": "{}"}}])[0]["id"] == "call_0"
+
+
+def test_call_signatures_accept_tools():
+    import inspect
+    assert "tools" in inspect.signature(run_ab.call_direct).parameters
+    assert "tools" in inspect.signature(run_ab.call_proxy).parameters
+
+
+def test_workload_agentic_wiring():
+    """Guard: the agentic workload runs multi-turn episodes on both arms."""
+    src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+    assert "AGENTIC_DATASET" in src and "agentic_dataset.jsonl" in src
+    assert '"standard", "cache", "agentic"' in src
+    assert 'slice_name == "agentic"' in src and "run_episode(" in src
+    assert 'agentic_dataset.jsonl missing' in src, "must guard a missing agentic pack"
+
+
+# --------------------------------------------------------------------------- #
+# Agentic dataset (BFCL-derived) + tool-trajectory gate (Phase 3)
+# --------------------------------------------------------------------------- #
+def test_agentic_dataset_shape():
+    """Each agentic item: >10 real BFCL tools (-> G08/G16 pruning), a >800-token system
+    prompt (-> G16 cap), tool_results for every tool, well-formed OpenAI tool schemas,
+    Apache-2.0 provenance."""
+    ds = BENCH / "agentic_dataset.jsonl"
+    items = [json.loads(ln) for ln in ds.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert items, "agentic_dataset.jsonl must be non-empty"
+    for it in items:
+        assert it["_profile"] == "agentic" and "_label" in it and "request_id" in it
+        assert it["_source"]["license"] == "Apache-2.0"
+        assert it["_source"]["corpus"].startswith("BFCL")
+        tools = it["tools"]
+        assert len(tools) > 10, "tool catalogue must exceed the pruning threshold"
+        for t in tools:
+            assert t["type"] == "function"
+            fn = t["function"]
+            assert fn["name"] and fn["parameters"]["type"] == "object"
+        # every tool has a mock result for loop continuation
+        names = {t["function"]["name"] for t in tools}
+        assert names <= set(it["tool_results"]), "each tool needs a mock result"
+        sysmsg = next(m["content"] for m in it["messages"] if m["role"] == "system")
+        assert len(sysmsg) // 4 > 800, "system prompt must exceed the G16 cap"
+        assert it["messages"][-1]["role"] == "user" and it["messages"][-1]["content"]
+    # ASCII-safe (cross-platform)
+    ds.read_text(encoding="ascii")
+
+
+def test_relative_tool_gate():
+    """Proxy dropping a tool the direct arm called -> fail; identical/superset -> pass."""
+    def tc(*names):
+        return [{"id": f"c{i}", "function": {"name": n, "arguments": "{}"}} for i, n in enumerate(names)]
+    # proxy dropped 'mv' that the direct arm used
+    r = run_ab.relative_tool_gate(tc("ls", "mv", "cat"), tc("ls", "cat"))
+    assert r["graded"] and not r["passed"] and r["dropped_tools"] == ["mv"]
+    # identical trajectory passes
+    assert run_ab.relative_tool_gate(tc("ls", "cat"), tc("ls", "cat"))["passed"]
+    # proxy calling MORE tools than direct still passes (no drop)
+    assert run_ab.relative_tool_gate(tc("ls"), tc("ls", "cat"))["passed"]
+    # direct made no tool calls -> not graded
+    assert run_ab.relative_tool_gate([], tc("ls"))["graded"] is False
+
+
+def test_agentic_pin_enables_g16():
+    """The launcher's pinned config must enable G16 tool pruning + system-prompt cap so the
+    agentic lever actually fires (safe for standard/cache: no tools, tiny system prompts)."""
+    sh = (BENCH / "run.sh").read_text(encoding="utf-8")
+    assert "G16_agent_arch" in sh and "max_tools_per_agent" in sh and "max_system_prompt_tokens" in sh
+
+
+def test_agentic_builder_script_present():
+    assert (BENCH / "build_agentic_dataset.py").exists(), "reproducible agentic builder must ship"
+
+
+# --------------------------------------------------------------------------- #
 # Fact extraction
 # --------------------------------------------------------------------------- #
 def test_extract_swe_facts():

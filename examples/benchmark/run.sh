@@ -156,10 +156,16 @@ for k in enable:
     _block(k)['enabled'] = True
 for k in disable:
     _block(k)['enabled'] = False
+# Agentic lever (G08/G16 tool-catalogue pruning + system-prompt cap). Safe to enable
+# globally: the standard/cache workloads carry no tools and <=32-token system prompts, so
+# G16 is a no-op there; it only bites on the --workload agentic tool-heavy episodes.
+_block('G8_tools').update({'enabled': True, 'max_tools_per_agent': 20})
+_block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20,
+                                 'max_system_prompt_tokens': 800})
 yaml.safe_dump(c, open('config/config.yaml', 'w'), sort_keys=False)
 if created:
     print("  note: created missing group blocks:", ", ".join(created))
-print("  pinned config written; six groups enabled, G28 CCR disabled")
+print("  pinned config written; six groups + G16 agentic pruning enabled, G28 CCR disabled")
 PY
   PINNED=1
   info "reloading proxy to load pinned config..."

@@ -21,6 +21,24 @@ date changes.
 
 ## 2026-07-26
 
+### A/B benchmark: agentic workload — multi-turn tool-loop A/B on recognized BFCL tasks — Enhancement (OSS)
+Adds a real **multi-turn agentic** lever to the public A/B harness. `run_ab.py` gained an N-turn tool
+loop (`run_episode`) that round-trips `tool_calls` on **both** arms — direct-to-provider and through the
+proxy — executing tools locally and summing **provider-billed tokens across the whole episode** (the
+honest agentic unit). New `--workload agentic` runs `agentic_dataset.jsonl`: 15 tasks built from
+**BFCL v3 multi_turn** (Berkeley Function Calling Leaderboard, Apache-2.0) — real tool schemas (18–39
+tools/task) + the first user turn verbatim — reproducible via `build_agentic_dataset.py`. The launcher
+pins G16 tool-catalogue pruning + system-prompt cap; a **relative tool-trajectory gate** flags any tool
+the proxy dropped that the direct arm called. Smoke at `max_tools=20`: **~29% token savings, trajectory
+5/5 preserved**. Honest scope: this reproduces the **tool-pruning** lever (G08/G16) only — G14/G15
+tool-*output* projection is response-side (fires on pre-baked embedded results) and **cannot** be
+reproduced by a live loop, so it is not claimed here (disclosed in `DATA_LICENSES.md` + item provenance).
+- **OSS:** `run_ab.py` (`run_episode`, `--workload agentic`, `relative_tool_gate`, tools on both arm
+  calls), `build_agentic_dataset.py` + `agentic_dataset.jsonl`, run.sh G16 agentic pin, BFCL license
+  entry, unit tests. Marketing: *"See the agentic savings for yourself — the harness runs real
+  multi-turn tool-using tasks through the proxy and measures the provider's own token bill, then checks
+  the proxy never dropped a tool the task needed."*
+
 ### A/B benchmark: reproduce the cache lever + per-workload transparency — Enhancement (OSS)
 The public A/B harness now lets a verifier **reproduce the cache-savings lever themselves** instead of
 only seeing a low single-shot blend. New `--workload cache` runs a **disclosed** warm-cache burst

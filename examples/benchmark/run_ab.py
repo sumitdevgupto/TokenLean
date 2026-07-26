@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover
 DATASET = HERE / "public_dataset.jsonl"
 SCHEDULE = HERE / "replay_schedule.json"
 CACHE_SCHEDULE = HERE / "cache_schedule.json"
+AGENTIC_DATASET = HERE / "agentic_dataset.jsonl"
 PRICES = HERE / "prices.json"
 RESULTS = HERE / "ab_results.json"
 COST_LOG = HERE / "ab_cost_log.jsonl"
@@ -205,6 +206,18 @@ def load_trace(mode: str, items: dict, schedule: dict) -> list:
 # --------------------------------------------------------------------------- #
 # Quality gate — relative facts (arm B must not drop a fact arm A had)
 # --------------------------------------------------------------------------- #
+def relative_tool_gate(a_calls: list, b_calls: list) -> dict:
+    """Agentic trajectory gate — RELATIVE: the proxy arm (with G08/G16 tool pruning) must not
+    DROP a tool the direct arm actually called. Compares the two arms' tool-NAME sets (not a
+    ground-truth answer), so a legitimate pruning that keeps behaviour identical passes, while
+    pruning that removes a tool the task needed (the direct arm used it, the proxy couldn't)
+    is flagged. Graded only when the direct arm called at least one tool."""
+    a_names = {t["function"]["name"] for t in (a_calls or [])}
+    b_names = {t["function"]["name"] for t in (b_calls or [])}
+    dropped = sorted(a_names - b_names)
+    return {"graded": bool(a_names), "passed": not dropped, "dropped_tools": dropped}
+
+
 def relative_facts_gate(item: dict, ans_a: str, ans_b: str) -> dict:
     """PASS unless arm B (proxy) misses a required fact that arm A (direct) had.
     Mirrors the internal relative gate: we never penalise the proxy for a fact the
@@ -294,26 +307,62 @@ def run_judge(records: list, model: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Provider calls
 # --------------------------------------------------------------------------- #
-def call_direct(litellm_model: str, messages: list, max_tokens: int) -> dict:
+def _norm_tool_calls(raw) -> list:
+    """Normalise provider/proxy tool_calls (dicts OR SDK objects) to a canonical
+    [{'id', 'function': {'name', 'arguments'}}] form the episode loop can round-trip."""
+    out = []
+    for i, tc in enumerate(raw or []):
+        if isinstance(tc, dict):
+            tid = tc.get("id") or f"call_{i}"
+            fn = tc.get("function") or {}
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+        else:  # SDK object
+            tid = getattr(tc, "id", None) or f"call_{i}"
+            fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", None)
+            args = getattr(fn, "arguments", None)
+        out.append({"id": tid, "function": {"name": name or "", "arguments": args or "{}"}})
+    return out
+
+
+def _assistant_msg(content: str, tcs: list) -> dict:
+    """The assistant message to append to the conversation before tool results."""
+    m = {"role": "assistant", "content": content or None}
+    if tcs:
+        m["tool_calls"] = [{"id": t["id"], "type": "function",
+                            "function": {"name": t["function"]["name"],
+                                         "arguments": t["function"]["arguments"]}} for t in tcs]
+    return m
+
+
+def call_direct(litellm_model: str, messages: list, max_tokens: int, tools: list = None) -> dict:
     import litellm
-    resp = litellm.completion(model=litellm_model, messages=messages,
-                              temperature=0, max_tokens=max_tokens)
+    kw = {"model": litellm_model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
+    if tools:
+        kw["tools"] = tools
+    resp = litellm.completion(**kw)
     usage = resp.get("usage") if isinstance(resp, dict) else resp.usage
     pt = int(usage["prompt_tokens"] if isinstance(usage, dict) else usage.prompt_tokens)
     ct = int(usage["completion_tokens"] if isinstance(usage, dict) else usage.completion_tokens)
     choice = (resp["choices"] if isinstance(resp, dict) else resp.choices)[0]
     msg = choice["message"] if isinstance(choice, dict) else choice.message
     content = (msg["content"] if isinstance(msg, dict) else msg.content) or ""
-    return {"content": content, "prompt_tokens": pt, "completion_tokens": ct}
+    raw_tcs = (msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None))
+    tcs = _norm_tool_calls(raw_tcs)
+    return {"content": content, "prompt_tokens": pt, "completion_tokens": ct,
+            "tool_calls": tcs, "assistant_msg": _assistant_msg(content, tcs)}
 
 
 def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_tokens: int,
-               x_controls: dict, tenant: str | None, timeout: float) -> dict:
+               x_controls: dict, tenant: str | None, timeout: float, tools: list = None) -> dict:
     url = base_url.rstrip("/") + "/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if tenant:  # only the local/admin benchmark path sets this; tenant self-verify omits it
         headers["X-Tenant-ID"] = tenant
     body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
+    if tools:
+        body["tools"] = tools
     body.update(x_controls)
     resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
     resp.raise_for_status()
@@ -325,10 +374,52 @@ def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_toke
     completion_tokens = 0 if cache_hit else int(opt.get("response_tokens") or 0)
     routed = opt.get("routed_model") or model
     choice = (data.get("choices") or [{}])[0]
-    content = ((choice.get("message") or {}).get("content")) or ""
+    msg = choice.get("message") or {}
+    content = msg.get("content") or ""
+    tcs = _norm_tool_calls(msg.get("tool_calls") or [])
     return {"content": content, "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens, "routed_model": routed,
-            "cache_hit": cache_hit}
+            "cache_hit": cache_hit, "tool_calls": tcs,
+            "assistant_msg": _assistant_msg(content, tcs)}
+
+
+def run_episode(arm_fn, messages: list, tools: list, tool_results: dict,
+                max_turns: int = 6) -> dict:
+    """Run a multi-turn tool loop on ONE arm and return per-EPISODE totals.
+
+    ``arm_fn(convo, tools) -> result`` is a call_direct/call_proxy closure. On each turn:
+    call the arm; if it returned tool_calls, execute each locally against ``tool_results``
+    (deterministic mocks keyed by tool name), append the assistant tool_calls message + one
+    ``role:"tool"`` message per call, and loop — until no tool_calls or ``max_turns``.
+    Provider-billed tokens are summed across every turn (that is the honest agentic A/B unit:
+    the whole episode, not one call). Returns content (final), summed prompt/completion tokens,
+    every tool_call made (for the trajectory gate), cache_hit (any turn), routed_model, turns."""
+    convo = [dict(m) for m in messages]
+    tot_pt = tot_ct = 0
+    all_calls, any_cache = [], False
+    routed, final = None, ""
+    turns = 0
+    for turns in range(1, max_turns + 1):
+        r = arm_fn(convo, tools)
+        tot_pt += r["prompt_tokens"]
+        tot_ct += r["completion_tokens"]
+        any_cache = any_cache or bool(r.get("cache_hit"))
+        routed = r.get("routed_model") or routed
+        if r.get("content"):
+            final = r["content"]
+        tcs = r.get("tool_calls") or []
+        if not tcs:
+            break
+        all_calls.extend(tcs)
+        convo.append(r["assistant_msg"])
+        for tc in tcs:
+            name = tc["function"]["name"]
+            result = tool_results.get(name, {"error": f"no mock result for {name!r}"})
+            convo.append({"role": "tool", "tool_call_id": tc["id"],
+                          "content": result if isinstance(result, str) else json.dumps(result)})
+    return {"content": final, "prompt_tokens": tot_pt, "completion_tokens": tot_ct,
+            "tool_calls": all_calls, "cache_hit": any_cache, "routed_model": routed or "",
+            "turns": turns}
 
 
 # --------------------------------------------------------------------------- #
@@ -449,9 +540,10 @@ def main() -> int:
     ap.add_argument("--providers", default="openai",
                     help="'openai' (default), 'all', or a comma list (e.g. openai,anthropic)")
     ap.add_argument("--mode", choices=["cold", "replay", "both"], default="both")
-    ap.add_argument("--workload", choices=["standard", "cache"], default="standard",
+    ap.add_argument("--workload", choices=["standard", "cache", "agentic"], default="standard",
                     help="'standard' = cold+replay on the neutral mix; 'cache' = the disclosed "
-                         "high-repeat warm-cache burst that reproduces the cache lever (~90%%)")
+                         "high-repeat warm-cache burst (~90%%); 'agentic' = multi-turn tool-loop "
+                         "episodes (reproduces the tool-pruning/tool-output lever)")
     ap.add_argument("--proxy-url", default=os.environ.get("PROXY_URL", "http://localhost:4000"))
     ap.add_argument("--api-key", default=os.environ.get("PROXY_API_KEY", ""))
     ap.add_argument("--tenant", default=os.environ.get("BENCHMARK_TENANT", ""),
@@ -507,6 +599,9 @@ def main() -> int:
     meta_ds = json.loads((HERE / "public_dataset.meta.json").read_text(encoding="utf-8"))
     if args.workload == "cache" and not CACHE_SCHEDULE.exists():
         return _fail("cache_schedule.json missing — run build_public_dataset.py first")
+    if args.workload == "agentic" and not AGENTIC_DATASET.exists():
+        return _fail("agentic_dataset.jsonl missing — build the agentic pack first, "
+                     "or use --workload standard/cache")
 
     spend = SpendMeter(args.max_spend_per_provider, args.max_spend)
     records: list = []
@@ -539,6 +634,14 @@ def main() -> int:
             cache_sched = json.loads(CACHE_SCHEDULE.read_text(encoding="utf-8"))
             passes.append(("cache", load_trace("replay", items, cache_sched),
                            {"x_cache_semantic": False}))
+        elif args.workload == "agentic":
+            # Multi-turn tool-loop episodes: one pass over the agentic scenario pack. Each
+            # item carries `tools` (>10) + a long system prompt + per-tool mock `tool_results`;
+            # run_episode round-trips tool_calls on BOTH arms so G08/G14/G15/G16 fire and the
+            # per-episode provider-billed tokens are compared honestly.
+            ag_items = [json.loads(ln) for ln in
+                        AGENTIC_DATASET.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            passes.append(("agentic", [("original", it) for it in ag_items], {}))
         else:
             if args.mode in ("cold", "both"):
                 passes.append(("cold", load_trace("cold", items, schedule), {"x_no_cache": True}))
@@ -562,13 +665,26 @@ def main() -> int:
                 x_controls.update(x_extra)
                 memo_key = json.dumps(messages, sort_keys=True) + f"|{mt}"
                 try:
-                    a = direct_memo.get(memo_key)
-                    a_billed = a is None          # only a real provider call costs money
-                    if a is None:
-                        a = call_direct(spec["litellm"], messages, mt)
-                        direct_memo[memo_key] = a
-                    b = call_proxy(args.proxy_url, args.api_key, spec["model"], messages, mt,
-                                   x_controls, args.tenant or None, args.timeout)
+                    if slice_name == "agentic":
+                        # Multi-turn tool-loop episode on BOTH arms; provider-billed tokens are
+                        # summed across the whole episode. No memo (episodes are unique).
+                        tools = item.get("tools") or (item.get("params") or {}).get("tools") or []
+                        tool_results = item.get("tool_results") or {}
+                        a_billed = True
+                        a = run_episode(lambda m, t: call_direct(spec["litellm"], m, mt, tools=t),
+                                        messages, tools, tool_results)
+                        b = run_episode(lambda m, t: call_proxy(
+                            args.proxy_url, args.api_key, spec["model"], m, mt,
+                            x_controls, args.tenant or None, args.timeout, tools=t),
+                            messages, tools, tool_results)
+                    else:
+                        a = direct_memo.get(memo_key)
+                        a_billed = a is None          # only a real provider call costs money
+                        if a is None:
+                            a = call_direct(spec["litellm"], messages, mt)
+                            direct_memo[memo_key] = a
+                        b = call_proxy(args.proxy_url, args.api_key, spec["model"], messages, mt,
+                                       x_controls, args.tenant or None, args.timeout)
                 except Exception as exc:  # noqa: BLE001 — report and continue
                     print(f"  [{i}/{len(trace)}] {item['_label']:<16} ERROR: {exc}")
                     continue
@@ -577,7 +693,12 @@ def main() -> int:
                 b_cost = price(b["routed_model"], b["prompt_tokens"], b["completion_tokens"], prices)
                 # Spend = real money: arm B always; arm A only when actually called (memo miss).
                 spend.add(provider, (a_cost if a_billed else 0.0) + b_cost)
-                facts = relative_facts_gate(item, a["content"], b["content"])
+                if slice_name == "agentic":
+                    # Agentic quality = the tool trajectory (proxy must not drop a tool the
+                    # direct arm called), not final-answer facts.
+                    facts = relative_tool_gate(a.get("tool_calls", []), b.get("tool_calls", []))
+                else:
+                    facts = relative_facts_gate(item, a["content"], b["content"])
                 if args.exec_humaneval and item["_profile"] == "code":
                     pa, pb = exec_humaneval(item, a["content"]), exec_humaneval(item, b["content"])
                     if pa is not None:  # regression = A passed the tests but B did not

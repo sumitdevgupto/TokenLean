@@ -18,6 +18,7 @@ Face before publishing any headline number.
 | `swe` | SWE-bench Lite | `princeton-nlp/SWE-bench_Lite` | `main` (*pin a sha before publish*) | permissive research use | gold-patch paths/symbols facts |
 | `code` | HumanEval | `openai/openai_humaneval` | `main` (*pin a sha before publish*) | MIT | judge / opt-in exec pass@1 |
 | `reason` | GSM8K | `openai/gsm8k` (`main` config) | `main` (*pin a sha before publish*) | MIT | final-numeric-answer facts |
+| `agentic` | BFCL v3 multi_turn | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` | `main` (*pin a sha before publish*) | Apache-2.0 | relative tool-trajectory (proxy vs direct arm) |
 
 > Replace *"pin before publish"* with the actual commit sha printed by `datasets` at
 > build time, and mirror it into `build_public_dataset.py:PINNED` + `public_dataset.meta.json`.
@@ -37,6 +38,12 @@ Face before publishing any headline number.
   on Code"*, Chen et al. (2021).
 - **GSM8K (MIT):** © OpenAI. Attribution: *"Training Verifiers to Solve Math Word
   Problems"*, Cobbe et al. (2021).
+- **BFCL v3 multi_turn (Apache-2.0):** Berkeley Function Calling Leaderboard, Gorilla team
+  (Patil, Mao et al.), UC Berkeley. Only the **tool schemas** (`multi_turn_func_doc`) and the
+  **first user turn** of each task are bundled, verbatim, in `agentic_dataset.jsonl`
+  (`build_agentic_dataset.py`). The system prompt is disclosed harness scaffolding and the
+  `tool_results` are mocks — the live A/B reproduces only the tool-catalogue-pruning lever
+  (G08/G16); it does not attempt tool-output projection (G14/G15), which is not live-reproducible.
 
 ## Deliberately excluded
 
