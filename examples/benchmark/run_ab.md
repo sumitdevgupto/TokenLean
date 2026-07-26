@@ -171,16 +171,21 @@ nothing reads `.env` for you in that path.
 ## Cold vs replay: the two numbers
 
 No recognized capability benchmark has repeat/traffic structure — they run each item once. So the
-harness reports **two numbers on the same standard items, from one pass**:
+harness reports **two numbers on the same standard items, from two clean passes**:
 
-- **cold** — first-occurrence items with a cold cache. Savings from the **stateless** optimisations
-  only (compression, routing, pruning, lazy tools, schema). The indisputable **floor**.
-- **replay** — the same items plus a **disclosed** repeat/paraphrase schedule that exercises the
-  cache/dedup lever. The realistic **ceiling**.
+- **cold** — first-occurrence items with **G05 caching fully bypassed** per request (`x_no_cache`).
+  Savings come from the **stateless** optimisations only (compression, routing, pruning, lazy tools,
+  schema). The indisputable **floor**. Bypassing the cache here is deliberate: it stops same-context
+  near-duplicate items (e.g. several SQuAD questions on one passage) from colliding in the semantic
+  (L2) cache — which would otherwise both *inflate* the cold savings and *serve a neighbour's answer*.
+- **replay** — the same items plus a **disclosed** repeat/paraphrase schedule, run with caching **ON**.
+  Originals populate; the repeats/paraphrases hit → the cache/dedup **ceiling**.
 
-One pass yields both because the replay schedule keeps every original **before** its repeats, so
-first occurrences are genuine misses and repeats are genuine hits — no cache cross-contamination.
-`--mode` selects what runs/reports: `both` (default), `cold`, or `replay`.
+Two passes, not one: the cold pass writes **nothing** to the cache (`x_no_cache` skips both lookup
+*and* store), so it leaves no residue and the replay pass is genuinely clean — no between-pass flush
+needed, which is what lets the same design run against a live remote proxy (`verify.sh`). The direct
+arm is memoised (temperature 0 → pass-independent), so your provider is never billed twice for a
+shared original. `--mode` selects what runs/reports: `both` (default), `cold`, or `replay`.
 
 ---
 

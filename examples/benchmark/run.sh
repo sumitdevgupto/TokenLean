@@ -169,10 +169,54 @@ PY
   info "pinned benchmark config active"
 fi
 
-# 6. Clear the benchmark tenant's prior-run keys (only its own data) -----------
+# 6. Clear the RUN's tenant prior-run keys (only its own data) -----------------
+# The flush must target the tenant the run ACTUALLY executes under, not the label
+# we pass as X-Tenant-ID. An admin key honours our X-Tenant-ID (= BENCH_TENANT); a
+# non-admin key (e.g. a real business tenant's tok- key set as PROXY_API_KEY)
+# IGNORES it and runs under the key's OWN tenant. Flushing BENCH_TENANT in that
+# case leaves the real namespace un-cleared, so cold mode reads stale cache hits.
+# Resolve the effective tenant from the key hash against whichever key store is
+# live: the OSS blob (config/local-keys.json) or the commercial Postgres proxy_keys.
 BENCH_TENANT="${BENCHMARK_TENANT:-bench}"
+resolve_effective_tenant() {
+  local k="$1" fb="$2" h t
+  h="$(printf '%s' "$k" | sha256sum | awk '{print $1}')"
+  # 1. OSS blob store. admin key → our X-Tenant-ID (=fallback) wins; else its tenant.
+  if [ -f config/local-keys.json ]; then
+    t="$(python - "$h" "$fb" <<'PY' 2>/dev/null || true
+import json, sys
+h, fb = sys.argv[1], sys.argv[2]
+try:
+    store = json.load(open('config/local-keys.json'))
+except Exception:
+    raise SystemExit(0)
+e = store.get(h)
+if isinstance(e, dict):
+    print(fb if e.get('admin') else e.get('tenant_id', fb))
+elif isinstance(e, str):
+    print(e)
+PY
+)"
+    if [ -n "$t" ]; then printf '%s\n' "$t"; return 0; fi
+  fi
+  # 2. Commercial Postgres proxy_keys store (same service/creds as clear-cache.sh).
+  local row tid adm
+  row="$(docker compose exec -T postgres psql -U token_opt -d token_opt -tAF'|' -c \
+       "SELECT tenant_id, admin FROM proxy_keys WHERE key_hash = '$h';" 2>/dev/null \
+       | tr -d '[:space:]' | head -1 || true)"
+  if [ -n "$row" ]; then
+    tid="${row%%|*}"; adm="${row##*|}"
+    if [ "$adm" = "t" ]; then printf '%s\n' "$fb"; else printf '%s\n' "$tid"; fi
+    return 0
+  fi
+  # 3. Unknown key store → fall back to the label (prior behaviour).
+  printf '%s\n' "$fb"
+}
+FLUSH_TENANT="$(resolve_effective_tenant "$key" "$BENCH_TENANT")"
 if [ "$KEEP_CACHE" = 0 ]; then
-  bash "$HERE/clear-cache.sh" "$BENCH_TENANT" || info "cache clear skipped (continuing)"
+  [ "$FLUSH_TENANT" = "$BENCH_TENANT" ] || \
+    info "proxy key runs under tenant '$FLUSH_TENANT' (not '$BENCH_TENANT') — flushing its namespace so cold mode is genuinely cold"
+  bash "$HERE/clear-cache.sh" "$FLUSH_TENANT" || info "cache clear skipped (continuing)"
 else
   info "keeping existing cache (--keep-cache)"
 fi

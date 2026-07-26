@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover
 
 DATASET = HERE / "public_dataset.jsonl"
 SCHEDULE = HERE / "replay_schedule.json"
+CACHE_SCHEDULE = HERE / "cache_schedule.json"
 PRICES = HERE / "prices.json"
 RESULTS = HERE / "ab_results.json"
 COST_LOG = HERE / "ab_cost_log.jsonl"
@@ -366,22 +367,25 @@ def _finalize(bucket):
     return bucket
 
 
-def aggregate(records: list, mode: str) -> dict:
-    """records: per-call pair dicts with keys provider, kind, profile, a, b, facts.
-    Returns {provider: {mode: {'by_profile': {...}, 'total': {...}}}} for the report
-    slices implied by `mode` (cold = original entries; replay = all)."""
-    slices = []
-    if mode in ("cold", "both"):
-        slices.append(("cold", lambda r: r["kind"] == "original"))
-    if mode in ("replay", "both"):
-        slices.append(("replay", lambda r: True))
+# Stable display/registry order for slices across workloads (standard + cache + future agentic).
+SLICE_ORDER = ["cold", "replay", "cache", "agentic"]
+
+
+def aggregate(records: list, mode: str = None) -> dict:
+    """records: per-call pair dicts with keys provider, slice, kind, profile, a, b, facts.
+    Returns {provider: {slice: {'by_profile': {...}, 'total': {...}}}} for whichever slices
+    are actually PRESENT in the records (cold = G05-bypassed floor, replay = cache ceiling,
+    cache = warm-cache burst). Slice-driven so any workload's records aggregate uniformly;
+    `mode` is accepted for backwards-compatibility but ignored."""
+    present = {r.get("slice") for r in records}
+    wanted = [s for s in SLICE_ORDER if s in present]
 
     out: dict = defaultdict(dict)
-    for slice_name, pred in slices:
+    for slice_name in wanted:
         per_prov_prof: dict = defaultdict(lambda: defaultdict(_blank))
         per_prov_total: dict = defaultdict(_blank)
         for r in records:
-            if not pred(r):
+            if r.get("slice") != slice_name:
                 continue
             _accumulate(per_prov_prof[r["provider"]][r["profile"]], r)
             _accumulate(per_prov_total[r["provider"]], r)
@@ -408,21 +412,28 @@ def render(agg: dict, meta: dict) -> None:
         print(f"  Skipped: " + "; ".join(f"{p} ({why})" for p, why in meta["providers_skipped"].items()))
     print(f"  Total spend this run: ${meta['spend_total_usd']:.4f}"
           + ("  [CAP HIT]" if meta.get("stopped_at_cap") else ""))
-    for prov, modes in agg.items():
+    _tags = {"cold": "cold floor  ", "replay": "replay ceil.", "cache": "cache burst "}
+    for prov, slices in agg.items():
         print("\n  " + "-" * 64)
         print(f"  PROVIDER: {prov}")
-        for mode_name in ("cold", "replay"):
-            if mode_name not in modes:
+        for slice_name in SLICE_ORDER:
+            if slice_name not in slices:
                 continue
-            t = modes[mode_name]["total"]
-            tag = "cold floor  " if mode_name == "cold" else "replay ceil."
+            t = slices[slice_name]["total"]
+            tag = _tags.get(slice_name, f"{slice_name:<12}")
             print(f"    {tag}  tokens saved {t['token_saving_pct']:>6.1f}%   "
                   f"cost saved {t['cost_saving_pct']:>6.1f}%   "
                   f"cache {t['cache_hits']}/{t['b_calls']}   "
                   f"facts {t['facts_checked']-t['facts_regressed']}/{t['facts_checked']} ok")
+            # Per-profile transparency — WHERE the savings come from (already computed).
+            for prof in sorted(slices[slice_name]["by_profile"]):
+                b = slices[slice_name]["by_profile"][prof]
+                print(f"        {prof:<8} tokens {b['token_saving_pct']:>6.1f}%   "
+                      f"cache {b['cache_hits']}/{b['b_calls']}")
     print("\n" + line)
-    print("  cold  = first-occurrence items, cold cache -> stateless-optimisation floor")
-    print("  replay= incl. disclosed repeats/paraphrases -> cache/dedup ceiling")
+    print("  cold  = first-occurrence items, G05 caching BYPASSED -> pure stateless-optimisation floor")
+    print("  replay= full schedule, caching ON (disclosed repeats/paraphrases) -> cache/dedup ceiling")
+    print("  cache = disclosed warm-cache burst (verbatim repeats) -> reproduces the cache lever")
     print("  Both arms priced from prices.json; arm B tokens = provider-billed (z).")
     print(line)
 
@@ -438,6 +449,9 @@ def main() -> int:
     ap.add_argument("--providers", default="openai",
                     help="'openai' (default), 'all', or a comma list (e.g. openai,anthropic)")
     ap.add_argument("--mode", choices=["cold", "replay", "both"], default="both")
+    ap.add_argument("--workload", choices=["standard", "cache"], default="standard",
+                    help="'standard' = cold+replay on the neutral mix; 'cache' = the disclosed "
+                         "high-repeat warm-cache burst that reproduces the cache lever (~90%%)")
     ap.add_argument("--proxy-url", default=os.environ.get("PROXY_URL", "http://localhost:4000"))
     ap.add_argument("--api-key", default=os.environ.get("PROXY_API_KEY", ""))
     ap.add_argument("--tenant", default=os.environ.get("BENCHMARK_TENANT", ""),
@@ -491,6 +505,8 @@ def main() -> int:
     items = load_items()
     schedule = json.loads(SCHEDULE.read_text(encoding="utf-8"))
     meta_ds = json.loads((HERE / "public_dataset.meta.json").read_text(encoding="utf-8"))
+    if args.workload == "cache" and not CACHE_SCHEDULE.exists():
+        return _fail("cache_schedule.json missing — run build_public_dataset.py first")
 
     spend = SpendMeter(args.max_spend_per_provider, args.max_spend)
     records: list = []
@@ -500,61 +516,94 @@ def main() -> int:
     for provider in run_providers:
         apply_litellm_env(provider, env)
         spec = PROVIDER_MODELS[provider]
-        trace = load_trace(args.mode if args.mode != "cold" else "replay", items, schedule)
-        # (we always walk the full replay trace so 'both' works in one pass; for
-        #  --mode cold we still walk it but only REPORT the original entries.)
-        if args.mode == "cold":
-            trace = [(k, it) for (k, it) in trace if k == "original"]
-        if args.limit:
-            trace = trace[: args.limit]
+        # Two clean passes so cold is a TRUE stateless floor and replay the cache ceiling:
+        #   * cold   — originals only, G05 fully BYPASSED per request (x_no_cache): zero cache
+        #              lookups (no same-context semantic collisions inflating savings or
+        #              serving a neighbour's answer) AND zero stores (no residue to
+        #              contaminate replay — which is why this needs no between-pass flush and
+        #              works against a live remote proxy too). Savings here are purely the
+        #              stateless optimisations (compression / routing / pruning / lazy tools).
+        #   * replay — the full schedule with caching ON; originals populate, the disclosed
+        #              repeats/paraphrases hit → the cache/dedup ceiling.
+        # The direct arm (arm A) is pass-independent at temperature 0, so it is memoised per
+        # (messages, max_tokens): the tenant's real provider money is never spent twice for a
+        # shared original, and the direct baseline is byte-identical across both slices.
+        #
+        # --workload cache replaces the two standard passes with ONE disclosed warm-cache
+        # burst: each cacheable item once (cold, populates L1) then N verbatim repeats (warm,
+        # exact-hit). x_cache_semantic:false isolates the EXACT-cache lever so distinct items
+        # can't collide → the ~90% number comes with 0 quality loss. This reproduces the
+        # published "cache 92.8%" lever a verifier can run themselves.
+        passes = []
+        if args.workload == "cache":
+            cache_sched = json.loads(CACHE_SCHEDULE.read_text(encoding="utf-8"))
+            passes.append(("cache", load_trace("replay", items, cache_sched),
+                           {"x_cache_semantic": False}))
+        else:
+            if args.mode in ("cold", "both"):
+                passes.append(("cold", load_trace("cold", items, schedule), {"x_no_cache": True}))
+            if args.mode in ("replay", "both"):
+                passes.append(("replay", load_trace("replay", items, schedule), {}))
+        direct_memo: dict = {}
 
-        print(f"\n[{provider}] {len(trace)} calls x2 arms (model {spec['model']})")
-        for i, (kind, item) in enumerate(trace, 1):
-            if spend.overall_tripped() or spend.provider_tripped(provider):
-                stopped_at_cap = True
-                print(f"  spend cap reached for {provider} — stopping this provider")
-                break
-            messages = item["messages"]
-            mt = int(item.get("max_tokens", 256))
-            x_controls = {k: v for k, v in item.items() if k.startswith("x_")}
-            try:
-                a = call_direct(spec["litellm"], messages, mt)
-                b = call_proxy(args.proxy_url, args.api_key, spec["model"], messages, mt,
-                               x_controls, args.tenant or None, args.timeout)
-            except Exception as exc:  # noqa: BLE001 — report and continue
-                print(f"  [{i}/{len(trace)}] {item['_label']:<16} ERROR: {exc}")
-                continue
+        for slice_name, trace, x_extra in passes:
+            if args.limit:
+                trace = trace[: args.limit]
+            _tag = {"cold": ", G05 bypassed)", "cache": ", warm-cache burst)"}.get(slice_name, ", caching on)")
+            print(f"\n[{provider}] {slice_name}: {len(trace)} proxy calls (model {spec['model']}{_tag}")
+            for i, (kind, item) in enumerate(trace, 1):
+                if spend.overall_tripped() or spend.provider_tripped(provider):
+                    stopped_at_cap = True
+                    print(f"  spend cap reached for {provider} — stopping this provider")
+                    break
+                messages = item["messages"]
+                mt = int(item.get("max_tokens", 256))
+                x_controls = {k: v for k, v in item.items() if k.startswith("x_")}
+                x_controls.update(x_extra)
+                memo_key = json.dumps(messages, sort_keys=True) + f"|{mt}"
+                try:
+                    a = direct_memo.get(memo_key)
+                    a_billed = a is None          # only a real provider call costs money
+                    if a is None:
+                        a = call_direct(spec["litellm"], messages, mt)
+                        direct_memo[memo_key] = a
+                    b = call_proxy(args.proxy_url, args.api_key, spec["model"], messages, mt,
+                                   x_controls, args.tenant or None, args.timeout)
+                except Exception as exc:  # noqa: BLE001 — report and continue
+                    print(f"  [{i}/{len(trace)}] {item['_label']:<16} ERROR: {exc}")
+                    continue
 
-            a_cost = price(spec["model"], a["prompt_tokens"], a["completion_tokens"], prices)
-            b_cost = price(b["routed_model"], b["prompt_tokens"], b["completion_tokens"], prices)
-            spend.add(provider, a_cost + b_cost)
-            facts = relative_facts_gate(item, a["content"], b["content"])
-            if args.exec_humaneval and item["_profile"] == "code":
-                pa, pb = exec_humaneval(item, a["content"]), exec_humaneval(item, b["content"])
-                if pa is not None:  # regression = A passed the tests but B did not
-                    facts = {"graded": True, "passed": not (pa and not pb),
-                             "exec": {"direct": pa, "proxy": pb}}
-            rec = {
-                "provider": provider, "kind": kind, "profile": item["_profile"],
-                "_messages": messages,
-                "a": {**a, "cost": a_cost},
-                "b": {**b, "cost": b_cost},
-                "facts": facts,
-            }
-            records.append(rec)
-            with COST_LOG.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"provider": provider, "kind": kind, "label": item["_label"],
-                                     "a_cost": round(a_cost, 6), "b_cost": round(b_cost, 6),
-                                     "cache_hit": b["cache_hit"]}) + "\n")
-            print(f"  [{i}/{len(trace)}] {item['_label']:<16} "
-                  f"A={a['prompt_tokens']:>5}tok/${a_cost:.5f}  "
-                  f"B={b['prompt_tokens']:>5}tok/${b_cost:.5f}  "
-                  f"{'HIT' if b['cache_hit'] else '   '}  {'facts!' if not facts['passed'] else ''}")
+                a_cost = price(spec["model"], a["prompt_tokens"], a["completion_tokens"], prices)
+                b_cost = price(b["routed_model"], b["prompt_tokens"], b["completion_tokens"], prices)
+                # Spend = real money: arm B always; arm A only when actually called (memo miss).
+                spend.add(provider, (a_cost if a_billed else 0.0) + b_cost)
+                facts = relative_facts_gate(item, a["content"], b["content"])
+                if args.exec_humaneval and item["_profile"] == "code":
+                    pa, pb = exec_humaneval(item, a["content"]), exec_humaneval(item, b["content"])
+                    if pa is not None:  # regression = A passed the tests but B did not
+                        facts = {"graded": True, "passed": not (pa and not pb),
+                                 "exec": {"direct": pa, "proxy": pb}}
+                rec = {
+                    "provider": provider, "slice": slice_name, "kind": kind,
+                    "profile": item["_profile"], "_messages": messages,
+                    "a": {**a, "cost": a_cost},
+                    "b": {**b, "cost": b_cost},
+                    "facts": facts,
+                }
+                records.append(rec)
+                with COST_LOG.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"provider": provider, "slice": slice_name, "kind": kind,
+                                         "label": item["_label"], "a_cost": round(a_cost, 6),
+                                         "b_cost": round(b_cost, 6), "cache_hit": b["cache_hit"]}) + "\n")
+                print(f"  [{i}/{len(trace)}] {item['_label']:<16} "
+                      f"A={a['prompt_tokens']:>5}tok/${a_cost:.5f}  "
+                      f"B={b['prompt_tokens']:>5}tok/${b_cost:.5f}  "
+                      f"{'HIT' if b['cache_hit'] else '   '}  {'facts!' if not facts['passed'] else ''}")
 
     if not records:
         return _fail("no successful A/B pairs — check proxy URL, keys, and provider credentials")
 
-    agg = aggregate(records, args.mode)
+    agg = aggregate(records)
     judge = run_judge(records, os.environ.get("QUALITY_JUDGE_MODEL", "gpt-4o-mini")) if args.judge else None
     meta = {
         "prices_as_of": prices.get("as_of"),
@@ -565,7 +614,9 @@ def main() -> int:
         "providers_skipped": skipped,
         "spend_total_usd": round(spend.total(), 6),
         "stopped_at_cap": stopped_at_cap,
+        "workload": args.workload,
         "mode": args.mode,
+        "cache_burst": meta_ds.get("cache_burst") if args.workload == "cache" else None,
     }
     if judge is not None:
         meta["judge"] = judge
@@ -577,9 +628,15 @@ def main() -> int:
     print(f"  Full detail -> {RESULTS}")
 
     # Non-zero exit if a cap tripped or a real quality regression occurred.
-    regressed = sum(1 for r in records if r["facts"]["graded"] and not r["facts"]["passed"])
+    def _reg(sl):
+        return sum(1 for r in records if r.get("slice") == sl
+                   and r["facts"]["graded"] and not r["facts"]["passed"])
+    present = [s for s in SLICE_ORDER if any(r.get("slice") == s for r in records)]
+    per_slice = {s: _reg(s) for s in present}
+    regressed = sum(per_slice.values())
     if regressed:
-        print(f"\n  QUALITY: {regressed} record(s) where the proxy dropped a fact the direct arm had")
+        detail = ", ".join(f"{s} {n}" for s, n in per_slice.items())
+        print(f"\n  QUALITY: proxy dropped a fact the direct arm had — {detail} record(s)")
     if stopped_at_cap:
         return 3
     return 2 if regressed else 0

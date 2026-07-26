@@ -94,10 +94,45 @@ if (-not (Test-ProxyHealthy)) {
 }
 Info "proxy healthy"
 
-# 6. Clear the benchmark tenant's prior-run keys (only its own data) -----------
+# 6. Clear the RUN's tenant prior-run keys (only its own data) -----------------
+# Flush the tenant the run ACTUALLY executes under, not the X-Tenant-ID label. An
+# admin key honours our X-Tenant-ID (= $benchTenant); a non-admin key (e.g. a real
+# business tenant's tok- key set as PROXY_API_KEY) IGNORES it and runs under the
+# key's OWN tenant, so flushing $benchTenant would leave that namespace un-cleared
+# and cold mode would read stale cache hits. Resolve the effective tenant from the
+# key hash against whichever store is live: OSS blob or commercial Postgres.
 $benchTenant = if ($env:BENCHMARK_TENANT) { $env:BENCHMARK_TENANT } else { "bench" }
+function Resolve-EffectiveTenant($k, $fb) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $h = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($k)) | ForEach-Object { $_.ToString("x2") }) -join "")
+    # 1. OSS blob store. admin key -> our X-Tenant-ID (=fallback) wins; else its tenant.
+    if (Test-Path "config/local-keys.json") {
+        try {
+            $store = Get-Content "config/local-keys.json" -Raw | ConvertFrom-Json
+            $e = $store.$h
+            if ($e) {
+                if ($e -is [string]) { return $e }
+                if ($e.admin) { return $fb } else { if ($e.tenant_id) { return $e.tenant_id } else { return $fb } }
+            }
+        } catch { }
+    }
+    # 2. Commercial Postgres proxy_keys store (same service/creds as clear-cache.ps1).
+    $row = (docker compose exec -T postgres psql -U token_opt -d token_opt -tAF'|' -c "SELECT tenant_id, admin FROM proxy_keys WHERE key_hash = '$h';" 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -eq 0 -and $row) {
+        $parts = ($row -replace '\s', '').Split('|')
+        if ($parts.Count -ge 2) {
+            if ($parts[1] -eq 't') { return $fb } else { return $parts[0] }
+        }
+    }
+    # 3. Unknown key store -> fall back to the label (prior behaviour).
+    return $fb
+}
+$flushTenant = Resolve-EffectiveTenant $key $benchTenant
 if (-not $keepCache) {
-    & (Join-Path $here "clear-cache.ps1") $benchTenant
+    if ($flushTenant -ne $benchTenant) {
+        Info "proxy key runs under tenant '$flushTenant' (not '$benchTenant') - flushing its namespace so cold mode is genuinely cold"
+    }
+    & (Join-Path $here "clear-cache.ps1") $flushTenant
 } else {
     Info "keeping existing cache (--keep-cache)"
 }

@@ -1,5 +1,13 @@
 {
   "build_source": "huggingface",
+  "cache_burst": {
+    "counts": {
+      "originals": 50,
+      "warm_repeats": 450
+    },
+    "multiplicity": 9,
+    "warm_frac": 0.9
+  },
   "counts": {
     "chat": 20,
     "code": 15,

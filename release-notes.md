@@ -19,7 +19,41 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-26
+
+### A/B benchmark: reproduce the cache lever + per-workload transparency — Enhancement (OSS)
+The public A/B harness now lets a verifier **reproduce the cache-savings lever themselves** instead of
+only seeing a low single-shot blend. New `--workload cache` runs a **disclosed** warm-cache burst
+(each cacheable item once cold, then N verbatim repeats — default 9, i.e. 90% warm, tunable via
+`--cache-multiplicity`) with the exact-cache lever isolated (`x_cache_semantic:false`), so it lands
+~90% token savings **with 0 quality loss** (verbatim repeats hit their own answer, no semantic
+collisions). The console now also prints a **per-profile breakdown** under every slice (rag/chat/code/
+reason/swe), so results show *where* savings come from. A new checked-in `cache_schedule.json` +
+`meta.cache_burst` disclose the repeat multiplicity; `replay_schedule.json` and the dataset sha are
+byte-identical (unchanged). Aggregation is now slice-driven so future workloads plug in uniformly.
+- **OSS:** `build_public_dataset.py` (`build_cache_burst_schedule`, `--cache-multiplicity`), `run_ab.py`
+  (`--workload standard|cache`, slice-driven `aggregate`/`render`, per-profile rows), `cache_schedule.json`,
+  unit tests. Marketing: *"Run the cache-savings lever yourself — a disclosed high-repeat traffic burst
+  shows ~90% token savings with zero quality loss, and every run breaks the number down by workload so
+  you see exactly where the savings come from."*
+
 ## 2026-07-25
+
+### A/B benchmark: trustworthy cold floor — flush the key's real tenant + bypass cache on the cold pass — Bug fix
+Two fixes so the A/B **cold floor** is a true stateless-optimisation number:
+1. **Flush the tenant the KEY actually runs under.** `run.sh`/`run.ps1 --ab` always flushed the label
+   tenant (`bench`), but an admin key honours our `X-Tenant-ID` while a **non-admin** key (e.g. a real
+   business tenant's `tok-…` set as `PROXY_API_KEY`) ignores it and runs under the key's OWN tenant —
+   so the flush missed the real namespace and cold mode read stale cache hits. The launchers now
+   resolve the effective tenant from the key hash against whichever store is live (OSS
+   `config/local-keys.json` blob or commercial Postgres `proxy_keys`) and flush that namespace — no
+   manual `BENCHMARK_TENANT` override.
+2. **Bypass G05 on the cold pass.** Cold now runs each item with `x_no_cache` (G05 fully bypassed), so
+   same-context near-duplicates (e.g. several SQuAD questions on one passage) can't collide in the L2
+   semantic cache — which was both *inflating* cold savings and *serving a neighbour's answer* (the
+   spurious cold "fact drops"). `run_ab.py` now runs **two clean passes** (cold = caching off/no
+   residue, replay = caching on) with the direct arm memoised (temp 0 → pass-independent, never billed
+   twice); replay stays flush-free so the same design still works against a live remote proxy.
 
 ### Publicly-verifiable A/B benchmark + tenant self-verify (proxy vs direct, 10 providers, recognized datasets) — Enhancement (OSS)
 The public `examples/benchmark/` measured the proxy's *own* `_token_opt` counterfactual — easy to

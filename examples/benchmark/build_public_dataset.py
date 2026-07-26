@@ -260,6 +260,32 @@ def build_replay_schedule(items, rng, seed):
                        "paraphrases": n_para}}
 
 
+def build_cache_burst_schedule(items, rng, seed, multiplicity=9):
+    """FAQ / warm-cache traffic — reproduces the CACHE lever a verifier can run.
+
+    Each cacheable (rag/chat) item appears once as a cold ``original`` (populates the
+    L1 exact cache) then ``multiplicity`` verbatim ``repeat`` entries (warm, exact-hit).
+    Ordering invariant preserved: every original precedes its warm repeats, so one pass
+    is a clean cold-populate block followed by warm hits. Verbatim exact repeats hit the
+    item's OWN cached answer → 0 quality loss (distinct from the replay schedule's
+    paraphrases). Models real high-repeat production traffic (support/FAQ bursts).
+
+    Fully DISCLOSED: ``multiplicity`` (→ warm fraction) is recorded in meta.json + README
+    and is tunable via ``--cache-multiplicity`` — it is never hidden or tuned to a target."""
+    cacheable = [it["request_id"] for it in items if it["_profile"] in ("rag", "chat")]
+    rng.shuffle(cacheable)
+    originals = [{"ref": rid, "kind": "original"} for rid in cacheable]
+    warm = []
+    for rid in cacheable:
+        warm.extend({"ref": rid, "kind": "repeat"} for _ in range(multiplicity))
+    rng.shuffle(warm)
+    entries = originals + warm  # cold-populate block, THEN warm hits
+    total = len(entries)
+    return {"seed": seed, "multiplicity": multiplicity, "entries": entries,
+            "counts": {"originals": len(originals), "warm_repeats": len(warm)},
+            "warm_frac": round(len(warm) / total, 4) if total else 0.0}
+
+
 # --------------------------------------------------------------------------- #
 # Source loading — Hugging Face (real) or local fixture (offline/tests)
 # --------------------------------------------------------------------------- #
@@ -303,6 +329,8 @@ def main() -> int:
     ap.add_argument("--from-fixture", default=None,
                     help="build from a local fixture JSON (offline; ships the structural placeholder)")
     ap.add_argument("--counts", default=None, help="override, e.g. rag=30,chat=20,swe=20,code=15,reason=15")
+    ap.add_argument("--cache-multiplicity", type=int, default=9,
+                    help="warm repeats per cacheable item in cache_schedule.json (9 -> 90%% warm)")
     ap.add_argument("--out-dir", default=str(HERE))
     args = ap.parse_args()
 
@@ -325,6 +353,10 @@ def main() -> int:
         items.extend(BUILDERS[profile](raw.get(profile, []), rng, counts[profile]))
 
     schedule = build_replay_schedule(items, rng, args.seed)
+    # Separate rng so the cache schedule NEVER perturbs replay_schedule.json / the
+    # dataset sha (byte-stability of the existing artifacts is a tested contract).
+    cache_schedule = build_cache_burst_schedule(
+        items, random.Random(args.seed + 1000), args.seed, args.cache_multiplicity)
 
     def _write_lf(path, text):
         # Write bytes with LF newlines so the artifact is byte-identical on every
@@ -340,6 +372,9 @@ def main() -> int:
     _write_lf(out_dir / "replay_schedule.json",
               json.dumps(schedule, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
 
+    _write_lf(out_dir / "cache_schedule.json",
+              json.dumps(cache_schedule, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+
     sha = hashlib.sha256(ds_text.encode("utf-8")).hexdigest()
     per_profile = {}
     for it in items:
@@ -350,6 +385,9 @@ def main() -> int:
         "counts": per_profile,
         "total_items": len(items),
         "replay_counts": schedule["counts"],
+        "cache_burst": {"multiplicity": cache_schedule["multiplicity"],
+                        "warm_frac": cache_schedule["warm_frac"],
+                        "counts": cache_schedule["counts"]},
         "dataset_sha256": sha,
         "pinned": PINNED,
         "note": ("STRUCTURAL PLACEHOLDER built from the offline fixture. Regenerate with "
@@ -364,6 +402,8 @@ def main() -> int:
     print(f"built {len(items)} items ({build_source}) -> {ds_path.name}  sha256={sha[:12]}…")
     print(f"  per-profile: {per_profile}")
     print(f"  replay: {schedule['counts']}")
+    print(f"  cache-burst: {cache_schedule['counts']} (mult {cache_schedule['multiplicity']}, "
+          f"warm {cache_schedule['warm_frac']:.0%})")
     return 0
 
 
