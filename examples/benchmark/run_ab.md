@@ -10,7 +10,7 @@ independently-verifiable counterpart to the single-arm [`run_benchmark.py`](run_
 - [The two arms & where keys come from](#the-two-arms--where-keys-come-from)
 - [Local vs GCP](#local-vs-gcp)
 - [Providers & running more than one](#providers--running-more-than-one)
-- [Cold vs replay: the two numbers](#cold-vs-replay-the-two-numbers)
+- [Workloads: per-lever, transparent](#workloads-per-lever-transparent)
 - [Datasets & quality gate](#datasets--quality-gate)
 - [Spend caps & budget](#spend-caps--budget)
 - [Output](#output)
@@ -168,24 +168,46 @@ nothing reads `.env` for you in that path.
 
 ---
 
-## Cold vs replay: the two numbers
+## Workloads: per-lever, transparent
 
 No recognized capability benchmark has repeat/traffic structure — they run each item once. So the
-harness reports **two numbers on the same standard items, from two clean passes**:
+harness reproduces **each production lever as its own workload** and reports every number
+separately. `--workload` selects which run: `standard` (default), `cache`, `agentic`, or `full`
+(all three in one pass). The **per-workload numbers are the primary artifact**; the blend is
+derived arithmetic (see below).
 
-- **cold** — first-occurrence items with **G05 caching fully bypassed** per request (`x_no_cache`).
-  Savings come from the **stateless** optimisations only (compression, routing, pruning, lazy tools,
-  schema). The indisputable **floor**. Bypassing the cache here is deliberate: it stops same-context
-  near-duplicate items (e.g. several SQuAD questions on one passage) from colliding in the semantic
-  (L2) cache — which would otherwise both *inflate* the cold savings and *serve a neighbour's answer*.
-- **replay** — the same items plus a **disclosed** repeat/paraphrase schedule, run with caching **ON**.
-  Originals populate; the repeats/paraphrases hit → the cache/dedup **ceiling**.
+- **standard** (cold) — first-occurrence items with **G05 caching fully bypassed** per request
+  (`x_no_cache`). Savings come from the **stateless** optimisations only (compression, routing,
+  pruning, lazy tools, schema). The indisputable **floor**. Bypassing the cache is deliberate: it
+  stops same-context near-duplicate items (e.g. several HotpotQA questions sharing a passage) from
+  colliding in the semantic (L2) cache — which would otherwise both *inflate* the floor and *serve a
+  neighbour's answer*. (`--mode cold|replay|both` further splits this workload into a cold floor and
+  a disclosed-repeat replay ceiling; `full` uses the cold slice for its prose/reasoning numbers.)
+- **cache** — a **disclosed** warm-repeat burst from `cache_schedule.json` (verbatim repeats, L1
+  exact-match via `x_cache_semantic:false`) that reproduces the caching lever at **0 quality loss**.
+  Every original precedes its repeats, so nothing cross-contaminates.
+- **agentic** — a multi-turn BFCL tool loop (`agentic_dataset.jsonl`) run on both arms via
+  `run_episode`. Reproduces the **tool-catalogue-pruning** lever (G08/G16) only; the larger
+  tool-output-projection lever (G14/G15) **structurally cannot fire in a live single-loop A/B** (it
+  acts on `role:"tool"` results a live model never inlines), so this reads ~25% vs the internal 46%
+  — disclosed, not hidden. Graded by a **relative tool-trajectory gate** (the proxy arm's tool calls
+  must cover the direct arm's, minus forbidden) alongside the answer facts gate.
 
-Two passes, not one: the cold pass writes **nothing** to the cache (`x_no_cache` skips both lookup
-*and* store), so it leaves no residue and the replay pass is genuinely clean — no between-pass flush
-needed, which is what lets the same design run against a live remote proxy (`verify.sh`). The direct
-arm is memoised (temperature 0 → pass-independent), so your provider is never billed twice for a
-shared original. `--mode` selects what runs/reports: `both` (default), `cold`, or `replay`.
+The cold pass writes **nothing** to the cache (`x_no_cache` skips both lookup *and* store), so it
+leaves no residue — which is what lets the same design run against a live remote proxy (`verify.sh`).
+The direct arm is memoised (temperature 0 → pass-independent), so your provider is never billed twice
+for a shared original.
+
+### The illustrative blend (`--workload full`)
+
+`full` also prints a **disclosed weighted average** of the reproducible parts —
+`Σ wᵢ·savingᵢ` over `{cache, agentic, prose, reasoning}` — with default balanced weights
+`cache=0.30 prose=0.35 agentic=0.20 reasoning=0.15`, overridable via
+`--weights cache=..,agentic=..,prose=..,reasoning=..`. The weights + their citations are echoed into
+`ab_results.json` under `meta.blend`. There is **no authoritative token-level split of enterprise LLM
+traffic**, so the defaults are labelled **ILLUSTRATIVE** — never tuned to land on a target. The blend
+lands **below the internal 54.1% by construction** (agentic only partially live-reproducible; public
+prose payloads are small/stateless); recompute it with your own weights to see the sensitivity.
 
 ---
 
@@ -196,20 +218,24 @@ Items come **verbatim** from recognized public datasets (pinned revisions + lice
 
 | Profile | Dataset | License | Grading |
 |---------|---------|---------|---------|
-| `rag` | SQuAD v2 | CC BY-SA 4.0 | gold-answer facts |
+| `rag` | HotpotQA (distractor) | CC BY-SA 4.0 | gold-answer facts |
 | `chat` | MT-Bench | Apache-2.0 | LLM judge |
 | `swe` | SWE-bench Lite | permissive research | gold-patch paths/symbols facts |
 | `code` | HumanEval | MIT | judge / opt-in exec pass@1 |
 | `reason` | GSM8K | MIT | final-numeric-answer facts |
+| `agentic` | BFCL v3 multi_turn | Apache-2.0 | relative tool-trajectory (proxy vs direct) |
 
-`public_dataset.jsonl` + `replay_schedule.json` are checked in (no HF account needed). Regenerate
-from source with `python build_public_dataset.py --hf` (`pip install datasets huggingface_hub`);
-the shipped copy may be a **structural placeholder** (`build_source: "fixture"` in
-`public_dataset.meta.json`) — regenerate before publishing any headline number.
+`public_dataset.jsonl` + `cache_schedule.json` + `agentic_dataset.jsonl` are checked in (no HF
+account needed). Regenerate from source with `python build_public_dataset.py --hf`
+(`pip install datasets huggingface_hub`); `build_source` in `public_dataset.meta.json` records the
+provenance (`"huggingface"` = the real verbatim build, `"fixture"` = a structural placeholder to
+regenerate before publishing any headline number).
 
 **Quality gate is relative:** a record fails only if arm B (proxy) drops a required fact that arm A
-(direct) had — the proxy is never penalised for a fact the direct model itself missed. `--judge`
-adds an LLM-judge pass over both arms (warns if the proxy mean drops >0.5 below direct).
+(direct) had — the proxy is never penalised for a fact the direct model itself missed. The agentic
+workload adds a **relative tool-trajectory gate** (the proxy arm's tool calls must cover the direct
+arm's, minus forbidden). `--judge` adds an LLM-judge pass over both arms (warns if the proxy mean
+drops >0.5 below direct).
 `--exec-humaneval` runs HumanEval canonical tests in a subprocess for a true pass@1 (executes model
 code — opt-in only).
 
@@ -229,12 +255,14 @@ Exit codes: `0` clean · `1` config error (before any spend) · `2` a quality re
 
 ## Output
 
-- **`ab_results.json`** — per provider → per mode (`cold`/`replay`) → per dataset + total (both
-  arms' tokens/cost/calls/cache-hits, `token_saving_pct`, `cost_saving_pct`, facts) + a top-level
-  meta block (`prices_as_of`, `seed`, `dataset_sha256`, `providers_run`, `providers_skipped`,
-  `spend_total_usd`, `stopped_at_cap`, optional `judge`).
+- **`ab_results.json`** — per provider → per workload slice (`cold`/`cache`/`agentic`) → per dataset
+  + total (both arms' tokens/cost/calls/cache-hits, `token_saving_pct`, `cost_saving_pct`, facts) + a
+  top-level meta block (`prices_as_of`, `seed`, `dataset_sha256`, `workload`, `providers_run`,
+  `providers_skipped`, `spend_total_usd`, `stopped_at_cap`, optional `judge`, and — under
+  `--workload full` — a `blend` block with the weight vector, citations, and blended result).
 - **`ab_cost_log.jsonl`** — one line per pair (provider, kind, per-arm cost, cache hit).
-- Console — a cold-vs-replay summary per provider.
+- Console — per-workload savings + `by_profile` breakdown per provider, and (for `full`) the
+  illustrative blend with its weights.
 
 All three are gitignored (the harness + built dataset ship; per-run outputs do not).
 
@@ -245,7 +273,9 @@ All three are gitignored (the harness + built dataset ship; per-run outputs do n
 | Flag | Default | Meaning |
 |---|---|---|
 | `--providers` | `openai` | `openai` · `all` · comma list |
-| `--mode` | `both` | `cold` · `replay` · `both` |
+| `--workload` | `standard` | `standard` · `cache` · `agentic` · `full` (all + blend) |
+| `--weights` | `""` | override blend weights for `full`, e.g. `cache=.4,agentic=.3,prose=.2,reasoning=.1` |
+| `--mode` | `both` | `cold` · `replay` · `both` (splits the `standard` workload) |
 | `--proxy-url` | `http://localhost:4000` (or `PROXY_URL`) | arm B endpoint |
 | `--api-key` | `PROXY_API_KEY` | proxy tenant key `tok-…` |
 | `--tenant` | `BENCHMARK_TENANT` | `X-Tenant-ID`; **omit for tenant self-verify** |

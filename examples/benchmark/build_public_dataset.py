@@ -13,7 +13,12 @@ checked-in artifacts consumed by ``run_ab.py``:
                          sha256 of public_dataset.jsonl, and build_source.
 
 Recognized datasets (see DATA_LICENSES.md for the pinned revisions + licenses):
-  rag     SQuAD v2            (CC BY-SA 4.0)   gold-answer facts gate
+  rag     HotpotQA distractor (CC BY-SA 4.0)   gold-answer facts gate; 10-paragraph
+                                               multi-document retrieval context (~1-2k
+                                               tokens) — production-realistic RAG so the
+                                               cold-floor compression lever (G01/G07/G19)
+                                               actually fires (SQuAD single paragraphs
+                                               sat below G01's min_tokens_to_compress).
   chat    MT-Bench            (Apache-2.0)     judge-only (8 categories)
   swe     SWE-bench Lite      (permissive)     gold-patch paths/symbols facts gate
   code    HumanEval           (MIT)            judge / opt-in exec pass@1
@@ -53,7 +58,8 @@ DEFAULT_FIXTURE = REPO / "tests" / "data" / "ab_corpus_fixture.json"
 # DATA_LICENSES.md whenever these move. MT-Bench is not a HF `datasets` set; its
 # question.jsonl ships in the FastChat repo at the pinned tag below.
 PINNED = {
-    "rag":    {"repo": "rajpurkar/squad_v2",          "revision": "main",  "license": "CC BY-SA 4.0"},
+    "rag":    {"repo": "hotpotqa/hotpot_qa", "config": "distractor", "split": "validation",
+               "revision": "main", "license": "CC BY-SA 4.0"},
     "chat":   {"repo": "HuggingFaceH4/mt_bench_prompts","revision": "main", "license": "Apache-2.0 (MT-Bench)"},
     "swe":    {"repo": "princeton-nlp/SWE-bench_Lite", "revision": "main",  "license": "SWE-bench (permissive research)"},
     "code":   {"repo": "openai/openai_humaneval",      "revision": "main",  "license": "MIT"},
@@ -70,6 +76,9 @@ X_CONTROLS = {"x_jit_retrieval": False}
 
 MAX_TOKENS = 256
 SWE_CONTEXT_CHARS = 4000  # bound the injected code context so a request stays cheap
+RAG_CONTEXT_CHARS = 8000  # bound the stuffed multi-doc RAG context (~2k tokens): large enough
+                          # to be production-realistic + cross G01's compression floor, capped
+                          # so a request stays cheap. HotpotQA distractor averages ~1.2k tokens.
 
 
 # --------------------------------------------------------------------------- #
@@ -128,14 +137,39 @@ def _src(profile, rid):
     return {"corpus": p["repo"], "hf_revision": p["revision"], "record_id": str(rid), "license": p["license"]}
 
 
+def _rag_fields(r):
+    """Normalize a raw RAG record to (context_text, question, [gold_answers]).
+
+    HotpotQA distractor (real HF source): ``context`` is a dict of parallel
+    ``title``/``sentences`` lists — 10 paragraphs (2 gold + 8 distractors) — which we
+    stuff into one large multi-document retrieval context, exactly the shape real
+    enterprise RAG sends. SQuAD v2 (the old source / offline fixture): ``context`` is a
+    single paragraph string with ``answers.text``. Both are supported so the offline
+    fixture keeps working."""
+    ctx = r.get("context")
+    if isinstance(ctx, dict) and "sentences" in ctx:  # HotpotQA distractor
+        titles, sents = ctx.get("title") or [], ctx.get("sentences") or []
+        text = "\n\n".join(f"{t}\n{' '.join(s)}" for t, s in zip(titles, sents))
+        ans = r.get("answer")
+        golds = [ans.strip()] if isinstance(ans, str) and ans.strip() else []
+        return text, r.get("question", ""), golds
+    golds = list(dict.fromkeys(t.strip() for t in (r.get("answers") or {}).get("text", []) if t.strip()))
+    return (ctx or ""), r.get("question", ""), golds
+
+
 def build_rag(raw, rng, count):
-    # answerable-only, seeded sample, gold-answer facts gate.
-    pool = [r for r in raw if (r.get("answers") or {}).get("text")]
+    # Answerable + SUBSTANTIVE gold only (skip yes/no comparison answers — a bare "yes"
+    # is a spurious substring match that makes the facts gate meaningless). Seeded sample,
+    # gold-answer facts gate over a large MULTI-DOCUMENT retrieval context.
+    def _ok(r):
+        text, q, golds = _rag_fields(r)
+        return bool(text and q and golds and golds[0].lower() not in ("yes", "no"))
+    pool = [r for r in raw if _ok(r)]
     rng.shuffle(pool)
     out = []
     for n, r in enumerate(pool[:count], 1):
-        ctx, q = r["context"], r["question"]
-        golds = list(dict.fromkeys(t.strip() for t in r["answers"]["text"] if t.strip()))
+        text, q, golds = _rag_fields(r)
+        ctx = text[:RAG_CONTEXT_CHARS]
         facts = [golds] if len(golds) > 1 else golds[:1]  # OR-group when multiple distinct golds
         msgs = [
             {"role": "system", "content": "Answer the question using ONLY the context. Be concise."},
@@ -297,8 +331,12 @@ def load_from_fixture(path):
 def load_from_hf():  # pragma: no cover - requires network + `datasets`
     from datasets import load_dataset
     raw = {}
-    raw["rag"] = [dict(r) for r in load_dataset(
-        PINNED["rag"]["repo"], split="validation", revision=PINNED["rag"]["revision"])]
+    rp = PINNED["rag"]  # HotpotQA distractor: 10-paragraph multi-doc context per question.
+    raw["rag"] = [{"id": r["id"], "question": r["question"], "answer": r["answer"],
+                   "context": r["context"]}
+                  for r in load_dataset(rp["repo"], rp.get("config"),
+                                        split=rp.get("split", "validation"),
+                                        revision=rp["revision"])]
     # SWE-bench Lite: no bundled code context column; fall back to hints_text.
     raw["swe"] = [{"instance_id": r["instance_id"], "problem_statement": r["problem_statement"],
                    "text_context": r.get("hints_text", ""), "patch": r["patch"]}

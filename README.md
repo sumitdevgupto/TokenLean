@@ -23,20 +23,29 @@
 
 🎯 **54.1% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 📊 **10 Grafana dashboards** &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
 
-> **Savings by workload** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 46.0%** · **prose 38.1%** · **reasoning −2.7%**. Input-token savings only — separate from output cost and from request-count billing. The headline carries run-to-run variance (borderline datasets flip PASS/FAIL under model nondeterminism even at temperature-0: **50.8–55.8% observed** across gated runs; ungated ceiling ~52%).
+> **Savings by workload — internal ablation** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 46.0%** · **prose 38.1%** · **reasoning −2.7%**. Measured on **production-scale** support/RAG/agentic payloads. Input-token savings only — separate from output cost and from request-count billing. The headline carries run-to-run variance (borderline datasets flip PASS/FAIL under model nondeterminism even at temperature-0: **50.8–55.8% observed** across gated runs; ungated ceiling ~52%). The **publicly runnable A/B** below reproduces each of these workloads independently — see [Verify it yourself](#verify-it-yourself--a-true-ab-you-can-run).
 
 > 💵 **Cost savings** run **~70%** on the same gated workloads (config-priced estimate — **directional, not invoice-grade**, and run-variable). Reported separately from the token metric on purpose: routing swaps models (a cost lever) without always cutting input tokens, and dollar figures come from a static price table, not real invoices.
 
-### Verify it yourself
+### Verify it yourself — a true A/B you can run
 
-The **54.1%** figure comes from our internal quality-gated ablation (temperature-0, 12 PASS datasets; methodology in `pitch-test-plan/`, not shipped). The **independently runnable proof** is [`examples/benchmark/`](examples/benchmark/) — a **true A/B**: every request is fired once **direct to the provider** and once **through the proxy**, and we compare the **provider's own billed usage** (not the proxy's self-report), over **recognized public datasets** used verbatim (SQuAD v2 · MT-Bench · SWE-bench Lite · HumanEval · GSM8K). It reports **two numbers** — a **cold standard-order floor** (each item once, zero shaping) and a **realistic-replay ceiling** (disclosed repeats that exercise caching) — across **all 10 providers** (auto-detected by your keys). OpenAI-only stays **under $1**:
+The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12 PASS datasets; methodology in `pitch-test-plan/`, not shipped), measured on **production-scale** payloads. The **independently runnable proof** is [`examples/benchmark/`](examples/benchmark/): a **true A/B** that fires every request once **direct to the provider** and once **through the proxy**, and compares the **provider's own billed usage** (never the proxy's self-report), over **recognized public datasets** used verbatim (**HotpotQA** · MT-Bench · SWE-bench Lite · HumanEval · GSM8K · **BFCL** for the agentic loop — pinned + cited in [`DATA_LICENSES.md`](examples/benchmark/DATA_LICENSES.md)).
+
+**Per-workload is the primary result** — each number is independently reproducible on your own key (calibrated OpenAI, temperature-0; carries the same run-to-run variance as the headline):
+
+| Workload | Public A/B (this harness) | Reproduce with |
+|---|---|---|
+| **cache** (warm-repeat traffic) | **~90%** | `--workload cache` |
+| **agentic** (multi-turn tool loop) | **~25%** | `--workload agentic` |
+| **prose** (stateless first-ask) | **~2–4%** | `--workload standard` (cold) |
+| **reasoning** | **~0%** | `--workload standard` (cold) |
 
 ```bash
-./examples/benchmark/run.sh --ab            # local, boots the stack
-./examples/benchmark/run.sh --ab --providers all   # full 10-provider sweep
+./examples/benchmark/run.sh --ab --workload full    # all workloads + the blend, OpenAI, <$1
+./examples/benchmark/run.sh --ab --providers all    # 10-provider sweep
 ```
 
-The number is **workload-dependent** and will differ from 54.1% — we publish the calibrated A/B result with its repeat-rate disclosure rather than claiming the headline transfers. Already on a managed proxy? A tenant can preview savings against their **live** deployment with one command — see [`docs/client-onboarding.md`](docs/client-onboarding.md).
+`--workload full` also prints a **disclosed illustrative-mix blend** (~33% at the default balanced weights; `--weights` tunable) — a weighted average of the reproducible parts, echoed with its weight vector into `ab_results.json`. It is **not** a second headline, and it lands **below 54.1% by construction — which is the honest point**: (a) the largest agentic lever (G14/G15 tool-output projection) **structurally cannot fire in a live single-loop A/B** — only tool-catalogue pruning (G08/G16) is live-reproducible here, so agentic reads ~25% vs the internal 46%; and (b) these public prose items are **small and stateless**, where the internal 38% prose figure comes from production-scale documents. A skeptic reproduces each *part*, sees exactly why the blend differs from the headline, and trusts both numbers more — nothing is tuned to land on a target. Already on a managed proxy? Preview savings against your **live** deployment — see [`docs/client-onboarding.md`](docs/client-onboarding.md).
 
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation

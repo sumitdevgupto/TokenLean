@@ -73,6 +73,42 @@ def test_checked_in_dataset_is_ascii():
     (BENCH / "public_dataset.jsonl").read_text(encoding="ascii")  # raises on non-ASCII
 
 
+def test_rag_corpus_is_production_realistic():
+    """The RAG lever only reproduces if prompts are large enough to compress. HotpotQA
+    distractor stuffs 10 paragraphs (~1-2k tokens) per question, well above G01's
+    min_tokens_to_compress=200 floor — the SQuAD single-paragraph corpus sat below it,
+    which is why the old cold-floor RAG saving was ~0%. Guard that the shipped corpus
+    stays large."""
+    rag = [json.loads(ln) for ln in
+           (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+           if ln.strip() and json.loads(ln)["_profile"] == "rag"]
+    assert rag, "must ship rag items"
+    approx_tok = [sum(len(m.get("content", "")) for m in it["messages"]) // 4 for it in rag]
+    approx_tok.sort()
+    median = approx_tok[len(approx_tok) // 2]
+    assert median >= 400, (
+        f"RAG median ~{median} tok is below the compression floor — the cold-floor RAG "
+        "lever will not fire; the corpus must be production-realistic multi-doc context")
+
+
+def test_build_rag_normalises_hotpot_and_filters_yes_no():
+    """build_rag handles the HotpotQA dict-context shape and drops yes/no comparison
+    answers (a bare 'yes' is a spurious substring match that voids the facts gate)."""
+    import random
+    raw = [
+        {"id": "h1", "question": "Q1", "answer": "Illinois",
+         "context": {"title": ["A", "B"], "sentences": [["s1.", "s2."], ["t1.", "t2."]]}},
+        {"id": "h2", "question": "Q2", "answer": "yes",  # must be filtered out
+         "context": {"title": ["C"], "sentences": [["u1."]]}},
+    ]
+    out = builder.build_rag(raw, random.Random(0), 10)
+    assert len(out) == 1, "yes/no answers must be excluded"
+    it = out[0]
+    assert it["expected_facts"] == ["Illinois"]
+    ctx = it["messages"][1]["content"]
+    assert "A" in ctx and "s1." in ctx and "t1." in ctx, "multi-doc paragraphs must be stuffed"
+
+
 def test_replay_schedule_refs_exist_and_originals_first():
     items = {json.loads(ln)["request_id"]
              for ln in (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()}
@@ -236,6 +272,45 @@ def test_call_signatures_accept_tools():
     assert "tools" in inspect.signature(run_ab.call_proxy).parameters
 
 
+def test_call_proxy_retries_on_429(monkeypatch):
+    """G00 rate-limiting is a throughput guard, not a savings lever: a 429 (e.g. the
+    cache burst against an un-pinned proxy) must be retried with backoff and served,
+    not dropped as an ERROR that corrupts the measurement."""
+    calls = {"n": 0}
+
+    class _Resp:
+        def __init__(self, status):
+            self.status_code = status
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}],
+                    "_token_opt": {"tokens_provider_billed": 5, "response_tokens": 3,
+                                   "cache_hit": False, "routed_model": "gpt-4o-mini"}}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        return _Resp(429 if calls["n"] < 3 else 200)
+
+    monkeypatch.setattr(run_ab.httpx, "post", _fake_post)
+    monkeypatch.setattr(run_ab.time, "sleep", lambda *_: None)  # no real backoff wait
+    out = run_ab.call_proxy("http://localhost:4000", "tok-x", "gpt-4o-mini",
+                            [{"role": "user", "content": "hi"}], 64, {}, "bench", 30.0)
+    assert calls["n"] == 3, "must retry the two 429s then succeed on the third"
+    assert out["prompt_tokens"] == 5 and out["content"] == "ok"
+
+
+def test_pin_raises_g00_burst_headroom():
+    """The benchmark config pin (run.sh) must lift G00's rate limit so the ~500-request
+    cache burst is not 429'd — otherwise arm B is throttled and the measurement is invalid."""
+    src = (BENCH / "run.sh").read_text(encoding="utf-8")
+    assert "rate_limit" in src and "requests_per_minute" in src, \
+        "run.sh pin must widen G00 rate-limit headroom for the cache burst"
+
+
 def test_workload_agentic_wiring():
     """Guard: the agentic workload runs multi-turn episodes on both arms."""
     src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
@@ -299,6 +374,69 @@ def test_agentic_pin_enables_g16():
 
 def test_agentic_builder_script_present():
     assert (BENCH / "build_agentic_dataset.py").exists(), "reproducible agentic builder must ship"
+
+
+# --------------------------------------------------------------------------- #
+# Illustrative production-mix blend (Phase 4)
+# --------------------------------------------------------------------------- #
+def test_parse_weights_default_and_override():
+    assert run_ab.parse_weights("") == run_ab.DEFAULT_WEIGHTS
+    w = run_ab.parse_weights("cache=0.5,agentic=0.1")
+    assert w["cache"] == 0.5 and w["agentic"] == 0.1
+    assert w["prose"] == run_ab.DEFAULT_WEIGHTS["prose"], "unspecified weights keep the default"
+
+
+def test_parse_weights_rejects_bad_input():
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        run_ab.parse_weights("cache=-1")            # negative
+    with _pytest.raises(ValueError):
+        run_ab.parse_weights("bogus=0.5")           # unknown lever
+    with _pytest.raises(ValueError):
+        run_ab.parse_weights("cache=0,prose=0,agentic=0,reasoning=0")  # all zero
+
+
+def _blend_agg():
+    # cold prose/reasoning (stateless, SMALL) is deliberately different from replay (cache-on,
+    # LARGE) so we can assert the blend reads prose/reasoning from COLD, not replay (no double-count).
+    return run_ab.aggregate(
+        [_rec("cache", "repeat", "rag", 200, 0, True) for _ in range(9)]
+        + [_rec("cache", "original", "rag", 200, 200, False),
+           _rec("cold", "original", "rag", 1000, 950, False),     # cold prose ~5% (stateless)
+           _rec("cold", "original", "chat", 1000, 960, False),
+           _rec("cold", "original", "reason", 1000, 1000, False),
+           _rec("replay", "original", "rag", 1000, 500, False),   # replay prose ~50% (cache-on)
+           _rec("replay", "original", "chat", 1000, 600, False),
+           _rec("agentic", "original", "agentic", 10000, 7000, False)])
+
+
+def test_blend_reads_prose_from_cold_not_replay():
+    """Fix guard: prose/reasoning levers come from the COLD (stateless) slice so cache is
+    NOT double-counted against the separate cache lever."""
+    b = run_ab.blend(_blend_agg(), run_ab.parse_weights(""))["openai"]
+    assert set(b["levers"]) == {"cache", "agentic", "prose", "reasoning"}
+    assert b["levers"]["cache"] == 90.0
+    # prose from COLD (~5%), NOT replay (~45%) — the double-count guard
+    assert b["levers"]["prose"] < 10, "prose must be the stateless cold number, not the cache-on replay"
+    # cache-heavier weights raise the blend
+    hi = run_ab.blend(_blend_agg(), run_ab.parse_weights("cache=0.7,prose=0.1,agentic=0.1,reasoning=0.1"))["openai"]
+    assert hi["token_saving_pct"] > b["token_saving_pct"]
+
+
+def test_blend_renormalises_on_missing_lever():
+    """A partial run (no agentic slice) still blends honestly over present levers."""
+    recs = [_rec("cache", "repeat", "rag", 200, 0, True),
+            _rec("cold", "original", "rag", 1000, 950, False)]
+    b = run_ab.blend(run_ab.aggregate(recs), run_ab.parse_weights(""))["openai"]
+    assert "agentic" not in b["levers"] and "cache" in b["levers"] and "prose" in b["levers"]
+    assert b["token_saving_pct"] > 0
+
+
+def test_workload_full_wiring():
+    src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+    assert '"standard", "cache", "agentic", "full"' in src
+    assert 'args.workload == "full"' in src and "render_blend(" in src
+    assert "ILLUSTRATIVE" in src and "--weights" in src
 
 
 # --------------------------------------------------------------------------- #

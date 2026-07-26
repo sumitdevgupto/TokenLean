@@ -162,10 +162,28 @@ for k in disable:
 _block('G8_tools').update({'enabled': True, 'max_tools_per_agent': 20})
 _block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20,
                                  'max_system_prompt_tokens': 800})
+# G00 rate-limiting is a production THROUGHPUT guard, not a token-savings lever. The
+# --workload cache burst fires ~500 requests back-to-back (well over the template's
+# 60/min default), so the un-pinned limit 429s most of arm B and corrupts the
+# measurement. Lift the ceiling for the controlled benchmark burst so every request
+# reaches the pipeline (savings are unaffected — throttled vs served changes nothing
+# about per-request token counts). Only the coarse `default` bucket is widened.
+rl = c.setdefault('rate_limit', {})
+rl['enabled'] = True
+rl.setdefault('default', {}).update({'requests_per_minute': 100000,
+                                     'requests_per_hour': 1000000})
+# G01 LLMLingua sidecar URL: the template defaults to the DEPLOYED service name
+# (`llmlingua-svc`, the GCP/Cloud-Run convention where the 54.1% was measured), but the
+# local docker-compose.yml names the service `llmlingua` (no -svc alias) — so G01's
+# compression calls silently DNS-fail here and the RAG-compression lever never fires.
+# Point it at the compose service so the large multi-doc RAG contexts actually compress.
+_block('G1_compression')['sidecar_url'] = 'http://llmlingua:8080/compress'
+c.setdefault('services', {})['llmlingua_url'] = 'http://llmlingua:8080/compress'
 yaml.safe_dump(c, open('config/config.yaml', 'w'), sort_keys=False)
 if created:
     print("  note: created missing group blocks:", ", ".join(created))
-print("  pinned config written; six groups + G16 agentic pruning enabled, G28 CCR disabled")
+print("  pinned config written; six groups + G16 agentic pruning enabled, G28 CCR disabled,")
+print("  G00 burst headroom raised, G01 LLMLingua sidecar pointed at the local compose service")
 PY
   PINNED=1
   info "reloading proxy to load pinned config..."

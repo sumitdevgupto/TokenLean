@@ -364,7 +364,15 @@ def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_toke
     if tools:
         body["tools"] = tools
     body.update(x_controls)
-    resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
+    # G00 rate-limiting is a throughput guard, not a savings lever. run.sh's pin lifts it
+    # for the burst, but an un-pinned proxy (e.g. run.ps1 --workload cache, no pin step)
+    # will 429 the cache burst. Retry 429s with backoff so a throttled request is served,
+    # not dropped as an ERROR that corrupts the measurement.
+    for attempt in range(6):
+        resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
+        if resp.status_code != 429:
+            break
+        time.sleep(min(2.0 * (attempt + 1), 10.0))
     resp.raise_for_status()
     data = resp.json()
     opt = data.get("_token_opt") or {}
@@ -530,6 +538,105 @@ def render(agg: dict, meta: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Illustrative production-mix blend (--workload full)
+# --------------------------------------------------------------------------- #
+# The blend is a DISCLOSED weighted average of the four independently-reproducible
+# per-workload numbers. There is no authoritative public breakdown of enterprise LLM
+# traffic at the token level, so these default weights are ILLUSTRATIVE — informed by
+# directional public figures, NOT calibrated to our own data — and fully overridable via
+# --weights. The per-workload numbers are the primary artifact; this is transparent
+# arithmetic a reader can recompute or re-weight for their own traffic.
+DEFAULT_WEIGHTS = {"cache": 0.30, "prose": 0.35, "agentic": 0.20, "reasoning": 0.15}
+WEIGHT_CITATIONS = [
+    "cache-eligible ~30%: ~31% of LLM queries are semantically similar to a prior request; "
+    "production cache-hit rates 30-70% (FAQ/agent 40-65%, creative/multi-turn ~0).",
+    "agentic ~20%: Gartner - 40% of enterprise apps embed task agents by end-2026 (from <5% in 2025); "
+    "token-share still a minority of traffic.",
+    "prose ~35% / reasoning ~15%: chat/support/knowledge dominate use-case penetration (code ~70%, "
+    "support ~58%, knowledge ~55%); reasoning-heavy math/logic is a small slice.",
+    "NO authoritative token-level traffic split exists -> weights are ILLUSTRATIVE + tunable (--weights).",
+]
+
+
+def parse_weights(spec: str) -> dict:
+    """Parse 'cache=0.3,prose=0.35,agentic=0.2,reasoning=0.15' into a weight dict.
+    Weights must be non-negative and not all zero (they are renormalised, so they need
+    not sum to 1); a malformed spec raises ValueError rather than silently skewing the blend."""
+    if not spec:
+        return dict(DEFAULT_WEIGHTS)
+    w = dict(DEFAULT_WEIGHTS)
+    for part in spec.split(","):
+        k, _, v = part.partition("=")
+        k = k.strip()
+        if k not in w:
+            raise ValueError(f"unknown blend lever {k!r}; valid: {', '.join(w)}")
+        val = float(v)
+        if val < 0:
+            raise ValueError(f"blend weight for {k!r} must be non-negative, got {val}")
+        w[k] = val
+    if sum(w.values()) <= 0:
+        raise ValueError("blend weights cannot all be zero")
+    return w
+
+
+def _combined_saving(by_profile: dict, profiles: list) -> tuple:
+    """Combine several profile buckets into one (token%, cost%) from raw tokens/cost."""
+    ap = sum(by_profile[p]["a_prompt"] for p in profiles if p in by_profile)
+    bp = sum(by_profile[p]["b_prompt"] for p in profiles if p in by_profile)
+    ac = sum(by_profile[p]["a_cost"] for p in profiles if p in by_profile)
+    bc = sum(by_profile[p]["b_cost"] for p in profiles if p in by_profile)
+    return (100.0 * (ap - bp) / ap if ap else 0.0,
+            100.0 * (ac - bc) / ac if ac else 0.0)
+
+
+def blend(agg: dict, weights: dict) -> dict:
+    """Map the aggregated slices onto the four traffic levers and return the disclosed
+    weighted-average blend per provider. Levers: cache=cache slice; agentic=agentic slice;
+    prose=COLD rag+chat; reasoning=COLD reason. Prose/reasoning are read from the COLD
+    (stateless, x_no_cache) slice ON PURPOSE — the repeated/cached prose benefit is already
+    captured by the separate `cache` lever, so using the cache-on replay number here would
+    DOUBLE-COUNT cache. Weights renormalise over whichever levers are present."""
+    out = {}
+    for prov, slices in agg.items():
+        levers = {}
+        if "cache" in slices:
+            t = slices["cache"]["total"]
+            levers["cache"] = (t["token_saving_pct"], t["cost_saving_pct"])
+        if "agentic" in slices:
+            t = slices["agentic"]["total"]
+            levers["agentic"] = (t["token_saving_pct"], t["cost_saving_pct"])
+        # Stateless prose/reasoning floor (cache counted once, in the cache lever).
+        base = slices.get("cold", slices.get("replay", {})).get("by_profile", {})
+        if base:
+            levers["prose"] = _combined_saving(base, ["rag", "chat"])
+            levers["reasoning"] = _combined_saving(base, ["reason"])
+        present = {k: weights[k] for k in levers if weights.get(k, 0) > 0}
+        wsum = sum(present.values()) or 1.0
+        tok = sum(present[k] * levers[k][0] for k in present) / wsum
+        cost = sum(present[k] * levers[k][1] for k in present) / wsum
+        out[prov] = {"token_saving_pct": round(tok, 2), "cost_saving_pct": round(cost, 2),
+                     "weights": present, "levers": {k: round(v[0], 1) for k, v in levers.items()}}
+    return out
+
+
+def render_blend(bl: dict) -> None:
+    line = "=" * 68
+    print("\n" + line)
+    print("  ILLUSTRATIVE PRODUCTION-MIX BLEND (disclosed weighted average, --weights tunable)")
+    print(line)
+    for prov, b in bl.items():
+        wtxt = " ".join(f"{k}={b['weights'][k]:.2f}" for k in b["weights"])
+        ltxt = " ".join(f"{k} {b['levers'][k]:.0f}%" for k in b["levers"])
+        print(f"  {prov}: blended tokens {b['token_saving_pct']:.1f}%  cost {b['cost_saving_pct']:.1f}%")
+        print(f"     weights: {wtxt}")
+        print(f"     levers:  {ltxt}")
+    print("  " + "-" * 64)
+    for c in WEIGHT_CITATIONS:
+        print(f"  * {c}")
+    print(line)
+
+
+# --------------------------------------------------------------------------- #
 def _fail(msg: str) -> int:
     print(f"ERROR: {msg}", file=sys.stderr)
     return 1
@@ -540,10 +647,13 @@ def main() -> int:
     ap.add_argument("--providers", default="openai",
                     help="'openai' (default), 'all', or a comma list (e.g. openai,anthropic)")
     ap.add_argument("--mode", choices=["cold", "replay", "both"], default="both")
-    ap.add_argument("--workload", choices=["standard", "cache", "agentic"], default="standard",
-                    help="'standard' = cold+replay on the neutral mix; 'cache' = the disclosed "
-                         "high-repeat warm-cache burst (~90%%); 'agentic' = multi-turn tool-loop "
-                         "episodes (reproduces the tool-pruning/tool-output lever)")
+    ap.add_argument("--workload", choices=["standard", "cache", "agentic", "full"], default="standard",
+                    help="'standard' = cold+replay on the neutral mix (<$1); 'cache' = disclosed "
+                         "warm-cache burst (~90%%); 'agentic' = multi-turn tool-loop episodes; "
+                         "'full' = ALL levers + the illustrative production-mix blend (costs more)")
+    ap.add_argument("--weights", default="",
+                    help="override blend weights for --workload full, e.g. "
+                         "'cache=0.3,prose=0.35,agentic=0.2,reasoning=0.15' (illustrative + tunable)")
     ap.add_argument("--proxy-url", default=os.environ.get("PROXY_URL", "http://localhost:4000"))
     ap.add_argument("--api-key", default=os.environ.get("PROXY_API_KEY", ""))
     ap.add_argument("--tenant", default=os.environ.get("BENCHMARK_TENANT", ""),
@@ -597,11 +707,23 @@ def main() -> int:
     items = load_items()
     schedule = json.loads(SCHEDULE.read_text(encoding="utf-8"))
     meta_ds = json.loads((HERE / "public_dataset.meta.json").read_text(encoding="utf-8"))
-    if args.workload == "cache" and not CACHE_SCHEDULE.exists():
+    if args.workload in ("cache", "full") and not CACHE_SCHEDULE.exists():
         return _fail("cache_schedule.json missing — run build_public_dataset.py first")
-    if args.workload == "agentic" and not AGENTIC_DATASET.exists():
+    if args.workload in ("agentic", "full") and not AGENTIC_DATASET.exists():
         return _fail("agentic_dataset.jsonl missing — build the agentic pack first, "
                      "or use --workload standard/cache")
+    try:
+        weights = parse_weights(args.weights)
+    except ValueError as exc:
+        return _fail(f"--weights: {exc}")
+
+    # Load the workload artifacts ONCE (not per provider). cache_schedule = the disclosed
+    # warm-cache burst; agentic_items = the BFCL-derived tool-loop tasks.
+    cache_sched = (json.loads(CACHE_SCHEDULE.read_text(encoding="utf-8"))
+                   if args.workload in ("cache", "full") else None)
+    agentic_items = ([json.loads(ln) for ln in
+                      AGENTIC_DATASET.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                     if args.workload in ("agentic", "full") else None)
 
     spend = SpendMeter(args.max_spend_per_provider, args.max_spend)
     records: list = []
@@ -611,37 +733,36 @@ def main() -> int:
     for provider in run_providers:
         apply_litellm_env(provider, env)
         spec = PROVIDER_MODELS[provider]
-        # Two clean passes so cold is a TRUE stateless floor and replay the cache ceiling:
-        #   * cold   — originals only, G05 fully BYPASSED per request (x_no_cache): zero cache
-        #              lookups (no same-context semantic collisions inflating savings or
-        #              serving a neighbour's answer) AND zero stores (no residue to
-        #              contaminate replay — which is why this needs no between-pass flush and
-        #              works against a live remote proxy too). Savings here are purely the
-        #              stateless optimisations (compression / routing / pruning / lazy tools).
-        #   * replay — the full schedule with caching ON; originals populate, the disclosed
-        #              repeats/paraphrases hit → the cache/dedup ceiling.
-        # The direct arm (arm A) is pass-independent at temperature 0, so it is memoised per
-        # (messages, max_tokens): the tenant's real provider money is never spent twice for a
-        # shared original, and the direct baseline is byte-identical across both slices.
+        # Pass registry per workload:
+        #   * cold   — originals only, G05 fully BYPASSED (x_no_cache): zero cache lookups AND
+        #              zero STORES, so it is a pure stateless floor that also leaves nothing
+        #              cached — which is why a cache pass right after it starts genuinely cold.
+        #   * replay — full schedule, caching ON; the cache/dedup ceiling for the standard run.
+        #   * cache  — disclosed warm-cache burst: each cacheable item once (cold, populates L1)
+        #              then N verbatim repeats (warm, exact-hit). x_cache_semantic:false isolates
+        #              the EXACT-cache lever (0 quality loss). Reproduces the published cache lever.
+        #   * agentic— multi-turn tool-loop episodes (BFCL tools) exercising G08/G16 pruning.
+        # The direct arm is memoised per (messages, max_tokens) so it is never billed twice.
         #
-        # --workload cache replaces the two standard passes with ONE disclosed warm-cache
-        # burst: each cacheable item once (cold, populates L1) then N verbatim repeats (warm,
-        # exact-hit). x_cache_semantic:false isolates the EXACT-cache lever so distinct items
-        # can't collide → the ~90% number comes with 0 quality loss. This reproduces the
-        # published "cache 92.8%" lever a verifier can run themselves.
+        # --workload full deliberately runs cold + cache + agentic (NOT replay): the blend's
+        # prose/reasoning levers are read from COLD (stateless — so cache is NOT double-counted
+        # against the separate cache lever), and skipping replay means the cache pass follows
+        # only the store-less cold pass, so its cold-populate originals are genuinely cold.
+        def _cache_pass():
+            return ("cache", load_trace("replay", items, cache_sched), {"x_cache_semantic": False})
+
+        def _agentic_pass():
+            return ("agentic", [("original", it) for it in agentic_items], {})
+
         passes = []
-        if args.workload == "cache":
-            cache_sched = json.loads(CACHE_SCHEDULE.read_text(encoding="utf-8"))
-            passes.append(("cache", load_trace("replay", items, cache_sched),
-                           {"x_cache_semantic": False}))
+        if args.workload == "full":
+            passes.append(("cold", load_trace("cold", items, schedule), {"x_no_cache": True}))
+            passes.append(_cache_pass())
+            passes.append(_agentic_pass())
+        elif args.workload == "cache":
+            passes.append(_cache_pass())
         elif args.workload == "agentic":
-            # Multi-turn tool-loop episodes: one pass over the agentic scenario pack. Each
-            # item carries `tools` (>10) + a long system prompt + per-tool mock `tool_results`;
-            # run_episode round-trips tool_calls on BOTH arms so G08/G14/G15/G16 fire and the
-            # per-episode provider-billed tokens are compared honestly.
-            ag_items = [json.loads(ln) for ln in
-                        AGENTIC_DATASET.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            passes.append(("agentic", [("original", it) for it in ag_items], {}))
+            passes.append(_agentic_pass())
         else:
             if args.mode in ("cold", "both"):
                 passes.append(("cold", load_trace("cold", items, schedule), {"x_no_cache": True}))
@@ -663,12 +784,11 @@ def main() -> int:
                 mt = int(item.get("max_tokens", 256))
                 x_controls = {k: v for k, v in item.items() if k.startswith("x_")}
                 x_controls.update(x_extra)
-                memo_key = json.dumps(messages, sort_keys=True) + f"|{mt}"
                 try:
                     if slice_name == "agentic":
                         # Multi-turn tool-loop episode on BOTH arms; provider-billed tokens are
                         # summed across the whole episode. No memo (episodes are unique).
-                        tools = item.get("tools") or (item.get("params") or {}).get("tools") or []
+                        tools = item.get("tools") or []
                         tool_results = item.get("tool_results") or {}
                         a_billed = True
                         a = run_episode(lambda m, t: call_direct(spec["litellm"], m, mt, tools=t),
@@ -678,6 +798,8 @@ def main() -> int:
                             x_controls, args.tenant or None, args.timeout, tools=t),
                             messages, tools, tool_results)
                     else:
+                        # Direct arm memoised per (messages, max_tokens): never billed twice.
+                        memo_key = json.dumps(messages, sort_keys=True) + f"|{mt}"
                         a = direct_memo.get(memo_key)
                         a_billed = a is None          # only a real provider call costs money
                         if a is None:
@@ -737,12 +859,17 @@ def main() -> int:
         "stopped_at_cap": stopped_at_cap,
         "workload": args.workload,
         "mode": args.mode,
-        "cache_burst": meta_ds.get("cache_burst") if args.workload == "cache" else None,
+        "cache_burst": meta_ds.get("cache_burst") if args.workload in ("cache", "full") else None,
     }
+    blended = blend(agg, weights) if args.workload == "full" else None
+    if blended is not None:
+        meta["blend"] = {"weights": weights, "citations": WEIGHT_CITATIONS, "result": blended}
     if judge is not None:
         meta["judge"] = judge
     RESULTS.write_text(json.dumps({"meta": meta, "results": agg}, indent=2), encoding="utf-8")
     render(agg, meta)
+    if blended is not None:
+        render_blend(blended)
     if judge and judge.get("ran"):
         flag = "  [WARN: proxy quality drop]" if judge["warn"] else ""
         print(f"  Judge ({judge['n']}): direct {judge['direct_mean']}/5  proxy {judge['proxy_mean']}/5{flag}")

@@ -7,13 +7,14 @@ below is distributed under its own license, which coexists with (and is not over
 by) the code license.
 
 `build_public_dataset.py --hf` reads each corpus at the pinned revision. The checked-in
-`public_dataset.jsonl` may be a **structural placeholder** built from the offline fixture
-(`build_source: "fixture"` in `public_dataset.meta.json`) — regenerate it from Hugging
-Face before publishing any headline number.
+`public_dataset.jsonl` records its provenance in `public_dataset.meta.json`
+(`build_source: "huggingface"` = the real verbatim build; `"fixture"` = a structural
+placeholder from the offline sample that must be regenerated from Hugging Face before
+publishing any headline number).
 
 | Profile | Dataset | Hugging Face id | Revision | License | Grading |
 |---------|---------|-----------------|----------|---------|---------|
-| `rag` | SQuAD v2 | `rajpurkar/squad_v2` | `main` (*pin a sha before publish*) | CC BY-SA 4.0 | gold-answer facts |
+| `rag` | HotpotQA (distractor) | `hotpotqa/hotpot_qa` | `main` (*pin a sha before publish*) | CC BY-SA 4.0 | gold-answer facts |
 | `chat` | MT-Bench | `HuggingFaceH4/mt_bench_prompts` | `main` (*pin a sha before publish*) | Apache-2.0 | LLM judge |
 | `swe` | SWE-bench Lite | `princeton-nlp/SWE-bench_Lite` | `main` (*pin a sha before publish*) | permissive research use | gold-patch paths/symbols facts |
 | `code` | HumanEval | `openai/openai_humaneval` | `main` (*pin a sha before publish*) | MIT | judge / opt-in exec pass@1 |
@@ -25,10 +26,14 @@ Face before publishing any headline number.
 
 ## Share-alike / attribution notices
 
-- **SQuAD v2 (CC BY-SA 4.0):** © the SQuAD authors (Rajpurkar et al.). Derivative
-  distributions of SQuAD text — including `public_dataset.jsonl` when built from SQuAD —
-  are licensed **CC BY-SA 4.0**. Attribution: *"Know What You Don't Know: Unanswerable
-  Questions for SQuAD"*, Rajpurkar, Jia, Liang (2018).
+- **HotpotQA (CC BY-SA 4.0):** © the HotpotQA authors (Yang, Qi, Zhang et al.). The
+  `distractor` setting ships each question with 10 paragraphs (2 gold + 8 distractors),
+  which we stuff verbatim into one multi-document retrieval context — production-realistic
+  RAG (~1–2k tokens) so the cold-floor compression lever actually fires. Derivative
+  distributions of HotpotQA text — including `public_dataset.jsonl` when built from it —
+  are licensed **CC BY-SA 4.0**. Attribution: *"HotpotQA: A Dataset for Diverse,
+  Explainable Multi-hop Question Answering"*, Yang, Qi, Zhang, Bengio, Cohen, Salakhutdinov,
+  Manning (2018).
 - **MT-Bench (Apache-2.0):** from LMSYS FastChat. Attribution: *"Judging LLM-as-a-Judge
   with MT-Bench and Chatbot Arena"*, Zheng et al. (2023).
 - **SWE-bench Lite:** from *"SWE-bench: Can Language Models Resolve Real-World GitHub

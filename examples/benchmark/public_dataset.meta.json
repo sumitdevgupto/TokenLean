@@ -15,7 +15,7 @@
     "reason": 15,
     "swe": 20
   },
-  "dataset_sha256": "4603ddb2819f156599008dc615d165575009a88dc1db53b2553547d536ef72d7",
+  "dataset_sha256": "8baed7fcd5048203435ad4a2cec57fbdcd932dd5395bf774f9ff895b23bca54f",
   "note": "Built from Hugging Face at the pinned revisions above.",
   "pinned": {
     "chat": {
@@ -29,9 +29,11 @@
       "revision": "main"
     },
     "rag": {
+      "config": "distractor",
       "license": "CC BY-SA 4.0",
-      "repo": "rajpurkar/squad_v2",
-      "revision": "main"
+      "repo": "hotpotqa/hotpot_qa",
+      "revision": "main",
+      "split": "validation"
     },
     "reason": {
       "license": "MIT",

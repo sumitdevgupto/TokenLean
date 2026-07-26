@@ -30,6 +30,15 @@ foreach ($a in $args) {
     else   { $passArgs += $a }
 }
 
+# run.ps1 has no config-pin step (run.sh only), so it cannot enable the G16 tool-pruning the
+# agentic/full workloads depend on. Refuse them rather than silently report ~0% agentic savings.
+for ($i = 0; $i -lt $passArgs.Count; $i++) {
+    if ($passArgs[$i] -eq "--workload" -and ($i + 1) -lt $passArgs.Count -and
+        ($passArgs[$i + 1] -eq "agentic" -or $passArgs[$i + 1] -eq "full")) {
+        Die "run.ps1 cannot pin the G16 config the '$($passArgs[$i + 1])' workload needs (no pin step on Windows). Run it via run.sh (WSL/Linux/macOS), which pins G16."
+    }
+}
+
 # 1. Docker present + running ---------------------------------------------------
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Die "Docker not found. Install Docker Desktop and retry." }
 docker info *> $null

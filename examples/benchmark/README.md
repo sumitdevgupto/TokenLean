@@ -230,29 +230,56 @@ clean-licensed datasets — see [`DATA_LICENSES.md`](DATA_LICENSES.md):
 
 | Profile | Dataset | License | Grading |
 |---------|---------|---------|---------|
-| `rag` | SQuAD v2 | CC BY-SA 4.0 | gold-answer facts |
+| `rag` | HotpotQA (distractor) | CC BY-SA 4.0 | gold-answer facts |
 | `chat` | MT-Bench | Apache-2.0 | LLM judge |
 | `swe` | SWE-bench Lite | permissive research | gold-patch paths/symbols facts |
 | `code` | HumanEval | MIT | judge / opt-in exec pass@1 |
 | `reason` | GSM8K | MIT | final-numeric-answer facts |
+| `agentic` | BFCL v3 multi_turn | Apache-2.0 | relative tool-trajectory (proxy vs direct) |
 
-`public_dataset.jsonl` (the canonical items) + `replay_schedule.json` are **checked in**, so
-you need no Hugging Face account. Regenerate them from source with
-`python build_public_dataset.py --hf` (needs `pip install datasets huggingface_hub`); the
-shipped copy may be a **structural placeholder** built from the offline fixture (see
-`build_source` in `public_dataset.meta.json`) — regenerate before publishing any headline number.
+`public_dataset.jsonl` (the canonical items) + `cache_schedule.json` + `agentic_dataset.jsonl`
+are **checked in**, so you need no Hugging Face account. Regenerate them from source with
+`python build_public_dataset.py --hf` (needs `pip install datasets huggingface_hub`);
+`build_source` in `public_dataset.meta.json` records the provenance (`"huggingface"` = the real
+verbatim build, `"fixture"` = a structural placeholder that must be regenerated before publishing).
 
-### Two numbers from one pass (the credibility spine)
+### Four workloads, per-workload transparency (the credibility spine)
 
-No recognized capability benchmark has repeat/traffic structure — they run each item once. So
-we report **two numbers on the same standard items**, from a single pass (no cache
-cross-contamination, because every original precedes its repeats):
+No recognized capability benchmark has repeat/traffic structure — they run each item once. So the
+harness reproduces **each production lever as its own workload** and reports every number
+separately. `--workload full` runs all of them in one pass (cold cache never contaminates the
+warm burst — every original precedes its repeats):
 
-- **cold** — the first-occurrence items with a cold cache. Savings come only from the
-  *stateless* optimisations (compression, routing, pruning, lazy tools, schema). The
-  **indisputable floor** — nobody can claim we shaped the data.
-- **replay** — the same items plus a **disclosed** repeat/paraphrase schedule that models
-  production traffic and exercises the cache/dedup lever. The **realistic ceiling**.
+- **prose / reasoning** (`--workload standard`, cold) — first-occurrence items with **G05 caching
+  bypassed**. Savings come only from the *stateless* optimisations (compression, routing, pruning,
+  lazy tools). The **indisputable floor** — nobody can claim we shaped the data. Genuinely low on
+  these small, stateless public items (the internal 38% prose figure comes from production-scale
+  documents, not one-line questions).
+- **cache** (`--workload cache`) — a **disclosed** warm-repeat burst (verbatim repeats, L1 exact-match
+  via `x_cache_semantic:false`) that reproduces the caching lever at **0 quality loss**.
+- **agentic** (`--workload agentic`) — a multi-turn BFCL tool loop run on both arms. Reproduces the
+  **tool-catalogue-pruning** lever (G08/G16) only; the larger tool-output-projection lever (G14/G15)
+  **structurally cannot fire in a live single-loop A/B** (it acts on `role:"tool"` results a live
+  model never inlines), so this reads ~25% vs the internal 46% — disclosed, not hidden.
+
+### Calibrated expected results (OpenAI, temperature-0)
+
+Reproduce each part; the numbers carry the same run-to-run variance as the headline (borderline
+items flip under model nondeterminism even at temperature-0), so treat them as bands, not exact:
+
+| Workload | Token savings | Notes |
+|---|---|---|
+| cache | **~90%** | warm repeats served locally; 0 fact drops |
+| agentic | **~25%** | G08/G16 tool pruning; trajectory gate green |
+| prose (cold) | **~2–4%** | stateless floor on small public items |
+| reasoning (cold) | **~0%** | reasoning traffic barely compresses — honest |
+| **illustrative blend** | **~33%** | disclosed weighted average (`--weights` tunable), **not** a headline |
+
+The **illustrative blend** (`--workload full`) is `Σ wᵢ·savingᵢ` over the reproducible parts, with
+default balanced weights `cache=0.30 prose=0.35 agentic=0.20 reasoning=0.15` echoed (with citations)
+into `ab_results.json`. It lands **below the internal 54.1% by construction** — agentic is only
+partially live-reproducible and the public prose payloads are small — and **we never tune the weights
+to hit a target**: change them with `--weights` and recompute the blend yourself.
 
 ### All 10 providers, auto-detected
 
@@ -262,10 +289,11 @@ endpoint/region). Default `--providers openai` stays **under $1**; `--providers 
 full sweep (each provider its own spend sub-cap).
 
 ```bash
-# local (boots the stack), OpenAI only, both modes, quality-gated:
-./examples/benchmark/run.sh --ab --judge
+# local (boots the stack), OpenAI only, all four workloads + the blend, quality-gated:
+./examples/benchmark/run.sh --ab --workload full --judge
 
-# a specific set / all configured providers:
+# a single lever, or a specific set / all configured providers:
+./examples/benchmark/run.sh --ab --workload cache
 ./examples/benchmark/run.sh --ab --providers openai,anthropic
 ./examples/benchmark/run.sh --ab --providers all
 ```
@@ -276,8 +304,9 @@ proxy `x_*` controls stripped from the direct arm; arm B tokens = `_token_opt.to
 **separately** (routing changes cost without always cutting input tokens); the facts gate is
 **relative** (a record fails only if the proxy drops a fact the direct arm had). Spend is capped
 per provider (`--max-spend-per-provider`, default $1) with an overall ceiling; a tripped cap
-stops that provider and exits non-zero. Results: `ab_results.json` (per provider → cold/replay →
-per dataset + total) + `ab_cost_log.jsonl`.
+stops that provider and exits non-zero. Results: `ab_results.json` (per provider → workload slice
+(`cold`/`cache`/`agentic`) → per dataset + total, plus the illustrative `blend` block under
+`--workload full`) + `ab_cost_log.jsonl`.
 
 ### Tenant self-verify (live GCP, no Docker)
 

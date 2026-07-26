@@ -21,6 +21,26 @@ date changes.
 
 ## 2026-07-26
 
+### A/B benchmark: production-realistic RAG corpus + honest two-number headline — Enhancement (OSS)
+Closes the public A/B harness's honesty loop. The `rag` profile now draws from **HotpotQA (distractor)**
+verbatim (CC BY-SA 4.0) — 10-paragraph multi-document contexts (~1–2k tokens) that look like real RAG,
+replacing the too-small SQuAD snippets — and the whole shipped `public_dataset.jsonl` is now a **real
+Hugging Face build** (`build_source: "huggingface"`), not a fixture placeholder. Fixed a local-only
+G01 miss where the LLMLingua sidecar URL used the deployed name (`llmlingua-svc`) that has no DNS in
+the compose stack, plus raised G00 burst headroom + a `call_proxy` 429 retry so the cache burst isn't
+throttled. **Calibration finding (disclosed):** the cold/prose floor is genuinely ~2–4% — this is
+*parity* with the 54.1% methodology (which also runs `compress_user_messages: false`), not a defect —
+so the README now leads with a **per-workload reproducibility map** (cache ~90% · agentic ~25% · prose
+~2–4% · reasoning ~0%, each independently runnable) plus a **disclosed illustrative-mix blend** (~33%
+at balanced weights, `--weights` tunable), shown alongside — and explaining the honest gap to — the
+internal 54.1%. No weight is tuned to hit a target. Docs (`run_ab.md`, benchmark README, DATA_LICENSES)
+reconciled from the retired `--mode cold/replay` model to `--workload standard/cache/agentic/full`.
+- **OSS:** `build_public_dataset.py` (HotpotQA normaliser + yes/no filter), real HF dataset artifacts,
+  run.sh G01 sidecar + G00 headroom pin, `run_ab.py` 429 retry, root+benchmark READMEs + run_ab.md +
+  DATA_LICENSES, unit tests (46). Marketing: *"Don't take our headline on faith — run the benchmark and
+  reproduce each savings lever yourself (caching, agentic tool-use, prose) on recognized public data,
+  measured against the provider's own token bill."*
+
 ### A/B benchmark: agentic workload — multi-turn tool-loop A/B on recognized BFCL tasks — Enhancement (OSS)
 Adds a real **multi-turn agentic** lever to the public A/B harness. `run_ab.py` gained an N-turn tool
 loop (`run_episode`) that round-trips `tool_calls` on **both** arms — direct-to-provider and through the
