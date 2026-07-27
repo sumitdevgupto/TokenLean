@@ -19,8 +19,12 @@
     "gpt-4o-mini":                 {"input_per_1m": 0.15,  "output_per_1m": 0.60,  "provider": "openai"},
     "gpt-4o":                      {"input_per_1m": 2.50,  "output_per_1m": 10.00, "provider": "openai"},
     "o4-mini":                     {"input_per_1m": 1.10,  "output_per_1m": 4.40,  "provider": "openai"},
+    "claude-haiku-4-5":            {"input_per_1m": 1.00,  "output_per_1m": 5.00,  "provider": "anthropic"},
+    "claude-sonnet-5":             {"input_per_1m": 3.00,  "output_per_1m": 15.00, "provider": "anthropic"},
     "claude-3-5-haiku-20241022":   {"input_per_1m": 0.80,  "output_per_1m": 4.00,  "provider": "anthropic"},
     "claude-3-5-sonnet-20241022":  {"input_per_1m": 3.00,  "output_per_1m": 15.00, "provider": "anthropic"},
+    "gemini-2.5-flash-lite":       {"input_per_1m": 0.10,  "output_per_1m": 0.40,  "provider": "gemini"},
+    "gemini-2.5-pro":              {"input_per_1m": 1.25,  "output_per_1m": 10.00, "provider": "gemini"},
     "gemini-1.5-flash":            {"input_per_1m": 0.075, "output_per_1m": 0.30,  "provider": "gemini"},
     "gemini-1.5-pro":              {"input_per_1m": 1.25,  "output_per_1m": 5.00,  "provider": "gemini"},
     "amazon.nova-lite-v1:0":       {"input_per_1m": 0.06,  "output_per_1m": 0.24,  "provider": "bedrock"},
@@ -30,6 +34,7 @@
     "llama-3.1-8b-instant":        {"input_per_1m": 0.05,  "output_per_1m": 0.08,  "provider": "groq"},
     "llama-3.3-70b-versatile":     {"input_per_1m": 0.59,  "output_per_1m": 0.79,  "provider": "groq"},
     "deepseek-chat":               {"input_per_1m": 0.14,  "output_per_1m": 0.28,  "provider": "deepseek"},
+    "grok-4.3":                    {"input_per_1m": 1.25,  "output_per_1m": 2.50,  "provider": "xai"},
     "grok-2-latest":               {"input_per_1m": 2.00,  "output_per_1m": 10.00, "provider": "xai"},
     "grok-3-mini":                 {"input_per_1m": 0.30,  "output_per_1m": 0.50,  "provider": "xai"},
     "command-r-08-2024":           {"input_per_1m": 0.15,  "output_per_1m": 0.60,  "provider": "cohere"},
@@ -38,12 +43,21 @@
   "_deprecations_note": "Retired/deprecated first-party ids as of the as_of date. Prices in models{} for these are LAST-PUBLISHED HISTORICAL rates, not currently-servable first-party prices — verify against the listed replacement before using for a live scorecard.",
   "deprecations": {
     "o4-mini":                    "Available but sunsetting (succeeded by GPT-5 mini); the dated snapshot o4-mini-2025-04-16 is flagged deprecated. Undated alias still resolves at this rate.",
-    "claude-3-5-haiku-20241022":  "RETIRED on the first-party Anthropic API — served only via Amazon Bedrock & Google Vertex at this rate. First-party Haiku is now Haiku 4.5 (~$1/$5).",
-    "claude-3-5-sonnet-20241022": "FULLY RETIRED (deprecated 2025-08-13, retired 2025-10-28); first-party calls fail. Value is historical only. Replacement: claude-sonnet-4-6 / Sonnet 5.",
-    "gemini-1.5-flash":           "RETIRED (~2025) — no current official price; endpoint 404s. Value is last-published <=128k-tier list price (>128k tier was 0.15/0.60). Current gen: Gemini 3.x Flash.",
-    "gemini-1.5-pro":             "RETIRED (~2025) — no current official price; endpoint 404s. Value is last-published <=128k-tier list price (>128k tier was 2.50/10.00). Current gen: Gemini 3.1 Pro.",
-    "deepseek-chat":              "Deprecated 2026-07-24 — the slug now maps to deepseek-v4-flash (non-thinking mode); price updated to the current v4-flash standard cache-miss input / output (0.14/0.28). Cache-hit input is lower.",
-    "grok-2-latest":              "RETIRED — not on the official xAI models table; dead slug auto-redirects to grok-4.3 (billed 1.25/2.50). Value is the historical grok-2 list price.",
-    "grok-3-mini":                "RETIRED — not on the official xAI models table. Value is the historical grok-3-mini list price. Current gen: grok-4.x."
-  }
+    "claude-3-5-haiku-20241022":  "RETIRED on the first-party Anthropic API — served only via Amazon Bedrock & Google Vertex at this rate. The benchmark provider map now uses claude-haiku-4-5 ($1/$5).",
+    "claude-3-5-sonnet-20241022": "FULLY RETIRED (deprecated 2025-08-13, retired 2025-10-28); first-party calls fail. Value is historical only. The benchmark provider map now uses claude-sonnet-5 ($3/$15 standard; $2/$10 intro through 2026-08-31).",
+    "gemini-1.5-flash":           "RETIRED (~2025) — no current official price; endpoint 404s. Value is last-published <=128k-tier list price. The benchmark provider map now uses gemini-2.5-flash-lite ($0.10/$0.40).",
+    "gemini-1.5-pro":             "RETIRED (~2025) — no current official price; endpoint 404s. Value is last-published <=128k-tier list price. The benchmark provider map now uses gemini-2.5-pro ($1.25/$10 at <=200k; $2.50/$15 above).",
+    "deepseek-chat":              "Deprecated 2026-07-24 — the slug now maps to deepseek-v4-flash (non-thinking mode); price is the current v4-flash standard cache-miss input / output (0.14/0.28). Cache-hit input is lower. Still resolves, so kept as the benchmark's deepseek model.",
+    "grok-2-latest":              "RETIRED — not on the official xAI models table; dead slug auto-redirects to grok-4.3. Value is the historical grok-2 list price. The benchmark provider map now uses grok-4.3 ($1.25/$2.50).",
+    "grok-3-mini":                "RETIRED — not on the official xAI models table; no 'mini' successor exists. Value is the historical grok-3-mini list price. The benchmark now runs a single grok-4.3 for xAI (no cheap route)."
+  },
+  "_retired_note": "Subset of 'deprecations' that is fully RETIRED / no longer resolves on its first-party API — the benchmark provider map must never target these (a live run would fail). Ids flagged in 'deprecations' but NOT here (o4-mini, deepseek-chat) are deprecated-but-still-servable and are intentionally kept in the map.",
+  "retired": [
+    "claude-3-5-haiku-20241022",
+    "claude-3-5-sonnet-20241022",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "grok-2-latest",
+    "grok-3-mini"
+  ]
 }

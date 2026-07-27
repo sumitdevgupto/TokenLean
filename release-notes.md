@@ -21,6 +21,18 @@ date changes.
 
 ## 2026-07-27
 
+### A/B benchmark: refresh retired provider model ids so --providers all runs clean — Bug fix
+Three providers in the A/B harness pointed at model ids retired from their first-party API, so a
+`--providers all` run would have failed on them. Refreshed the `run_ab.py` provider map to current GA
+ids (grounded against official pricing pages): **anthropic** `claude-3-5-haiku/sonnet-20241022` →
+`claude-haiku-4-5` ($1/$5) + `claude-sonnet-5` ($3/$15); **gemini** `gemini-1.5-flash/pro` →
+`gemini-2.5-flash-lite` ($0.10/$0.40) + `gemini-2.5-pro` ($1.25/$10); **xai** `grok-2-latest`/
+`grok-3-mini` → a single `grok-4.3` ($1.25/$2.50, EU-safe; no cheap "mini" successor exists). Added
+priced rows for the new ids, kept the retired rows as historical reference under a new `retired` list,
+and added a guard test asserting the provider map never targets a retired id. The six working providers
+(openai, azure, bedrock, mistral, groq, cohere) and the deprecated-but-servable ids (o4-mini,
+deepseek-chat) are unchanged. Cost-estimate table only — token savings unaffected.
+
 ### A/B benchmark: re-grounded prices.json against live vendor pricing — Bug fix
 Reconfirmed every row in `examples/benchmark/prices.json` against the official vendor pricing pages
 (the file's cost estimate prices both A/B arms identically, so drift skews the reported cost saving).

@@ -487,6 +487,24 @@ def test_prices_grounding_metadata_and_deprecations():
     models = prices["models"]
     for model_id in prices.get("deprecations", {}):
         assert model_id in models, f"deprecation {model_id!r} has no priced row"
+    # every retired id must be a subset of the deprecations notes and have a priced row
+    for model_id in prices.get("retired", []):
+        assert model_id in models, f"retired {model_id!r} has no priced row"
+        assert model_id in prices["deprecations"], f"retired {model_id!r} lacks a deprecation note"
+
+
+def test_provider_map_points_at_live_models_only():
+    # A --providers all run must never target a RETIRED model (a live run would fail).
+    # Every model the provider map sends (primary + routes) must be priced AND absent
+    # from the 'retired' set. Deprecated-but-servable ids (o4-mini, deepseek-chat) are
+    # allowed. Guards against the map drifting back onto a dead id.
+    prices = run_ab.load_prices()
+    retired = set(prices.get("retired", []))
+    for prov, spec in run_ab.PROVIDER_MODELS.items():
+        for model in [spec["model"]] + spec["routes"]:
+            bare = run_ab._bare(model)
+            assert bare in prices["models"], f"{prov}: {bare!r} not priced"
+            assert bare not in retired, f"{prov}: {bare!r} is retired/unservable"
 
 
 # --------------------------------------------------------------------------- #
