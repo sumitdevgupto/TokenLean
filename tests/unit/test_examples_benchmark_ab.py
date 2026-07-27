@@ -512,6 +512,16 @@ def test_provider_map_points_at_live_models_only():
             assert bare not in retired, f"{prov}: {bare!r} is retired/unservable"
 
 
+def test_gemini_map_uses_latest_aliases():
+    # Pinned Gemini versions (gemini-2.5-*) 404 with "not available to new users" on
+    # newly-created API projects — Google steers new projects onto the floating -latest
+    # aliases. The public A/B must stay runnable for ANY verifier, so the gemini map uses
+    # the -latest aliases (which every project can reach), not a pinned id.
+    spec = run_ab.PROVIDER_MODELS["gemini"]
+    for model in [spec["model"]] + spec["routes"]:
+        assert model.endswith("-latest"), f"gemini map must use a -latest alias, got {model!r}"
+
+
 # --------------------------------------------------------------------------- #
 # Provider detection + require-direct
 # --------------------------------------------------------------------------- #

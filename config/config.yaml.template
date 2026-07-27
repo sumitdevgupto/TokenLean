@@ -157,7 +157,9 @@ providers:
 # models[] lead with each provider's cheapest model (verify exact IDs against the provider).
 - name: gemini
   models:
-  - gemini-2.5-flash-lite      # cheapest Gemini
+  - gemini-flash-latest        # floating alias — stays available to new projects
+  - gemini-pro-latest          # floating alias — pinned 2.5 ids 404 for new projects
+  - gemini-2.5-flash-lite      # cheapest Gemini (existing projects only)
   - gemini-2.5-flash
   model_prefixes:
   - gemini
@@ -312,6 +314,12 @@ pricing:
     output: 0.075
   # New providers (USD per 1k tokens — verify against current price sheets; reporting only,
   # billing is per-request). Keys are substring-matched against the routed model name.
+  gemini-flash-latest:
+    input: 0.0003
+    output: 0.0025
+  gemini-pro-latest:
+    input: 0.00125
+    output: 0.01
   gemini-2.5-flash:
     input: 0.0003
     output: 0.0025

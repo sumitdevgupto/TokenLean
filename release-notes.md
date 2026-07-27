@@ -21,6 +21,20 @@ date changes.
 
 ## 2026-07-27
 
+### Public A/B benchmark: Gemini provider now uses floating `-latest` aliases so new projects can run it — Enhancement (OSS)
+The A/B harness pointed its Gemini arm at pinned ids (`gemini-2.5-flash-lite` / `gemini-2.5-pro`),
+but Google now 404s those with *"not available to new users"* on **newly-created** API projects —
+steering new projects onto the floating `-latest` aliases. A verifier with a fresh Gemini key
+therefore couldn't run `--providers gemini` at all. Switched the provider map to
+`gemini-flash-latest` (+ `gemini-pro-latest` for the routed tier), added priced rows for both to
+`prices.json` (with deprecation notes explaining the new-project restriction on the 2.5 ids, kept
+priced for existing projects), and added the aliases to the `config.yaml.template` Gemini provider
+model list + pricing so the proxy routes them. Validated live end-to-end on a paid key: cold floor
+5.4%, and the structural `ops` lever fires at **45.2% — matching OpenAI's 44.2%**, confirming the
+levers are model-agnostic. Reasoning-model note: `gemini-flash-latest` has thinking on by default,
+so small stateless profiles (chat/reason) can go net-negative through the proxy — disclosed, not hidden.
+- **OSS:** provider-map + `prices.json` + `config.yaml.template` updates; new `test_gemini_map_uses_latest_aliases` guard; 51 A/B tests green.
+
 ### Public A/B benchmark: disclosed production-shaped `ops` profile so the structured-pruning levers are reproducible — Enhancement (OSS)
 The public A/B harness's cold "prose" floor read only ~2–4% because the recognized Q&A datasets
 (HotpotQA/MT-Bench/etc.) are too small and stateless to exercise the **structured-pruning (G19)** and
