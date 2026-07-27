@@ -478,6 +478,17 @@ def test_all_provider_models_priced():
             run_ab.price(model, 1, 1, prices)  # raises if missing
 
 
+def test_prices_grounding_metadata_and_deprecations():
+    # The grounded snapshot must carry an as_of date and honest per-id deprecation
+    # flags; every deprecation must reference a real priced model row (no dangling
+    # notes) so a reader can always cross-check the historical price it annotates.
+    prices = run_ab.load_prices()
+    assert prices.get("as_of"), "prices.json must record its grounding date"
+    models = prices["models"]
+    for model_id in prices.get("deprecations", {}):
+        assert model_id in models, f"deprecation {model_id!r} has no priced row"
+
+
 # --------------------------------------------------------------------------- #
 # Provider detection + require-direct
 # --------------------------------------------------------------------------- #

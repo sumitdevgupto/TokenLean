@@ -1,18 +1,18 @@
 {
-  "as_of": "2026-07-25",
+  "as_of": "2026-07-27",
   "currency": "USD",
   "unit": "per_1m_tokens",
-  "_note": "List-price snapshot used to price BOTH A/B arms identically (see run_ab.py). Keyed by BARE model name; run_ab.py strips any 'provider/' prefix before lookup, so 'azure/gpt-4o-mini' and 'gpt-4o-mini' resolve to the same row. These are directional public list prices as of the date above and MUST be reconfirmed against each vendor's pricing page before publishing any headline scorecard. An unknown model is a hard error in run_ab.py (never silently priced at $0).",
+  "_note": "List-price snapshot used to price BOTH A/B arms identically (see run_ab.py). Keyed by BARE model name; run_ab.py strips any 'provider/' prefix before lookup, so 'azure/gpt-4o-mini' and 'gpt-4o-mini' resolve to the same row. Directional public list prices (standard on-demand, non-batch, non-cached) — reconfirm against each vendor before publishing a headline scorecard. Grounded 2026-07-27 against the official pricing pages below. IMPORTANT: several 2024-era model ids kept here are now RETIRED or DEPRECATED on their first-party API (see the 'deprecations' block); their numbers are the last-published historical list prices, retained so an unknown-model lookup never hard-errors mid-run — do NOT read them as currently-servable first-party rates. An unknown model is a hard error in run_ab.py (never silently priced at $0).",
   "sources": {
-    "openai": "https://openai.com/api/pricing/",
-    "anthropic": "https://www.anthropic.com/pricing",
-    "gemini": "https://ai.google.dev/pricing",
+    "openai": "https://developers.openai.com/api/docs/pricing",
+    "anthropic": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
+    "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
     "azure": "https://azure.microsoft.com/pricing/details/cognitive-services/openai-service/",
     "bedrock": "https://aws.amazon.com/bedrock/pricing/",
-    "mistral": "https://mistral.ai/pricing/",
+    "mistral": "https://mistral.ai/pricing/api",
     "groq": "https://groq.com/pricing/",
     "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
-    "xai": "https://x.ai/api",
+    "xai": "https://docs.x.ai/docs/models",
     "cohere": "https://cohere.com/pricing"
   },
   "models": {
@@ -25,14 +25,25 @@
     "gemini-1.5-pro":              {"input_per_1m": 1.25,  "output_per_1m": 5.00,  "provider": "gemini"},
     "amazon.nova-lite-v1:0":       {"input_per_1m": 0.06,  "output_per_1m": 0.24,  "provider": "bedrock"},
     "amazon.nova-pro-v1:0":        {"input_per_1m": 0.80,  "output_per_1m": 3.20,  "provider": "bedrock"},
-    "mistral-small-latest":        {"input_per_1m": 0.20,  "output_per_1m": 0.60,  "provider": "mistral"},
-    "mistral-large-latest":        {"input_per_1m": 2.00,  "output_per_1m": 6.00,  "provider": "mistral"},
+    "mistral-small-latest":        {"input_per_1m": 0.15,  "output_per_1m": 0.60,  "provider": "mistral"},
+    "mistral-large-latest":        {"input_per_1m": 0.50,  "output_per_1m": 1.50,  "provider": "mistral"},
     "llama-3.1-8b-instant":        {"input_per_1m": 0.05,  "output_per_1m": 0.08,  "provider": "groq"},
     "llama-3.3-70b-versatile":     {"input_per_1m": 0.59,  "output_per_1m": 0.79,  "provider": "groq"},
-    "deepseek-chat":               {"input_per_1m": 0.27,  "output_per_1m": 1.10,  "provider": "deepseek"},
+    "deepseek-chat":               {"input_per_1m": 0.14,  "output_per_1m": 0.28,  "provider": "deepseek"},
     "grok-2-latest":               {"input_per_1m": 2.00,  "output_per_1m": 10.00, "provider": "xai"},
     "grok-3-mini":                 {"input_per_1m": 0.30,  "output_per_1m": 0.50,  "provider": "xai"},
     "command-r-08-2024":           {"input_per_1m": 0.15,  "output_per_1m": 0.60,  "provider": "cohere"},
     "command-r-plus-08-2024":      {"input_per_1m": 2.50,  "output_per_1m": 10.00, "provider": "cohere"}
+  },
+  "_deprecations_note": "Retired/deprecated first-party ids as of the as_of date. Prices in models{} for these are LAST-PUBLISHED HISTORICAL rates, not currently-servable first-party prices — verify against the listed replacement before using for a live scorecard.",
+  "deprecations": {
+    "o4-mini":                    "Available but sunsetting (succeeded by GPT-5 mini); the dated snapshot o4-mini-2025-04-16 is flagged deprecated. Undated alias still resolves at this rate.",
+    "claude-3-5-haiku-20241022":  "RETIRED on the first-party Anthropic API — served only via Amazon Bedrock & Google Vertex at this rate. First-party Haiku is now Haiku 4.5 (~$1/$5).",
+    "claude-3-5-sonnet-20241022": "FULLY RETIRED (deprecated 2025-08-13, retired 2025-10-28); first-party calls fail. Value is historical only. Replacement: claude-sonnet-4-6 / Sonnet 5.",
+    "gemini-1.5-flash":           "RETIRED (~2025) — no current official price; endpoint 404s. Value is last-published <=128k-tier list price (>128k tier was 0.15/0.60). Current gen: Gemini 3.x Flash.",
+    "gemini-1.5-pro":             "RETIRED (~2025) — no current official price; endpoint 404s. Value is last-published <=128k-tier list price (>128k tier was 2.50/10.00). Current gen: Gemini 3.1 Pro.",
+    "deepseek-chat":              "Deprecated 2026-07-24 — the slug now maps to deepseek-v4-flash (non-thinking mode); price updated to the current v4-flash standard cache-miss input / output (0.14/0.28). Cache-hit input is lower.",
+    "grok-2-latest":              "RETIRED — not on the official xAI models table; dead slug auto-redirects to grok-4.3 (billed 1.25/2.50). Value is the historical grok-2 list price.",
+    "grok-3-mini":                "RETIRED — not on the official xAI models table. Value is the historical grok-3-mini list price. Current gen: grok-4.x."
   }
 }

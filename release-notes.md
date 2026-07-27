@@ -19,6 +19,21 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-07-27
+
+### A/B benchmark: re-grounded prices.json against live vendor pricing — Bug fix
+Reconfirmed every row in `examples/benchmark/prices.json` against the official vendor pricing pages
+(the file's cost estimate prices both A/B arms identically, so drift skews the reported cost saving).
+Three rows had drifted and are corrected: **Mistral Large** `$2.00/$6.00 → $0.50/$1.50` (Large 3
+repricing), **Mistral Small** input `$0.20 → $0.15`, **DeepSeek chat** `$0.27/$1.10 → $0.14/$0.28`
+(the slug now maps to `deepseek-v4-flash`). The other 15 rows verified unchanged. Added a
+`deprecations` block flagging eight 2024-era ids that are now retired/deprecated on their first-party
+API (Claude 3.5 Haiku/Sonnet, Gemini 1.5 Flash/Pro, grok-2/grok-3-mini, o4-mini sunsetting, deepseek-chat)
+— their prices are kept as last-published historical constants so an unknown-model lookup never
+hard-errors mid-run, but they're explicitly marked not-currently-servable. Bumped `as_of` to 2026-07-27
+and refreshed the moved OpenAI/Anthropic/Mistral source URLs. Token savings are unaffected (this is the
+cost-estimate table only).
+
 ## 2026-07-26
 
 ### A/B benchmark: production-realistic RAG corpus + honest two-number headline — Enhancement (OSS)
