@@ -66,7 +66,7 @@ PINNED = {
     "reason": {"repo": "openai/gsm8k",                 "revision": "main",  "license": "MIT"},
 }
 
-DEFAULT_COUNTS = {"rag": 30, "chat": 20, "swe": 20, "code": 15, "reason": 15}
+DEFAULT_COUNTS = {"rag": 30, "chat": 20, "swe": 20, "code": 15, "reason": 15, "ops": 10}
 
 # Proxy per-request controls mirrored from the calibrated dataset: the A/B measures
 # the safe, quality-preserving stages, and opts out of the slow one-time embedding
@@ -250,8 +250,44 @@ def build_reason(raw, rng, count):
     return out
 
 
+OPS_SEED = HERE / "ops_seed.jsonl"
+
+
+def build_ops(raw, rng, count):
+    """Production-shaped structured-prose profile (NOT a recognized public benchmark).
+
+    Reads the bundled ``ops_seed.jsonl`` — verbose DevOps/support payloads (pasted JSON,
+    logs, config) adapted from the single-arm harness — so the G19 structured-pruning +
+    G22 dedup levers fire on a *stateless first-ask*, the one place the recognized-benchmark
+    Q&A profiles are too small to move. Relative facts-gated. Ignores ``raw`` (this content
+    is bundled + disclosed, not Hugging-Face-derived), so it builds identically under --hf,
+    --from-fixture, and the offline fixture path."""
+    if not OPS_SEED.exists():
+        return []
+    seed_rows = [json.loads(l) for l in OPS_SEED.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rng.shuffle(seed_rows)
+    out = []
+    for n, s in enumerate(seed_rows[:count], 1):
+        src = {"corpus": "tokenlean/ops-devops-structured",
+               "origin": "production-shaped (adapted from the single-arm DevOps/support "
+                         "benchmark dataset.jsonl); NOT a recognized public benchmark",
+               "license": "Apache-2.0 (this repo)",
+               "record_id": s.get("origin_label", s["seed_id"]),
+               "note": "disclosed production-shaped structured payload (JSON/logs/config) so the "
+                       "G19 structured-pruning + G22 dedup levers fire on a stateless first-ask."}
+        r = {"request_id": f"ops-{n:04d}", "_label": f"ops-{n:04d}", "_profile": "ops",
+             "_source": src, "messages": s["messages"], "max_tokens": MAX_TOKENS,
+             "grade": "facts", **X_CONTROLS}
+        if s.get("expected_facts"):
+            r["expected_facts"] = s["expected_facts"]
+        if s.get("forbidden"):
+            r["forbidden"] = s["forbidden"]
+        out.append(r)
+    return out
+
+
 BUILDERS = {"rag": build_rag, "chat": build_chat, "swe": build_swe,
-            "code": build_code, "reason": build_reason}
+            "code": build_code, "reason": build_reason, "ops": build_ops}
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +423,7 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     items = []
-    for profile in ("rag", "chat", "swe", "code", "reason"):  # stable order
+    for profile in ("rag", "chat", "swe", "code", "reason", "ops"):  # stable order (ops last)
         items.extend(BUILDERS[profile](raw.get(profile, []), rng, counts[profile]))
 
     schedule = build_replay_schedule(items, rng, args.seed)
@@ -428,6 +464,12 @@ def main() -> int:
                         "counts": cache_schedule["counts"]},
         "dataset_sha256": sha,
         "pinned": PINNED,
+        "ops_profile": ("The 'ops' profile is PRODUCTION-SHAPED, not a recognized public "
+                        "benchmark: verbose DevOps/support payloads (pasted JSON/logs/config) "
+                        "bundled in ops_seed.jsonl (Apache-2.0, this repo), adapted from the "
+                        "single-arm harness. It is built identically under --hf/--fixture and "
+                        "exists so the G19 structured-pruning + G22 dedup levers fire on a "
+                        "stateless first-ask; relative facts-gated. Disclosed in DATA_LICENSES.md."),
         "note": ("STRUCTURAL PLACEHOLDER built from the offline fixture. Regenerate with "
                  "`python build_public_dataset.py --hf` (needs `pip install datasets huggingface_hub`) "
                  "to pull the recognized-standard items verbatim before publishing any headline number."

@@ -608,7 +608,9 @@ def blend(agg: dict, weights: dict) -> dict:
         # Stateless prose/reasoning floor (cache counted once, in the cache lever).
         base = slices.get("cold", slices.get("replay", {})).get("by_profile", {})
         if base:
-            levers["prose"] = _combined_saving(base, ["rag", "chat"])
+            # prose = stateless first-ask savings across recognized Q&A (rag/chat) + the
+            # production-shaped structured 'ops' payloads (G19 pruning / G22 dedup fire there).
+            levers["prose"] = _combined_saving(base, ["rag", "chat", "ops"])
             levers["reasoning"] = _combined_saving(base, ["reason"])
         present = {k: weights[k] for k in levers if weights.get(k, 0) > 0}
         wsum = sum(present.values()) or 1.0

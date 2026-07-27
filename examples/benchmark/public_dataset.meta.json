@@ -11,12 +11,14 @@
   "counts": {
     "chat": 20,
     "code": 15,
+    "ops": 10,
     "rag": 30,
     "reason": 15,
     "swe": 20
   },
-  "dataset_sha256": "8baed7fcd5048203435ad4a2cec57fbdcd932dd5395bf774f9ff895b23bca54f",
+  "dataset_sha256": "ac1f91908a29a90768cdfbde3badeb7b187aaaa6a786d0c348498dd689119281",
   "note": "Built from Hugging Face at the pinned revisions above.",
+  "ops_profile": "The 'ops' profile is PRODUCTION-SHAPED, not a recognized public benchmark: verbose DevOps/support payloads (pasted JSON/logs/config) bundled in ops_seed.jsonl (Apache-2.0, this repo), adapted from the single-arm harness. It is built identically under --hf/--fixture and exists so the G19 structured-pruning + G22 dedup levers fire on a stateless first-ask; relative facts-gated. Disclosed in DATA_LICENSES.md.",
   "pinned": {
     "chat": {
       "license": "Apache-2.0 (MT-Bench)",
@@ -47,10 +49,10 @@
     }
   },
   "replay_counts": {
-    "originals": 100,
+    "originals": 110,
     "paraphrases": 12,
     "repeats": 21
   },
   "seed": 42,
-  "total_items": 100
+  "total_items": 110
 }

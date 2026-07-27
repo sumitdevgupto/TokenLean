@@ -20,6 +20,7 @@ publishing any headline number).
 | `code` | HumanEval | `openai/openai_humaneval` | `main` (*pin a sha before publish*) | MIT | judge / opt-in exec pass@1 |
 | `reason` | GSM8K | `openai/gsm8k` (`main` config) | `main` (*pin a sha before publish*) | MIT | final-numeric-answer facts |
 | `agentic` | BFCL v3 multi_turn | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` | `main` (*pin a sha before publish*) | Apache-2.0 | relative tool-trajectory (proxy vs direct arm) |
+| `ops` | **production-shaped (NOT a recognized benchmark)** — `ops_seed.jsonl`, this repo | n/a | Apache-2.0 (this repo) | relative gold-fact substrings |
 
 > Replace *"pin before publish"* with the actual commit sha printed by `datasets` at
 > build time, and mirror it into `build_public_dataset.py:PINNED` + `public_dataset.meta.json`.
@@ -49,6 +50,18 @@ publishing any headline number).
   (`build_agentic_dataset.py`). The system prompt is disclosed harness scaffolding and the
   `tool_results` are mocks — the live A/B reproduces only the tool-catalogue-pruning lever
   (G08/G16); it does not attempt tool-output projection (G14/G15), which is not live-reproducible.
+  Each task's catalogue is its own BFCL `involved_classes` toolset (verbatim, 18–39 tools),
+  from which G08/G16 prune the tools irrelevant to the turn; every tool the direct arm actually
+  calls is protected by the relative tool-trajectory gate, so pruning can never mask a dropped
+  required tool.
+- **`ops` (production-shaped — NOT a recognized public benchmark):** the `ops` profile is the one
+  deliberately non-recognized source. It bundles verbose DevOps/support payloads (pasted JSON,
+  logs, config) in `ops_seed.jsonl` (Apache-2.0, this repo), adapted from the single-arm harness
+  (`dataset.jsonl`, itself already published in the 57.1% single-arm result). It exists because the
+  recognized Q&A profiles are too small/stateless to exercise the **structured-pruning (G19)** and
+  **dedup (G22)** levers on a first-ask; `ops` is where those fire. It is **facts-gated** (relative)
+  and disclosed as production-shaped in `public_dataset.meta.json` (`ops_profile`). We report
+  whatever it yields; we do not tune it to a target.
 
 ## Deliberately excluded
 

@@ -36,8 +36,8 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 | Workload | Public A/B (this harness) | Reproduce with |
 |---|---|---|
 | **cache** (warm-repeat traffic) | **~90%** | `--workload cache` |
-| **agentic** (multi-turn tool loop) | **~25%** | `--workload agentic` |
-| **prose** (stateless first-ask) | **~2–4%** | `--workload standard` (cold) |
+| **agentic** (multi-turn tool loop) | **~20%** (run-variable 19–25%) | `--workload agentic` |
+| **prose** (stateless first-ask) | **~8%** | `--workload standard` (cold) |
 | **reasoning** | **~0%** | `--workload standard` (cold) |
 
 ```bash
@@ -45,7 +45,7 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 ./examples/benchmark/run.sh --ab --providers all    # 10-provider sweep
 ```
 
-`--workload full` also prints a **disclosed illustrative-mix blend** (~33% at the default balanced weights; `--weights` tunable) — a weighted average of the reproducible parts, echoed with its weight vector into `ab_results.json`. It is **not** a second headline, and it lands **below 54.1% by construction — which is the honest point**: (a) the largest agentic lever (G14/G15 tool-output projection) **structurally cannot fire in a live single-loop A/B** — only tool-catalogue pruning (G08/G16) is live-reproducible here, so agentic reads ~25% vs the internal 46%; and (b) these public prose items are **small and stateless**, where the internal 38% prose figure comes from production-scale documents. A skeptic reproduces each *part*, sees exactly why the blend differs from the headline, and trusts both numbers more — nothing is tuned to land on a target. Already on a managed proxy? Preview savings against your **live** deployment — see [`docs/client-onboarding.md`](docs/client-onboarding.md).
+`--workload full` also prints a **disclosed illustrative-mix blend** (~34% at the default balanced weights; `--weights` tunable) — a weighted average of the reproducible parts, echoed with its weight vector into `ab_results.json`. It is **not** a second headline, and it lands **below 54.1% by construction — which is the honest point**: (a) the largest agentic lever (G14/G15 tool-output projection) **structurally cannot fire in a live single-loop A/B** — only tool-catalogue pruning (G08/G16) is live-reproducible here, so agentic reads ~20% vs the internal 46%; and (b) the recognized public prose items are **small and stateless** (~2–4%), where the internal 38% prose figure comes from production-scale documents — so a disclosed **production-shaped `ops` profile** (verbose DevOps payloads, flagged in [`DATA_LICENSES.md`](examples/benchmark/DATA_LICENSES.md) as *not* a recognized benchmark) is included to exercise the structured-pruning levers (G19/G22) that only fire on bulky first-asks, lifting the prose lever to ~8%. A skeptic reproduces each *part*, sees exactly why the blend differs from the headline, and trusts both numbers more — nothing is tuned to land on a target. Already on a managed proxy? Preview savings against your **live** deployment — see [`docs/client-onboarding.md`](docs/client-onboarding.md).
 
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation

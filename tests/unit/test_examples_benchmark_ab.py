@@ -58,11 +58,16 @@ def test_checked_in_artifacts_present_and_shaped():
     items = [json.loads(ln) for ln in ds.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert items, "public_dataset.jsonl must be non-empty"
     profiles = {it["_profile"] for it in items}
-    assert profiles == {"rag", "chat", "swe", "code", "reason"}, "all five profiles present"
+    assert profiles == {"rag", "chat", "swe", "code", "reason", "ops"}, "all six profiles present"
     for it in items:
         assert it["max_tokens"] and "_source" in it and "request_id" in it
         src = it["_source"]
-        assert {"corpus", "hf_revision", "record_id", "license"} <= set(src)
+        if it["_profile"] == "ops":
+            # production-shaped, not HF-derived: no hf_revision, but must disclose its origin
+            assert {"corpus", "origin", "record_id", "license"} <= set(src)
+            assert "NOT a recognized" in src["origin"]
+        else:
+            assert {"corpus", "hf_revision", "record_id", "license"} <= set(src)
     # meta sha matches the file bytes (LF-stable, cross-platform)
     import hashlib
     sha = hashlib.sha256(ds.read_bytes()).hexdigest()
@@ -665,3 +670,29 @@ def test_launchers_flush_effective_tenant():
             "resolver must consult both the OSS blob and the commercial Postgres key store"
         assert "FROM proxy_keys WHERE key_hash" in text, \
             "resolver must look the key hash up in the commercial proxy_keys store"
+
+
+# --------------------------------------------------------------------------- #
+# Lever 1 — 'ops' production-shaped structural-prose profile
+# --------------------------------------------------------------------------- #
+def test_ops_profile_structural_and_facts_gated():
+    """The 'ops' profile must carry substantial structured payloads (so G19/G22 fire) and a
+    relative facts gate, and disclose itself as production-shaped (not a recognized benchmark)."""
+    items = [json.loads(ln) for ln in (BENCH / "public_dataset.jsonl").read_text(
+        encoding="utf-8").splitlines() if ln.strip()]
+    ops = [it for it in items if it["_profile"] == "ops"]
+    assert len(ops) == 10, "10 ops records shipped"
+    for it in ops:
+        assert it["grade"] == "facts" and it.get("expected_facts"), "ops is facts-gated"
+        assert "NOT a recognized" in it["_source"]["origin"], "ops discloses production-shaped origin"
+        big = max(len(m["content"]) for m in it["messages"])
+        assert big > 400, "ops carries a substantial structured payload for G19/G22 to compact"
+
+
+def test_blend_prose_lever_includes_ops():
+    """The blend's prose lever must fold in the cold 'ops' savings alongside rag/chat."""
+    agg = {"openai": {"cold": {"by_profile": {
+        "ops": {"a_prompt": 1000.0, "b_prompt": 600.0, "a_cost": 1.0, "b_cost": 0.6}}}}}
+    out = run_ab.blend(agg, run_ab.DEFAULT_WEIGHTS)
+    # prose lever = (1000-600)/1000 = 40% driven entirely by ops here
+    assert out["openai"]["levers"]["prose"] == pytest.approx(40.0)

@@ -183,15 +183,21 @@ derived arithmetic (see below).
   colliding in the semantic (L2) cache — which would otherwise both *inflate* the floor and *serve a
   neighbour's answer*. (`--mode cold|replay|both` further splits this workload into a cold floor and
   a disclosed-repeat replay ceiling; `full` uses the cold slice for its prose/reasoning numbers.)
+  The cold pass also carries one **disclosed** `ops` profile — verbose DevOps payloads (pasted
+  JSON/logs/config) flagged in `DATA_LICENSES.md` as **not** a recognized benchmark — because the
+  small recognized-Q&A items don't exercise the **structured-pruning (G19) / dedup (G22)** levers on
+  a first-ask. `ops` reads ~44% and lifts the combined prose lever (`rag`+`chat`+`ops`) to ~8%; it is
+  facts-gated and never tuned to a target.
 - **cache** — a **disclosed** warm-repeat burst from `cache_schedule.json` (verbatim repeats, L1
   exact-match via `x_cache_semantic:false`) that reproduces the caching lever at **0 quality loss**.
   Every original precedes its repeats, so nothing cross-contaminates.
 - **agentic** — a multi-turn BFCL tool loop (`agentic_dataset.jsonl`) run on both arms via
   `run_episode`. Reproduces the **tool-catalogue-pruning** lever (G08/G16) only; the larger
   tool-output-projection lever (G14/G15) **structurally cannot fire in a live single-loop A/B** (it
-  acts on `role:"tool"` results a live model never inlines), so this reads ~25% vs the internal 46%
-  — disclosed, not hidden. Graded by a **relative tool-trajectory gate** (the proxy arm's tool calls
-  must cover the direct arm's, minus forbidden) alongside the answer facts gate.
+  acts on `role:"tool"` results a live model never inlines), so this reads ~20% (run-variable 19–25%
+  under model nondeterminism) vs the internal 46% — disclosed, not hidden. Graded by a **relative
+  tool-trajectory gate** (the proxy arm's tool calls must cover the direct arm's, minus forbidden)
+  alongside the answer facts gate.
 
 The cold pass writes **nothing** to the cache (`x_no_cache` skips both lookup *and* store), so it
 leaves no residue — which is what lets the same design run against a live remote proxy (`verify.sh`).
@@ -204,10 +210,12 @@ for a shared original.
 `Σ wᵢ·savingᵢ` over `{cache, agentic, prose, reasoning}` — with default balanced weights
 `cache=0.30 prose=0.35 agentic=0.20 reasoning=0.15`, overridable via
 `--weights cache=..,agentic=..,prose=..,reasoning=..`. The weights + their citations are echoed into
-`ab_results.json` under `meta.blend`. There is **no authoritative token-level split of enterprise LLM
-traffic**, so the defaults are labelled **ILLUSTRATIVE** — never tuned to land on a target. The blend
-lands **below the internal 54.1% by construction** (agentic only partially live-reproducible; public
-prose payloads are small/stateless); recompute it with your own weights to see the sensitivity.
+`ab_results.json` under `meta.blend` (the **prose** lever = combined `rag`+`chat`+`ops` cold savings,
+≈8%). There is **no authoritative token-level split of enterprise LLM traffic**, so the defaults are
+labelled **ILLUSTRATIVE** — never tuned to land on a target. The blend lands **below the internal
+54.1% by construction** (agentic only partially live-reproducible; recognized public prose payloads
+are small/stateless); recompute it with your own weights to see the sensitivity. On OpenAI at the
+default weights it prints **~34%**.
 
 ---
 

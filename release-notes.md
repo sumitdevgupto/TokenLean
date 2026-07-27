@@ -21,6 +21,21 @@ date changes.
 
 ## 2026-07-27
 
+### Public A/B benchmark: disclosed production-shaped `ops` profile so the structured-pruning levers are reproducible — Enhancement (OSS)
+The public A/B harness's cold "prose" floor read only ~2–4% because the recognized Q&A datasets
+(HotpotQA/MT-Bench/etc.) are too small and stateless to exercise the **structured-pruning (G19)** and
+**dedup (G22)** levers on a first-ask — the levers only bite on bulky, repetitive real-world payloads.
+Added one **disclosed, production-shaped** `ops` profile (10 verbose DevOps/support items — pasted
+JSON, logs, config — in `ops_seed.jsonl`, adapted from the single-arm harness and flagged in
+`DATA_LICENSES.md` + `public_dataset.meta.json` as **not** a recognized benchmark). It is relative
+facts-gated, reads ~44%, and lifts the combined cold prose lever to ~8%, so the illustrative full-mix
+blend now prints **~34%** (was ~33%). In the same pass, an experimental agentic tool-catalogue
+*enrichment* was **reverted** after calibration proved it was dominated by the un-enriched baseline
+(it only raised the agentic number by over-pruning tools the model needed) — the agentic lever stays
+on verbatim BFCL catalogues at its honest live-reproducible **~20%** (run-variable 19–25%). Nothing is
+tuned to hit a target: the harness reports whatever it prints. 50 A/B unit tests green.
+- **OSS:** new `ops` dataset profile + builder; `run.sh` agentic pin restored to `max_tools_per_agent: 20`; README/benchmark-README/`run_ab.md`/`DATA_LICENSES.md` refreshed to the calibrated ~34% blend.
+
 ### A/B benchmark: refresh retired provider model ids so --providers all runs clean — Bug fix
 Three providers in the A/B harness pointed at model ids retired from their first-party API, so a
 `--providers all` run would have failed on them. Refreshed the `run_ab.py` provider map to current GA
