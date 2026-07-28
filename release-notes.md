@@ -19,7 +19,17 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
-## 2026-07-27
+## 2026-07-28
+
+### Admin console self-lockout guard: an operator can no longer disable its own tenant — Bug fix
+The Enterprise admin console let an admin key run destructive lifecycle actions against **its own**
+tenant. Because deactivating/suspending/deleting a tenant flags **every** key of that tenant —
+including the key making the call — an operator could set the `admin` tenant's contract to `inactive`
+and instantly lock out all admin keys (a request-time 403 that then needs out-of-band recovery). The
+admin authenticator now stamps the acting tenant, and `/tenants/{id}/contract` (non-active), `/suspend`,
+`DELETE /tenants/{id}`, and `/offboard` refuse when the target is the caller's own tenant (403). Since
+all admin keys share the bootstrap `admin` tenant, this also hard-protects that root tenant from console
+self-lockout; managing every other (customer) tenant is unchanged. Covered by 4 new admin-router tests.
 
 ### Public A/B benchmark: Gemini provider now uses floating `-latest` aliases so new projects can run it — Enhancement (OSS)
 The A/B harness pointed its Gemini arm at pinned ids (`gemini-2.5-flash-lite` / `gemini-2.5-pro`),
