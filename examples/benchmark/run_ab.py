@@ -77,6 +77,12 @@ PROVIDER_MODELS = {
                  "key_env": "XAI_API_KEY",      "routes": []},
     "cohere":   {"model": "command-r-08-2024",           "litellm": "cohere/command-r-08-2024",
                  "key_env": "COHERE_API_KEY",   "routes": ["command-r-plus-08-2024"]},
+    # OpenAI-compatible model gateway (opencode/zen). Not a native litellm provider: the direct
+    # arm calls openai/<model> with an explicit api_base+api_key. Uses a free model, so the cost
+    # lever is $0-vs-$0 by construction — only the token lever is meaningful here.
+    "opencode": {"model": "opencode/ling-3.0-flash-free", "litellm": "openai/ling-3.0-flash-free",
+                 "key_env": "OPENCODE_API_KEY", "routes": [],
+                 "api_base": "https://opencode.ai/zen/v1"},
 }
 
 
@@ -139,7 +145,7 @@ def _has_key(provider: str, spec: dict, env: dict) -> bool:
 
 
 def detect_providers(env: dict) -> dict:
-    """{provider: {'configured': bool, 'reason': str}} for all 10 first-class providers."""
+    """{provider: {'configured': bool, 'reason': str}} for all providers (10 native + opencode)."""
     out = {}
     for provider, spec in PROVIDER_MODELS.items():
         ok = _has_key(provider, spec, env)
@@ -336,11 +342,18 @@ def _assistant_msg(content: str, tcs: list) -> dict:
     return m
 
 
-def call_direct(litellm_model: str, messages: list, max_tokens: int, tools: list = None) -> dict:
+def call_direct(litellm_model: str, messages: list, max_tokens: int, tools: list = None,
+                api_base: str = None, api_key: str = None) -> dict:
     import litellm
     kw = {"model": litellm_model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
     if tools:
         kw["tools"] = tools
+    # OpenAI-compatible gateways (e.g. opencode/zen) are reached as openai/<model> with an
+    # explicit endpoint + key so litellm never falls back to the real OPENAI_API_KEY/base.
+    if api_base:
+        kw["api_base"] = api_base
+    if api_key:
+        kw["api_key"] = api_key
     resp = litellm.completion(**kw)
     usage = resp.get("usage") if isinstance(resp, dict) else resp.usage
     pt = int(usage["prompt_tokens"] if isinstance(usage, dict) else usage.prompt_tokens)
@@ -735,6 +748,10 @@ def main() -> int:
     for provider in run_providers:
         apply_litellm_env(provider, env)
         spec = PROVIDER_MODELS[provider]
+        # OpenAI-compatible gateways carry an explicit endpoint + key for the direct arm
+        # (litellm openai/<model> route); native providers leave both None (key via env).
+        direct_base = spec.get("api_base")
+        direct_key = (env.get(spec["key_env"]) or env.get(f"LLM_KEY_{provider.upper()}")) if direct_base else None
         # Pass registry per workload:
         #   * cold   — originals only, G05 fully BYPASSED (x_no_cache): zero cache lookups AND
         #              zero STORES, so it is a pure stateless floor that also leaves nothing
@@ -793,7 +810,8 @@ def main() -> int:
                         tools = item.get("tools") or []
                         tool_results = item.get("tool_results") or {}
                         a_billed = True
-                        a = run_episode(lambda m, t: call_direct(spec["litellm"], m, mt, tools=t),
+                        a = run_episode(lambda m, t: call_direct(spec["litellm"], m, mt, tools=t,
+                                        api_base=direct_base, api_key=direct_key),
                                         messages, tools, tool_results)
                         b = run_episode(lambda m, t: call_proxy(
                             args.proxy_url, args.api_key, spec["model"], m, mt,
@@ -805,7 +823,8 @@ def main() -> int:
                         a = direct_memo.get(memo_key)
                         a_billed = a is None          # only a real provider call costs money
                         if a is None:
-                            a = call_direct(spec["litellm"], messages, mt)
+                            a = call_direct(spec["litellm"], messages, mt,
+                                            api_base=direct_base, api_key=direct_key)
                             direct_memo[memo_key] = a
                         b = call_proxy(args.proxy_url, args.api_key, spec["model"], messages, mt,
                                        x_controls, args.tenant or None, args.timeout)

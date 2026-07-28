@@ -477,10 +477,24 @@ def test_price_unknown_model_raises():
 
 def test_all_provider_models_priced():
     prices = run_ab.load_prices()
-    assert len(run_ab.PROVIDER_MODELS) == 10, "10 first-class providers"
+    assert len(run_ab.PROVIDER_MODELS) == 11, "10 native providers + opencode gateway"
     for prov, spec in run_ab.PROVIDER_MODELS.items():
         for model in [spec["model"]] + spec["routes"]:
             run_ab.price(model, 1, 1, prices)  # raises if missing
+
+
+def test_opencode_is_openai_compatible_gateway():
+    # opencode is a model gateway, not a native litellm provider: the direct arm reaches it
+    # as openai/<model> with an explicit api_base, and its key var must NOT be OPENAI_API_KEY
+    # (that would clobber the real openai provider / the judge).
+    spec = run_ab.PROVIDER_MODELS["opencode"]
+    assert spec["api_base"].startswith("https://"), "opencode needs an explicit endpoint"
+    assert spec["litellm"].startswith("openai/"), "direct arm uses the openai-compatible route"
+    assert spec["key_env"] != "OPENAI_API_KEY", "must not clobber the real OpenAI key"
+    import inspect
+    sig = inspect.signature(run_ab.call_direct)
+    assert "api_base" in sig.parameters and "api_key" in sig.parameters, \
+        "call_direct must accept api_base/api_key to reach an OpenAI-compatible gateway"
 
 
 def test_prices_grounding_metadata_and_deprecations():

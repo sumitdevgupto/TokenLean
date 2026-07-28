@@ -13,8 +13,10 @@
     "groq": "https://groq.com/pricing/",
     "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
     "xai": "https://docs.x.ai/docs/models",
-    "cohere": "https://cohere.com/pricing"
+    "cohere": "https://cohere.com/pricing",
+    "opencode": "https://opencode.ai/docs/zen/"
   },
+  "_opencode_note": "opencode is an OpenAI-compatible model gateway (base https://opencode.ai/zen/v1); the A/B uses one of its FREE models (ling-3.0-flash-free), so its price is a genuine $0/$0 — the cost lever is $0-vs-$0 by construction and only the token lever is meaningful for opencode. Point the provider map at a paid opencode model (e.g. gpt-5.6-luna) + a real price row for a cost scorecard.",
   "models": {
     "gpt-4o-mini":                 {"input_per_1m": 0.15,  "output_per_1m": 0.60,  "provider": "openai"},
     "gpt-4o":                      {"input_per_1m": 2.50,  "output_per_1m": 10.00, "provider": "openai"},
@@ -40,7 +42,8 @@
     "grok-2-latest":               {"input_per_1m": 2.00,  "output_per_1m": 10.00, "provider": "xai"},
     "grok-3-mini":                 {"input_per_1m": 0.30,  "output_per_1m": 0.50,  "provider": "xai"},
     "command-r-08-2024":           {"input_per_1m": 0.15,  "output_per_1m": 0.60,  "provider": "cohere"},
-    "command-r-plus-08-2024":      {"input_per_1m": 2.50,  "output_per_1m": 10.00, "provider": "cohere"}
+    "command-r-plus-08-2024":      {"input_per_1m": 2.50,  "output_per_1m": 10.00, "provider": "cohere"},
+    "ling-3.0-flash-free":         {"input_per_1m": 0.00,  "output_per_1m": 0.00,  "provider": "opencode"}
   },
   "_deprecations_note": "Retired/deprecated first-party ids as of the as_of date. Prices in models{} for these are LAST-PUBLISHED HISTORICAL rates, not currently-servable first-party prices — verify against the listed replacement before using for a live scorecard.",
   "deprecations": {

@@ -21,6 +21,20 @@ date changes.
 
 ## 2026-07-28
 
+### Public A/B benchmark: OpenAI-compatible model gateways (opencode/zen) as an A/B provider — Enhancement (OSS)
+The A/B harness assumed every provider was a *native* litellm provider that reads its key from an
+env var, so a model **gateway** like OpenCode Zen (an OpenAI-compatible endpoint fronting many
+models) couldn't be A/B-tested. Added a generic gateway path: `call_direct` now accepts an explicit
+`api_base`+`api_key` (the direct arm calls it as `openai/<model>` so litellm never falls back to the
+real `OPENAI_API_KEY`/base), and a new `opencode` entry in `PROVIDER_MODELS` (11th provider) carries
+`api_base: https://opencode.ai/zen/v1` + a distinct `OPENCODE_API_KEY` key var. Priced `ling-3.0-flash-free`
+in `prices.json` at a genuine $0 (free model → the **cost** lever is $0-vs-$0 by construction; only the
+**token** lever is meaningful — disclosed in `_opencode_note`) and fixed the stale `config.yaml.template`
+opencode model ids (`mimo-v2.5` etc. 404; real ids are `-free`-suffixed) by adding the runnable
+`opencode/ling-3.0-flash-free`. Validated live: both arms route to opencode, correct content. Generalizes
+the harness to any OpenAI-compatible gateway (point the map at any `api_base`).
+- **OSS:** `call_direct` api_base/api_key; `opencode` provider entry; `prices.json` + `config.yaml.template` rows; new `test_opencode_is_openai_compatible_gateway` guard + provider-count 10→11; 52 A/B tests green.
+
 ### Admin console Trial tab now labels the day/request units and explains how the limits work — Enhancement [Enterprise]
 The per-tenant **Trial** tab in the Enterprise admin console showed two bare number boxes per row
 whose meaning lived only in placeholder text that vanished once a value was typed — so a filled form

@@ -242,6 +242,7 @@ providers:
   # Lead model = Kimi K2.7 Code; the free models below are $0. Verify slugs on the OpenCode Zen dashboard.
   models:
   - opencode/kimi-k2.7-code        # Kimi K2.7 Code (default)
+  - opencode/ling-3.0-flash-free   # Ling 3.0 Flash (free) — A/B benchmark's opencode model
   - opencode/mimo-v2.5             # MiMo V2.5 (free)
   - opencode/qwen3.6-plus          # Qwen3.6 Plus (free)
   - opencode/minimax-m3            # MiniMax M3 (free)
@@ -391,6 +392,9 @@ pricing:
   opencode/minimax-m2.7:
     input: 0.0003
     output: 0.0012
+  opencode/ling-3.0-flash-free:    # free model used by the A/B benchmark's opencode provider
+    input: 0.0
+    output: 0.0
   # Free models = $0. OpenRouter free models all end in ":free" (one catch-all row); the
   # OpenCode Zen free models are listed explicitly.
   ':free':
