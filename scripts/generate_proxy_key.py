@@ -8,6 +8,8 @@ Outputs:
     - Appends to config/local-keys.json (format: {hash: {tenant_id, tier}})
     - Prints export statement for the plaintext key
 """
+from __future__ import annotations  # PEP 563: lazy annotations so tuple[...]/list[...]
+                                    # subscripts don't evaluate at import on Python 3.7/3.8
 import argparse
 import hashlib
 import json

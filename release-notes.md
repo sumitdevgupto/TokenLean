@@ -21,6 +21,13 @@ date changes.
 
 ## 2026-07-28
 
+### `generate_proxy_key.py` runs on Python 3.7/3.8 again — Bug fix
+The local key-mint helper (`scripts/generate_proxy_key.py`) used PEP 585 builtin-generic annotations
+(`tuple[str, str, dict]`) that are evaluated at import time, so it crashed with
+`TypeError: 'type' object is not subscriptable` on Python 3.7/3.8 (common on stock WSL/Ubuntu) — the
+documented admin-key mint command failed there. Added `from __future__ import annotations` (PEP 563)
+so the annotations are lazy strings and the script runs unchanged on any Python 3.7+.
+
 ### Admin console self-lockout guard: an operator can no longer disable its own tenant — Bug fix
 The Enterprise admin console let an admin key run destructive lifecycle actions against **its own**
 tenant. Because deactivating/suspending/deleting a tenant flags **every** key of that tenant —
