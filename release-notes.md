@@ -21,6 +21,17 @@ date changes.
 
 ## 2026-07-28
 
+### Admin console Trial tab now labels the day/request units and explains how the limits work — Enhancement [Enterprise]
+The per-tenant **Trial** tab in the Enterprise admin console showed two bare number boxes per row
+whose meaning lived only in placeholder text that vanished once a value was typed — so a filled form
+read as `14 / 5000` with no indication of units. Added always-visible **days** / **requests** labels
+next to each input (and **more days** / **more requests** on the Extend row to signal those are
+increments, not replacements), plus per-row captions and a collapsible *"How these numbers work"*
+explainer: a trial ends when **either** limit is reached, `0` leaves a dimension unlimited, Start/Set
+set absolute limits while Extend adds to the running trial. Inputs gained `aria-label`s for screen
+readers. No behavioural change — copy/labels only. Covered by an extended `TenantDrawer` vitest.
+- **[Enterprise]:** admin-console UX clarity — <https://tokenlean.cbeyond.cloud/>
+
 ### `generate_proxy_key.py` runs on Python 3.7/3.8 again — Bug fix
 The local key-mint helper (`scripts/generate_proxy_key.py`) used PEP 585 builtin-generic annotations
 (`tuple[str, str, dict]`) that are evaluated at import time, so it crashed with
