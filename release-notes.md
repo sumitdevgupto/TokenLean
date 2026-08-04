@@ -19,6 +19,24 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-04
+
+### Per-provider model routing (G06) — non-OpenAI providers now route within their own family out of the box — Enhancement (OSS)
+G06's tiers were a single OpenAI-only ladder (`simple→gpt-4o-mini`, …), so with routing enabled a
+Claude/Gemini/Mistral/… request was silently rerouted to `gpt-4o-mini` — the wrong provider and
+model. Added `tiers_by_provider`: G06 now picks the ladder for the **requested model's own provider
+family** (a Claude request cascades `claude-haiku-4-5 → sonnet → opus`, a Gemini request
+`flash → pro`, …), and a provider with **no** ladder passes through untouched — G06 never
+cross-provider misroutes. The template ships ladders for all 10 native providers (delete the ones
+you don't use). The `openai` ladder mirrors the previous flat tiers, so OpenAI routing — and the
+published savings baseline — is byte-identical (verified by a flat-tiers-identity regression test).
+The **cross-provider** cost cascade (route by complexity *across* providers — `simple→openai`,
+`medium→gemini`, `complex→anthropic`) is still supported and is documented as the opt-in alternative
+(the flat `tiers` map with a mixed-provider ladder; delete `tiers_by_provider` to use it).
+Also fixes the public A/B benchmark so `--providers <anything>` measures that provider on both arms
+instead of unknowingly comparing it against `gpt-4o-mini`.
+- **OSS:** `_resolve_tiers` in `g06_routing.py` (family-aware, pass-through on miss, legacy flat-`tiers` fallback); `tiers_by_provider` in `config.yaml.template` (10 providers); provider-aware benchmark pin (`run.sh` + `run_ab.py`); 15 new unit tests (flat-tiers identity + template parity).
+
 ## 2026-07-28
 
 ### Public A/B benchmark: OpenAI-compatible model gateways (opencode/zen) as an A/B provider — Enhancement (OSS)

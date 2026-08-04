@@ -483,6 +483,61 @@ def test_all_provider_models_priced():
             run_ab.price(model, 1, 1, prices)  # raises if missing
 
 
+# --------------------------------------------------------------------------- #
+# Provider-aware G06 routing pin (so a non-OpenAI --providers <p> isn't silently
+# rerouted to gpt-4o-mini by G06's OpenAI-only default tiers).
+# --------------------------------------------------------------------------- #
+def test_resolve_providers_parsing():
+    assert run_ab.resolve_providers("all") == list(run_ab.PROVIDER_MODELS)
+    assert run_ab.resolve_providers("anthropic") == ["anthropic"]
+    assert run_ab.resolve_providers("anthropic, openai") == ["anthropic", "openai"]
+    assert run_ab.resolve_providers("") == ["openai"]          # blank -> default
+    assert run_ab.resolve_providers("  ") == ["openai"]
+
+
+def test_g06_pin_plan_openai_keeps_template():
+    # The OpenAI (default) path must never touch the template tiers — its A/B
+    # numbers are the calibrated headline and have to stay byte-identical.
+    assert run_ab.g06_pin_plan(["openai"]) == ("keep", None)
+    assert run_ab.g06_pin_plan([]) == ("keep", None)
+
+
+def test_g06_pin_plan_single_nonopenai_builds_provider_ladder():
+    action, tiers = run_ab.g06_pin_plan(["anthropic"])
+    assert action == "tiers"
+    assert tiers["simple"] == ["claude-haiku-4-5"]           # base model
+    assert tiers["medium"] == ["claude-sonnet-5"]            # first route target
+    assert tiers["complex"] == ["claude-sonnet-5"]           # last route target
+    # a routeless provider collapses every tier onto its single model (no misroute)
+    action2, tiers2 = run_ab.g06_pin_plan(["deepseek"])
+    assert action2 == "tiers"
+    assert tiers2["simple"] == tiers2["medium"] == tiers2["complex"] == ["deepseek/deepseek-chat"]
+
+
+def test_g06_pin_plan_mixed_or_unknown_disables():
+    # One static tier map can't route each provider within its own family, and an
+    # unknown provider must not be silently treated as OpenAI — both fail safe to
+    # pass-through (G06 disabled) so nothing is misrouted.
+    assert run_ab.g06_pin_plan(["anthropic", "openai"]) == ("disable", None)
+    assert run_ab.g06_pin_plan(run_ab.resolve_providers("all")) == ("disable", None)
+    assert run_ab.g06_pin_plan(["bogusprov"]) == ("disable", None)
+
+
+def test_g06_pin_tiers_are_all_priced():
+    # The pin's tier models feed arm B's routed_model, which run_ab prices — any
+    # unpriced tier model would hard-error mid-run. Guarantee every provider's
+    # generated ladder is fully priced.
+    prices = run_ab.load_prices()
+    for prov in run_ab.PROVIDER_MODELS:
+        if prov == "openai":
+            continue
+        action, tiers = run_ab.g06_pin_plan([prov])
+        assert action == "tiers", prov
+        for models in tiers.values():
+            for m in models:
+                run_ab.price(m, 1, 1, prices)  # raises KeyError if missing
+
+
 def test_opencode_is_openai_compatible_gateway():
     # opencode is a model gateway, not a native litellm provider: the direct arm reaches it
     # as openai/<model> with an explicit api_base, and its key var must NOT be OPENAI_API_KEY

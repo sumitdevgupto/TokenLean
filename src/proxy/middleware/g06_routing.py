@@ -162,11 +162,17 @@ def _log_cascade_tier_reachability(ctx: RequestContext, cfg: Dict[str, Any]) -> 
     """Once per tier-config signature, log which cascade tier models are reachable, so a
     misconfigured (e.g. OpenAI-free) deployment is flagged loudly at first use — not just
     silently degraded per request. Covers the classifier tiers AND the routellm weak/strong."""
-    tiers = cfg.get("tiers", {}) or {}
     routellm = cfg.get("routellm", {}) or {}
     models: List[str] = []
-    for _k in ("simple", "medium", "complex"):
-        models += tiers.get(_k, []) or []
+    # Gather from the flat `tiers` map AND every per-provider ladder (tiers_by_provider),
+    # so a misconfigured ladder is flagged regardless of which routing shape is in use.
+    _tier_maps = [cfg.get("tiers", {}) or {}]
+    _tbp = cfg.get("tiers_by_provider", {}) or {}
+    if isinstance(_tbp, dict):
+        _tier_maps += [v for v in _tbp.values() if isinstance(v, dict)]
+    for _tmap in _tier_maps:
+        for _k in ("simple", "medium", "complex"):
+            models += _tmap.get(_k, []) or []
     for _k in ("weak_model", "strong_model"):
         if routellm.get(_k):
             models.append(routellm[_k])
@@ -192,6 +198,35 @@ def _log_cascade_tier_reachability(ctx: RequestContext, cfg: Dict[str, Any]) -> 
             "[%s] G06 cascade tier check: all %d tier model(s) reachable",
             ctx.request_id, len(models),
         )
+
+
+def _resolve_tiers(cfg: Dict[str, Any], model: str) -> Optional[Dict[str, List[str]]]:
+    """Pick the active tier ladder for a request, given its model.
+
+    - ``tiers_by_provider`` configured → route WITHIN the requested model's provider
+      family: return that family's ladder, or ``None`` if the family has no ladder
+      (the caller then passes the request through untouched). This is G06's
+      never-cross-provider-misroute guarantee — a Claude request must never come back
+      from ``gpt-4o-mini`` just because the flat tiers happen to point at OpenAI.
+    - ``tiers_by_provider`` absent → the legacy flat ``tiers`` map. This path is
+      byte-identical to the pre-existing behaviour and is the one every
+      calibration/benchmark config takes (they carry no ``tiers_by_provider``), so the
+      published savings baseline is unaffected by construction.
+
+    Returns a tiers dict (possibly empty → the existing no-op rule fires), or ``None``
+    to signal 'pass the request through, keep the requested model'.
+    """
+    tbp = cfg.get("tiers_by_provider")
+    if isinstance(tbp, dict) and tbp:
+        fam = _tier_provider(model)
+        fam_tiers = tbp.get(fam) if fam else None
+        if isinstance(fam_tiers, dict) and any(
+            fam_tiers.get(t) for t in ("simple", "medium", "complex")
+        ):
+            return fam_tiers
+        return None
+    return cfg.get("tiers", {})
+
 
 _COMPLEX_KEYWORDS = re.compile(
     r"\b(analyse|analyze|explain|compare|evaluate|synthesise|synthesize|"
@@ -926,7 +961,17 @@ class G06Routing:
                     )
             return ctx
 
-        tiers: Dict[str, List[str]] = cfg.get("tiers", {})
+        tiers = _resolve_tiers(cfg, ctx.model)
+        if tiers is None:
+            # tiers_by_provider is configured but the requested model's provider has no
+            # ladder → pass the request through untouched. Never cross-provider misroute:
+            # a Claude/Gemini/etc. request keeps its own model instead of being rerouted to
+            # whatever the (OpenAI) default tier points at. Preserves ctx.model as-is.
+            logger.debug(
+                "[%s] G06: no tier ladder for %s's provider → pass-through",
+                ctx.request_id, ctx.model,
+            )
+            return ctx
         if not tiers:
             # No tiers configured → same no-op rule for config-known models.
             if not _is_configured_model(ctx.model):

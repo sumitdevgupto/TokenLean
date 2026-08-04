@@ -42,6 +42,19 @@ for a in "$@"; do
   esac
 done
 
+# Extract the A/B target provider(s) so the config pin below can route them
+# correctly. G06's default tiers are OpenAI-only, so without this a non-OpenAI
+# `--ab --providers <p>` gets silently rerouted to gpt-4o-mini (the A/B then
+# compares two different models). Supports `--providers x` and `--providers=x`.
+AB_PROVIDERS="openai"
+for ((i=0; i<${#ARGS[@]}; i++)); do
+  case "${ARGS[$i]}" in
+    --providers)   AB_PROVIDERS="${ARGS[$((i+1))]:-openai}" ;;
+    --providers=*) AB_PROVIDERS="${ARGS[$i]#--providers=}" ;;
+  esac
+done
+export AB_PROVIDERS
+
 # 1. Docker present + running ---------------------------------------------------
 command -v docker >/dev/null 2>&1 || die "Docker not found. Install Docker and retry."
 docker info >/dev/null 2>&1       || die "Docker daemon not running. Start it and retry."
@@ -162,6 +175,36 @@ for k in disable:
 _block('G8_tools').update({'enabled': True, 'max_tools_per_agent': 20})
 _block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20,
                                  'max_system_prompt_tokens': 800})
+# Provider-aware G06 routing. The template's tiers are OpenAI-only
+# (simple->gpt-4o-mini, ...), so a non-OpenAI `--ab --providers <p>` request
+# would be silently rerouted to gpt-4o-mini and the A/B would compare two
+# different models. Set the tiers to the *target* provider's own model ladder so
+# G06 cascades within that provider. The OpenAI (default) path is left untouched
+# so its calibrated numbers stay byte-identical; a mixed/`all` run disables G06
+# (one static tier map can't route each provider within its own family).
+import os as _os
+_provs = _os.environ.get('AB_PROVIDERS', 'openai')
+try:
+    import sys as _sys
+    _sys.path.insert(0, 'examples/benchmark')
+    from run_ab import g06_pin_plan, resolve_providers
+    _action, _tiers = g06_pin_plan(resolve_providers(_provs))
+except Exception as _e:                       # fail safe: keep template tiers
+    _action, _tiers = 'keep', None
+    print(f"  note: G06 provider-aware pin skipped ({_e!r}); keeping template tiers")
+# The benchmark drives its OWN routing via the flat `tiers` map + g06_pin_plan (models
+# guaranteed present in prices.json), so drop the template's per-provider ladders — their
+# declared models aren't necessarily priced in the benchmark's prices.json and would crash
+# arm-B pricing on an escalation. Production keeps tiers_by_provider; the harness doesn't.
+_block('G6_routing').pop('tiers_by_provider', None)
+if _action == 'disable':
+    _block('G6_routing')['enabled'] = False
+    print(f"  G06 routing: DISABLED for mixed providers '{_provs}' (pass-through — no misroute)")
+elif _action == 'tiers':
+    _block('G6_routing')['tiers'] = _tiers
+    print(f"  G06 routing: tiers set to '{_provs}' ladder {_tiers}")
+else:
+    print(f"  G06 routing: template tiers kept (providers='{_provs}')")
 # G00 rate-limiting is a production THROUGHPUT guard, not a token-savings lever. The
 # --workload cache burst fires ~500 requests back-to-back (well over the template's
 # 60/min default), so the un-pinned limit 429s most of arm B and corrupts the

@@ -283,10 +283,54 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `routellm.strong_model` | `gpt-4-1106-preview` | Strong/expensive model for RouteLLM |
 | `routellm.weak_model` | `gpt-4o-mini` | Weak/cheap model for RouteLLM |
 | `routellm.timeout_ms` | `500` | Max wait for routing decision before fallback |
-| `tiers.simple` | `[gemini-flash-lite, ...]` | Simple task models (heuristic mode) |
+| `tiers.simple` | `[gemini-flash-lite, ...]` | Simple task models (heuristic mode). The flat, single-provider ladder — used when `tiers_by_provider` is absent |
 | `tiers.medium` | `[gemini-flash, ...]` | Medium task models (heuristic mode) |
 | `tiers.complex` | `[gemini-pro, ...]` | Complex task models (heuristic mode) |
+| `tiers_by_provider.<provider>.<simple\|medium\|complex>` | *(ships for all 10 native providers)* | **Per-provider routing ladders** (see below). When present, **takes precedence** over the flat `tiers` and routes each request within the **requested model's own provider family** |
 | `rules` | `[]` | Declarative per-tenant routing rules (see below). Default empty = no-op → the classifier decides as usual (byte-identical, protects the savings baseline) |
+
+**Per-provider routing ladders (`tiers_by_provider`)**
+
+The flat `tiers` map is a single ladder, so with routing enabled a request for a model
+outside that ladder's provider (e.g. `claude-haiku-4-5` against OpenAI-only tiers) is
+rerouted to a tier model of the **wrong** provider (`gpt-4o-mini`). `tiers_by_provider`
+fixes that: keyed by provider `name` (from the `providers:` list), each entry is its own
+`simple`/`medium`/`complex` ladder, and G06 routes a request **within the requested model's
+provider family** — a model is matched to its provider by that provider's `model_prefixes`.
+
+- **Precedence:** when `tiers_by_provider` is present it is used instead of the flat `tiers`.
+  The template's `openai` ladder mirrors the flat tiers, so OpenAI routing (and the published
+  savings baseline) is **byte-identical** whether or not this block is present.
+- **No ladder → pass-through:** a request whose provider family has no ladder here (you deleted
+  it, or never added it) is served on its **requested** model, untouched — G06 never
+  cross-provider misroutes.
+- **Legacy configs:** omit `tiers_by_provider` entirely and behaviour is exactly the flat-`tiers`
+  path (unchanged).
+
+The template ships ladders for all 10 native providers (`openai`, `anthropic`, `gemini`,
+`azure`, `bedrock`, `mistral`, `groq`, `cohere`, `deepseek`, `xai`); trim or extend freely. A
+single-model provider (its ladder repeats one model across tiers) still routes on-provider — add
+a stronger id to `medium`/`complex` to turn on a real cheap→strong cascade.
+
+**Cross-provider routing (the alternative).** Within-provider is the shipped default, but G06 also
+supports routing by **complexity across providers** — the cheapest capable model *anywhere*,
+ignoring which model the caller asked for. That's the flat `tiers` map with a **mixed-provider**
+ladder:
+
+```yaml
+tiers:
+  simple:  [gpt-4o-mini]        # openai   — cheap
+  medium:  [gemini-2.5-flash]   # gemini   — mid
+  complex: [claude-sonnet-4-5]  # anthropic — strong
+```
+
+To use it, **delete `tiers_by_provider`** (it takes precedence) and set the flat `tiers` as above.
+Notes: (1) it needs a key for **every** provider in the ladder — an unkeyed tier falls back per
+`on_unreachable_tier`; (2) down-routing (`simple`→a cheaper provider) works as-is, but routing **up**
+to a provider costlier than the caller's requested model is blocked by the cost floor unless you also
+set `allow_escalation_above_requested: true`; (3) a caller who deliberately picked a provider (e.g.
+Claude) may be served another provider's model on a lower-complexity turn — that's the intended
+cost-cascade behaviour, and the reason within-provider is the default.
 
 **Declarative routing rules (`rules`)**
 

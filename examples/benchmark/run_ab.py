@@ -35,6 +35,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import List
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -84,6 +85,58 @@ PROVIDER_MODELS = {
                  "key_env": "OPENCODE_API_KEY", "routes": [],
                  "api_base": "https://opencode.ai/zen/v1"},
 }
+
+
+def resolve_providers(spec: str) -> List[str]:
+    """Parse a --providers value into a concrete provider list.
+
+    'all' expands to every known provider; otherwise comma-split + trimmed.
+    Unknown names are kept as-is (the run loop already errors on them) so the
+    G06 planner can fall back to a safe pass-through rather than silently
+    pretending an unknown provider is OpenAI.
+    """
+    spec = (spec or "").strip()
+    if spec == "all":
+        return list(PROVIDER_MODELS)
+    return [p.strip() for p in spec.split(",") if p.strip()] or ["openai"]
+
+
+def g06_pin_plan(providers: List[str]):
+    """Decide how the benchmark's config pin should set G06 for a run.
+
+    G06's default tiers are OpenAI-only (simple->gpt-4o-mini, ...), so a
+    non-OpenAI request otherwise gets silently rerouted to gpt-4o-mini and the
+    A/B compares two different models. This returns the routing the pin should
+    apply so `--providers <p>` measures provider *p* on both arms:
+
+      ('keep',    None)  -> leave the template tiers untouched. Used for the
+                            OpenAI (default) path so its calibrated numbers stay
+                            byte-identical.
+      ('disable', None)  -> disable G06 (pass-through). Used when the run mixes
+                            providers ('all' or a comma list): one static tier
+                            map can't route each provider within its own family,
+                            so every model is measured on its own provider with
+                            no cross-model routing lever (disclosed).
+      ('tiers',   {...}) -> set G06 tiers to this single non-OpenAI provider's
+                            own model ladder (base -> route targets) so the
+                            cascade runs *within* that provider.
+    """
+    provs = [p for p in (providers or []) if p] or ["openai"]
+    if provs == ["openai"]:
+        return ("keep", None)
+    if len(provs) != 1:
+        return ("disable", None)
+    p = provs[0]
+    spec = PROVIDER_MODELS.get(p)
+    if spec is None:
+        return ("disable", None)          # unknown provider: fail safe to pass-through
+    if p == "openai":
+        return ("keep", None)
+    base = spec["model"]
+    routes = spec.get("routes") or []
+    medium = routes[0] if routes else base
+    hard = routes[-1] if routes else base
+    return ("tiers", {"simple": [base], "medium": [medium], "complex": [hard]})
 
 
 # --------------------------------------------------------------------------- #

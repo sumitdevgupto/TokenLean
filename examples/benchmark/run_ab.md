@@ -10,6 +10,7 @@ independently-verifiable counterpart to the single-arm [`run_benchmark.py`](run_
 - [The two arms & where keys come from](#the-two-arms--where-keys-come-from)
 - [Local vs GCP](#local-vs-gcp)
 - [Providers & running more than one](#providers--running-more-than-one)
+- [Arm B for a non-OpenAI provider — routing + provider key](#arm-b-for-a-non-openai-provider--routing--provider-key)
 - [Workloads: per-lever, transparent](#workloads-per-lever-transparent)
 - [Datasets & quality gate](#datasets--quality-gate)
 - [Spend caps & budget](#spend-caps--budget)
@@ -86,7 +87,9 @@ The launcher discovers the proxy key in this order: `$PROXY_API_KEY` in the shel
 `PROXY_API_KEY=tok-…` line in `.env` → the first `ROI_PROXY_API_KEY_*` in `.env` → a generated
 local key. **Set `PROXY_API_KEY=tok-…` in `.env` to run with a fixed key and pass nothing at the
 command line.** Against an **already-running** proxy (e.g. a commercial deploy), add
-`--no-pin-config` so the launcher measures the live config and does not rewrite/restart it.
+`--no-pin-config` so the launcher measures the live config and does not rewrite/restart it — but
+note that for a **non-OpenAI** provider the pin is what sets provider-correct G06 routing, so
+prefer letting it pin (see [Arm B for a non-OpenAI provider](#arm-b-for-a-non-openai-provider--routing--provider-key)).
 
 Or call the script directly against an already-running local proxy:
 
@@ -165,6 +168,43 @@ AWS_REGION_NAME=us-east-1
 
 If you invoke `run_ab.py` **directly** (not through a launcher), export the vars yourself first —
 nothing reads `.env` for you in that path.
+
+---
+
+## Arm B for a non-OpenAI provider — routing + provider key
+
+Pick any provider with `--providers <name>` — the launcher handles routing for you:
+
+```bash
+./examples/benchmark/run.sh --ab --providers anthropic
+```
+
+**Routing is automatic.** Arm B sends the provider's model (e.g. `claude-haiku-4-5`), and G06's
+default tiers are OpenAI-only — so a naive run would silently reroute a Claude request to
+`gpt-4o-mini` and benchmark the wrong model. The launcher prevents that from its `--providers`
+value: a **single non-OpenAI** provider gets its pinned G06 tiers set to *that provider's own*
+model ladder (`claude-haiku-4-5` → `claude-sonnet-5`), so the cascade stays within the provider; a
+**mixed / `all`** run disables G06 (pass-through — each model measured on its own provider, no
+cross-model routing lever); **OpenAI** keeps its calibrated tiers unchanged. The decision is
+printed during the pin step (`G06 routing: tiers set to 'anthropic' ladder …`), and every ladder
+model is checked against `prices.json` so a run can't crash on an unpriced routed model.
+
+> This routing is applied by the launcher's config **pin**. If you point the launcher at an
+> already-running proxy with **`--no-pin-config`**, it measures the live config as-is and does
+> **not** apply per-provider routing — so for a non-OpenAI provider either let the launcher pin
+> (recommended), or set that live stack's `G6_routing` tiers to the target provider (or disable
+> G06) yourself, else the request reroutes to `gpt-4o-mini`.
+
+**The proxy must hold a key for that provider.** The two arms read keys from different places
+(see [the two arms](#the-two-arms--where-keys-come-from)) — arm A's `.env` key does **not** satisfy
+arm B. Self-hosted core: the global `LLM_KEY_<PROVIDER>` in the proxy's environment. Managed /
+strict-BYOK stack: your tenant's stored provider key for that provider — without it arm B returns
+**`402 provider_key_missing`** (add it through the managed onboarding; the OpenAI key is usually
+already present, others you add explicitly).
+
+> **OpenAI needs neither** — it's the default routing target and its key is already seeded, which
+> is why `--providers openai` "just works". Every other provider gets the routing handled for you
+> and only needs its key present in the proxy.
 
 ---
 
@@ -324,5 +364,6 @@ See also [`../../docs/client-onboarding.md`](../../docs/client-onboarding.md).
 | `--providers all` only ran OpenAI | Other keys weren't in the environment. Put them in `.env` and use `run.sh --ab`, or `export` them before a direct `run_ab.py` call. |
 | "provider … has no direct-arm credentials" | `--require-direct` (tenant flow) with a missing key — supply `--provider-key` or the provider's env vars. |
 | "no price for model …" | The routed/mapped model isn't in `prices.json`. Add it (never priced at $0 silently). |
+| non-OpenAI results look wrong / came back from `gpt-4o-mini` | G06 rerouted the request. Let the launcher **pin** (don't pass `--no-pin-config`) so it sets that provider's routing tiers, or set the live stack's `G6_routing` tiers to the target provider. |
 | azure/bedrock skipped | Missing extras — set `AZURE_API_BASE`, or `AWS_SECRET_ACCESS_KEY` + `AWS_REGION_NAME`. |
 | exit 3 | A spend cap tripped — raise `--max-spend-per-provider` / `--max-spend` or lower `--limit`. |

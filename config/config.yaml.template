@@ -566,6 +566,76 @@ groups:
       - gpt-4o
       complex:
       - gpt-4-5
+    # Per-provider routing ladders (ships enabled). When present, this TAKES PRECEDENCE
+    # over the flat `tiers` above and G06 routes each request WITHIN the requested model's
+    # own provider family — a Claude request cascades claude-haiku-4-5 → claude-sonnet-5, a
+    # Gemini request gemini-flash → gemini-pro, etc. — instead of the flat OpenAI-only tiers
+    # silently rerouting every non-OpenAI request to gpt-4o-mini. A provider you DELETE here
+    # (or never add) has no ladder, so its requests PASS THROUGH untouched — G06 never
+    # cross-provider misroutes. The `openai` ladder mirrors the flat `tiers` above, so OpenAI
+    # routing is byte-identical whether or not this block is present (the published savings
+    # baseline is unaffected). Keys are provider `name`s from the `providers:` list; a model
+    # is matched to its provider by that provider's `model_prefixes`. Trim/edit freely.
+    # Ladders reference each provider's own models[] declared above; a model is matched to
+    # its provider by that provider's model_prefixes. openai/anthropic/gemini/mistral/cohere
+    # declare a real cheap→strong cascade; the single-model providers (groq/bedrock/deepseek/
+    # xai, and azure whose deployment names are yours to set) route every tier to one model —
+    # still on-provider, no misroute — add a stronger id to simple/medium/complex to turn on a
+    # true cascade for them.
+    tiers_by_provider:
+      openai:
+        simple: [gpt-4o-mini]
+        medium: [gpt-4o]
+        complex: [gpt-4-5]
+      anthropic:
+        simple: [claude-haiku-4-5]
+        medium: [claude-sonnet-4-5]
+        complex: [claude-opus-4]
+      gemini:
+        simple: [gemini-flash-latest]
+        medium: [gemini-pro-latest]
+        complex: [gemini-pro-latest]
+      azure:
+        simple: [azure/gpt-4o-mini]
+        medium: [azure/gpt-4o]
+        complex: [azure/gpt-4o]
+      bedrock:
+        simple: [bedrock/amazon.nova-micro-v1:0]
+        medium: [bedrock/amazon.nova-micro-v1:0]
+        complex: [bedrock/amazon.nova-micro-v1:0]
+      mistral:
+        simple: [ministral-3b-latest]
+        medium: [mistral-small-latest]
+        complex: [mistral-small-latest]
+      groq:
+        simple: [groq/llama-3.1-8b-instant]
+        medium: [groq/llama-3.1-8b-instant]
+        complex: [groq/llama-3.1-8b-instant]
+      cohere:
+        simple: [command-r7b-12-2024]
+        medium: [command-r]
+        complex: [command-r]
+      deepseek:
+        simple: [deepseek-chat]
+        medium: [deepseek-chat]
+        complex: [deepseek-chat]
+      xai:
+        simple: [grok-3-mini]
+        medium: [grok-3-mini]
+        complex: [grok-3-mini]
+    # ── ALTERNATIVE: cross-provider cost cascade ────────────────────────────────
+    # The default above routes each request WITHIN its own provider's family. If you'd
+    # rather route by COMPLEXITY *across* providers (the cheapest capable model anywhere,
+    # ignoring which model the caller asked for), DELETE `tiers_by_provider` above and set
+    # the flat `tiers` to a mixed-provider ladder — e.g.:
+    #   tiers:
+    #     simple:  [gpt-4o-mini]        # openai  — cheap
+    #     medium:  [gemini-2.5-flash]   # gemini  — mid
+    #     complex: [claude-sonnet-4-5]  # anthropic — strong
+    # Needs a key for EVERY provider in the ladder (an unkeyed tier falls back per
+    # on_unreachable_tier). Down-routing (simple→cheaper) works as-is; routing UP to a
+    # provider costlier than the caller's requested model is blocked by the cost floor
+    # unless you also set allow_escalation_above_requested: true.
     judge_model: ${G06_JUDGE_MODEL:-}
     judge_timeout_ms: 2000
     cascade_confidence_threshold: 0.7
