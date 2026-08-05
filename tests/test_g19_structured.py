@@ -34,10 +34,17 @@ from middleware.g19_headroom import (
 def _make_config(enabled=True, request_side=True, response_side=True,
                  min_length=50, strategies=None):
     if strategies is None:
+        # MUST mirror config/config.yaml.template's G19_headroom.compression_strategies.
+        # This fixture previously omitted "text", so the whole suite validated a config
+        # that was never shipped — and test_plain_text_not_compressed passed vacuously
+        # while prose answers were being rewritten in production. See
+        # test_fixture_matches_shipped_template, which now enforces the match.
         strategies = {
             "json": {"remove_empty": True, "dedupe_keys": True},
             "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
-            "logs": {"dedupe_lines": True, "truncate_long_lines": 200},
+            "logs": {"dedupe_lines": True, "truncate_long_lines": 200,
+                     "always_keep_severities": ["ERROR", "FATAL", "CRITICAL", "PANIC"]},
+            "text": {"dedupe_sentences": True, "max_sentence_len": 0},
         }
     return {
         "groups": {
@@ -592,11 +599,191 @@ class TestCompressText:
 
     @pytest.mark.asyncio
     async def test_middleware_skips_text_when_no_text_strategy(self):
-        """Without 'text' in strategies, plain text passes through unchanged."""
+        """Without 'text' in strategies, plain text passes through unchanged.
+
+        Passes an EXPLICIT strategies dict with no "text" key. This test used to rely on
+        the shared fixture omitting "text" — which it did, wrongly, while the shipped
+        template included it, so the assertion proved nothing about production.
+        """
         text = "The quick brown fox. " * 5
         msgs = [{"role": "system", "content": text}]
-        ctx = _make_ctx(msgs, config=_make_config(min_length=10))
+        no_text = {"json": {"remove_empty": True}, "code": {"strip_comments": True},
+                   "logs": {"dedupe_lines": True}}
+        ctx = _make_ctx(msgs, config=_make_config(min_length=10, strategies=no_text))
         g19 = G19Headroom()
         result = await g19.process_request(ctx)
         assert result.messages[0]["content"] == text
         assert len(result.savings.step_savings) == 0
+
+
+# ─── Answer-fidelity regressions (2026-08-05) ────────────────────────────────
+#
+# Root cause of all three: the detector used `.search()` over the WHOLE message, so a
+# single ``` fence or one "from ..." line reclassified a prose answer as code, and
+# _compress_code then deleted every '#'-leading line — the answer's Markdown headings.
+# Surfaced by an Anthropic A/B run: Claude emits far more Markdown than gpt-4o-mini, so
+# the misclassification fired constantly on one provider and rarely on the other.
+
+class TestAnswerFidelity:
+
+    def test_fixture_matches_shipped_template(self):
+        """The test fixture MUST offer the same strategies as config.yaml.template.
+
+        The fixture used to omit "text" while the template shipped it, so the entire
+        suite validated a configuration that never ran in production and
+        test_plain_text_not_compressed passed vacuously. Guard against that drift.
+        """
+        import yaml
+        here = os.path.dirname(__file__)
+        tmpl = os.path.join(here, "..", "config", "config.yaml.template")
+        with open(tmpl, encoding="utf-8") as fh:
+            shipped = yaml.safe_load(fh)["groups"]["G19_headroom"]["compression_strategies"]
+        fixture = _make_config()["groups"]["G19_headroom"]["compression_strategies"]
+        # FULL equality, not just key sets — a value drift (e.g. the template changing
+        # truncate_long_lines) would otherwise leave the suite validating thresholds
+        # production no longer uses, which is this bug's failure mode one level down.
+        assert fixture == shipped, (
+            f"fixture strategies differ from shipped template —\n"
+            f"  fixture: {fixture}\n  shipped: {shipped}\n"
+            "tests would validate a config that is not the one we ship")
+
+    def test_prose_answer_with_one_code_fence_is_not_code(self):
+        """A mostly-prose answer that quotes an example is prose, not a code payload."""
+        answer = (
+            "# Analysis\n\n"
+            "The issue is that method_decorator passes a partial object.\n"
+            "This breaks decorators that read __name__.\n\n"
+            "## Files to change\n\n"
+            "- django/utils/decorators.py\n\n"
+            "```python\n"
+            "def fixed():\n"
+            "    pass\n"
+            "```\n\n"
+            "That restores the expected attributes.\n"
+        )
+        assert _detect_content_type(answer) == "text"
+
+    def test_genuine_code_payload_still_detected(self):
+        """Dominance must not break real code payloads — most lines ARE code here."""
+        code = "import os\nimport sys\nfrom pathlib import Path\nclass A:\n    pass\n"
+        assert _detect_content_type(code) == "code"
+
+    def test_fenced_markdown_keeps_headings_and_prose(self):
+        """_compress_code must leave everything OUTSIDE a fence byte-identical."""
+        text = (
+            "# Heading One\n"
+            "Some prose that explains things.\n"
+            "## Heading Two\n"
+            "```python\n"
+            "# a real comment inside the fence\n"
+            "x = 1\n"
+            "```\n"
+            "Closing prose.\n"
+        )
+        out = _compress_code(text, {"strip_comments": True, "strip_whitespace": True,
+                                    "compress_imports": True})
+        assert "# Heading One" in out
+        assert "## Heading Two" in out
+        assert "Closing prose." in out
+        assert "Some prose that explains things." in out
+        # the comment INSIDE the fence is still stripped — that part is genuine code
+        assert "# a real comment inside the fence" not in out
+
+    @pytest.mark.asyncio
+    async def test_response_side_leaves_prose_answer_untouched_by_default(self):
+        """Default config must never rewrite a prose answer (user-visible text)."""
+        answer = "The same sentence. The same sentence. A distinct closing sentence."
+        resp = {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+        ctx = _make_ctx([{"role": "user", "content": "hi"}], config=_make_config(min_length=10))
+        out = await G19Headroom().process_response(ctx, resp)
+        assert out["choices"][0]["message"]["content"] == answer
+        assert len(ctx.savings.step_savings) == 0
+
+    @pytest.mark.asyncio
+    async def test_response_side_answer_compression_is_opt_in(self):
+        """Setting response_side_compress_answers:true restores the old behaviour."""
+        answer = "The same sentence. The same sentence. A distinct closing sentence."
+        resp = {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+        cfg = _make_config(min_length=10)
+        cfg["groups"]["G19_headroom"]["response_side_compress_answers"] = True
+        ctx = _make_ctx([{"role": "user", "content": "hi"}], config=cfg)
+        out = await G19Headroom().process_response(ctx, resp)
+        assert len(out["choices"][0]["message"]["content"]) < len(answer)
+
+    @pytest.mark.asyncio
+    async def test_response_side_leaves_code_answer_untouched_by_default(self):
+        """A code-dominant ANSWER (comments included) is the user's deliverable — the
+        default must return it exactly as the model wrote it, not comment-stripped."""
+        answer = (
+            "# Solution with explanatory comments\n"
+            "def solve(x):\n"
+            "    # handle the edge case first\n"
+            "    if x < 0:\n"
+            "        return None\n"
+            "    return x * 2\n"
+        )
+        resp = {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+        ctx = _make_ctx([{"role": "user", "content": "hi"}], config=_make_config(min_length=10))
+        out = await G19Headroom().process_response(ctx, resp)
+        assert out["choices"][0]["message"]["content"] == answer
+
+    @pytest.mark.asyncio
+    async def test_response_side_leaves_json_answer_untouched_by_default(self):
+        """A JSON the model produced FOR the caller must keep its empty fields — their
+        absence-of-value is itself information the user asked for."""
+        answer = json.dumps({"name": "Alice", "email": "", "errors": [], "note": None})
+        resp = {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+        ctx = _make_ctx([{"role": "user", "content": "hi"}], config=_make_config(min_length=10))
+        out = await G19Headroom().process_response(ctx, resp)
+        assert out["choices"][0]["message"]["content"] == answer
+
+    @pytest.mark.asyncio
+    async def test_response_side_tool_results_still_compressed_by_default(self):
+        """The answer guard must NOT disable tool-RESULT compression — results are data
+        replayed into later turns, and compressing them is G19's real deferred saving."""
+        big_json = json.dumps({"rows": [{"id": 1, "empty": ""}, {"id": 2, "empty": ""}],
+                               "null_field": None, "blank": ""})
+        resp = {"choices": [{"message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "q", "result": big_json}}]}}]}
+        ctx = _make_ctx([{"role": "user", "content": "hi"}], config=_make_config(min_length=10))
+        out = await G19Headroom().process_response(ctx, resp)
+        compressed = out["choices"][0]["message"]["tool_calls"][0]["function"]["result"]
+        result_str = compressed if isinstance(compressed, str) else json.dumps(compressed)
+        assert len(result_str) < len(big_json)
+
+    def test_dominance_ratio_is_config_driven(self):
+        """detect_dominance_ratio must tune detection (AGENTS.md: config-driven, never
+        hardcode); invalid values fall back to the 0.5 default instead of raising."""
+        from middleware.g19_headroom import _dominance_ratio
+        # 2 code lines / 5 non-blank = 40%: prose at the 0.5 default, code at 0.3
+        mixed = ("import os\n"
+                 "import sys\n"
+                 "This explains what the import does in plain prose.\n"
+                 "More prose describing the approach in detail here.\n"
+                 "Closing prose paragraph wrapping up the answer.\n")
+        assert _detect_content_type(mixed, 0.5) == "text"
+        assert _detect_content_type(mixed, 0.3) == "code"
+        assert _dominance_ratio({"detect_dominance_ratio": 0.3}) == 0.3
+        assert _dominance_ratio({}) == 0.5
+        for bad in (0, -1, 1.5, "nonsense", None):
+            assert _dominance_ratio({"detect_dominance_ratio": bad}) == 0.5
+
+    @pytest.mark.asyncio
+    async def test_request_side_prose_compression_still_active(self):
+        """The response-side guard must NOT disable request-side prose dedup (savings)."""
+        payload = "Repeated boilerplate line. " * 6
+        ctx = _make_ctx([{"role": "user", "content": payload}], config=_make_config(min_length=10))
+        result = await G19Headroom().process_request(ctx)
+        assert len(result.messages[0]["content"]) < len(payload)
+
+    def test_single_quoted_log_line_does_not_make_answer_logs(self):
+        """One quoted log line in a prose answer must not classify the whole as logs."""
+        answer = (
+            "The root cause is a connection timeout.\n"
+            "You can see it in the log line below:\n"
+            "2026-07-23T10:51:01Z ERROR Connection timeout\n"
+            "Increasing the pool size resolves it.\n"
+            "Redeploy afterwards to pick up the change.\n"
+        )
+        assert _detect_content_type(answer) == "text"

@@ -20,4 +20,4 @@ config.BaseURL = os.Getenv("PROXY_ENDPOINT") + "/v1"
 client := openai.NewClientWithConfig(config)
 ```
 
-All G1–G18 optimisations are transparent. Pass `User` field for per-user savings tracking.
+All G0–G28 optimisations are transparent. Pass `User` field for per-user savings tracking.

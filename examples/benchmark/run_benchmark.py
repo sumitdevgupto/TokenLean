@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -73,6 +74,34 @@ def _bar(frac: float) -> str:
     return "#" * max(0, round(frac * BAR_W))
 
 
+_MD_EMPHASIS = re.compile(r"[*`~]+")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def normalise_for_match(s):
+    """Lowercase, strip Markdown emphasis, and collapse whitespace for substring matching.
+
+    A raw substring gate silently fails whenever the model EMPHASISES the very entity
+    being checked: "A simple iron boar crest" is not a substring of
+    "A **simple iron boar crest**". Models differ sharply in how much Markdown they
+    emit, so the raw gate ends up measuring formatting style rather than answer
+    fidelity — and it fires hardest on precisely the arm whose formatting an
+    optimisation changed, manufacturing "regressions" where no fact was lost.
+
+    Applied to BOTH needle and haystack, so a fact that legitimately contains one of
+    these characters still matches. Whitespace is collapsed so a fact broken across a
+    line wrap still matches. Underscores are deliberately NOT stripped — identifiers
+    like `_affinity_propagation.py` depend on them.
+
+    Emphasis runs are replaced with a SPACE, never deleted: deleting them merges the
+    neighbouring characters ("2*4" → "24"), which would let an expected fact "24" match
+    an answer that actually computed 2*4 — a manufactured pass. Space-replacement keeps
+    the boundary ("2 4") so no new adjacency is ever created, while "**St Andrews**"
+    still normalises to "St Andrews" via whitespace collapse.
+    """
+    return _WHITESPACE.sub(" ", _MD_EMPHASIS.sub(" ", s or "")).strip().lower()
+
+
 def check_facts(answer, expected_facts=None, forbidden=None):
     """Deterministic ground-truth check of a single answer — no LLM call.
 
@@ -86,15 +115,15 @@ def check_facts(answer, expected_facts=None, forbidden=None):
     Returns {passed, missing, present_forbidden}; an answer with no curated
     facts trivially passes.
     """
-    text = (answer or "").lower()
+    text = normalise_for_match(answer)
     missing = []
     for item in (expected_facts or []):
         if isinstance(item, (list, tuple)):
-            if not any(str(opt).lower() in text for opt in item):
+            if not any(normalise_for_match(str(opt)) in text for opt in item):
                 missing.append(list(item))
-        elif str(item).lower() not in text:
+        elif normalise_for_match(str(item)) not in text:
             missing.append(item)
-    present_forbidden = [f for f in (forbidden or []) if str(f).lower() in text]
+    present_forbidden = [f for f in (forbidden or []) if normalise_for_match(str(f)) in text]
     return {
         "passed": not missing and not present_forbidden,
         "missing": missing,

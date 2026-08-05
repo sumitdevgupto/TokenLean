@@ -75,6 +75,19 @@ DEFAULT_COUNTS = {"rag": 30, "chat": 20, "swe": 20, "code": 15, "reason": 15, "o
 X_CONTROLS = {"x_jit_retrieval": False}
 
 MAX_TOKENS = 256
+# Per-profile output budget, overriding MAX_TOKENS.
+#
+# `swe` answers must enumerate the files/symbols a patch touches, and 256 truncated
+# BOTH arms mid-sentence (finish_reason='length' at exactly 256 completion tokens,
+# verified 2026-08-05 on the Anthropic A/B run). With both arms cut off, the facts
+# gate scored whichever arm happened to reach the filename first inside an inadequate
+# budget rather than answer fidelity — manufacturing a "dropped fact" regression.
+MAX_TOKENS_BY_PROFILE = {"swe": 768}
+
+
+def max_tokens_for(profile):
+    """Output budget for a profile — per-profile override, else the global default."""
+    return MAX_TOKENS_BY_PROFILE.get(profile, MAX_TOKENS)
 SWE_CONTEXT_CHARS = 4000  # bound the injected code context so a request stays cheap
 RAG_CONTEXT_CHARS = 8000  # bound the stuffed multi-doc RAG context (~2k tokens): large enough
                           # to be production-realistic + cross G01's compression floor, capped
@@ -123,7 +136,7 @@ def _rec(profile, n, source, messages, *, grade, expected_facts=None):
         "_profile": profile,
         "_source": source,
         "messages": messages,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens_for(profile),
         "grade": grade,
         **X_CONTROLS,
     }
@@ -276,7 +289,7 @@ def build_ops(raw, rng, count):
                "note": "disclosed production-shaped structured payload (JSON/logs/config) so the "
                        "G19 structured-pruning + G22 dedup levers fire on a stateless first-ask."}
         r = {"request_id": f"ops-{n:04d}", "_label": f"ops-{n:04d}", "_profile": "ops",
-             "_source": src, "messages": s["messages"], "max_tokens": MAX_TOKENS,
+             "_source": src, "messages": s["messages"], "max_tokens": max_tokens_for("ops"),
              "grade": "facts", **X_CONTROLS}
         if s.get("expected_facts"):
             r["expected_facts"] = s["expected_facts"]
@@ -462,6 +475,11 @@ def main() -> int:
         "cache_burst": {"multiplicity": cache_schedule["multiplicity"],
                         "warm_frac": cache_schedule["warm_frac"],
                         "counts": cache_schedule["counts"]},
+        # Per-profile output budgets actually stamped on the records — MUST be emitted
+        # here so a rebuild reproduces the checked-in meta.json byte-for-byte (the
+        # first version of this key was patched into the artifact without updating the
+        # builder, which would have silently dropped it on the next --hf rebuild).
+        "max_tokens_by_profile": {p: max_tokens_for(p) for p in sorted(per_profile)},
         "dataset_sha256": sha,
         "pinned": PINNED,
         "ops_profile": ("The 'ops' profile is PRODUCTION-SHAPED, not a recognized public "

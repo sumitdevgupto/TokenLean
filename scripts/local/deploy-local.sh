@@ -21,7 +21,7 @@
 #   5. Seeds Qdrant with rag_docs (if --seed)
 #   6. Optionally backs up to GCS
 #
-# All G1-G18 optimisations are available via Docker networking.
+# All G0-G28 optimisations are available via Docker networking.
 # =============================================================================
 set -euo pipefail
 

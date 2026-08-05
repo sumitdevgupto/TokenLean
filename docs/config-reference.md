@@ -557,6 +557,8 @@ Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and 
 | `enabled` | `true` | Enable structured context pruning |
 | `request_side_enabled` | `true` | Compress structured content in request messages |
 | `response_side_enabled` | `true` | Compress structured content in responses / tool outputs |
+| `response_side_compress_answers` | `false` | Also rewrite the model's user-visible **answer** content (prose, code, logs, JSON alike — e.g. stripping code comments or deduping sentences). Off by default: the answer is what the caller reads, and rewriting it saves nothing on that call (the provider already generated and billed those output tokens). Response-side **tool results** are compressed regardless; request-side compression is unaffected. |
+| `detect_dominance_ratio` | `0.5` | Fraction of non-blank lines that must be code-shaped (or log-shaped) before a payload is pruned as code/logs rather than prose — guards against a single code fence or quoted log line reclassifying a whole prose message |
 | `min_length_to_compress` | `50` | Skip content shorter than this (chars) |
 | `compression_strategies.json` | `{remove_empty, dedupe_keys}` | Drop null/empty fields, dedupe repeated array structures |
 | `compression_strategies.code` | `{strip_comments, strip_whitespace, compress_imports}` | Remove comments/blank lines, collapse import blocks |

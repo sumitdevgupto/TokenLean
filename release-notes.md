@@ -19,6 +19,52 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-05
+
+### G19 no longer rewrites the model's answer — Bug fix
+G19's content detector used a whole-message `.search()`, so a **single ``` fence** — or one line
+opening `from `/`class ` — reclassified an entire prose answer as a *code payload*. `_compress_code`
+then deleted every `#`-leading line, i.e. the answer's **Markdown headings**, in text that goes
+straight back to the caller. Detection now requires code (or logs) to **dominate** the payload
+(configurable `detect_dominance_ratio`, default ≥50% of non-blank lines), and `_compress_code`
+only compresses **inside** ``` fences — prose, headings and bullets around a code block are
+emitted verbatim. Separately, the response side no longer rewrites **answer content at all** by
+default (`response_side_compress_answers`, default `false` — covers prose sentence-dedup, code
+comment-stripping, log dedup and JSON field-dropping alike): the answer is what the caller reads,
+and rewriting it saves nothing on that call since the provider has already generated and billed
+those output tokens. Request-side compression and response-side **tool-result** compression are
+unchanged, so payload savings are unaffected — verified offline: the internal calibration datasets
+(DS7/DS14) have **zero** classification changes under the new detector, pinned by a regression
+test. The stale docstring claiming "prose is excluded by default" was false against the shipped
+template — and the test fixture omitted `text`, so the whole suite validated a config that never
+ran; a guard test now asserts the fixture equals `config.yaml.template` (values, not just keys).
+Both knobs are settable from the portal's Optimisations tab.
+
+### Quality gate scored Markdown formatting as a dropped fact — Bug fix
+Both facts gates matched required facts as raw case-insensitive substrings, so a fact the model
+**emphasised** was scored as missing: `"The St Andrews Agreement"` is not a substring of
+`"The **St Andrews Agreement**"`. Because the gate is *relative*, this fired precisely when an
+optimisation changed the answer's **formatting** rather than its content — manufacturing quality
+regressions where nothing was lost, and hitting Markdown-heavy models hardest. Facts, OR-groups and
+forbidden strings are now normalised (emphasis stripped, whitespace collapsed) on **both** sides of
+the comparison; underscores are deliberately preserved so identifiers like `_affinity_propagation.py`
+still match. A genuinely absent fact still fails — covered by regression tests in both harnesses.
+
+### A/B harness: right-sized output budget and diagnosable quality failures — Bug fix
+`swe` items capped output at 256 tokens, which truncated **both** arms mid-answer
+(`finish_reason='length'`), so the facts gate scored whichever arm happened to reach the filename
+first rather than answer fidelity; the per-profile budget is now 768 for `swe` (others unchanged).
+The harness also reported only a *count* of dropped facts, leaving a failing gate impossible to
+investigate — it now records each failure's label, the dropped fact, both arms' answers, the cache
+flag and `finish_reason`, printing `[proxy TRUNCATED at max_tokens]` when the answer simply ran out
+of budget. New `--profiles rag,swe` re-runs just the profiles that regressed instead of the whole
+corpus (a typo'd profile name exits 1 before any spend rather than silently running nothing).
+The fact matcher also normalises Markdown emphasis to **spaces** (never deletions), so stripping
+can never merge adjacent characters into a false match (`2*4` can no longer satisfy an expected
+`24`). Re-measured on OpenAI after the G19 fix: the combined prose lever holds at **~8%** with a
+clean 40/40 facts gate; the disclosed `ops` figure is restated **~44% → ~43%**, the cost of no
+longer running a pasted config through the *code* compressor (which stripped its `#` comments).
+
 ## 2026-08-04
 
 ### Per-provider model routing (G06) — non-OpenAI providers now route within their own family out of the box — Enhancement (OSS)

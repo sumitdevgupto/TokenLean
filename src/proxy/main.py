@@ -1337,7 +1337,7 @@ async def _serve_core(
     )
     ctx.ingress_protocol = ingress_protocol
 
-    # Run G0-G17 request pipeline
+    # Run the request-side pipeline (authoritative stage order: middleware/pipeline.py)
     try:
         ctx = await _pipeline.process_request(ctx, request_headers=dict(request.headers))
     except RateLimitExceeded as exc:
@@ -1615,8 +1615,9 @@ async def _serve_core(
     )
     _emit_resilience_metrics(ctx)
 
-    # Run G14-G18 response pipeline, then finalise (savings metadata, headers,
-    # SLA metrics + billing) via the shared helper.
+    # Run the response-side pipeline (authoritative stage order: middleware/pipeline.py),
+    # then finalise (savings metadata, headers, SLA metrics + billing) via the
+    # shared helper.
     ctx, response_dict = await _pipeline.process_response(ctx, response_dict)
     return _served_response(ctx, response_dict, _request_start)
 

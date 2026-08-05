@@ -16,7 +16,15 @@
     "reason": 15,
     "swe": 20
   },
-  "dataset_sha256": "ac1f91908a29a90768cdfbde3badeb7b187aaaa6a786d0c348498dd689119281",
+  "dataset_sha256": "e55040150e344497a0ad2e22583cea195c7fba8b611dee17b4984402a7054469",
+  "max_tokens_by_profile": {
+    "chat": 256,
+    "code": 256,
+    "ops": 256,
+    "rag": 256,
+    "reason": 256,
+    "swe": 768
+  },
   "note": "Built from Hugging Face at the pinned revisions above.",
   "ops_profile": "The 'ops' profile is PRODUCTION-SHAPED, not a recognized public benchmark: verbose DevOps/support payloads (pasted JSON/logs/config) bundled in ops_seed.jsonl (Apache-2.0, this repo), adapted from the single-arm harness. It is built identically under --hf/--fixture and exists so the G19 structured-pruning + G22 dedup levers fire on a stateless first-ask; relative facts-gated. Disclosed in DATA_LICENSES.md.",
   "pinned": {

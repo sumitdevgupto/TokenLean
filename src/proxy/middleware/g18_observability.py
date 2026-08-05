@@ -140,7 +140,7 @@ HTTP_REQUESTS = Counter(
 )
 GROUP_TOKENS_SAVED = Counter(
     "token_opt_group_tokens_saved_total",
-    "Tokens saved per optimisation group (G0-G18), for real-time per-group dashboards",
+    "Tokens saved per optimisation group (G0-G28), for real-time per-group dashboards",
     ["group", "tenant_id"],
 )
 USD_SAVED = Counter(

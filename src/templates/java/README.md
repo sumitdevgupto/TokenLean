@@ -30,5 +30,5 @@ OpenAIClient client = OpenAIOkHttpClient.builder()
     .build();
 ```
 
-All optimisations (G1–G18) are transparent — your code doesn't change.
+All optimisations (G0–G28) are transparent — your code doesn't change.
 Pass `x_session_id` for multi-turn memory (G10) and `workflow_id` for budget tracking (G17).

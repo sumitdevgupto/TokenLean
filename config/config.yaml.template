@@ -960,6 +960,18 @@ groups:
     enabled: true
     request_side_enabled: true
     response_side_enabled: true
+    # Compress the model's ANSWER content on the response side (prose, code, logs and
+    # JSON alike). Default false: the answer is user-visible — rewriting it (deleting
+    # code comments, deduping sentences/log lines, dropping empty JSON fields) changes
+    # what the caller reads while saving nothing on that call, since the provider has
+    # already generated and billed those output tokens. Request-side compression is
+    # unaffected, and response-side tool RESULTS are compressed either way.
+    response_side_compress_answers: false
+    # Fraction of non-blank lines that must be code-shaped (or log-shaped) before a
+    # payload is treated as code/logs rather than prose. Guards against a single
+    # ``` fence or one quoted log line reclassifying a whole prose message; raise it
+    # for stricter detection, lower it if your payloads mix heavy prose with logs.
+    detect_dominance_ratio: 0.5
     min_length_to_compress: 50
     compression_strategies:
       json:

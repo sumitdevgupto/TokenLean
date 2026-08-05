@@ -1,0 +1,111 @@
+# Dependabot version updates.
+#
+# These open pull requests only — Dependabot cannot merge them. With auto-merge
+# disabled and CODEOWNERS review required, every bump still waits for maintainer
+# approval. Schedules are monthly and grouped to keep that review load to roughly
+# one PR per ecosystem per month.
+#
+# Coverage: workflow actions, the proxy runtime, test deps, the four sidecar /
+# pipeline requirement sets, every Docker base image, and the Java client sample.
+version: 2
+
+updates:
+  # GitHub Actions used by .github/workflows/ci.yml — currently pinned to
+  # floating major tags, so this is the only signal when those tags move.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Proxy runtime dependencies (src/proxy/requirements.txt) — what ships in the image.
+  - package-ecosystem: pip
+    directory: /src/proxy
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      proxy-runtime:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Test dependencies (tests/requirements-test.txt) — installed by CI on every run.
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: deps-test
+    groups:
+      test-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Sidecar / pipeline Python deps. Separate containers, not the proxy runtime —
+  # grouped into one PR so four manifests don't mean four review threads.
+  - package-ecosystem: pip
+    directories:
+      - /src/doc-pipeline
+      - /src/finetune-pipeline
+      - /src/llmlingua-sidecar
+      - /src/routellm-sidecar
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: deps-sidecar
+    groups:
+      sidecar-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Docker base images for the proxy, the sidecars, and the migration jobs.
+  - package-ecosystem: docker
+    directories:
+      - /infra/migrations
+      - /src/doc-pipeline
+      - /src/finetune-pipeline
+      - /src/llmlingua-sidecar
+      - /src/proxy
+      - /src/routellm-sidecar
+      - /src/tika-sidecar
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: docker
+    groups:
+      base-images:
+        patterns:
+          - "*"
+
+  # Java client sample (src/templates/java/pom.xml) — a published example, not a
+  # build target; keeps the snippet from drifting against current SDK versions.
+  - package-ecosystem: maven
+    directory: /src/templates/java
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: deps-java
+    groups:
+      java-sample:
+        patterns:
+          - "*"

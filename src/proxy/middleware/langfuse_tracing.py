@@ -1,5 +1,5 @@
 """
-Langfuse tracing helpers for the G1-G18 middleware pipeline.
+Langfuse tracing helpers for the G0-G28 middleware pipeline.
 
 Provides clean abstractions so individual middleware can emit spans
 without importing the Langfuse SDK directly.

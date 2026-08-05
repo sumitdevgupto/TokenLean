@@ -7,7 +7,7 @@
 #   docker-compose --profile observability up -d  # Include Grafana
 #   docker-compose down               # Stop all (zero cost)
 #
-# All services support G1-G18 optimisations via local Docker networking.
+# All services support the G0-G28 optimisations via local Docker networking.
 # =============================================================================
 version: '3.8'
 

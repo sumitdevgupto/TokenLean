@@ -226,7 +226,7 @@ derived arithmetic (see below).
   The cold pass also carries one **disclosed** `ops` profile — verbose DevOps payloads (pasted
   JSON/logs/config) flagged in `DATA_LICENSES.md` as **not** a recognized benchmark — because the
   small recognized-Q&A items don't exercise the **structured-pruning (G19) / dedup (G22)** levers on
-  a first-ask. `ops` reads ~44% and lifts the combined prose lever (`rag`+`chat`+`ops`) to ~8%; it is
+  a first-ask. `ops` reads ~43% and lifts the combined prose lever (`rag`+`chat`+`ops`) to ~8%; it is
   facts-gated and never tuned to a target.
 - **cache** — a **disclosed** warm-repeat burst from `cache_schedule.json` (verbatim repeats, L1
   exact-match via `x_cache_semantic:false`) that reproduces the caching lever at **0 quality loss**.

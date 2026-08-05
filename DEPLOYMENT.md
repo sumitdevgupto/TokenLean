@@ -2,7 +2,7 @@
 
 Complete step-by-step guide for deploying, managing, and tearing down the TokenLean — Token Optimisation Framework.
 
-This project supports **two deployment modes** with identical G1-G18 functionality:
+This project supports **two deployment modes** with identical optimisation coverage (G0–G28, G26 reserved — 27 implemented):
 
 - **GCP Deployment** — Managed services, production-grade, pay-per-use. See [`docs/deployment-gcp.md`](docs/deployment-gcp.md) for a focused GCP guide.
 - **Local Deployment** — Docker Compose on your machine, zero GCP cost. See [`docs/deployment-local.md`](docs/deployment-local.md) for a focused local guide.

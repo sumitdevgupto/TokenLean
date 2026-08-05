@@ -28,6 +28,10 @@ def _make_ctx(messages, config=None):
                     "enabled": True,
                     "request_side_enabled": True,
                     "response_side_enabled": True,
+                    # These tests exercise the ANSWER-content compressors, which are
+                    # opt-in since 2026-08-05 (the default returns answers verbatim —
+                    # covered by TestAnswerFidelity in test_g19_structured.py).
+                    "response_side_compress_answers": True,
                     "min_length_to_compress": 30,
                     "compression_strategies": {
                         "json": {"remove_empty": True, "dedupe_keys": False},

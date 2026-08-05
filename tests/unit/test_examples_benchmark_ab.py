@@ -775,3 +775,108 @@ def test_blend_prose_lever_includes_ops():
     out = run_ab.blend(agg, run_ab.DEFAULT_WEIGHTS)
     # prose lever = (1000-600)/1000 = 40% driven entirely by ops here
     assert out["openai"]["levers"]["prose"] == pytest.approx(40.0)
+
+
+# ─── Per-profile output budget + regression diagnostics (2026-08-05) ─────────
+
+def test_swe_profile_gets_a_larger_output_budget():
+    """swe answers must enumerate files/symbols; 256 truncated BOTH arms mid-answer
+    (finish_reason='length'), so the facts gate scored whichever arm reached the
+    filename first rather than answer fidelity."""
+    assert builder.max_tokens_for("swe") == 768
+    assert builder.max_tokens_for("rag") == builder.MAX_TOKENS
+    assert builder.max_tokens_for("anything-unknown") == builder.MAX_TOKENS
+
+
+def test_checked_in_dataset_matches_per_profile_budget():
+    """The shipped artifact must agree with the builder, else a rebuild silently
+    changes every swe measurement."""
+    ds = BENCH / "public_dataset.jsonl"
+    items = [json.loads(ln) for ln in ds.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert items, "public_dataset.jsonl is empty"
+    for it in items:
+        assert it["max_tokens"] == builder.max_tokens_for(it["_profile"]), it["_label"]
+
+
+def test_dataset_meta_sha_matches_the_shipped_file():
+    """dataset_sha256 in meta must match the artifact byte-for-byte."""
+    import hashlib
+    ds = BENCH / "public_dataset.jsonl"
+    meta = json.loads((BENCH / "public_dataset.meta.json").read_text(encoding="utf-8"))
+    sha = hashlib.sha256(ds.read_bytes()).hexdigest()
+    assert meta["dataset_sha256"] == sha
+
+
+def test_collect_regressions_reports_only_graded_failures_with_detail():
+    records = [
+        {"provider": "anthropic", "slice": "cold", "profile": "rag", "label": "rag-0011",
+         "kind": "original", "facts": {"graded": True, "passed": False,
+                                       "regressed": ["The St Andrews Agreement"]},
+         "a": {"content": "plain", "finish_reason": "stop", "completion_tokens": 10},
+         "b": {"content": "bolded", "cache_hit": False, "finish_reason": "length",
+               "completion_tokens": 256}},
+        {"provider": "anthropic", "slice": "cold", "profile": "rag", "label": "rag-0002",
+         "kind": "original", "facts": {"graded": True, "passed": True},
+         "a": {"content": "x"}, "b": {"content": "y", "cache_hit": False}},
+        {"provider": "anthropic", "slice": "cold", "profile": "chat", "label": "chat-0001",
+         "kind": "original", "facts": {"graded": False, "passed": True},
+         "a": {"content": "x"}, "b": {"content": "y", "cache_hit": False}},
+    ]
+    out = run_ab.collect_regressions(records)
+    assert len(out) == 1
+    g = out[0]
+    assert g["label"] == "rag-0011"
+    assert g["dropped"] == ["The St Andrews Agreement"]
+    # finish_reason is what separates "model omitted it" from "model ran out of budget"
+    assert g["proxy_finish"] == "length"
+    assert g["direct_finish"] == "stop"
+    assert g["cache_hit"] is False
+
+
+def test_collect_regressions_flags_a_cache_hit_regression():
+    """A regression on a CACHE HIT means the cache served a wrong answer — a
+    different and more serious defect than a fresh call."""
+    records = [{"provider": "openai", "slice": "replay", "profile": "rag", "label": "rag-0003",
+                "kind": "repeat", "facts": {"graded": True, "passed": False, "regressed": ["x"]},
+                "a": {"content": "a"}, "b": {"content": "b", "cache_hit": True}}]
+    out = run_ab.collect_regressions(records)
+    assert out[0]["cache_hit"] is True
+
+
+# ─── Review fixes (2026-08-05): profile validation, exec detail, meta emission ─
+
+def test_unknown_profiles_are_detected():
+    """A typo'd --profiles must fail fast (exit 1 path), not silently run nothing."""
+    assert run_ab.unknown_profiles({"swee"}, {"swe", "rag"}) == ["swee"]
+    assert run_ab.unknown_profiles({"swe", "rag"}, {"swe", "rag", "ops"}) == []
+    assert run_ab.unknown_profiles({"a", "z"}, {"m"}) == ["a", "z"]
+
+
+def test_exec_humaneval_regression_carries_detail():
+    """An exec pass@1 regression must render a non-empty 'dropped' in diagnostics."""
+    rec = {"provider": "openai", "slice": "cold", "profile": "code", "label": "code-0007",
+           "kind": "original",
+           "facts": {"graded": True, "passed": False,
+                     "exec": {"direct": True, "proxy": False},
+                     "regressed": ["exec pass@1: direct passed, proxy failed"]},
+           "a": {"content": "def f(): return 1", "finish_reason": "stop"},
+           "b": {"content": "def f(): return 2", "cache_hit": False, "finish_reason": "stop"}}
+    out = run_ab.collect_regressions([rec])
+    assert out[0]["dropped"] == ["exec pass@1: direct passed, proxy failed"]
+
+
+def test_builder_meta_emits_max_tokens_by_profile():
+    """The builder must emit max_tokens_by_profile so a --hf rebuild reproduces the
+    checked-in meta.json instead of silently dropping the field (artifact drift)."""
+    meta = json.loads((BENCH / "public_dataset.meta.json").read_text(encoding="utf-8"))
+    items = [json.loads(ln) for ln in
+             (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+             if ln.strip()]
+    profiles = sorted({it["_profile"] for it in items})
+    expected = {p: builder.max_tokens_for(p) for p in profiles}
+    # checked-in artifact carries the map, and it matches the builder's function...
+    assert meta.get("max_tokens_by_profile") == expected
+    # ...and the builder source emits the key (guards a regression where the artifact
+    # keeps the field but main() stops writing it — the original defect).
+    src = (BENCH / "build_public_dataset.py").read_text(encoding="utf-8")
+    assert '"max_tokens_by_profile"' in src

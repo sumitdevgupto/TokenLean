@@ -416,8 +416,14 @@ def call_direct(litellm_model: str, messages: list, max_tokens: int, tools: list
     content = (msg["content"] if isinstance(msg, dict) else msg.content) or ""
     raw_tcs = (msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None))
     tcs = _norm_tool_calls(raw_tcs)
+    # finish_reason distinguishes "the model omitted the fact" from "the model ran out of
+    # max_tokens before reaching it" — the two look identical in a facts gate but mean
+    # opposite things (a real regression vs a too-tight output budget).
+    fr = (choice.get("finish_reason") if isinstance(choice, dict)
+          else getattr(choice, "finish_reason", None)) or ""
     return {"content": content, "prompt_tokens": pt, "completion_tokens": ct,
-            "tool_calls": tcs, "assistant_msg": _assistant_msg(content, tcs)}
+            "tool_calls": tcs, "finish_reason": fr,
+            "assistant_msg": _assistant_msg(content, tcs)}
 
 
 def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_tokens: int,
@@ -454,6 +460,7 @@ def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_toke
     return {"content": content, "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens, "routed_model": routed,
             "cache_hit": cache_hit, "tool_calls": tcs,
+            "finish_reason": choice.get("finish_reason") or "",
             "assistant_msg": _assistant_msg(content, tcs)}
 
 
@@ -530,6 +537,41 @@ def _finalize(bucket):
     bucket["a_cost"] = round(ac, 6)
     bucket["b_cost"] = round(bc, 6)
     return bucket
+
+
+def unknown_profiles(requested: set, available: set) -> list:
+    """--profiles entries that match no dataset profile (sorted, for the error message)."""
+    return sorted(requested - available)
+
+
+def collect_regressions(records: list, max_chars: int = 1500) -> list:
+    """Per-record detail for every graded record the proxy arm regressed on.
+
+    The aggregate only COUNTS regressions, which leaves a failing quality gate
+    undiagnosable — you learn that a fact was dropped but never which record, which
+    fact, or what the two arms actually said. This returns that detail so a real
+    optimisation bug can be told apart from model nondeterminism at the margin.
+    `cache_hit` is included deliberately: a regression on a cache HIT means the cache
+    served a wrong answer (serious), which is a different defect from a fresh call."""
+    out = []
+    for r in records:
+        f = r.get("facts") or {}
+        if not (f.get("graded") and not f.get("passed")):
+            continue
+        out.append({
+            "provider": r.get("provider"), "slice": r.get("slice"),
+            "profile": r.get("profile"), "label": r.get("label", ""),
+            "kind": r.get("kind"),
+            "dropped": f.get("regressed") or f.get("dropped_tools") or [],
+            "cache_hit": bool((r.get("b") or {}).get("cache_hit")),
+            "direct_finish": (r.get("a") or {}).get("finish_reason", ""),
+            "proxy_finish": (r.get("b") or {}).get("finish_reason", ""),
+            "direct_completion_tokens": (r.get("a") or {}).get("completion_tokens", 0),
+            "proxy_completion_tokens": (r.get("b") or {}).get("completion_tokens", 0),
+            "direct_answer": ((r.get("a") or {}).get("content") or "")[:max_chars],
+            "proxy_answer": ((r.get("b") or {}).get("content") or "")[:max_chars],
+        })
+    return out
 
 
 # Stable display/registry order for slices across workloads (standard + cache + future agentic).
@@ -730,6 +772,10 @@ def main() -> int:
     ap.add_argument("--max-spend-per-provider", type=float, default=1.0)
     ap.add_argument("--max-spend", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="cap trace length per provider (0 = all)")
+    ap.add_argument("--profiles", default="",
+                    help="comma list of dataset profiles to run (e.g. 'rag,swe'). Default: all. "
+                         "DIAGNOSTIC AID for re-running just the profiles that regressed — a "
+                         "filtered run is NOT a calibrated headline number.")
     ap.add_argument("--judge", action="store_true", help="LLM-judge both arms (extra cost)")
     ap.add_argument("--exec-humaneval", action="store_true",
                     help="run HumanEval canonical tests (executes model code in a subprocess)")
@@ -798,6 +844,21 @@ def main() -> int:
     stopped_at_cap = False
     COST_LOG.write_text("", encoding="utf-8")
 
+    profile_filter = {p.strip() for p in args.profiles.split(",") if p.strip()}
+    if profile_filter:
+        # Fail fast on a typo'd profile (exit 1, before any spend) — an unknown name
+        # would otherwise match nothing, run zero records, and exit 0 looking like a
+        # clean pass.
+        available = {it.get("_profile") for it in items.values() if it.get("_profile")}
+        if agentic_items:
+            available |= {it.get("_profile", "agentic") for it in agentic_items}
+        bad = unknown_profiles(profile_filter, available)
+        if bad:
+            return _fail(f"--profiles: unknown profile(s): {', '.join(bad)} — "
+                         f"available: {', '.join(sorted(available))}")
+        print(f"  [diagnostic] profile filter active: {', '.join(sorted(profile_filter))} "
+              f"— partial run, NOT a calibrated headline number")
+
     for provider in run_providers:
         apply_litellm_env(provider, env)
         spec = PROVIDER_MODELS[provider]
@@ -843,8 +904,12 @@ def main() -> int:
         direct_memo: dict = {}
 
         for slice_name, trace, x_extra in passes:
+            if profile_filter:
+                trace = [(k, it) for k, it in trace if it.get("_profile") in profile_filter]
             if args.limit:
                 trace = trace[: args.limit]
+            if not trace:
+                continue
             _tag = {"cold": ", G05 bypassed)", "cache": ", warm-cache burst)"}.get(slice_name, ", caching on)")
             print(f"\n[{provider}] {slice_name}: {len(trace)} proxy calls (model {spec['model']}{_tag}")
             for i, (kind, item) in enumerate(trace, 1):
@@ -898,11 +963,17 @@ def main() -> int:
                 if args.exec_humaneval and item["_profile"] == "code":
                     pa, pb = exec_humaneval(item, a["content"]), exec_humaneval(item, b["content"])
                     if pa is not None:  # regression = A passed the tests but B did not
-                        facts = {"graded": True, "passed": not (pa and not pb),
-                                 "exec": {"direct": pa, "proxy": pb}}
+                        exec_regressed = pa and not pb
+                        facts = {"graded": True, "passed": not exec_regressed,
+                                 "exec": {"direct": pa, "proxy": pb},
+                                 # collect_regressions/QUALITY print read `regressed` —
+                                 # without it an exec failure renders an empty 'dropped:'
+                                 "regressed": (["exec pass@1: direct passed, proxy failed"]
+                                               if exec_regressed else [])}
                 rec = {
                     "provider": provider, "slice": slice_name, "kind": kind,
-                    "profile": item["_profile"], "_messages": messages,
+                    "profile": item["_profile"], "label": item.get("_label", ""),
+                    "_messages": messages,
                     "a": {**a, "cost": a_cost},
                     "b": {**b, "cost": b_cost},
                     "facts": facts,
@@ -940,7 +1011,9 @@ def main() -> int:
         meta["blend"] = {"weights": weights, "citations": WEIGHT_CITATIONS, "result": blended}
     if judge is not None:
         meta["judge"] = judge
-    RESULTS.write_text(json.dumps({"meta": meta, "results": agg}, indent=2), encoding="utf-8")
+    regressions = collect_regressions(records)
+    RESULTS.write_text(json.dumps({"meta": meta, "results": agg,
+                                   "regressions": regressions}, indent=2), encoding="utf-8")
     render(agg, meta)
     if blended is not None:
         render_blend(blended)
@@ -959,6 +1032,15 @@ def main() -> int:
     if regressed:
         detail = ", ".join(f"{s} {n}" for s, n in per_slice.items())
         print(f"\n  QUALITY: proxy dropped a fact the direct arm had — {detail} record(s)")
+        for g in regressions[:12]:
+            drop = "; ".join(str(d) for d in g["dropped"])[:70]
+            # TRUNCATED = the proxy arm hit max_tokens; the fact may simply be past the
+            # cut, which is an output-budget artifact, not an optimisation regression.
+            trunc = " [proxy TRUNCATED at max_tokens]" if g.get("proxy_finish") == "length" else ""
+            print(f"    - {g['slice']:<6} {g['label']:<14} "
+                  f"{'CACHE-HIT ' if g['cache_hit'] else ''}dropped: {drop}{trunc}")
+        if len(regressions) > 12:
+            print(f"    ... +{len(regressions) - 12} more (full detail in {RESULTS.name})")
     if stopped_at_cap:
         return 3
     return 2 if regressed else 0

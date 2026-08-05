@@ -84,6 +84,12 @@ for the config schema.
 3. Fill in the [PR template](.github/PULL_REQUEST_TEMPLATE.md) — what changed, why, and how it was tested.
 4. Ensure `pytest tests/ -q` is green locally and CI passes.
 5. Update relevant docs (`docs/`, `README.md`) when behaviour or config changes.
+6. **A maintainer reviews and merges every PR.** All changes reach `main` through a
+   pull request approved by the maintainer — contributors, including anyone with
+   write access, do not merge their own pull requests. This is enforced: `main` is
+   protected by a branch ruleset requiring a pull request, an approving review from
+   the code owner in [.github/CODEOWNERS](.github/CODEOWNERS), passing CI, and
+   resolved review threads. Force pushes and branch deletion are blocked.
 
 ## License of contributions
 

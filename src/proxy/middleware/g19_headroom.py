@@ -55,6 +55,7 @@ class G19Headroom:
         tokens_before = ctx.current_token_count
         min_length = cfg.get("min_length_to_compress", 50)
         strategies = cfg.get("compression_strategies", {})
+        ratio = _dominance_ratio(cfg)
 
         changed = False
         compressed_messages = []
@@ -63,7 +64,7 @@ class G19Headroom:
             content = msg.get("content", "")
 
             if isinstance(content, str) and len(content) >= min_length:
-                content_type = _detect_content_type(content)
+                content_type = _detect_content_type(content, ratio)
                 if content_type and content_type in strategies:
                     compressed = _compress(content, content_type, strategies[content_type])
                     if compressed and len(compressed) < len(content):
@@ -97,7 +98,11 @@ class G19Headroom:
     async def process_response(
         self, ctx: RequestContext, response: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Response-side: compress structured content in tool outputs and assistant messages."""
+        """Response-side: compress tool RESULTS (always) + assistant answer content (opt-in).
+
+        Answer content is only touched when `response_side_compress_answers: true` —
+        by default the user-visible answer is returned exactly as the model wrote it.
+        """
         cfg = ctx.config.get("groups", {}).get("G19_headroom", {})
         if not cfg.get("enabled", False):
             return response
@@ -107,6 +112,17 @@ class G19Headroom:
 
         min_length = cfg.get("min_length_to_compress", 50)
         strategies = cfg.get("compression_strategies", {})
+        ratio = _dominance_ratio(cfg)
+        # The ANSWER (assistant message content) is user-visible, whatever its shape —
+        # prose, code (comments/docstrings are part of the deliverable), quoted logs,
+        # or a JSON the model produced for the caller. Rewriting it changes what the
+        # user reads while saving nothing on THIS call: the provider has already
+        # generated and billed those output tokens (the only benefit is deferred, if
+        # the answer is replayed as later-turn history). Off by default; opt in to
+        # restore the old behaviour. Tool RESULTS are still compressed either way —
+        # they are data that gets replayed into later turns, not the answer itself.
+        # Request-side compression is unaffected (there it genuinely shrinks the send).
+        compress_answers = cfg.get("response_side_compress_answers", False)
 
         choices = response.get("choices", [])
         total_before = 0
@@ -116,10 +132,10 @@ class G19Headroom:
         for choice in choices:
             msg = choice.get("message", {})
 
-            # Compress assistant message content (code blocks, JSON in responses)
+            # Compress assistant message content — opt-in only (see compress_answers)
             content = msg.get("content", "")
-            if isinstance(content, str) and len(content) >= min_length:
-                content_type = _detect_content_type(content)
+            if compress_answers and isinstance(content, str) and len(content) >= min_length:
+                content_type = _detect_content_type(content, ratio)
                 if content_type and content_type in strategies:
                     before_tokens = estimate_tokens(content, ctx.routed_model)
                     compressed = _compress(content, content_type, strategies[content_type])
@@ -143,7 +159,7 @@ class G19Headroom:
                 if len(result_str) < min_length:
                     continue
 
-                content_type = _detect_content_type(result_str)
+                content_type = _detect_content_type(result_str, ratio)
                 if content_type and content_type in strategies:
                     before_tokens = estimate_tokens(result_str, ctx.routed_model)
                     compressed = _compress(result_str, content_type, strategies[content_type])
@@ -187,24 +203,90 @@ class G19Headroom:
 
 # Patterns for content type heuristics
 _JSON_PATTERN = re.compile(r"^\s*[\[{]", re.DOTALL)
-_CODE_PATTERNS = [
-    re.compile(r"^(import |from |def |class |function |const |let |var |public |private )", re.MULTILINE),
-    re.compile(r"```\w*\n", re.MULTILINE),
-]
-_LOG_PATTERNS = [
-    re.compile(r"^\d{4}-\d{2}-\d{2}[T ]", re.MULTILINE),
-    re.compile(r"^\[?(INFO|DEBUG|WARN|ERROR|FATAL)\]?", re.MULTILINE),
+_FENCE_PATTERN = re.compile(r"^\s*```")
+_CODE_LINE_PATTERN = re.compile(
+    r"^\s*(import |from |def |class |function |const |let |var |public |private )")
+_LOG_LINE_PATTERNS = [
+    re.compile(r"^\d{4}-\d{2}-\d{2}[T ]"),
+    re.compile(r"^\[?(INFO|DEBUG|WARN|ERROR|FATAL)\]?"),
 ]
 
+# A payload must be MOSTLY code (or mostly logs) before we treat it as one.
+#
+# The previous detector used `.search()` over the whole message, so a single ```
+# fence — or one line starting "from " — reclassified an entire prose answer as
+# code. _compress_code then deleted every '#'-leading line, i.e. the answer's
+# Markdown headings, silently rewriting user-visible text. Requiring dominance
+# keeps genuine code/log payloads (where such lines are the overwhelming majority)
+# while leaving prose-with-an-example alone. Default only — tunable per tenant via
+# `G19_headroom.detect_dominance_ratio` (resolved by `_dominance_ratio(cfg)`).
+_DOMINANCE_RATIO = 0.5
 
-def _detect_content_type(text: str) -> Optional[str]:
+
+def _dominance_ratio(cfg: Dict[str, Any]) -> float:
+    """Resolve the detection dominance threshold from config, defaulting safely.
+
+    Invalid values (non-numeric, <=0, >1) fall back to the default rather than
+    raising or producing an always-/never-matching detector.
+    """
+    try:
+        ratio = float(cfg.get("detect_dominance_ratio", _DOMINANCE_RATIO))
+    except (TypeError, ValueError):
+        return _DOMINANCE_RATIO
+    return ratio if 0.0 < ratio <= 1.0 else _DOMINANCE_RATIO
+
+
+def _iter_fenced(lines):
+    """Walk ``` fences once: yields (line, is_fence_marker, in_fence).
+
+    Single source of truth for fence semantics — _line_stats (detection) and
+    _compress_code (compression) must always agree on what is inside a fence,
+    otherwise a payload can be classified by one boundary and compressed by
+    another. `in_fence` is the state AFTER processing the marker (True on the
+    opening marker, False on the closing one).
+    """
+    in_fence = False
+    for line in lines:
+        if _FENCE_PATTERN.match(line):
+            in_fence = not in_fence
+            yield line, True, in_fence
+        else:
+            yield line, False, in_fence
+
+
+def _line_stats(text: str) -> tuple:
+    """(non_blank_lines, code_lines, log_lines). Lines inside a ``` fence count as code."""
+    total = code = logs = 0
+    for line, is_marker, in_fence in _iter_fenced(text.split("\n")):
+        if is_marker:
+            continue  # the fence marker itself is neither code nor prose
+        if not line.strip():
+            continue
+        total += 1
+        if in_fence or _CODE_LINE_PATTERN.match(line):
+            code += 1
+        stripped = line.lstrip()
+        if any(p.match(stripped) for p in _LOG_LINE_PATTERNS):
+            logs += 1
+    return total, code, logs
+
+
+def _detect_content_type(text: str, dominance_ratio: float = None) -> Optional[str]:
     """Detect whether text is JSON, code, logs, or plain text.
 
     Uses Headroom's auto-detection if available, otherwise falls back
     to pattern heuristics. Returns "text" for plain prose so SmartCrusher
     can apply verbosity reduction — callers must have "text" in their
     compression_strategies config to activate this path.
+
+    `dominance_ratio` is the fraction of non-blank lines that must be code-shaped
+    (or log-shaped) before the payload counts as code/logs; None uses the module
+    default. The middleware resolves it from `G19_headroom.detect_dominance_ratio`
+    via `_dominance_ratio(cfg)` — keep the parameter threaded so the threshold
+    stays config-driven, never hardcoded at a call site.
     """
+    if dominance_ratio is None:
+        dominance_ratio = _DOMINANCE_RATIO
     if _headroom_available:
         try:
             detected = _headroom_mod.detect_type(text)
@@ -224,14 +306,13 @@ def _detect_content_type(text: str) -> Optional[str]:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Code detection
-    for pattern in _CODE_PATTERNS:
-        if pattern.search(stripped):
+    # Code / log detection — the signal must DOMINATE the payload, not merely appear
+    # somewhere in it (see _DOMINANCE_RATIO / detect_dominance_ratio).
+    total, code_lines, log_lines = _line_stats(stripped)
+    if total:
+        if code_lines / total >= dominance_ratio:
             return "code"
-
-    # Log detection
-    for pattern in _LOG_PATTERNS:
-        if pattern.search(stripped):
+        if log_lines / total >= dominance_ratio:
             return "logs"
 
     # Plain text — return "text" so SmartCrusher can apply verbosity reduction
@@ -247,8 +328,14 @@ def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optiona
       logs/code/text → built-in compressors (Headroom's query-less crush does not help
                        these; the upstream CodeCompressor was removed).
 
-    Instruction/prose content never reaches here — callers gate on content_type being in
-    the configured strategies, and prose ("text") is excluded by default.
+    Prose ("text") DOES reach here on the request side — the shipped config enables the
+    `text` strategy so repeated boilerplate in a pasted payload is deduped. ANSWER content
+    (assistant messages, ALL types) is blocked on the RESPONSE side by
+    `response_side_compress_answers` (default false), because there the content is the
+    user-visible answer; response-side tool RESULTS still flow through here. (An earlier
+    version of this docstring claimed prose was excluded by default; that was false
+    against the shipped template, and the test fixture omitted `text` so nothing caught
+    it.)
     """
     # Headroom: JSON compaction (its strongest path); guard so we only keep a real reduction.
     if _headroom_available and _smart_crusher is not None and content_type == "json":
@@ -329,32 +416,63 @@ def _dedupe_repeated_structures(obj: Any) -> Any:
 
 
 def _compress_code(text: str, strategy: Dict[str, Any]) -> Optional[str]:
-    """Strip comments, blank lines, and optionally compress imports."""
+    """Strip comments, blank lines, and optionally compress imports.
+
+    When the payload contains ``` fences, ONLY the fenced regions are treated as code —
+    everything outside them is prose (Markdown headings, bullets, explanation) and is
+    emitted verbatim. Without this, a '# Heading' outside a fence is indistinguishable
+    from a Python comment and gets deleted, silently rewriting the answer.
+    """
     lines = text.split("\n")
-    result = []
+    has_fence = any(_FENCE_PATTERN.match(ln) for ln in lines)
 
-    for line in lines:
-        stripped = line.strip()
+    def _crush(code_lines):
+        """Apply the code compressors to a run of lines known to BE code."""
+        out = []
+        for line in code_lines:
+            stripped = line.strip()
 
-        # Strip single-line comments
-        if strategy.get("strip_comments", True):
-            if stripped.startswith("#") or stripped.startswith("//"):
+            # Strip single-line comments
+            if strategy.get("strip_comments", True):
+                if stripped.startswith("#") or stripped.startswith("//"):
+                    continue
+                # Strip inline comments (simple heuristic — not AST-level)
+                for comment_marker in (" #", " //"):
+                    idx = line.find(comment_marker)
+                    if idx > 0 and not _in_string(line, idx):
+                        line = line[:idx].rstrip()
+
+            # Strip blank lines
+            if strategy.get("strip_whitespace", True) and stripped == "":
                 continue
-            # Strip inline comments (simple heuristic — not AST-level)
-            for comment_marker in (" #", " //"):
-                idx = line.find(comment_marker)
-                if idx > 0 and not _in_string(line, idx):
-                    line = line[:idx].rstrip()
 
-        # Strip blank lines
-        if strategy.get("strip_whitespace", True) and stripped == "":
-            continue
+            out.append(line)
+        # Collapse consecutive imports. Safe here because every line in this run is
+        # code — applied to a whole fenced document it could not tell a prose line
+        # opening "from ..." from a real import statement.
+        if strategy.get("compress_imports", True):
+            out = _compress_import_lines(out)
+        return out
 
-        result.append(line)
+    if not has_fence:
+        return "\n".join(_crush(lines))
 
-    # Compress imports: collapse multiple import lines into fewer
-    if strategy.get("compress_imports", True):
-        result = _compress_import_lines(result)
+    # Fenced payload: compress each fenced region, pass everything else through
+    # verbatim. A '# Heading' outside a fence is indistinguishable from a Python
+    # comment, so deleting it would silently rewrite the surrounding prose.
+    result, segment = [], []
+    for line, is_marker, in_fence in _iter_fenced(lines):
+        if is_marker:
+            if not in_fence:          # closing marker — flush the region we just left
+                result.extend(_crush(segment))
+                segment = []
+            result.append(line)
+        elif in_fence:
+            segment.append(line)
+        else:
+            result.append(line)       # prose outside a fence — never touched
+    if segment:                       # unterminated fence
+        result.extend(_crush(segment))
 
     return "\n".join(result)
 

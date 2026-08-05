@@ -68,12 +68,15 @@ that does **not** impose copyleft on the larger Apache-2.0 Work:
 ## Compliance summary
 
 - **No GPL, AGPL, or SSPL code is imported into or redistributed as part of this Work.**
-  (Audit method: `importlib.metadata` license/classifier scan across the installed
-  environment — see plan item 7.)
+  (Reproduce with `python scripts/audit_licenses.py` — an `importlib.metadata`
+  license/classifier scan of the installed environment, cross-checked against
+  published package metadata for any declared dependency not present locally.
+  The resulting per-package inventory is in
+  [docs/oss-licenses.md](docs/oss-licenses.md).)
 - Copyleft components (Grafana AGPL-3.0) are run as **independent network services**
   from unmodified upstream images.
 - Weak-copyleft transitive deps (certifi, tqdm — MPL-2.0) are file-level and
   compatible with Apache-2.0 redistribution.
 - No dependency requires attribution in compiled binaries or restricts sublicensing.
 
-*Last verified: 2026-06-25.*
+*Last verified: 2026-08-05.*

@@ -1,0 +1,4 @@
+# Every file in this repository requires review from the maintainer before a
+# pull request can be merged. Paired with the `main` branch ruleset's
+# "Require review from Code Owners" setting.
+* @sumitdevgupto
