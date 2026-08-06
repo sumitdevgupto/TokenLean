@@ -1,9 +1,11 @@
 # Dependabot policy — pins are the signal, floors are not.
 #
 # The proxy runtime and test deps are PINNED lockfiles compiled from *.in files
-# by scripts/compile-requirements.sh (pip-compile). A Dependabot PR against them
-# changes what actually installs, CI tests exactly that change, and green means
-# something — so version updates stay ON there (monthly, grouped).
+# by scripts/compile-requirements.sh (pip-compile). A Dependabot PR against a
+# lockfile changes what actually installs and CI tests exactly that change — so
+# version updates stay ON for the TESTS lockfile and GitHub Actions. The PROXY
+# lockfile is refreshed via the script instead (see that entry's comment:
+# Dependabot's regenerator cannot honor its CUDA exclusions).
 #
 # Everywhere else the manifests are open ">=" floors: pip already resolves to
 # latest on every install, so a floor-bump PR changes nothing about built
@@ -30,22 +32,22 @@ updates:
           - "*"
 
   # Proxy runtime lockfile (src/proxy/requirements.txt, compiled from
-  # requirements.in) — what ships in the image. Bumps here are real: CI installs
-  # the changed pins and the full unit suite runs against them.
+  # requirements.in) — what ships in the image. Version-update PRs are DISABLED
+  # here: Dependabot regenerates pip-compile lockfiles with a plain re-resolve
+  # that does NOT honor the --unsafe-package exclusions or the nvidia-* sweep
+  # (proven by PR #33, which re-pinned torch + the ~17-package CUDA runtime and
+  # went red on tests/unit/test_requirements_pinned.py), so every PR it opened
+  # would fail CI by design. Refresh the pins deliberately instead:
+  #   bash scripts/compile-requirements.sh   (then commit both files)
+  # Security updates still flow — treat a security PR here as the ALERT and
+  # apply the fix via the script rather than merging the PR as-is.
   - package-ecosystem: pip
     directory: /src/proxy
     schedule:
       interval: monthly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: deps
-    groups:
-      proxy-runtime:
-        patterns:
-          - "*"
-        update-types:
-          - minor
-          - patch
     ignore:
       # qdrant-client is deliberately pinned to the running server's minor
       # (>=1.12,<1.13). The client refuses a client/server minor gap greater

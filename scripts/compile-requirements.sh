@@ -16,7 +16,12 @@
 # on Linux via uvicorn[standard]'s own environment marker, and an unconditional
 # pin would break `pip install -r` on Windows dev machines.
 # tests/unit/test_requirements_pinned.py enforces these exclusions in CI, so a
-# Dependabot regeneration that reintroduces them fails the PR loudly.
+# Dependabot regeneration that reintroduces them fails the PR loudly. That is
+# not theoretical: Dependabot's pip-compile regenerator does a plain re-resolve
+# that honors NEITHER --unsafe-package NOR the sed sweep (its first live PR,
+# #33, re-pinned torch + the full CUDA runtime and went red on the guard), so
+# proxy-lockfile version updates are disabled in .github/dependabot.yml and THIS
+# SCRIPT is the one sanctioned way to refresh the pins.
 #
 # Usage: bash scripts/compile-requirements.sh          (needs Docker running)
 # =============================================================================

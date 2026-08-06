@@ -29,9 +29,11 @@ and `tests/requirements-test.txt` are now full pinned resolves compiled from hum
 `requirements*.in` files by `scripts/compile-requirements.sh` (runs pip-compile inside the same
 python:3.11 image the proxy ships on; torch stays unpinned so the image keeps its CPU build).
 CI and the Dockerfile are unchanged — they install the same filenames, now deterministic.
-Dependabot is scoped to match: version PRs stay on for the two lockfiles (where a bump is a real,
-CI-tested change) and GitHub Actions, and are disabled for the sidecar/pipeline floors, Docker
-base images and the Java sample — security updates still flow everywhere.
+Dependabot is scoped to match: version PRs stay on for the tests lockfile (where a bump is a real,
+CI-tested change) and GitHub Actions, and are disabled for the proxy lockfile (Dependabot's
+regenerator re-pins the excluded CUDA stack — proven by its first live PR going red on the new
+guard; refresh via the script instead), the sidecar/pipeline floors, Docker base images and the
+Java sample — security updates still flow everywhere.
 `tests/unit/test_requirements_pinned.py` guards the lockfiles' completeness and exclusions.
 
 ### Qdrant client and server versions no longer drift apart — Bug fix
