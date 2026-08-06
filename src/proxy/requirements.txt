@@ -21,7 +21,7 @@ sentence-transformers>=2.2.0                 # Apache-2.0
 prometheus-client>=0.20.0                    # Apache-2.0
 instructor>=1.3.0                            # MIT
 jsonschema>=4.20.0                           # MIT — G11 output JSON-schema validation (validate_output); also a transitive litellm dep, pinned here as a direct dependency
-temporalio>=1.5.0                            # MIT
+temporalio>=1.31.0                            # MIT
 
 # Optional deps — imported via try/except; install only when the feature is enabled
 headroom-ai>=0.27                            # Apache-2.0 (SmartCrusher/headroom.image APIs)
