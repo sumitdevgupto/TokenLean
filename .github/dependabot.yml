@@ -38,6 +38,15 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # qdrant-client is deliberately pinned to the running server's minor
+      # (>=1.12,<1.13). The client refuses a client/server minor gap greater
+      # than 1, so it can only move when the Qdrant server moves with it —
+      # see infra/variables.tf + docker-compose.yml. Patches stay in scope.
+      - dependency-name: qdrant-client
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
 
   # Test dependencies (tests/requirements-test.txt) — installed by CI on every run.
   - package-ecosystem: pip
@@ -75,6 +84,13 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # Same lockstep constraint as the proxy: the pipelines write into the very
+      # collections the proxy reads, so their client must track the server too.
+      - dependency-name: qdrant-client
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
 
   # Docker base images for the proxy, the sidecars, and the migration jobs.
   - package-ecosystem: docker

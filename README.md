@@ -162,6 +162,13 @@ OpenAI-compatible providers are served by the shared `GenericLiteLLMAdapter`, so
 extra provider entries out of the box (including **free-tier** models via OpenRouter `:free` and OpenCode
 Zen) that you can enable without writing a line of code.
 
+**Model catalog you control.** Each provider's `models:` list in `config/config.yaml` is the catalog —
+it governs which requested models the proxy accepts and (on the managed portal) populates the model
+picker, grouped by provider. It is a plain static file on the normal hot-reload path, so adding a
+model a provider shipped this morning takes an edit and ~60 seconds — no deploy, no code change. The
+template's catalog and price rows are refreshed periodically against the providers' live line-ups
+(last verified **2026-08-06**); keep your own copy current the same way.
+
 ---
 
 ## Quick Start

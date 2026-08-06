@@ -9,7 +9,7 @@
 #
 # All services support the G0-G28 optimisations via local Docker networking.
 # =============================================================================
-version: '3.8'
+# (No `version:` key — Compose v2 ignores it and warns that it is obsolete.)
 
 # Project name is pinned here so EVERY entrypoint shares ONE set of token-opt-*
 # images, containers and volumes, no matter which directory it is invoked from:

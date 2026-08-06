@@ -119,8 +119,18 @@ providers:
   #   resilience:
   #     failure_threshold: 3
   #     num_retries: 2
+  # ── Model catalog ────────────────────────────────────────────────────────────────
+  # This list IS the model picker in the portal (Settings → Models & Keys) and the
+  # allowlist a caller's requested model is validated against. It is a plain static
+  # file, hot-reloaded like the rest of the config — add a newly-released model here
+  # and it appears in the dropdown within ~60s, no deploy and no code change.
+  # Order matters: newest / most-recommended first. Catalog verified 2026-08-06.
   models:
-  - gpt-4o-mini
+  - gpt-5.6-sol                  # frontier (gpt-5.6 is an alias for -sol)
+  - gpt-5.6-terra                # balanced production
+  - gpt-5.6-luna                 # cost-sensitive / high volume
+  - gpt-5.1
+  - gpt-4o-mini                  # legacy, still served
   - gpt-4o
   - o1
   - o3
@@ -145,10 +155,14 @@ providers:
   - ada
 - name: anthropic
   api_base: https://api.anthropic.com/v1
-  models:
+  models:                        # verified 2026-08-06
+  - claude-opus-5                # current Opus
+  - claude-sonnet-5
   - claude-haiku-4-5
-  - claude-sonnet-4-5
-  - claude-opus-4
+  - claude-fable-5               # most capable; priced above Opus tier
+  - claude-opus-4-8
+  - claude-sonnet-4-6
+  - claude-opus-4                # legacy, deprecated by Anthropic
   model_prefixes:
   - claude
 # ── Additional first-class providers (each has a dedicated adapter) ─────────────────
@@ -156,16 +170,23 @@ providers:
 # so only model_prefixes are required. Set the matching LLM_KEY_<NAME> / llm-key-<name>.
 # models[] lead with each provider's cheapest model (verify exact IDs against the provider).
 - name: gemini
-  models:
+  models:                      # verified 2026-08-06
+  - gemini-3.6-flash           # current stable flash
+  - gemini-3.5-flash
+  - gemini-3.5-flash-lite      # cheapest current Gemini
+  - gemini-3.1-pro-preview     # flagship reasoning (preview)
   - gemini-flash-latest        # floating alias — stays available to new projects
   - gemini-pro-latest          # floating alias — pinned 2.5 ids 404 for new projects
-  - gemini-2.5-flash-lite      # cheapest Gemini (existing projects only)
+  - gemini-2.5-flash-lite      # existing projects only; 2.5-flash retires 2026-10-16
   - gemini-2.5-flash
   model_prefixes:
   - gemini
 - name: mistral
-  models:
-  - ministral-3b-latest        # cheapest Mistral
+  models:                      # verified 2026-08-06
+  - mistral-medium-3.5-latest  # current flagship
+  - mistral-large-3-latest
+  - mistral-small-4-latest
+  - ministral-3b-latest        # cheapest Mistral (edge family)
   - mistral-small-latest
   model_prefixes:
   - mistral
@@ -175,26 +196,37 @@ providers:
   - codestral
   - pixtral
 - name: deepseek
-  models:
-  - deepseek-chat              # cheapest DeepSeek (deepseek-reasoner costs more)
+  models:                      # verified 2026-08-06
+  - deepseek-v4-flash          # low-latency production (thinking is now a request param)
+  - deepseek-v4-pro            # quality-focused reasoning
+  # deepseek-chat / deepseek-reasoner were the legacy aliases; discontinued 2026-07-24.
   model_prefixes:
   - deepseek
 - name: xai
-  models:
-  - grok-3-mini                # cheapest xAI
+  models:                      # verified 2026-08-06
+  - grok-4.1-fast              # cheapest xAI
+  - grok-4.5                   # current flagship
+  - grok-4.3
   model_prefixes:
   - grok
 - name: cohere
-  models:
+  models:                      # verified 2026-08-06
   - command-r7b-12-2024        # cheapest Cohere
+  - command-a-plus-05-2026     # current flagship (MoE, vision)
+  - command-a-03-2025
   - command-r
   model_prefixes:
   - command
   - cohere/
 # Groq hosts many model families — route with an explicit "groq/" prefix to disambiguate.
 - name: groq
-  models:
-  - groq/llama-3.1-8b-instant  # cheapest Groq
+  # Groq's roster churns fast and it has deprecated its older Llama chat ids — confirm
+  # against https://api.groq.com/openai/v1/models before relying on any entry here.
+  models:                                        # verified 2026-08-06
+  - groq/openai/gpt-oss-20b                      # cheapest Groq
+  - groq/openai/gpt-oss-120b
+  - groq/moonshotai/kimi-k2-instruct-0905
+  - groq/meta-llama/llama-4-scout-17b-16e-instruct
   model_prefixes:
   - groq/
 # Azure shares OpenAI model names — route with an explicit "azure/<deployment>" and set
@@ -208,8 +240,13 @@ providers:
 # Bedrock uses AWS SigV4 (no bearer key) — creds from the environment / instance profile.
 - name: bedrock
   aws_region: us-east-1
-  models:
-  - bedrock/amazon.nova-micro-v1:0   # cheapest Bedrock (Amazon Nova Micro)
+  models:                              # verified 2026-08-06
+  - bedrock/amazon.nova-micro-v1:0     # cheapest Bedrock (Amazon Nova Micro)
+  - bedrock/amazon.nova-2-lite-v1:0    # current generation (Nova 2)
+  - bedrock/amazon.nova-lite-v1:0
+  - bedrock/amazon.nova-pro-v1:0
+  - bedrock/anthropic.claude-opus-5    # Claude on Bedrock keeps the anthropic. prefix
+  - bedrock/anthropic.claude-sonnet-5
   model_prefixes:
   - bedrock/
   - anthropic.
@@ -289,6 +326,36 @@ resilience:
   #   - gemini-2.5-flash-lite
 
 pricing:
+  # Current-generation rows (USD per 1k tokens, verified 2026-08-06). Keys are
+  # substring-matched against the routed model name, longest key wins — so these sit
+  # alongside the legacy rows below without disturbing them.
+  gpt-5.6-sol:
+    input: 0.005
+    output: 0.03
+  gpt-5.6-terra:
+    input: 0.002
+    output: 0.012
+  gpt-5.6-luna:
+    input: 0.0002
+    output: 0.0012
+  gpt-5.1:
+    input: 0.00125
+    output: 0.01
+  claude-fable-5:
+    input: 0.01
+    output: 0.05
+  claude-opus-5:
+    input: 0.005
+    output: 0.025
+  claude-opus-4-8:
+    input: 0.005
+    output: 0.025
+  claude-sonnet-5:
+    input: 0.003
+    output: 0.015
+  claude-haiku-4-5:
+    input: 0.001
+    output: 0.005
   gpt-4o-mini:
     input: 0.00015
     output: 0.0006
@@ -315,6 +382,39 @@ pricing:
     output: 0.075
   # New providers (USD per 1k tokens — verify against current price sheets; reporting only,
   # billing is per-request). Keys are substring-matched against the routed model name.
+  gemini-3.6-flash:
+    input: 0.0015
+    output: 0.0075
+  gemini-3.5-flash-lite:
+    input: 0.0003
+    output: 0.0025
+  gemini-3.1-pro:
+    input: 0.002
+    output: 0.012
+  mistral-medium-3.5:
+    input: 0.0015
+    output: 0.0075
+  mistral-large-3:
+    input: 0.0005
+    output: 0.0015
+  mistral-small-4:
+    input: 0.00015
+    output: 0.0006
+  ministral:
+    input: 0.0001
+    output: 0.0002
+  grok-4.5:
+    input: 0.002
+    output: 0.006
+  grok-4.3:
+    input: 0.00125
+    output: 0.0025
+  grok-4.1-fast:
+    input: 0.0002
+    output: 0.0005
+  command-r7b:
+    input: 0.0000375
+    output: 0.00015
   gemini-flash-latest:
     input: 0.0003
     output: 0.0025

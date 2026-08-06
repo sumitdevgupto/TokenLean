@@ -19,6 +19,46 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-06
+
+### Qdrant client and server versions no longer drift apart — Bug fix
+`qdrant-client` refuses a client/server gap of more than one minor version, and five independent
+pins had drifted: the proxy was capped `>=1.12,<1.13` while the doc/finetune pipelines and the
+pitch-test-plan harness were uncapped (resolving to 1.18.x), and the server was v1.12.6 locally but
+v1.9.0 on GCP. The pipelines were therefore seeding, with a 1.18 client, the very collections a 1.12
+proxy reads back for retrieval, and every test run logged an explicit incompatibility warning. All
+client pins are now `>=1.12,<1.13`, both server declarations are `v1.12.6`, and Dependabot holds
+qdrant-client at that minor (patches still flow). A new `tests/unit/test_qdrant_version_alignment.py`
+fails if any one of them moves without the others.
+
+### Pick models and providers from a dropdown, backed by a refreshed model catalog — Enhancement (OSS + Enterprise)
+Model and provider fields in the portal were free text with a loose autocomplete, and the model
+suggestions came from the `pricing:` keys — matching *fragments* like `claude-opus`, not real model
+ids. Both are now proper dropdowns: providers come from the configured `providers:` list (a closed
+set — the proxy can only route to those), and models come from each provider's `models:` list in
+`config/config.yaml`, grouped by provider. That list is the operator-maintained catalog: a plain
+static file, hot-reloaded like the rest of the config, so a newly-released model appears in the
+picker within ~60s with no deploy and no code change. A **Custom…** option keeps any model usable
+before it is added. The shipped catalog and `pricing:` table were refreshed against the providers'
+current line-ups (verified 2026-08-06) across OpenAI, Anthropic, Gemini, Mistral, DeepSeek, xAI,
+Cohere, Groq and Bedrock; legacy ids are kept where the provider still serves them.
+- **OSS:** the refreshed catalog + pricing rows in `config.yaml.template`, and the same list already
+  governs which requested models the proxy accepts.
+- **[Enterprise]:** the grouped dropdowns in the portal's Models & Keys tab — <https://tokenlean.cbeyond.cloud/>
+
+### A tenant's contract is now scoped to that tenant, not to its whole company — Bug fix
+Contract state lived only on the `companies` row (one per 4-letter company code), so every stack
+of a company shared it: deactivating `ACME-PRD-01` immediately blocked portal login for
+`ACME-PRD-02` (and the console showed both as inactive), while key-level request blocking was
+already per-tenant — half company-wide, half per-tenant. Creating a second stack also silently
+re-activated a deliberately deactivated sibling. Contracts now live in a new per-tenant
+`tenant_contracts` table (status + `paid_until`); the company row remains a read-only **fallback**
+for tenants provisioned before it, so no migration runs and no live customer is locked out. The
+same fix closes a self-serve signup lockout: `companies.contract_status` defaults to `pending`, so
+a brand-new self-serve owner was 403'd out of the portal on their very next request — signup now
+writes an explicit `active` contract row for the tenant it provisions. "Resend invite" is also
+per-tenant now instead of flagging every stack sharing the code.
+
 ## 2026-08-05
 
 ### G19 no longer rewrites the model's answer — Bug fix

@@ -185,8 +185,9 @@ def is_contract_inactive(metadata: Optional[dict]) -> bool:
     ``set_contract_active``; this proxy only *enforces* it (HTTP 403 at
     ``_authenticate``). The flag's ABSENCE means "active" — so legacy keys that
     predate the contract feature (and every key of an active tenant) are never
-    blocked. ``companies.contract_status`` is the source-of-record; this metadata
-    field is the derived per-request enforcement copy.
+    blocked. ``tenant_contracts.contract_status`` (per tenant; the ``companies`` row
+    is only a fallback for tenants that predate it) is the source-of-record — this
+    metadata field is the derived per-request enforcement copy.
     """
     return bool(isinstance(metadata, dict) and metadata.get("contract_inactive"))
 

@@ -70,7 +70,12 @@ variable "redis_memory_size_gb" {
 variable "qdrant_image" {
   description = "Qdrant Docker image to deploy on Cloud Run"
   type        = string
-  default     = "qdrant/qdrant:v1.9.0"
+  # MUST stay in lockstep with docker-compose.yml's qdrant image and with the
+  # qdrant-client pin in every requirements file (>=1.12,<1.13). qdrant-client
+  # refuses a client/server minor gap greater than 1, so a bump here needs the
+  # client pins bumped in the same change. Guarded by
+  # tests/unit/test_qdrant_version_alignment.py.
+  default     = "qdrant/qdrant:v1.12.6"
 }
 
 # ─── Cost-optimization toggles (defaults preserve current OSS behaviour) ──────
