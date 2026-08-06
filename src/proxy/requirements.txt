@@ -1,4 +1,4 @@
-litellm>=1.90.1,<2.0.0                       # MIT — pinned: floor at tested 1.90.1, cap pre-2.0 to avoid breaking changes
+litellm>=1.95.0,<2.0.0                       # MIT — pinned: floor at tested 1.90.1, cap pre-2.0 to avoid breaking changes
 boto3>=1.34.0                                # Apache-2.0 — AWS Bedrock provider lane (litellm `bedrock/`); pulls in botocore
 fastapi>=0.111.0                             # MIT
 uvicorn[standard]>=0.30.0                    # BSD-3-Clause
