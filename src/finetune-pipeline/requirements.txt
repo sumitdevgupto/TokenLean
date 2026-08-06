@@ -2,4 +2,4 @@ google-cloud-aiplatform>=1.38.0
 openai>=1.0.0
 google-cloud-storage>=3.13.0
 redis>=5.0.0
-qdrant-client>=1.12,<1.13
+qdrant-client>=1.18.0,<1.19
