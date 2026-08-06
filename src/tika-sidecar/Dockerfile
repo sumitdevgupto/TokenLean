@@ -1,6 +1,6 @@
 # Standard Tika image — no OCR bundle needed (only text-based docs flow through this pipeline).
 # The -full tag (Tesseract OCR) added ~1 GB with no benefit for this workload.
-FROM apache/tika:2.9.1.0
+FROM apache/tika:3.3.1.0
 
 EXPOSE 9998
 
