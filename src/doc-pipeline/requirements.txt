@@ -1,6 +1,6 @@
 unstructured>=0.18.32
 pdfminer.six>=20260107
-python-docx>=1.1.0
+python-docx>=1.2.0
 google-cloud-storage>=3.13.0
 qdrant-client>=1.12,<1.13
 langchain-text-splitters>=0.2.0
