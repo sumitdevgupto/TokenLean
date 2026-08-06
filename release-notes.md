@@ -21,6 +21,19 @@ date changes.
 
 ## 2026-08-06
 
+### Reproducible installs: proxy + test dependencies are now pinned lockfiles — Enhancement (OSS)
+Every dependency was an open `>=` floor, so each CI run and image build silently installed
+whatever PyPI had that day — contributor PRs could go red from an overnight upstream release,
+and dependabot's floor-bump PRs changed nothing about what actually shipped. `src/proxy/requirements.txt`
+and `tests/requirements-test.txt` are now full pinned resolves compiled from human-edited
+`requirements*.in` files by `scripts/compile-requirements.sh` (runs pip-compile inside the same
+python:3.11 image the proxy ships on; torch stays unpinned so the image keeps its CPU build).
+CI and the Dockerfile are unchanged — they install the same filenames, now deterministic.
+Dependabot is scoped to match: version PRs stay on for the two lockfiles (where a bump is a real,
+CI-tested change) and GitHub Actions, and are disabled for the sidecar/pipeline floors, Docker
+base images and the Java sample — security updates still flow everywhere.
+`tests/unit/test_requirements_pinned.py` guards the lockfiles' completeness and exclusions.
+
 ### Qdrant client and server versions no longer drift apart — Bug fix
 `qdrant-client` refuses a client/server gap of more than one minor version, and five independent
 pins had drifted: the proxy was capped `>=1.12,<1.13` while the doc/finetune pipelines and the

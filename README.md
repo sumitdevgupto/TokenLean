@@ -571,6 +571,7 @@ main._record_outcome ───────────────────�
 | `check-local-and-gcp-status.sh` | Show GCP + local Docker status |
 | `validate-cascade.py` | Ground-truth validation for G6 routing thresholds |
 | `check-stale-templates.py` | Detect and flag 30-day stale templates |
+| `compile-requirements.sh` | Regenerate the pinned dependency lockfiles (`requirements.txt`) from the human-edited `*.in` floors, inside the same python:3.11 image the proxy ships on. Edit `*.in`, run this, commit both |
 
 ## Technology Stack
 

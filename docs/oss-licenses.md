@@ -4,7 +4,7 @@ All **Python package dependencies** used by the Token Optimisation proxy. Every 
 
 > For **bundled OSS services & sidecars** (Redis, Postgres, Qdrant, Grafana, Langfuse, Tika, LLMLingua, RouteLLM, OpenMeter, etc. — run as separate containers) and the project's overall license posture, see [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md) at the repo root. Project license: Apache-2.0 ([`LICENSE`](../LICENSE)).
 
-## Core Dependencies (`src/proxy/requirements.txt`)
+## Core Dependencies (`src/proxy/requirements.in` — the human-edited source; `requirements.txt` is its compiled pin set)
 
 | Package | Version | SPDX License | Notes |
 |---|---|---|---|

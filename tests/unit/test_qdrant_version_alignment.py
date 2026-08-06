@@ -16,14 +16,19 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 
-# Every requirements file that pins qdrant-client. All must carry the SAME spec.
+# Every HUMAN-MAINTAINED requirements file that pins qdrant-client. All must carry
+# the SAME range spec. The proxy's spec lives in requirements.in — requirements.txt
+# is its COMPILED lockfile (exact ==pin), checked separately below.
 # Split by tree: the OSS gate builds via `git archive HEAD`, so anything gitignored
 # is simply absent there and must be checked only when it is actually present.
 CLIENT_PIN_FILES = [
-    "src/proxy/requirements.txt",
+    "src/proxy/requirements.in",
     "src/doc-pipeline/requirements.txt",
     "src/finetune-pipeline/requirements.txt",
 ]
+
+# Compiled lockfile — carries the exact resolved pin (e.g. ==1.12.2).
+COMPILED_LOCKFILE = "src/proxy/requirements.txt"
 
 # Gitignored (commercial repo) — present in a full working tree, absent in the OSS tree.
 OPTIONAL_CLIENT_PIN_FILES = [
@@ -116,4 +121,22 @@ def test_client_pin_tracks_the_server_minor():
             f"qdrant-client {client[0]}.{client[1]} is more than one minor from the "
             f"server {server[0]}.{server[1]} declared in {rel} — the client will "
             "refuse to talk to it. Bump the server and every client pin together."
+        )
+
+
+def test_compiled_lockfile_pin_matches_server():
+    """The pin that actually SHIPS (compiled requirements.txt) must sit inside the
+    server's minor window too — this is the line a Dependabot lockfile bump edits."""
+    match = re.search(
+        r"^qdrant-client==(\d+)\.(\d+)", _read(COMPILED_LOCKFILE), re.MULTILINE
+    )
+    assert match, f"{COMPILED_LOCKFILE} no longer pins qdrant-client exactly"
+    client = (int(match.group(1)), int(match.group(2)))
+
+    for rel, server in _server_versions().items():
+        assert client[0] == server[0] and abs(client[1] - server[1]) <= 1, (
+            f"compiled qdrant-client pin {client[0]}.{client[1]} in "
+            f"{COMPILED_LOCKFILE} is incompatible with the server "
+            f"{server[0]}.{server[1]} declared in {rel} — regenerate via "
+            "scripts/compile-requirements.sh after fixing requirements.in"
         )
