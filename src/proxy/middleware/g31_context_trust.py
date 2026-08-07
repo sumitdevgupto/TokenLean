@@ -58,6 +58,21 @@ _VALID_MODES = ("allow", "flag", "block", "strip")
 _VALID_PII_MODES = ("off", "flag", "mask", "block")
 _DEFAULT_SCAN_ROLES = ["system", "tool"]
 
+# Conversation summaries the PROXY itself wrote (G10's sliding window, G26's budget
+# compaction). They are `system` messages, so `strip` mode would happily delete one — and
+# because the compacting group replaced the original turns with it, dropping the summary
+# discards the whole earlier conversation rather than a single poisoned document. They are
+# also not untrusted input: they are derived from the caller's own turns, which G30 already
+# scanned. Trust boundary unchanged — retrieved documents and memories are still scanned.
+_PROXY_SUMMARY_MARKER = "[Conversation summary — earlier turns]"
+
+
+def _is_proxy_summary(msg: Dict[str, Any]) -> bool:
+    content = msg.get("content")
+    return (msg.get("role") == "system"
+            and isinstance(content, str)
+            and content.lstrip().startswith(_PROXY_SUMMARY_MARKER))
+
 
 class G31ContextTrust:
     """Apply the context-trust (indirect-injection) policy to injected context."""
@@ -206,7 +221,7 @@ class G31ContextTrust:
         categories: List[str] = []
         survivors: List[Dict[str, Any]] = []
         for msg in messages or []:
-            if msg.get("role") not in scan_roles:
+            if msg.get("role") not in scan_roles or _is_proxy_summary(msg):
                 survivors.append(msg)
                 continue
             content = msg.get("content")

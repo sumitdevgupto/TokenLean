@@ -23,6 +23,21 @@ date changes.
 
 ## 2026-08-07
 
+### Context-budget compaction hardened after code review — Bug fix
+Nine defects found reviewing the budget-aware compaction that shipped earlier the same day,
+all fixed before it can be enabled in anger (the feature is off by default, so no deployment
+was affected). The ones that could have changed answers: the prose compressor was rewriting
+**tool results**, so a payload value like `"the north"` came back as `"north"`; repeated short
+turns ("ok", "continue") were being deleted as duplicates, stranding the replies that answered
+them; and a conversation summary could be larger than the history it replaced, growing the
+prompt invisibly. The ones that could have broken requests: the output reservation ignored the
+`max_tokens` the proxy itself adds later, `keep_recent_turns` protected half the exchanges it
+promised, an over-large history could exceed the summariser's own context window, and a
+negative setting disabled compaction permanently instead of failing loudly. Also: summaries are
+now reused as a conversation grows (previously the cache could never hit on a live thread), and
+the trust-and-safety context scan no longer strips the proxy's own summary — which, since the
+summary replaces the earlier turns, would have discarded the whole conversation.
+
 ### Long conversations now compact themselves before they overflow the model's context window — Enhancement (OSS + Enterprise)
 Multi-turn agents and long-running support threads grow until they hit the model's context
 limit, at which point the request either fails or the caller has to throw history away by hand.

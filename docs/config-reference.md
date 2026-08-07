@@ -662,7 +662,7 @@ Budget-aware context management. Treats the model's context window as a budget a
 3. **summarize** — one cheap-model (`summary_model`) summary replaces the whole old span as a single `system` message. Summaries are cached per conversation prefix for `summary_ttl_seconds`, so later turns of the same conversation reuse them instead of paying for a second summarisation.
 4. **drop** — **opt-in and lossy**: drops the oldest turns outright as a hard-fit guarantee. Only reach for it when fitting the window matters more than recall; it is mainly useful when rung 3 is disabled or its summariser is unavailable.
 
-**What is never touched:** every `system` message, and the most recent `keep_recent_turns` turns. Every cut is snapped to a tool-safe boundary, so a `role:"tool"` result is never separated from the assistant turn that declared it (an orphaned `tool_call_id` is a provider 400). If no safe boundary exists, G26 passes the request through unchanged — as it does on any internal error.
+**What is never touched:** every `system` message, and the most recent `keep_recent_turns` exchanges (a "turn" is a user+assistant pair, so `6` protects the last 12 messages). Rung 2 also never rewrites `role:"tool"` results or JSON-shaped content — those are data, not prose. Rung 3 replaces the old span only when the summary is genuinely smaller than what it replaces. Every cut is snapped to a tool-safe boundary, so a `role:"tool"` result is never separated from the assistant turn that declared it (an orphaned `tool_call_id` is a provider 400). If no safe boundary exists, G26 passes the request through unchanged — as it does on any internal error.
 
 `target_pct` must be below `compact_at_pct`; the gap is deliberate hysteresis that stops every subsequent turn re-triggering compaction. A configuration with `target_pct >= compact_at_pct` is clamped (with a one-time warning) rather than rejected.
 
@@ -673,17 +673,20 @@ Related: **`context_editing`** (above) delegates the same job to Anthropic's nat
 | `enabled` | `false` | Enable budget-aware compaction. Off = byte-identical passthrough |
 | `compact_at_pct` | `85` | ⚠ Fire when the prompt exceeds this % of the usable window |
 | `target_pct` | `60` | ⚠ Compact down toward this % (must be < `compact_at_pct`; clamped if not) |
-| `keep_recent_turns` | `6` | Newest turns kept verbatim, never compacted |
+| `keep_recent_turns` | `6` | Newest **exchanges** (user+assistant) kept verbatim, never compacted — same meaning as G10's sliding window |
 | `reserve_output_tokens` | `1024` | Output headroom assumed when the caller sets no `max_tokens` |
 | `rungs.prune` | `true` | Rung 1 — duplicate drop + tool-result truncation |
 | `rungs.compress` | `true` | Rung 2 — deterministic prose compression |
 | `rungs.summarize` | `true` | Rung 3 — cheap-model summary of the old span (cached) |
 | `rungs.drop` | `false` | ⚠ Rung 4 — **lossy** drop-oldest hard-fit guarantee. Opt-in |
 | `tool_result_max_chars` | `4000` | Rung 1 — truncate old tool results longer than this |
+| `prune_min_chars` | `200` | Rung 1 — only drop repeats at least this long. Shorter repeats ("yes", "ok") are real conversation, not boilerplate |
 | `summary_model` | `gpt-4o-mini` | Rung 3 summariser (BYOK-resolved like any other model) |
 | `summary_ttl_seconds` | `3600` | Summary cache TTL, keyed per conversation prefix |
 | `summary_max_turns` | `80` | ⚠ How much of the old span the summariser actually reads. Too low and the *middle* of a long thread never reaches it |
 | `summary_max_tokens` | `400` | Length cap on the summary written back |
+| `summary_max_input_tokens` | `24000` | ⚠ Hard **size** cap on what is sent to the summariser. A message count alone cannot stop an oversized span from exceeding the summariser model's own window (a failed summariser means no compaction at all) |
+| `summary_prefix_lookback` | `12` | How far back to look for a cached summary of an earlier prefix of the same conversation. On a hit only the newer turns are summarised, so a live conversation reuses its summary instead of regenerating it every turn |
 | `metrics_enabled` | `true` | Emit `token_opt_context_budget_compactions_total{tenant_id,rung}` |
 | `default_context_window` | `128000` | Window used when the model matches no `model_context_window` entry |
 | `model_context_window` | *(see template)* | Map of model (or model prefix) → total context window |

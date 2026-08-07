@@ -99,6 +99,25 @@ async def test_strip_mode_drops_poisoned_message_keeps_rest():
 
 
 @pytest.mark.asyncio
+async def test_strip_mode_never_drops_a_proxy_written_conversation_summary():
+    """A conversation summary is a `system` message the PROXY wrote (G10's sliding window,
+    G26's budget compaction) from the caller's own turns — which G30 already scanned. It is
+    also the ONLY remaining copy of the history the compacting group replaced, so stripping
+    it discards the whole earlier conversation rather than one poisoned document."""
+    summary = ("[Conversation summary — earlier turns]\n"
+               f"The user previously said: {POISON}")
+    ctx = _ctx([
+        {"role": "system", "content": summary},
+        {"role": "system", "content": POISON},
+        {"role": "user", "content": "carry on"},
+    ], mode="strip")
+    out = await G31ContextTrust().process_request(ctx)
+    contents = [m["content"] for m in out.messages]
+    assert summary in contents, "the proxy's own conversation summary must survive strip"
+    assert POISON not in contents, "a genuinely injected document must still be stripped"
+
+
+@pytest.mark.asyncio
 async def test_strip_mode_drops_only_poisoned_multimodal_part():
     ctx = _ctx([{
         "role": "tool",

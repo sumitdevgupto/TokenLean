@@ -42,6 +42,14 @@ class TestSafeWindowSplit:
         turns = [{"role": "user"}, {"role": "assistant"}]
         assert safe_window_split(turns, 99) == 0
 
+    def test_negative_keep_is_clamped_not_an_indexerror(self):
+        """A negative value used to push `start` past the end of the list and raise
+        IndexError — which a caller's broad handler swallows, silently disabling
+        compaction for good instead of failing loudly."""
+        turns = [{"role": "user"}, {"role": "assistant"}, {"role": "user"}]
+        assert safe_window_split(turns, -5) == 0
+        assert safe_window_split([], -1) == 0
+
 
 class TestG10AliasesStillResolve:
     def test_g10_private_names_are_the_shared_functions(self):
@@ -93,3 +101,32 @@ class TestSummariseTurnsCaps:
 
     async def test_empty_span_short_circuits(self, make_ctx):
         assert await summarise_turns([], "gpt-4o-mini", make_ctx([])) == ""
+
+    async def test_oversized_span_is_trimmed_to_the_token_budget(self, make_ctx, monkeypatch):
+        """A message COUNT cap cannot bound SIZE: 80 messages of a large-payload agentic
+        thread can exceed the summariser model's own window, and a failed summariser means
+        no compaction happens at all. The oldest turns go first."""
+        seen = {}
+        self._wire(monkeypatch, seen)
+        turns = [{"role": "user", "content": f"turn {i} " + "x" * 4000} for i in range(20)]
+        await summarise_turns(turns, "gpt-4o-mini", make_ctx([]),
+                              max_turns=80, max_input_tokens=3000)
+        prompt = seen["messages"][0]["content"]
+        assert "turn 19" in prompt, "the newest turns must be kept"
+        assert "turn 0 " not in prompt, "the oldest turns must be dropped to fit the budget"
+
+    async def test_multimodal_parts_become_placeholders_not_base64(self, make_ctx, monkeypatch):
+        """Serialising an image_url part would paste a megabyte of base64 into the
+        summarisation prompt — burning the budget on data the summariser cannot read."""
+        seen = {}
+        self._wire(monkeypatch, seen)
+        blob = "data:image/png;base64," + "A" * 5000
+        turns = [{"role": "user", "content": [
+            {"type": "text", "text": "describe this diagram"},
+            {"type": "image_url", "image_url": {"url": blob}},
+        ]}]
+        await summarise_turns(turns, "gpt-4o-mini", make_ctx([]))
+        prompt = seen["messages"][0]["content"]
+        assert "describe this diagram" in prompt
+        assert "AAAA" not in prompt
+        assert "[image_url]" in prompt

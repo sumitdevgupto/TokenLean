@@ -3,6 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
 import copy
+import json
 import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,7 +30,7 @@ def g26_cfg(**overrides):
         "enabled": True,
         "compact_at_pct": 60,
         "target_pct": 30,
-        "keep_recent_turns": 4,
+        "keep_recent_turns": 2,
         "reserve_output_tokens": 0,
         "rungs": {"prune": True, "compress": True, "summarize": True, "drop": False},
         "tool_result_max_chars": 200,
@@ -54,6 +55,9 @@ def conversation(n_pairs=12, filler="Please note that in order to answer the que
 
 def prep(ctx, cfg=None, **cfg_overrides):
     ctx.config["groups"]["G26_context_budget"] = cfg or g26_cfg(**cfg_overrides)
+    # G11 (Stage 4) would otherwise set the output reservation; these tests exercise G26's
+    # own budget maths, so pin it off. `test_reservation_follows_g11` covers the interaction.
+    ctx.config.setdefault("groups", {})["G11_output"] = {"enabled": False}
     return ctx
 
 
@@ -153,9 +157,27 @@ class TestWindowResolution:
     def test_max_tokens_reserves_output_headroom(self, make_ctx):
         cfg = g26_cfg(reserve_output_tokens=100)
         ctx = make_ctx([], model="gpt-4o", params={})
+        ctx.config["groups"]["G11_output"] = {"enabled": False}
         assert _usable_window(ctx, cfg) == 900          # 1000 − configured reserve
         ctx = make_ctx([], model="gpt-4o", params={"max_tokens": 400})
+        ctx.config["groups"]["G11_output"] = {"enabled": False}
         assert _usable_window(ctx, cfg) == 600          # caller's max_tokens wins
+
+    def test_reservation_follows_g11_when_caller_sets_no_max_tokens(self, make_ctx):
+        """G11 runs LATER and injects its own max_tokens. Reserving less than G11 is about
+        to request re-creates the exact `prompt + max_tokens > window` rejection G26 exists
+        to prevent, so the reservation takes the larger of the two."""
+        cfg = g26_cfg(reserve_output_tokens=100, model_context_window={"gpt-4o": 10000})
+        ctx = make_ctx([], model="gpt-4o", params={})
+        ctx.config["groups"]["G11_output"] = {
+            "enabled": True, "model_max_tokens": {"gpt-4o": 4096}}
+        assert _usable_window(ctx, cfg) == 10000 - 4096   # G11's, not the smaller 100
+
+        # An explicit caller max_tokens still wins — that is what will actually be sent.
+        ctx = make_ctx([], model="gpt-4o", params={"max_tokens": 256})
+        ctx.config["groups"]["G11_output"] = {
+            "enabled": True, "model_max_tokens": {"gpt-4o": 4096}}
+        assert _usable_window(ctx, cfg) == 10000 - 256
 
     def test_target_above_trigger_is_clamped_and_warns_once(self, make_ctx, caplog):
         ctx = make_ctx([])
@@ -173,8 +195,12 @@ class TestWindowResolution:
 class TestLadder:
     async def test_prune_alone_can_reach_target(self, make_ctx):
         # A history that is mostly byte-exact duplicates: rung 1 is enough.
+        # Long enough to count as boilerplate rather than a short conversational repeat.
         dup = {"role": "user", "content": "Please note that in order to proceed, you must confirm "
-                                          "the ticket id and the account tier before answering."}
+                                          "the ticket id and the account tier before answering. "
+                                          "In order to keep the audit trail complete, due to the "
+                                          "fact that enterprise contracts require it, please also "
+                                          "restate the region and the plan tier on every update."}
         msgs = [{"role": "system", "content": "sys"}] + [dict(dup) for _ in range(24)]
         msgs += [{"role": "user", "content": "final question"}]
         ctx = prep(make_ctx(msgs), rungs={"prune": True, "compress": False, "summarize": False, "drop": False})
@@ -191,7 +217,7 @@ class TestLadder:
         for i in range(6):
             msgs.append({"role": "user", "content": f"q{i}"})
             msgs.append({"role": "assistant", "content": f"a{i}"})
-        ctx = prep(make_ctx(msgs), tool_result_max_chars=100,
+        ctx = prep(make_ctx(msgs), keep_recent_turns=2, tool_result_max_chars=100,
                    rungs={"prune": True, "compress": False, "summarize": False, "drop": False})
         ctx = await G26ContextBudget().process_request(ctx)
         tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
@@ -246,7 +272,7 @@ class TestLadder:
         msgs.append({"role": "assistant", "content": "Here is what I found."})
         msgs.append({"role": "user", "content": "thanks"})
 
-        ctx = prep(make_ctx(msgs), keep_recent_turns=3)
+        ctx = prep(make_ctx(msgs), keep_recent_turns=2)
         ctx = await G26ContextBudget().process_request(ctx)
 
         non_system = [m for m in ctx.messages if m.get("role") != "system"]
@@ -292,7 +318,7 @@ class TestRungToggles:
     async def test_drop_when_enabled_removes_oldest_only(self, make_ctx):
         msgs = conversation(n_pairs=12)
         system_msg, tail_before = msgs[0], msgs[-4:]
-        ctx = prep(make_ctx(msgs), keep_recent_turns=4,
+        ctx = prep(make_ctx(msgs), keep_recent_turns=2,
                    rungs={"prune": False, "compress": False, "summarize": False, "drop": True})
         ctx = await G26ContextBudget().process_request(ctx)
 
@@ -336,6 +362,7 @@ class TestTenantOverride:
         ctx = make_ctx(conversation())
         ctx.tenant_id = "NOVA-STG-01"
         ctx.config["groups"]["G26_context_budget"] = g26_cfg(enabled=False)
+        ctx.config["groups"]["G11_output"] = {"enabled": False}
         ctx.config.setdefault("tenants", {})["NOVA-STG-01"] = {
             "groups": {"G26_context_budget": {"enabled": True,
                                               "rungs": {"summarize": False}}}
@@ -406,6 +433,139 @@ class TestObservability:
         step = [s for s in ctx.savings.step_savings if s.group == "G26"][0]
         assert step.tokens_before == before
         assert step.tokens_after == ctx.current_request_token_count < before
+
+
+@pytest.mark.asyncio
+class TestCodeReviewRegressions:
+    """One test per finding from the 2026-08-07 review of the initial G26 commit."""
+
+    async def test_summarize_never_grows_the_prompt(self, make_ctx):
+        """R1: when the budget pressure comes from the tools or the protected tail, the old
+        span can already be smaller than a summary of it. Swapping anyway would GROW the
+        prompt — invisibly, because the recorded saving clamps at zero."""
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(8):
+            msgs.append({"role": "user", "content": f"q{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+        ctx = prep(make_ctx(msgs), compact_at_pct=10, target_pct=5, keep_recent_turns=2,
+                   rungs={"prune": False, "compress": False, "summarize": True, "drop": False})
+        before = copy.deepcopy(ctx.messages)
+        bloated = "This is a very long summary that is far larger than the tiny turns. " * 20
+        with patch("middleware.g26_context_budget.summarise_turns",
+                   new_callable=AsyncMock, return_value=bloated):
+            ctx = await G26ContextBudget().process_request(ctx)
+        assert ctx.messages == before, "a summary bigger than the span must be refused"
+        assert not [s for s in ctx.savings.step_savings if s.group == "G26"]
+
+    async def test_summariser_input_is_size_capped(self, make_ctx):
+        """R2: a message-count cap cannot stop an oversized span from blowing the
+        summariser's own context window — and a failed summariser means no compaction."""
+        captured = {}
+
+        async def _capture(turns, model, _ctx, **kw):
+            captured.update(kw)
+            return "ok"
+
+        ctx = prep(make_ctx(conversation()), summary_max_input_tokens=1234)
+        with patch("middleware.g26_context_budget.summarise_turns", side_effect=_capture):
+            await G26ContextBudget().process_request(ctx)
+        assert captured.get("max_input_tokens") == 1234
+
+    async def test_short_repeated_turns_are_never_pruned(self, make_ctx):
+        """R3: "yes"/"ok"/"continue" repeat legitimately and each has its own reply.
+        Collapsing them is deleting conversation, not deduplication."""
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(10):
+            msgs.append({"role": "user", "content": "continue"})
+            msgs.append({"role": "assistant", "content":
+                         f"Step {i}: here is the next distinct part of the long answer, "
+                         f"with enough detail to keep the conversation over budget."})
+        ctx = prep(make_ctx(msgs), rungs={"prune": True, "compress": False,
+                                          "summarize": False, "drop": False})
+        await G26ContextBudget().process_request(ctx)
+        assert sum(1 for m in ctx.messages if m.get("content") == "continue") == 10
+
+    async def test_prune_never_welds_two_same_role_messages_together(self, make_ctx):
+        """R3: dropping a duplicate must not make its neighbours adjacent same-role."""
+        boiler = "Reminder: " + ("please restate the ticket id and the account tier. " * 8)
+        msgs = [{"role": "system", "content": "sys"}]
+        for _ in range(8):
+            msgs.append({"role": "user", "content": boiler})
+            msgs.append({"role": "assistant", "content": "Acknowledged, continuing the work."})
+        ctx = prep(make_ctx(msgs), rungs={"prune": True, "compress": False,
+                                          "summarize": False, "drop": False})
+        await G26ContextBudget().process_request(ctx)
+        roles = [m["role"] for m in ctx.messages if m["role"] != "system"]
+        assert all(a != b for a, b in zip(roles, roles[1:])), f"welded roles: {roles}"
+
+    async def test_tool_results_are_never_rewritten_by_the_compressor(self, make_ctx):
+        """R4: tool output is DATA. The prose compressor strips articles, so
+        `{"region": "the north"}` would come back as `{"region": "north"}`."""
+        payload = json.dumps({"region": "the north", "note": "the very large the cluster"})
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(8):
+            msgs.append({"role": "assistant", "content": None, "tool_calls": [
+                {"id": f"c{i}", "function": {"name": "f", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": payload})
+            msgs.append({"role": "user", "content":
+                         "Please note that in order to continue, describe the result briefly."})
+            msgs.append({"role": "assistant", "content": "Described the result in some detail."})
+        ctx = prep(make_ctx(msgs), tool_result_max_chars=0,
+                   rungs={"prune": False, "compress": True, "summarize": False, "drop": False})
+        await G26ContextBudget().process_request(ctx)
+        for m in ctx.messages:
+            if m.get("role") == "tool":
+                assert m["content"] == payload, "tool payload was rewritten"
+                assert json.loads(m["content"])["region"] == "the north"
+
+    async def test_json_string_content_is_not_compressed(self, make_ctx):
+        """R4: JSON-shaped assistant content is data too."""
+        from middleware.g26_context_budget import _is_compressible
+        assert _is_compressible({"role": "user", "content": "the quick brown fox"}) is True
+        assert _is_compressible({"role": "user", "content": '{"a": "the b"}'}) is False
+        assert _is_compressible({"role": "tool", "tool_call_id": "c", "content": "the x"}) is False
+
+    async def test_growing_conversation_reuses_the_previous_summary(self, make_ctx):
+        """R5: keying only on the whole span means the key is new every turn, so a live
+        conversation never hits the cache it was given. A later turn must reuse the
+        earlier summary and only summarise what was added since."""
+        calls = []
+
+        async def _summ(turns, model, _ctx, **kw):
+            calls.append(list(turns))
+            return "Summary of the conversation so far."
+
+        with patch("middleware.g26_context_budget.summarise_turns", side_effect=_summ):
+            base = conversation(n_pairs=12)
+            await G26ContextBudget().process_request(prep(make_ctx(base)))
+            assert len(calls) == 1
+            first_span_len = len(calls[0])
+
+            # Next turn: same conversation, one more exchange appended.
+            grown = base + [{"role": "user", "content": "And what happened after that?"},
+                            {"role": "assistant", "content": "Then the incident was resolved."}]
+            await G26ContextBudget().process_request(prep(make_ctx(grown)))
+
+        assert len(calls) == 2, "the grown conversation still needs a summariser call"
+        # The second call summarises the prior summary + only the new turns, not the lot.
+        assert len(calls[1]) < first_span_len
+        assert "[Conversation summary" in str(calls[1][0].get("content"))
+
+    async def test_negative_keep_recent_turns_does_not_kill_the_group(self, make_ctx):
+        """R9: a negative value used to raise IndexError inside the broad handler, leaving
+        G26 a permanent silent no-op instead of failing loudly."""
+        ctx = prep(make_ctx(conversation()), keep_recent_turns=-5)
+        ctx = await G26ContextBudget().process_request(ctx)
+        assert [s for s in ctx.savings.step_savings if s.group == "G26"], \
+            "G26 must still compact when keep_recent_turns is misconfigured"
+
+    async def test_keep_recent_turns_counts_exchanges_not_messages(self, make_ctx, summariser):
+        """R8: a "turn" is a user+assistant pair — the same meaning G10 gives it. Passing
+        the raw number would hand operators half the recent context they configured."""
+        msgs = conversation(n_pairs=12)
+        ctx = prep(make_ctx(msgs), keep_recent_turns=3)   # 3 exchanges == 6 messages
+        await G26ContextBudget().process_request(ctx)
+        assert ctx.messages[-6:] == msgs[-6:], "the last 3 exchanges must survive verbatim"
 
 
 class TestTokenAccounting:

@@ -1184,7 +1184,8 @@ groups:
     target_pct: 60                 # compact down toward this % (must be < compact_at_pct;
                                    # the gap is hysteresis — it stops every later turn
                                    # re-triggering compaction)
-    keep_recent_turns: 6           # newest turns kept verbatim, never compacted
+    keep_recent_turns: 6           # newest EXCHANGES (user+assistant) kept verbatim — never
+                                   # compacted. Same meaning as G10's sliding window.
     reserve_output_tokens: 1024    # output headroom when the caller sets no max_tokens
     rungs:                         # cheapest first; each rung runs only if still over target
       prune: true                  #   1 · drop byte-exact duplicate turns, truncate old tool results
@@ -1193,11 +1194,18 @@ groups:
       drop: false                  #   4 · LOSSY last resort: drop oldest turns outright. Opt-in —
                                    #       only reach for it when a hard fit matters more than recall
     tool_result_max_chars: 4000    # rung 1: truncate old tool results longer than this
+    prune_min_chars: 200           # rung 1 only drops repeats at least this long — shorter
+                                   # repeats ("yes", "ok", "continue") are real conversation
     summary_model: gpt-4o-mini     # rung 3 summariser (BYOK-resolved like any other model)
     summary_ttl_seconds: 3600      # rung-3 summaries are cached per conversation prefix
     summary_max_turns: 80          # how much of the old span the summariser actually reads —
                                    # too low and the MIDDLE of a long thread never reaches it
     summary_max_tokens: 400        # length cap on the summary it writes back
+    summary_max_input_tokens: 24000  # hard SIZE cap on what is sent to the summariser (a
+                                   # message count alone cannot stop an oversized span from
+                                   # exceeding the summariser model's own window)
+    summary_prefix_lookback: 12    # how far back to look for a cached summary of an earlier
+                                   # prefix; on a hit only the newer turns are summarised
     metrics_enabled: true
     default_context_window: 128000 # used when the model matches no entry below
     model_context_window:          # TOTAL context window per model — exact key, else longest prefix

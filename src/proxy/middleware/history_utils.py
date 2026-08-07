@@ -36,11 +36,68 @@ def safe_window_split(turns: List[Dict], keep: int) -> int:
     run of tool results: the tail then starts on the assistant turn that declared
     them and the whole tool exchange stays intact. Returns 0 when no clean cut
     exists (pathological all-tool history) so the caller trims nothing.
+
+    A non-positive ``keep`` is a misconfiguration, and both plausible readings of it are
+    destructive: taken literally it protects nothing, so the caller would replace the
+    ENTIRE conversation — including the question being asked right now — with a summary.
+    (Left unclamped it instead indexes past the end of the list and raises ``IndexError``,
+    which a caller's broad exception handler swallows, silently disabling compaction for
+    good.) Return 0 instead: trim nothing, and let the caller pass the request through
+    untouched.
     """
+    keep = int(keep)
+    if keep <= 0:
+        return 0
     start = max(0, len(turns) - keep)
-    while start > 0 and turns[start].get("role") == "tool":
+    while 0 < start < len(turns) and turns[start].get("role") == "tool":
         start -= 1
     return start
+
+
+def _content_to_text(content: Any) -> str:
+    """Flatten a message's content to plain text for summarisation.
+
+    Multimodal parts are replaced by a short placeholder rather than serialised: an
+    ``image_url`` part can carry a megabyte of base64, and pasting that into a summarisation
+    prompt burns the budget on data the summariser cannot read anyway.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                parts.append(str(part))
+            elif part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+            else:
+                parts.append(f"[{part.get('type', 'attachment')}]")
+        return " ".join(p for p in parts if p)
+    return str(content)
+
+
+def _fit_turns_to_budget(
+    turns: List[Dict], max_input_tokens: int, ctx: RequestContext
+) -> List[Dict]:
+    """Trim ``turns`` from the OLDEST end until it fits ``max_input_tokens``."""
+    if max_input_tokens <= 0 or not turns:
+        return turns
+    try:
+        from savings.calculator import estimate_tokens
+        model = getattr(ctx, "model", "") or ""
+        costs = [estimate_tokens(_content_to_text(m.get("content")), model) + 4 for m in turns]
+    except Exception:
+        return turns
+    total = sum(costs)
+    start = 0
+    while start < len(turns) - 1 and total > max_input_tokens:
+        total -= costs[start]
+        start += 1
+    if start:
+        logger.debug("summarisation span trimmed to fit budget: dropped %d oldest turns", start)
+    return turns[start:]
 
 
 async def summarise_turns(
@@ -49,6 +106,7 @@ async def summarise_turns(
     ctx: RequestContext,
     max_turns: int = 20,
     max_tokens: int = 150,
+    max_input_tokens: int = 0,
 ) -> str:
     """Summarise old conversation turns using a cheap model.
 
@@ -58,6 +116,13 @@ async def summarise_turns(
     sliding window, so a 20-turn view would silently drop everything said in the middle of
     a long thread — and losing mid-conversation facts is precisely the failure the budget
     compaction is supposed to avoid.
+
+    ``max_input_tokens`` (0 = unbounded, G10's original behaviour) additionally bounds the
+    span by SIZE, not just message count. Message count alone is not a safety property: 80
+    messages of a large-payload agentic thread can be hundreds of thousands of tokens, which
+    the summariser model itself would reject — and a failed summariser means no compaction at
+    all. When the budget is exceeded the OLDEST messages are dropped first, keeping the part
+    of the history closest to the live conversation.
     """
     if not turns:
         return ""
@@ -80,9 +145,9 @@ async def summarise_turns(
             )
             return "[summary unavailable]"
 
-        text = "\n".join(
-            f"{m.get('role','')}: {m.get('content','')}" for m in turns[:max(1, max_turns)]
-        )
+        selected = _fit_turns_to_budget(turns[:max(1, max_turns)], max_input_tokens, ctx)
+        text = "\n".join(f"{m.get('role','')}: {_content_to_text(m.get('content'))}"
+                         for m in selected)
         _call_model, _call_kwargs = summary_adapter.build_call(
             summary_model,
             get_provider_entry(summary_model, ctx.config.get("providers", [])) or {},
