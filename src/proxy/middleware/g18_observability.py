@@ -208,6 +208,14 @@ CONTEXT_TRUST_EVENTS_TOTAL = Counter(
     "flag, block or strip; `category` is the PII-free attack class.",
     ["tenant_id", "category", "action"],
 )
+CONTEXT_BUDGET_COMPACTIONS_TOTAL = Counter(
+    "token_opt_context_budget_compactions_total",
+    "Budget-aware context compactions from G26, one increment per ladder rung actually "
+    "applied on a request whose prompt crossed compact_at_pct of the usable context "
+    "window. `rung` is prune, compress, summarize or drop — a request that fires more "
+    "than one rung increments each. No increment at all is the healthy steady state.",
+    ["tenant_id", "rung"],
+)
 # G03 fine-tuning: one increment per trigger, labelled by tenant. Emitted from the trigger
 # (g03_doc_pipeline.trigger_fine_tuning_pipeline) since the Cloud Run Job runs out-of-process
 # and can't push to the proxy registry — so this counts SUBMISSIONS, not completions.

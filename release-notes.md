@@ -21,6 +21,25 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-07
+
+### Long conversations now compact themselves before they overflow the model's context window — Enhancement (OSS + Enterprise)
+Multi-turn agents and long-running support threads grow until they hit the model's context
+limit, at which point the request either fails or the caller has to throw history away by hand.
+The proxy now watches that budget for you: when an assembled prompt passes a configurable share
+of the *usable* window (the model's window minus the space reserved for its answer), it compacts
+the older part of the conversation back down using the cheapest step that works — dropping
+repeated turns and trimming stale tool output, then compressing wording, then replacing the older
+span with a short cached summary, with an opt-in last-resort step that drops the oldest turns
+outright. Recent turns and system prompts are never touched, and every cut is made at a
+tool-call boundary so a tool result is never separated from the call that produced it. Off by
+default; when off, requests are byte-identical.
+- **OSS:** the full engine, all thresholds and per-step switches, the per-model context-window
+  map, the `token_opt_context_budget_compactions_total` metric, and a new benchmark dataset
+  (DS21) that measures it end to end under the standard quality gate.
+- **[Enterprise]:** tune every threshold and step per tenant from the portal's Groups tab
+  without touching config files — <https://tokenlean.cbeyond.cloud/>
+
 ## 2026-08-06
 
 ### Reproducible installs: proxy + test dependencies are now pinned lockfiles — Enhancement (OSS)

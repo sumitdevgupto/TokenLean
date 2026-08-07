@@ -34,6 +34,7 @@ from middleware.g22_deduplication import G22Deduplication
 from middleware.g23_streaming_compression import G23StreamingCompression
 from middleware.g24_adaptive_bypass import G24AdaptiveBypass
 from middleware.g25_adaptive_reasoning import G25AdaptiveReasoning
+from middleware.g26_context_budget import G26ContextBudget
 from middleware.g27_multimodal_optimizer import G27MultimodalOptimizer
 from middleware.g28_ccr import G28CCR
 from middleware.g29_pii_redaction import G29PiiRedaction
@@ -52,7 +53,7 @@ class OptimisationPipeline:
     """
     Orchestrates the full G0–G28 token optimisation pipeline.
 
-    Request path:  G0 → G24 → G30 → G29 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21
+    Request path:  G0 → G24 → G30 → G29 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G26 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21
     Response path: G14 → G23 → G19 → G15 → G11(feedback) → G18
     """
 
@@ -84,6 +85,7 @@ class OptimisationPipeline:
         self.g23 = G23StreamingCompression()
         self.g24 = G24AdaptiveBypass()
         self.g25 = G25AdaptiveReasoning()
+        self.g26 = G26ContextBudget()
         self.g27 = G27MultimodalOptimizer()
         self.g28 = G28CCR()
         self.g29 = G29PiiRedaction()
@@ -263,6 +265,10 @@ class OptimisationPipeline:
             ("G09-context-schema", self.g09, "G09"),
             ("G10-memory", self.g10, "G10"),
             ("G22-deduplication", self.g22, "G22"),
+            # G26 runs LAST in Stage 3: it is the budget backstop, so it must see the
+            # prompt exactly as every earlier optimisation left it — and only compacts
+            # history when what remains still exceeds compact_at_pct of the window.
+            ("G26-context-budget", self.g26, "G26"),
         ]:
             if _group in ctx.skip_groups:
                 logger.debug("[%s] G24 skipping %s", ctx.request_id, _group)

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation slots (G0–G28); G26 is reserved, so 27 optimisation groups are fully operational** — plus three **trust & safety** groups, **G30 (injection guardrails)** and **G29 (PII redaction)** that run unconditionally right after G24 (never skippable), and **G31 (context-trust — indirect/RAG injection)** that runs after retrieval/memory have assembled the context — across the files in `src/proxy/middleware/`.
+This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation groups (G0–G28), all fully operational** — plus three **trust & safety** groups, **G30 (injection guardrails)** and **G29 (PII redaction)** that run unconditionally right after G24 (never skippable), and **G31 (context-trust — indirect/RAG injection)** that runs after retrieval/memory have assembled the context — across the files in `src/proxy/middleware/`.
 
 It also carries an **OSS-core F2 Intent Orchestration** stage (`middleware/intent_orchestration.py`) right after G06: it classifies the request's intent and, if it matches a registered downstream agent, dispatches to that agent's OpenAI-compatible endpoint INSTEAD of the LLM and short-circuits. Default off / byte-identical when no agents are registered.
 
@@ -61,6 +61,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G09 Schema        → prose detection → Instructor typed output → compact handoffs    │       │
 │  │  G10 Memory        → sliding window + Mem0 + Zep + Qdrant skills → injected recall │       │
 │  │  G22 Dedup         → collapse near-duplicate conversation turns (cosine / n-gram)    │       │
+│  │  G26 Ctx Budget    → over X% of usable window? prune → compress → summarise → drop   │       │
 │  │  G31 Context-Trust → re-scan assembled RAG/memory context → allow|flag|block|strip  │       │
 │  │                      (+ opt-in irreversible PII mask over retrieved content)         │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
@@ -132,7 +133,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 ## Pipeline Order (authoritative — `pipeline.py`)
 
 Request path:
-`G0 → G24 → G30 → G29 → G4 → G5 → G6 → F2 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
+`G0 → G24 → G30 → G29 → G4 → G5 → G6 → F2 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G26 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
 
 Response path:
 `G29(resp) → G30(resp) → G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → emit_grounding → G18 → G5(store)`
@@ -141,8 +142,9 @@ Response path:
 > `if _group in ctx.skip_groups: continue` guard, so G24 can disable any of them per request.
 > **G30/G29 (after G24) and G31 (after G22) are NOT guarded by `ctx.skip_groups`** — trust & safety
 > must be non-bypassable. **F2 Intent Orchestration** runs right after G06 and, when an agent matches,
-> short-circuits the pipeline (`ctx.agent_dispatched`) like a cache hit. **G26 is a reserved slot**
-> with no implementation.
+> short-circuits the pipeline (`ctx.agent_dispatched`) like a cache hit. **G26 runs last in Stage 3**
+> so it sees the prompt exactly as every earlier optimisation left it, and compacts conversation
+> history only when what remains still exceeds its configured share of the context window.
 
 ## End-to-End Flow
 
@@ -267,7 +269,16 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Collapses near-duplicate conversation turns by cosine similarity
 - Falls back to character n-gram similarity when sentence-transformers is unavailable
 
-**G31: Context-Trust** (`g31_context_trust.py` + `guardrails/injection.py` + `guardrails/pii.py`) — *trust & safety, NOT skippable* — *runs right after G07/G10/G22*
+**G26: Context Budget** (`g26_context_budget.py` + `history_utils.py`) — *runs last in Stage 3*
+- Assesses the assembled prompt (messages + tool definitions) against the **usable** context window
+  — the model's window minus the output reservation (`max_tokens` or `reserve_output_tokens`)
+- Over `compact_at_pct`, compacts the older span down toward `target_pct` via the cheapest sufficient
+  rung: prune duplicates/stale tool results → deterministic prose compression → cached cheap-model
+  summary → opt-in (default off) drop-oldest
+- Never touches `system` messages or the newest `keep_recent_turns` turns; every cut snaps to a
+  tool-safe boundary so a `tool_call_id` is never orphaned. Default off; no-op under budget
+
+**G31: Context-Trust** (`g31_context_trust.py` + `guardrails/injection.py` + `guardrails/pii.py`) — *trust & safety, NOT skippable* — *runs right after G07/G10/G22/G26*
 - G30 scanned the untrusted USER prompt, but G07/G10/G28 inject retrieved docs + memories as
   `system`/`tool` messages AFTER G30 ran; G31 re-scans that assembled context for indirect / RAG
   injection (`allow | flag | block | strip`; block → OpenAI content-filter 200 like G30)
@@ -699,7 +710,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G23** | `g23_streaming_compression.py` | Streaming output compression (response path) |
 | **G24** | `g24_adaptive_bypass.py` | Adaptive bypass — populates `ctx.skip_groups` (runs first) |
 | **G25** | `g25_adaptive_reasoning.py` | Adaptive reasoning-mode selection |
-| **G26** | *(reserved — not implemented)* | — |
+| **G26** | `g26_context_budget.py`, `history_utils.py` | Budget-aware context management — compacts history (prune → compress → summarize → opt-in drop) when the prompt crosses a % of the usable context window |
 | **G27** | `g27_multimodal_optimizer.py` | Multimodal image optimisation |
 | **G28** | `g28_ccr.py` | Context Compression & Reuse — request + response |
 | **G29** | `g29_pii_redaction.py`, `guardrails/pii.py` | **Trust & Safety** — PII/PHI detection + redaction (request + response); modes off/flag/mask/block |
@@ -709,10 +720,10 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | — | `pipeline.py` | Orchestrates the G0–G28 + F2 + G29/G30/G31 request/response pipeline |
 | — | `__init__.py` | RequestContext dataclass definition |
 
-## Implementation Status: 27 optimisation groups (G0–G28, G26 reserved) + 3 trust & safety (G29/G30/G31) + F2
+## Implementation Status: 28 optimisation groups (G0–G28) + 3 trust & safety (G29/G30/G31) + F2
 
-All 28 optimisation slots are accounted for; **G26 is intentionally reserved**, leaving **27
-optimisation groups fully operational**, plus the three non-savings **trust & safety** groups
+All 28 optimisation slots are implemented — G26 filled the last reserved slot with budget-aware
+context management — plus the three non-savings **trust & safety** groups
 (G29 PII, G30 injection, G31 context-trust) and the OSS-core **F2 Intent Orchestration** stage.
 Optional integrations (headroom, Mem0, Zep, Kafka, Temporal, Instructor, Presidio) degrade
 gracefully when their packages or backing services are absent.

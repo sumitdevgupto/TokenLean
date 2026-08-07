@@ -1168,6 +1168,45 @@ groups:
     effort_floor: low
     effort_ceiling: high
     extra_reasoning_prefixes: []
+  # ── G26 · Budget-aware context management (BACM-style) ───────────────────────
+  # Treats the model's context window as a budget assessed BEFORE the call: when the
+  # assembled prompt crosses compact_at_pct of the USABLE window (context window minus
+  # the output reservation), the older span of the conversation is compacted back down
+  # toward target_pct using the cheapest ladder rung that gets there. The most recent
+  # keep_recent_turns turns and every system message are never touched, and cuts snap to
+  # tool-safe boundaries so a tool_call_id is never orphaned (providers 400 otherwise).
+  # OFF by default — enabling it changes what long conversations send to the model.
+  # Complementary to (not a replacement for) `groups.context_editing`, which delegates
+  # the same job to Anthropic's native server-side context management for Claude traffic.
+  G26_context_budget:
+    enabled: false
+    compact_at_pct: 85             # fire when the prompt exceeds this % of the usable window
+    target_pct: 60                 # compact down toward this % (must be < compact_at_pct;
+                                   # the gap is hysteresis — it stops every later turn
+                                   # re-triggering compaction)
+    keep_recent_turns: 6           # newest turns kept verbatim, never compacted
+    reserve_output_tokens: 1024    # output headroom when the caller sets no max_tokens
+    rungs:                         # cheapest first; each rung runs only if still over target
+      prune: true                  #   1 · drop byte-exact duplicate turns, truncate old tool results
+      compress: true               #   2 · deterministic prose compression (lossless-ish, idempotent)
+      summarize: true              #   3 · one cheap-model summary replaces the whole old span
+      drop: false                  #   4 · LOSSY last resort: drop oldest turns outright. Opt-in —
+                                   #       only reach for it when a hard fit matters more than recall
+    tool_result_max_chars: 4000    # rung 1: truncate old tool results longer than this
+    summary_model: gpt-4o-mini     # rung 3 summariser (BYOK-resolved like any other model)
+    summary_ttl_seconds: 3600      # rung-3 summaries are cached per conversation prefix
+    summary_max_turns: 80          # how much of the old span the summariser actually reads —
+                                   # too low and the MIDDLE of a long thread never reaches it
+    summary_max_tokens: 400        # length cap on the summary it writes back
+    metrics_enabled: true
+    default_context_window: 128000 # used when the model matches no entry below
+    model_context_window:          # TOTAL context window per model — exact key, else longest prefix
+      gpt-4o: 128000
+      gpt-4o-mini: 128000
+      gpt-4.1: 1047576
+      o4-mini: 200000
+      claude-: 200000
+      gemini-: 1048576
   # ── Trust & Safety (G29 PII redaction, G30 injection guardrails) ─────────────
   # Both run early and UNCONDITIONALLY — inserted after G24 and before the G04/G05
   # gate, outside the skip_groups loops — so G24 adaptive-bypass can never disable

@@ -79,6 +79,7 @@ class TestPipelineStageOrdering:
         pipeline.g24 = _make("G24")
         pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
         pipeline.g25 = _make("G25")
+        pipeline.g26 = _make("G26")
         pipeline.g27 = _make("G27")
         pipeline.g28 = _make("G28")
         pipeline.g29 = _make("G29")
@@ -143,6 +144,7 @@ class TestPipelineStageOrdering:
         pipeline.g24 = _make("G24")
         pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
         pipeline.g25 = _make("G25")
+        pipeline.g26 = _make("G26")
         pipeline.g27 = _make("G27")
         pipeline.g28 = _make("G28")
         pipeline.g29 = _make("G29")
@@ -170,6 +172,47 @@ class TestPipelineStageOrdering:
         )
 
     @pytest.mark.asyncio
+    async def test_g26_runs_last_in_stage3_after_g22_before_g31(self):
+        """G26 is the budget backstop: it must see the prompt as every earlier Stage-3
+        optimisation left it (so after G22, the previous last stage), and still run before
+        G31 re-scans the assembled context — otherwise a summary G26 injects would skip
+        the indirect-injection scan."""
+        from middleware.pipeline import OptimisationPipeline
+
+        call_log = []
+        pipeline = _build_stubbed_pipeline(call_log)
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(_make_ctx())
+
+        for g in ("G22", "G26", "G31"):
+            assert g in call_log, f"{g} missing from {call_log}"
+        assert call_log.index("G22") < call_log.index("G26") < call_log.index("G31"), (
+            f"Expected G22 < G26 < G31, got: {call_log}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_g26_is_skippable_by_g24(self):
+        """G26 is an optimisation, not trust & safety — G24 adaptive bypass must be able
+        to skip it per request (unlike G29/G30/G31, which are unconditional)."""
+        call_log = []
+        pipeline = _build_stubbed_pipeline(call_log)
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            ctx = _make_ctx()
+            ctx.skip_groups = ["G26"]
+            await pipeline.process_request(ctx)
+
+        assert "G26" not in call_log
+        assert "G31" in call_log, "trust & safety must still run when G26 is skipped"
+
+    @pytest.mark.asyncio
     async def test_f2_runs_after_g06_and_before_g01(self):
         """F2 intent orchestration must run after G06 routing and before the Stage 3
         prompt optimisations (G01) — so a dispatched request skips optimisations tuned for
@@ -186,7 +229,7 @@ class TestPipelineStageOrdering:
         pipeline._tenant_config_loader.load = AsyncMock()
         for _n in ("g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
                    "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g24",
-                   "g25", "g27", "g28", "g29", "g30", "g31", "g15"):
+                   "g25", "g26", "g27", "g28", "g29", "g30", "g31", "g15"):
             setattr(pipeline, _n, _make(_n.upper()))
         pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
         pipeline.f2 = _make("F2")
@@ -226,7 +269,7 @@ class TestPipelineStageOrdering:
         pipeline._tenant_config_loader.load = AsyncMock()
         for _n in ("g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
                    "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g24",
-                   "g25", "g27", "g28", "g29", "g30", "g31", "g15"):
+                   "g25", "g26", "g27", "g28", "g29", "g30", "g31", "g15"):
             setattr(pipeline, _n, _make(_n.upper()))
 
         async def _reeval_side(ctx):
@@ -320,7 +363,7 @@ def _build_stubbed_pipeline(call_log):
 
     for n in ["g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
               "g11", "g12", "g13", "g15", "g16", "g17", "g19", "g20", "g21", "g22",
-              "g24", "g25", "g27", "g28", "g29", "g30", "g31"]:
+              "g24", "g25", "g26", "g27", "g28", "g29", "g30", "g31"]:
         setattr(p, n, _mk(n.upper()))
     p.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
     p.f2 = _mk("F2")  # F2 intent orchestration stage

@@ -21,7 +21,7 @@
 
 **TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **22 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
 
-🎯 **54.1% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **27 techniques** (G0–G28, G26 reserved) &nbsp;·&nbsp; 📊 **10 Grafana dashboards** &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
+🎯 **54.1% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **28 techniques** (G0–G28) &nbsp;·&nbsp; 📊 **10 Grafana dashboards** &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
 
 > **Savings by workload — internal ablation** (quality-gated, only counting datasets where answer quality held): **cache 92.8%** · **agentic 46.0%** · **prose 38.1%** · **reasoning −2.7%**. Measured on **production-scale** support/RAG/agentic payloads. Input-token savings only — separate from output cost and from request-count billing. The headline carries run-to-run variance (borderline datasets flip PASS/FAIL under model nondeterminism even at temperature-0: **50.8–55.8% observed** across gated runs; ungated ceiling ~52%). The **publicly runnable A/B** below reproduces each of these workloads independently — see [Verify it yourself](#verify-it-yourself--a-true-ab-you-can-run).
 
@@ -243,7 +243,7 @@ flowchart TB
     ReqOpt["`**2 · Request-side optimisation** (each stage skippable via G24)
     G1 Compress (LLMLingua-2) → G27 Multimodal → G2 Templates → G20 Prompt-opt →
     G7 RAG → G8 Tools (MCP) → G28 CCR → G19 Headroom-prune →
-    G9 Schema → G10 Memory → G22 Dedup`"]
+    G9 Schema → G10 Memory → G22 Dedup → G26 Context-budget`"]
 
     CtxTrust["`**2b · Context-trust** (non-bypassable — 2nd trust boundary)
     G31 re-scans the assembled RAG / memory context for indirect injection + PII`"]
@@ -285,7 +285,8 @@ flowchart TB
 > unchanged. **G24 runs first** and can skip any later stage per request; **G21** is the last step
 > before the provider call. **G4 bypass**, an **L1/L2/L3 cache hit**, and an **F2 agent dispatch**
 > short-circuit straight to the response. **G3** is an offline ingestion job that feeds the G7 RAG index.
-> (G26 is a reserved slot.)
+> **G26** is the budget backstop: it runs last in the prompt-optimisation stage and compacts
+> conversation history only when what remains still exceeds its configured share of the window.
 > **Two trust boundaries, both non-bypassable.** **G30 (injection guardrails) + G29 (PII redaction)** run
 > right after G24 over the **user prompt** — never skipped by G24, covering bypass/cache traffic, and
 > redacting before any content-persisting stage. Then **G31 (context-trust)** runs after RAG/memory have
@@ -394,7 +395,7 @@ tests/                      # Unit and integration tests (pytest)
 
 ## G0–G31 Optimisation and Safety Groups
 
-27 token-optimisation techniques (G0–G28, G26 reserved) plus **three** trust & safety groups (G29 PII, G30 injection guardrails, G31 context-trust). The Savings column applies to the optimisation groups; G29/G30/G31 are safety controls, not token-savers.
+28 token-optimisation techniques (G0–G28) plus **three** trust & safety groups (G29 PII, G30 injection guardrails, G31 context-trust). The Savings column applies to the optimisation groups; G29/G30/G31 are safety controls, not token-savers.
 
 | Group | Technique | Savings | Key Implementation |
 |-------|-----------|---------|-------------------|
@@ -423,12 +424,14 @@ tests/                      # Unit and integration tests (pytest)
 | **G23** | Streaming Compression | Variable | Collapse repeated n-grams in response output |
 | **G24** | Adaptive Bypass | Variable | Skip groups with historically negative savings per request pattern |
 | **G25** | Adaptive Reasoning | 10-30% | Classify complexity → set reasoning_effort before G12 |
-| **G26** | *(reserved)* | — | Reserved slot — not implemented |
+| **G26** | Context Budget Compaction | 20-60%¹ | Compact history when the prompt passes X% of the usable context window: prune duplicates/stale tool output → compress wording → cached summary → opt-in drop-oldest. Default off |
 | **G27** | Multimodal Optimizer | Variable | Compress inline base64 images (Headroom + LRU cache) |
 | **G28** | Context Compression & Reuse | 20-50% | Replace repeated blocks with `[CCR:sha256]` + headroom MCP tools |
 | **G29** | PII Redaction *(trust & safety)* | — | Detect + `off\|flag\|mask\|block` personal data (email/SSN/card/phone/IP + optional Presidio) before the provider call. Opt-in **PHI** (DEA/NPI/MRN/ICD-10) via `phi: true` |
 | **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts in the user prompt; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens. Optional response-side scan (`scan_response`) also checks the model's **output** |
 | **G31** | Context-Trust *(trust & safety)* | — | Indirect / RAG prompt-injection defence — re-scans retrieved documents + memories (injected after G30) for injection; `allow\|flag\|block\|strip`; non-bypassable. Opt-in **`pii_mode: off\|flag\|mask\|block`** over retrieved content (irreversible masking) |
+
+¹ On long multi-turn conversations only — G26 is inert until a prompt approaches the context window, so it contributes nothing to the 54.1% headline (which predates its DS21 dataset).
 
 > **G29/G30/G31 are trust & safety groups, not token-savings optimisations** — they don't contribute to the 54.1% headline and are kept out of the ablation harness. All groups are OSS (Apache-2.0) and never tier-gated; the managed red-team ruleset feed, the portal Security tab, and the compliance attestation are the commercial layer.
 >
@@ -469,11 +472,11 @@ On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **eve
 | **G23** Streaming Compression | `min_repeat` 3; `ngram_size` 5 | lower `min_repeat` → compress more | raise `min_repeat` → only heavy repetition collapsed |
 | **G24** Adaptive Bypass | `rules_file` (per-rule skip conditions) | add skip rules for negative-savings patterns | scope rules tightly (token/model/tenant conditions) |
 | **G25** Adaptive Reasoning | `effort_floor` low / `effort_ceiling` high; `{high,medium,low}_keywords` | lower ceiling → cap reasoning effort | raise floor/ceiling for reasoning-heavy workloads |
-| **G26** *(reserved)* | — | — | — |
+| **G26** Context Budget | `enabled` false; `compact_at_pct` 85 → `target_pct` 60; `keep_recent_turns` 6; four `rungs.*` switches | enable for long conversations; lower the trigger/target | raise `keep_recent_turns`/`target_pct`; leave `rungs.drop` off |
 | **G27** Multimodal | `quality` 75; `min_bytes` 4096 | lower JPEG quality; lower min bytes | raise quality for detail-critical images |
 | **G28** Context Reuse (CCR) | `enabled` false; `min_tokens` 300; `compress_system_prompt` false | enable for agent clients; lower min | keep `compress_system_prompt` **off** in pass-through |
 
-> Groups **G18** and **G21** have no savings-vs-quality trade-off (observability and prefix-cache alignment respectively). **G26** is a reserved, unimplemented slot.
+> Groups **G18** and **G21** have no savings-vs-quality trade-off (observability and prefix-cache alignment respectively).
 
 ## Savings Tracking
 

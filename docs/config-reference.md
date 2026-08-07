@@ -8,7 +8,7 @@ All parameters are externalised in `config.yaml`, hot-reloaded every 60 seconds 
 
 Per-group parameter files under `config/params/` are merged into this config alphabetically at
 startup (`params_dir`), so a group's tuning can live in its own file. This reference covers the
-optimisation groups **G0–G28** (G26 reserved — 27 implemented); the tables below show the most
+optimisation groups **G0–G28** (28 implemented); the tables below show the most
 commonly tuned keys per group, not every field.
 
 ## Top-level sections
@@ -650,8 +650,45 @@ Classifies request complexity (HIGH/MEDIUM/LOW) and injects `reasoning_effort` b
 | `effort_ceiling` | `high` | Never classify above this effort level |
 | `extra_reasoning_prefixes` | `[]` | Additional reasoning-model name prefixes |
 
-### G26 *(reserved — not implemented)*
-Reserved slot; no configuration.
+### G26_context_budget
+Budget-aware context management. Treats the model's context window as a budget assessed **before** the call: when the assembled prompt (messages + tool definitions) exceeds `compact_at_pct` of the **usable window**, G26 compacts the older span of the conversation back down toward `target_pct`.
+
+**Usable window** = the model's total context window (from `model_context_window`, exact key → longest matching prefix → `default_context_window`) **minus the output reservation** — the caller's own `max_tokens` when set, otherwise `reserve_output_tokens`. Providers reject a call when `prompt + max_tokens > context_window`, so this is the budget that actually matters.
+
+**The ladder.** Rungs run cheapest-first, and each one only runs if the prompt is *still* above `target_pct` after the previous one:
+
+1. **prune** — drops byte-exact duplicate turns and truncates stale tool results to `tool_result_max_chars`. Free; never drops a message carrying `tool_calls`/`tool_call_id`.
+2. **compress** — deterministic prose compression (the shared `prose_compress` engine, also used by G01/G08/G11). Idempotent and code/URL-safe; a compressed result is kept only when it is genuinely shorter.
+3. **summarize** — one cheap-model (`summary_model`) summary replaces the whole old span as a single `system` message. Summaries are cached per conversation prefix for `summary_ttl_seconds`, so later turns of the same conversation reuse them instead of paying for a second summarisation.
+4. **drop** — **opt-in and lossy**: drops the oldest turns outright as a hard-fit guarantee. Only reach for it when fitting the window matters more than recall; it is mainly useful when rung 3 is disabled or its summariser is unavailable.
+
+**What is never touched:** every `system` message, and the most recent `keep_recent_turns` turns. Every cut is snapped to a tool-safe boundary, so a `role:"tool"` result is never separated from the assistant turn that declared it (an orphaned `tool_call_id` is a provider 400). If no safe boundary exists, G26 passes the request through unchanged — as it does on any internal error.
+
+`target_pct` must be below `compact_at_pct`; the gap is deliberate hysteresis that stops every subsequent turn re-triggering compaction. A configuration with `target_pct >= compact_at_pct` is clamped (with a one-time warning) rather than rejected.
+
+Related: **`context_editing`** (above) delegates the same job to Anthropic's native server-side context management for Claude-routed traffic. The two are complementary — `context_editing` is Claude-only and provider-side; G26 is provider-agnostic and runs in the proxy — and can be enabled together.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Enable budget-aware compaction. Off = byte-identical passthrough |
+| `compact_at_pct` | `85` | ⚠ Fire when the prompt exceeds this % of the usable window |
+| `target_pct` | `60` | ⚠ Compact down toward this % (must be < `compact_at_pct`; clamped if not) |
+| `keep_recent_turns` | `6` | Newest turns kept verbatim, never compacted |
+| `reserve_output_tokens` | `1024` | Output headroom assumed when the caller sets no `max_tokens` |
+| `rungs.prune` | `true` | Rung 1 — duplicate drop + tool-result truncation |
+| `rungs.compress` | `true` | Rung 2 — deterministic prose compression |
+| `rungs.summarize` | `true` | Rung 3 — cheap-model summary of the old span (cached) |
+| `rungs.drop` | `false` | ⚠ Rung 4 — **lossy** drop-oldest hard-fit guarantee. Opt-in |
+| `tool_result_max_chars` | `4000` | Rung 1 — truncate old tool results longer than this |
+| `summary_model` | `gpt-4o-mini` | Rung 3 summariser (BYOK-resolved like any other model) |
+| `summary_ttl_seconds` | `3600` | Summary cache TTL, keyed per conversation prefix |
+| `summary_max_turns` | `80` | ⚠ How much of the old span the summariser actually reads. Too low and the *middle* of a long thread never reaches it |
+| `summary_max_tokens` | `400` | Length cap on the summary written back |
+| `metrics_enabled` | `true` | Emit `token_opt_context_budget_compactions_total{tenant_id,rung}` |
+| `default_context_window` | `128000` | Window used when the model matches no `model_context_window` entry |
+| `model_context_window` | *(see template)* | Map of model (or model prefix) → total context window |
+
+All keys are per-tenant overridable under `tenants.<id>.groups.G26_context_budget`. `model_context_window` is deliberately operator-level only in the portal — a wrong value there forces premature compaction for every request.
 
 ### G27_multimodal
 Compresses inline base64 image blocks before the LLM call via `headroom.compress_image()`, with a SHA256-keyed LRU cache for repeated images. No-op when headroom is absent or there are no image blocks.
