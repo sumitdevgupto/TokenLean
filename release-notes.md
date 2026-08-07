@@ -14,7 +14,9 @@ large change. For Enterprise items, state it explicitly and link the URL below.>
 - **OSS:** <what ships in every tier>            (omit both bullets for a pure bug fix)
 - **[Enterprise]:** <the managed depth> — <https://tokenlean.cbeyond.cloud/>
 
-Type = Bug fix | Enhancement (OSS) | Enhancement (OSS + Enterprise) | Enhancement [Enterprise].
+Type = Bug fix | Bug fix [Enterprise] | Enhancement (OSS) | Enhancement (OSS + Enterprise) |
+Enhancement [Enterprise].  Use the [Enterprise] bug-fix type when the fix lands entirely in the
+managed product — self-hosters have nothing to upgrade, and the entry should say so.
 Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD` when the
 date changes.
 -->
@@ -61,7 +63,9 @@ Cohere, Groq and Bedrock; legacy ids are kept where the provider still serves th
   governs which requested models the proxy accepts.
 - **[Enterprise]:** the grouped dropdowns in the portal's Models & Keys tab — <https://tokenlean.cbeyond.cloud/>
 
-### A tenant's contract is now scoped to that tenant, not to its whole company — Bug fix
+### A tenant's contract is now scoped to that tenant, not to its whole company — Bug fix [Enterprise]
+Affects the managed product only (customer portal + operator console — <https://tokenlean.cbeyond.cloud/>);
+self-hosted deployments are unchanged and have nothing to upgrade.
 Contract state lived only on the `companies` row (one per 4-letter company code), so every stack
 of a company shared it: deactivating `ACME-PRD-01` immediately blocked portal login for
 `ACME-PRD-02` (and the console showed both as inactive), while key-level request blocking was
