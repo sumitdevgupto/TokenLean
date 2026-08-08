@@ -168,7 +168,9 @@ class IntentOrchestration:
         # Respect every upstream short-circuit — never dispatch a bypassed/cached/blocked
         # request, and never override a cascade result.
         if (ctx.bypassed or ctx.cache_hit or getattr(ctx, "security_blocked", False)
-                or ctx.cascade_response is not None or ctx.agent_dispatched):
+                or ctx.cascade_response is not None
+                or getattr(ctx, "cascade_plan", None) is not None  # deferred cascade owns it
+                or ctx.agent_dispatched):
             return ctx
 
         cfg = _orchestration_cfg(ctx.config, ctx.tenant_id)

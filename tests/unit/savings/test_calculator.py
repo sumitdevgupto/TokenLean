@@ -6,11 +6,14 @@ import pytest
 from savings.calculator import (
     estimate_tokens,
     count_messages_tokens,
+    count_tools_tokens,
+    count_request_tokens,
     estimate_cost,
     estimate_cost_with_cache,
     effective_token_cost,
     get_cost_per_1k,
     messages_to_text,
+    _render_tool_signature,
 )
 
 
@@ -243,3 +246,86 @@ class TestMessagesToText:
         msgs = [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
         result = messages_to_text(msgs)
         assert "Hello" in result
+
+
+class TestCountToolsTokens:
+    """Packed-signature tool counting (2026-08-08 fix).
+
+    Counting raw json.dumps overestimated tool tokens ~2.4-2.8x vs provider billing
+    (measured live on DS13: 755 estimated vs ~267 billed for 11 tools), inflating
+    baselines on every tool-bearing dataset and G16's recorded savings. Tools are now
+    rendered in OpenAI's packed TypeScript-namespace form and counted as text.
+    """
+
+    _TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_service_health",
+            "description": "Return the health status of a deployed service.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string", "description": "Service name."},
+                    "verbose": {"type": "boolean"},
+                    "env": {"type": "string", "enum": ["dev", "staging", "prod"]},
+                    "limits": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["service"],
+            },
+        },
+    }
+
+    def test_empty_tools_zero(self):
+        assert count_tools_tokens([], "gpt-4o-mini") == 0
+        assert count_tools_tokens(None, "gpt-4o-mini") == 0
+
+    def test_packed_render_shape(self):
+        sig = _render_tool_signature(self._TOOL["function"])
+        assert "// Return the health status" in sig            # descriptions kept
+        assert "type get_service_health = (_: {" in sig        # TS-signature form
+        assert "service: string," in sig                       # required → no '?'
+        assert "verbose?: boolean," in sig                     # optional → '?'
+        assert '"dev" | "staging" | "prod"' in sig             # enum → union
+        assert "number[]," in sig                              # array<int> → number[]
+        assert "{" in sig and '"parameters"' not in sig        # raw JSON schema NOT counted
+
+    def test_packed_is_far_below_raw_json(self):
+        import json as _json
+        raw = estimate_tokens(_json.dumps(self._TOOL), "gpt-4o-mini")
+        packed = count_tools_tokens([self._TOOL], "gpt-4o-mini")
+        assert packed < raw * 0.75, f"packed {packed} should be well under raw {raw}"
+
+    def test_no_parameters_function(self):
+        tool = {"type": "function", "function": {"name": "ping", "description": "Ping."}}
+        n = count_tools_tokens([tool], "gpt-4o-mini")
+        assert 0 < n < 40
+        assert "type ping = () => any;" in _render_tool_signature(tool["function"])
+
+    def test_non_function_tool_falls_back_to_json(self):
+        weird = {"type": "retrieval", "config": {"index": "docs"}}
+        assert count_tools_tokens([weird], "gpt-4o-mini") > 0
+
+    def test_count_request_tokens_includes_tools(self):
+        msgs = [{"role": "user", "content": "check the api please"}]
+        with_tools = count_request_tokens(msgs, "gpt-4o-mini", [self._TOOL])
+        without = count_request_tokens(msgs, "gpt-4o-mini")
+        assert with_tools > without
+
+    def test_g16_tools_tokens_delegates(self):
+        """g16's helper and the calculator must agree — one estimator, one truth."""
+        from middleware.g16_agent_arch import _tools_tokens
+        assert _tools_tokens([self._TOOL], "gpt-4o-mini") == count_tools_tokens(
+            [self._TOOL], "gpt-4o-mini")
+
+    def test_ds13_magnitude_when_dataset_present(self):
+        """Anchor to the live measurement: DS13's 11 tools billed ~267-298 tokens.
+        The packed estimate must land within +/-40% of that (raw JSON was +180%)."""
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(__file__), "..", "..", "..",
+                             "pitch-test-plan", "datasets", "DS13", "requests.jsonl")
+        if not _os.path.exists(path):
+            pytest.skip("DS13 dataset not present in this checkout (commercial-only)")
+        with open(path, encoding="utf-8") as fh:
+            req = _json.loads(fh.readline())
+        est = count_tools_tokens(req["params"]["tools"], "gpt-4o-mini")
+        assert 160 <= est <= 420, f"tool estimate {est} drifted from the billed ~267-298"

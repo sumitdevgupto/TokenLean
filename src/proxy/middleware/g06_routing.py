@@ -1059,20 +1059,28 @@ class G06Routing:
         if not user_override_attempted and not rule_pinned:
             classifier = eff_cfg.get("classifier", "cascade")
             
-            # Use true 3-tier cascade when classifier=cascade and cascade_execution=true
+            # Use true 3-tier cascade when classifier=cascade and cascade_execution=true.
+            # DEFERRED (2026-08-08): do NOT execute the cascade here. Executing at Stage 2
+            # called the provider with the pre-optimisation messages/tools, so Stages 3-4
+            # (G01 compression, G16 tool pruning, G11, …) ran against a request whose call
+            # had already happened and recorded savings that never reached the wire
+            # (proven live on DS12/DS13/DS14: all-on byte-identical to all-off). G06 now
+            # stores the plan; main.py executes it at the normal LLM-call site with the
+            # fully optimised prompt. Tier-1 pick doubles as the fallback route should the
+            # deferred execution error out (it is the cheap model, guards below still apply).
             if classifier == "cascade" and eff_cfg.get("cascade_execution", False):
-                cascade_model, cascade_response = await _execute_three_tier_cascade(ctx, tiers, eff_cfg)
-                if cascade_model and "error" not in cascade_response:
-                    selected_model = cascade_model
+                simple_models = tiers.get("simple") or []
+                if simple_models:
+                    ctx.cascade_plan = {"tiers": tiers, "cfg": eff_cfg}
                     ctx.savings.routing_mode = "cascade_execution"
-                    ctx.cascade_response = cascade_response  # Store for direct return in main.py
+                    selected_model = _select_from_tier(simple_models, eff_cfg, ctx, "simple")
                     logger.debug(
-                        "[%s] G06 cascade execution: %s",
+                        "[%s] G06 cascade planned (deferred to LLM-call site): tier1=%s",
                         ctx.request_id,
                         selected_model,
                     )
                 else:
-                    # Fallback to standard classification
+                    # No simple tier → cascade cannot start; standard classification.
                     complexity = await _timed_llm(ctx, _dispatch_classifier(ctx, eff_cfg))
                     candidates = tiers.get(complexity, tiers.get("medium", []))
                     if candidates:

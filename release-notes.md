@@ -21,6 +21,27 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-08
+
+### Cascade routing now applies every optimisation before calling the model — Bug fix
+With cascade execution enabled, the tier-1 model call was made at the routing stage —
+*before* prompt compression, tool pruning, output-format control and the other
+optimisations had run. Those stages still executed and recorded savings, but their work
+never reached the wire: the provider received the unoptimised prompt, and the recorded
+savings were phantom. The cascade call now happens at the normal call site, after the
+full pipeline, so cascaded requests get exactly the same optimisations as everything
+else. On any cascade error the request falls back to a normal call on the cheap tier —
+never a failure, never a duplicate provider round-trip.
+
+### Tool definitions are no longer over-counted in savings estimates — Bug fix
+Token estimates for tool/function definitions counted the raw JSON schema, but providers
+send the model a much more compact packed form — so requests carrying many tools
+over-stated their baseline by ~2-3x, inflating both the disclosed savings on tool-heavy
+traffic and the per-step savings recorded by architecture enforcement. The estimator now
+renders tools the way the provider actually packs them and counts that, validated against
+provider-billed usage. Savings figures on tool-bearing requests become more conservative
+and more honest; no served traffic changes.
+
 ## 2026-08-07
 
 ### Context-budget compaction hardened after code review — Bug fix

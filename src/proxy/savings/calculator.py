@@ -14,6 +14,7 @@ except ImportError:
 _CHARS_PER_TOKEN: int = int(os.getenv("CHARS_PER_TOKEN", "4"))
 _PER_MESSAGE_OVERHEAD: int = int(os.getenv("PER_MESSAGE_OVERHEAD_TOKENS", "4"))
 _PER_TOOL_OVERHEAD: int = int(os.getenv("PER_TOOL_OVERHEAD_TOKENS", "4"))
+_TOOLS_WRAPPER_OVERHEAD: int = int(os.getenv("TOOLS_WRAPPER_OVERHEAD_TOKENS", "16"))
 
 _TIKTOKEN_CACHE: Dict[str, Any] = {}
 
@@ -102,21 +103,78 @@ def count_messages_tokens(
     return total
 
 
+def _render_tool_signature(fn: Dict[str, Any]) -> str:
+    """Render one function tool the way OpenAI packs it into the prompt.
+
+    Providers do NOT send the raw JSON schema to the model — OpenAI serialises
+    functions into a compact TypeScript-namespace form (community-verified against
+    billed usage). Counting the raw ``json.dumps`` overestimates tool tokens ~2.4-2.8x
+    (measured live 2026-08-08: 11 DS13 tools = 755 estimated vs 267 provider-billed),
+    which inflated baselines on every tool-bearing dataset and G16's per-step savings.
+    """
+    name = fn.get("name", "")
+    desc = (fn.get("description") or "").strip()
+    params = fn.get("parameters") or {}
+    props = params.get("properties") or {}
+    required = set(params.get("required") or [])
+
+    def _ts_type(schema: Dict[str, Any]) -> str:
+        if not isinstance(schema, dict):
+            return "any"
+        if "enum" in schema:
+            return " | ".join(f'"{v}"' for v in schema["enum"])
+        t = schema.get("type")
+        if t == "array":
+            return f"{_ts_type(schema.get('items') or {})}[]"
+        if t == "object":
+            return "object"
+        if t in ("integer", "number"):
+            return "number"
+        return t or "any"
+
+    lines = []
+    if desc:
+        lines.append(f"// {desc}")
+    if not props:
+        lines.append(f"type {name} = () => any;")
+    else:
+        lines.append(f"type {name} = (_: {{")
+        for pname, pschema in props.items():
+            pdesc = ""
+            if isinstance(pschema, dict) and pschema.get("description"):
+                pdesc = str(pschema["description"]).strip()
+            if pdesc:
+                lines.append(f"// {pdesc}")
+            opt = "" if pname in required else "?"
+            lines.append(f"{pname}{opt}: {_ts_type(pschema)},")
+        lines.append("}) => any;")
+    return "\n".join(lines)
+
+
 def count_tools_tokens(tools: List[Dict[str, Any]], model: str) -> int:
-    """Count tokens for tool definitions in the request.
-    
-    Phase 2 fix: Tools consume tokens in the prompt (approximate via JSON length).
+    """Count tokens for tool definitions the way the provider actually bills them.
+
+    Function tools are rendered in OpenAI's packed TypeScript-namespace form and
+    counted as text; non-function tools fall back to compact JSON. The namespace
+    wrapper costs a small fixed overhead once per request.
     """
     if not tools:
         return 0
     import json
-    total = 0
+    rendered: List[str] = []
+    n_json_fallback = 0
     for tool in tools:
-        # Serialize tool definition and count as if it were text
-        tool_text = json.dumps(tool, separators=(',', ':'))
-        total += estimate_tokens(tool_text, model)
-        # Add overhead per tool (similar to message overhead)
-        total += _PER_TOOL_OVERHEAD
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(fn, dict) and fn.get("name"):
+            # Signature syntax is part of the render — no extra per-tool pad.
+            rendered.append(_render_tool_signature(fn))
+        else:
+            rendered.append(json.dumps(tool, separators=(',', ':')))
+            n_json_fallback += 1
+    body = "\n\n".join(rendered)
+    # "namespace functions { ... }" wrapper + tools-section preamble, once per request.
+    total = estimate_tokens(body, model) + _TOOLS_WRAPPER_OVERHEAD
+    total += _PER_TOOL_OVERHEAD * n_json_fallback
     return total
 
 

@@ -15,7 +15,7 @@ import re
 from typing import Any, Dict, List
 
 from middleware import RequestContext
-from savings.calculator import count_messages_tokens, estimate_tokens
+from savings.calculator import count_messages_tokens, count_tools_tokens, estimate_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G16"
@@ -110,7 +110,10 @@ def _truncate_to_tokens(text: str, max_tokens: int, model: str) -> str:
 
 
 def _tools_tokens(tools: List[Dict[str, Any]], model: str) -> int:
-    return sum(estimate_tokens(json.dumps(t), model) for t in tools)
+    # Delegate to the shared estimator (packed-signature form). Counting raw
+    # json.dumps here overstated tool tokens ~2.4x vs provider billing, inflating
+    # G16's recorded per-step savings (found via DS13, 2026-08-08).
+    return count_tools_tokens(tools, model)
 
 
 class G16AgentArch:

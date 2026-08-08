@@ -59,11 +59,18 @@ class RequestContext:
     # G09 schema). 0 = no provider call yet (cache hit / bypass / pre-LLM
     # error). The SLA metrics use it to split proxy latency from LLM latency.
     llm_elapsed_ms: float = 0.0
-    # G06 cascade execution result. When set, G06 already produced the final
-    # answer by running the tier cascade, so main.py returns it directly and
-    # MUST NOT call the LLM again (avoids a duplicate provider call). None =
-    # normal path (main.py makes the call).
+    # G06 cascade execution result. When set, the tier cascade already produced
+    # the final answer, so main.py returns it directly and MUST NOT call the LLM
+    # again (avoids a duplicate provider call). None = normal path.
     cascade_response: Optional[Dict] = None
+    # G06 cascade DEFERRAL (2026-08-08): when classifier=cascade + cascade_execution,
+    # G06 no longer calls the provider inline at Stage 2 — that sent the
+    # PRE-optimisation messages/tools, so every later group (G01…G16…) "optimised"
+    # a request whose call had already happened and recorded savings that never
+    # reached the wire. Instead G06 stores the plan here ({"tiers", "cfg"}) and
+    # main.py executes it at the normal LLM-call site, AFTER the full pipeline,
+    # so the cascade sends the optimised prompt. None = no cascade planned.
+    cascade_plan: Optional[Dict] = None
     # ── F2 Intent Orchestration (downstream-agent dispatch) ──────────────────
     # Short-circuit pair (mirrors cascade_response): set by IntentOrchestration when the
     # request's intent matches a registered downstream agent and the request was dispatched

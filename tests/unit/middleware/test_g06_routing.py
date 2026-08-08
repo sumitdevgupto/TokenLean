@@ -50,6 +50,30 @@ def _mk_resp(model, content="An adequate answer.", finish_reason="stop"):
     return resp
 
 
+async def _drive_deferred_cascade(ctx):
+    """Mirror main.py's deferred cascade-execution block (2026-08-08).
+
+    G06 no longer executes the cascade inside process_request — it stores
+    ctx.cascade_plan and main.py runs it at the LLM-call site with the optimised
+    prompt. Behavioural cascade tests call this right after process_request,
+    INSIDE the same patch context, so escalation/cap/cost assertions exercise the
+    real deferred flow. No plan → no-op (safe for non-cascade tests)."""
+    if getattr(ctx, "cascade_plan", None) is None or ctx.cascade_response is not None:
+        return ctx
+    from middleware.g06_routing import _execute_three_tier_cascade
+    try:
+        model, resp = await _execute_three_tier_cascade(
+            ctx, ctx.cascade_plan.get("tiers") or {}, ctx.cascade_plan.get("cfg") or {}
+        )
+    except Exception as exc:  # noqa: BLE001 — mirror main.py's never-500 guard
+        model, resp = None, {"error": f"{type(exc).__name__}: {exc}"}
+    if model and isinstance(resp, dict) and "error" not in resp:
+        ctx.routed_model = model
+        ctx.savings.routed_model = model
+        ctx.cascade_response = resp
+    return ctx
+
+
 # A ~100-word prompt with no complex/simple keywords → _classify_heuristic == "medium".
 # This is the DS9 shape: a substantive but non-complex query the cheap tier handles.
 _MEDIUM_PROMPT = (
@@ -86,6 +110,7 @@ class TestG06Routing:
         original_model = ctx.routed_model
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == original_model
 
     async def test_simple_query_routes_to_mini(self, make_ctx):
@@ -95,6 +120,7 @@ class TestG06Routing:
         )
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
 
     async def test_complex_query_routes_to_full_model(self, make_ctx):
@@ -109,12 +135,14 @@ class TestG06Routing:
         }
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4-5"
 
     async def test_routing_records_step_saving(self, make_ctx):
         ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         if ctx.routed_model != ctx.model:
             assert any(s.group == "G06" for s in ctx.savings.step_savings)
 
@@ -122,6 +150,7 @@ class TestG06Routing:
         ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o-mini")
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         # If simple tier is gpt-4o-mini and model is already gpt-4o-mini, no saving
         if ctx.routed_model == ctx.model:
             g06_steps = [s for s in ctx.savings.step_savings if s.group == "G06"]
@@ -133,6 +162,7 @@ class TestG06Routing:
         from middleware.g06_routing import G06Routing
         original = ctx.model
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == original
 
     # Distinct pricing so the cost-floor guard can tell gpt-4o (pricey) from gpt-4o-mini
@@ -159,6 +189,7 @@ class TestG06Routing:
         from middleware.g06_routing import G06Routing
         with patch("config_loader.get_pricing_table", return_value=self._PRICING):
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
         assert "cost_floor" in (ctx.savings.routing_mode or "")
 
@@ -175,6 +206,7 @@ class TestG06Routing:
         from middleware.g06_routing import G06Routing
         with patch("config_loader.get_pricing_table", return_value=self._PRICING):
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o"
 
     async def test_heuristic_classifier_explicit(self, make_ctx):
@@ -190,6 +222,7 @@ class TestG06Routing:
         }
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4-5"
         assert ctx.savings.routing_mode == "heuristic"
 
@@ -209,6 +242,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "llm_judge"
 
@@ -224,6 +258,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         # Falls back to heuristic: simple query → simple tier
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "llm_judge"
@@ -247,6 +282,7 @@ class TestG06Routing:
         ):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "llm_judge"
 
@@ -265,6 +301,7 @@ class TestG06Routing:
         }
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4-5"
         assert ctx.savings.routing_mode == "cascade"
 
@@ -291,6 +328,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"  # judge overrode medium → simple
         assert ctx.savings.routing_mode == "cascade"
 
@@ -304,6 +342,7 @@ class TestG06Routing:
         ctx.config["groups"]["G6_routing"]["judge_model"] = ""
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         # Falls back to heuristic medium tier
         assert ctx.routed_model == "gpt-4o"
         assert ctx.savings.routing_mode == "cascade"
@@ -319,6 +358,7 @@ class TestG06Routing:
         ctx.config["groups"]["G6_routing"]["judge_model"] = ""
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         # Default cascade with no judge_model → heuristic medium → gpt-4o
         assert ctx.routed_model == "gpt-4o"
         assert ctx.savings.routing_mode == "cascade"
@@ -341,6 +381,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing._classify_routellm", mock_routellm):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "user_override"
 
@@ -357,6 +398,7 @@ class TestG06Routing:
         ctx.params["x_complexity"] = "complex"
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4-5"
         assert ctx.savings.routing_mode == "user_override"
 
@@ -368,6 +410,7 @@ class TestG06Routing:
         ctx.params["complexity"] = "banana"
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         # Falls through to default cascade → heuristic (no judge) → simple tier
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "cascade"
@@ -381,6 +424,7 @@ class TestG06Routing:
         ctx.config["groups"]["G6_routing"]["judge_model"] = ""
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
         # Unknown classifier → defaults to cascade → heuristic (no judge) → simple
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "nonexistent"
@@ -405,6 +449,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing.httpx.AsyncClient", return_value=FakeClient(mock_resp)):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "routellm"
 
@@ -425,6 +470,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing.httpx.AsyncClient", return_value=FakeClientError()):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         # Falls back to heuristic → simple tier
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "routellm"
@@ -449,6 +495,7 @@ class TestG06Routing:
         with patch("middleware.g06_routing.httpx.AsyncClient", return_value=FakeClient(mock_resp)):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         # strong_model mapped to medium tier
         assert ctx.routed_model == "gpt-4o"
         assert ctx.savings.routing_mode == "routellm"
@@ -490,6 +537,7 @@ class TestG06CascadeExecution:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "cascade_execution"
@@ -543,6 +591,7 @@ class TestG06CascadeExecution:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert ctx.routed_model == "gpt-4o"  # Escalated to tier 2
         assert call_count >= 2  # Both tier 1 and tier 2 called
@@ -600,6 +649,7 @@ class TestG06CascadeExecution:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         # Should roll back to tier 2 (the best response before tier 3 failure)
         assert ctx.routed_model == "gpt-4o"
@@ -632,6 +682,7 @@ class TestG06CascadeExecution:
         with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert ctx.routed_model == "gpt-4o-mini"
 
@@ -651,6 +702,7 @@ class TestG06CascadeExecution:
 
         from middleware.g06_routing import G06Routing
         ctx = await G06Routing().process_request(ctx)
+        ctx = await _drive_deferred_cascade(ctx)
 
         # Falls back to standard classification
         assert ctx.savings.routing_mode == "cascade_fallback"
@@ -675,9 +727,15 @@ class TestG06CascadeExecution:
         with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
-        # Falls back to standard classification
-        assert "fallback" in ctx.savings.routing_mode
+        # Deferred contract (2026-08-08): the plan was made, the execution errored,
+        # so no cascade_response — main.py falls back to a normal single call on the
+        # tier-1 route G06 already selected (never a 500, never a duplicate call).
+        assert ctx.cascade_plan is not None
+        assert ctx.cascade_response is None
+        assert ctx.savings.routing_mode == "cascade_execution"
+        assert ctx.routed_model == "gpt-4o-mini"  # tier-1 pick = the fallback route
 
 
 @pytest.mark.asyncio
@@ -713,7 +771,8 @@ class TestG06CascadeOverEscalationGuards:
             for p in patches:
                 stack.enter_context(p)
             from middleware.g06_routing import G06Routing
-            return await G06Routing().process_request(ctx)
+            ctx = await G06Routing().process_request(ctx)
+            return await _drive_deferred_cascade(ctx)
 
     # ── No-judge response-derived confidence ──────────────────────────────────
 
@@ -1035,6 +1094,7 @@ class TestG06UnreachableTierGuard:
         with patch("middleware.g06_routing._tier_reachable",
                    side_effect=lambda m: m == "claude-haiku-4-5"):
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "claude-haiku-4-5"
 
     async def test_error_mode_keeps_unreachable_tier(self, make_ctx):
@@ -1045,6 +1105,7 @@ class TestG06UnreachableTierGuard:
         with patch("middleware.g06_routing._tier_reachable",
                    side_effect=lambda m: m == "claude-haiku-4-5"):
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
 
 
@@ -1079,6 +1140,7 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert seen.get("max_tokens") == 256
         assert ctx.routed_model == "gpt-4o-mini"
@@ -1097,6 +1159,7 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert "max_tokens" not in seen
 
@@ -1116,6 +1179,7 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert len(calls) == 1
         assert calls[0].get("max_tokens") == 777
@@ -1138,6 +1202,7 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert len(calls) == 2
         assert calls[0].get("max_tokens") == 512          # injected default cap
@@ -1159,6 +1224,7 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert len(calls) == 1
 
@@ -1188,6 +1254,7 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         # tier-2 was blocked (never called); tier-3 ran and was served
         assert not any(m == "gpt-4o" for m in models_called)
@@ -1213,5 +1280,82 @@ class TestG06CascadeTier1CapAndTruncation:
              patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
             from middleware.g06_routing import G06Routing
             ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
 
         assert 2048 in seen_outputs
+
+
+@pytest.mark.asyncio
+class TestG06CascadeDeferral:
+    """The 2026-08-08 defect fix: executing the cascade INSIDE G06 (Stage 2) sent the
+    PRE-optimisation messages/tools, so Stages 3-4 optimised a request whose provider
+    call had already happened and recorded savings that never reached the wire
+    (proven live: DS12/DS13/DS14 all-on byte-identical to all-off)."""
+
+    def _cfg(self, ctx):
+        g = ctx.config["groups"]["G6_routing"]
+        g["enabled"] = True
+        g["classifier"] = "cascade"
+        g["cascade_execution"] = True
+        g["judge_model"] = ""
+        g["tiers"] = {"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["gpt-4-5"]}
+
+    async def test_process_request_makes_no_provider_call(self, make_ctx):
+        """G06 must only PLAN the cascade — zero provider traffic at Stage 2."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cfg(ctx)
+        calls = 0
+
+        async def mock(*a, **k):
+            nonlocal calls; calls += 1
+            return _mk_resp(k.get("model", ""), "4")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+
+        assert calls == 0, "cascade executed inside G06 — the Stage-2 regression is back"
+        assert ctx.cascade_plan is not None
+        assert ctx.cascade_response is None
+        assert ctx.savings.routing_mode == "cascade_execution"
+        assert ctx.routed_model == "gpt-4o-mini"  # tier-1 pick doubles as fallback route
+
+    async def test_deferred_execution_sends_the_optimised_prompt(self, make_ctx):
+        """Mutations made AFTER G06 (G01/G16/G11 …) must reach the cascade's wire."""
+        ctx = make_ctx(
+            [{"role": "user", "content": "original long unoptimised prompt " * 20}],
+            model="gpt-4o",
+        )
+        self._cfg(ctx)
+        seen = {}
+
+        async def mock(*a, **k):
+            seen["messages"] = k.get("messages")
+            seen["tools"] = k.get("tools")
+            return _mk_resp(k.get("model", ""), "ok")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+            # Simulate Stage 3/4 work (compression + tool pruning) between plan and call.
+            ctx.messages = [{"role": "user", "content": "optimised"}]
+            ctx.params["tools"] = [{"type": "function",
+                                    "function": {"name": "kept_tool", "parameters": {}}}]
+            ctx = await _drive_deferred_cascade(ctx)
+
+        assert ctx.cascade_response is not None
+        assert seen["messages"] == [{"role": "user", "content": "optimised"}]
+        assert [t["function"]["name"] for t in seen["tools"]] == ["kept_tool"]
+
+    async def test_f2_respects_planned_cascade(self, make_ctx):
+        """A planned (not yet executed) cascade must block F2 agent dispatch, exactly
+        as an executed cascade_response always did."""
+        from middleware.intent_orchestration import IntentOrchestration
+        ctx = make_ctx([{"role": "user", "content": "billing question"}])
+        ctx.cascade_plan = {"tiers": {}, "cfg": {}}
+        ctx.config["orchestration"] = {"enabled": True, "agents": [
+            {"id": "billing", "keywords": ["billing"], "endpoint": "http://x/v1/chat/completions"}]}
+        ctx = await IntentOrchestration().process_request(ctx)
+        assert not ctx.agent_dispatched

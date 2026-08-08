@@ -1431,12 +1431,38 @@ async def _serve_core(
             content={"status": "queued", "request_id": request_id},
         )
 
-    # G06 cascade-execution already produced the final answer by running the tier
-    # cascade inline (its provider time is already accumulated in
-    # ctx.llm_elapsed_ms). Return it directly — calling the LLM again here would
-    # be a duplicate provider round-trip. Fix: ctx.cascade_response was set by
-    # G06 "for direct return in main.py" but was never consumed, so cascade
-    # requests paid for the cascade AND a second main call.
+    # G06 cascade execution — DEFERRED to here (2026-08-08). G06 only stores the
+    # plan; executing inside G06 (Stage 2) sent the PRE-optimisation messages/tools,
+    # so every later pipeline group optimised a request whose provider call had
+    # already happened (proven live: DS12/DS13/DS14 all-on byte-identical to
+    # all-off). Running it here sends the fully optimised prompt. On any cascade
+    # error we fall through to the normal single call on ctx.routed_model (G06 set
+    # it to the tier-1 pick, with the reachability/cost-floor guards applied).
+    if ctx.cascade_plan is not None and ctx.cascade_response is None:
+        try:
+            from middleware.g06_routing import (
+                _execute_three_tier_cascade as g06_execute_cascade,
+            )
+            _c_model, _c_resp = await g06_execute_cascade(
+                ctx, ctx.cascade_plan.get("tiers") or {}, ctx.cascade_plan.get("cfg") or {}
+            )
+        except Exception as _c_exc:  # noqa: BLE001 — cascade failure must never 500
+            _c_model, _c_resp = None, {"error": f"{type(_c_exc).__name__}: {_c_exc}"}
+        if _c_model and isinstance(_c_resp, dict) and "error" not in _c_resp:
+            ctx.routed_model = _c_model
+            ctx.savings.routed_model = _c_model
+            ctx.cascade_response = _c_resp
+        else:
+            logger.warning(
+                "[%s] G06 deferred cascade errored (%s) — falling back to a normal "
+                "call on %s", request_id,
+                (_c_resp or {}).get("error") if isinstance(_c_resp, dict) else _c_resp,
+                ctx.routed_model,
+            )
+
+    # The cascade already produced the final answer (its provider time is
+    # accumulated in ctx.llm_elapsed_ms). Return it directly — calling the LLM
+    # again here would be a duplicate provider round-trip.
     if ctx.cascade_response is not None:
         logger.info(
             "[%s] Using G06 cascade result (model=%s); skipping duplicate main LLM call",
