@@ -76,7 +76,7 @@ Gateways route, meter, and observe. TokenLean's edge is what happens *between* t
 | Capability | **TokenLean** | LiteLLM | Portkey | Helicone | Bifrost | TensorZero |
 |---|---|---|---|---|---|---|
 | Primary role | **Token-optimisation layer** | Unified gateway | Gateway + guardrails | Observability-first | High-perf gateway (Go) | Data & learning gateway |
-| Stacked transparent token optimisations, one pass | **27** | few (cache, routing) | some (cache, guardrails) | observability-focused | few (cache, load-balancing) | inference-focused |
+| Stacked transparent token optimisations, one pass | **28** | few (cache, routing) | some (cache, guardrails) | observability-focused | few (cache, load-balancing) | inference-focused |
 | Quality-gated **measured** savings across all optimisations | ✅ 54.1% (50.8–55.8 band) | — | — | — | — | — |
 | Inline prompt compression (LLMLingua-2) | ✅ | — | — | — | — | — |
 | Multi-level + semantic cache (L1/L2/L3) | ✅ | basic | ✅ | ✅ (proxy) | ✅ | partial |
