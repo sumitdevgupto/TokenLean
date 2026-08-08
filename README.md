@@ -19,7 +19,7 @@
 [![Quality-gated savings](https://img.shields.io/badge/quality--gated_savings-54.1%25-brightgreen.svg)](#g0g31-optimisation-and-safety-groups)
 [![GitHub stars](https://img.shields.io/github/stars/sumitdevgupto/TokenLean?style=social)](https://github.com/sumitdevgupto/TokenLean/stargazers)
 
-**TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **22 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
+**TokenLean** is a production-ready proxy (run locally or GCP-hosted) that sits between your app and any LLM provider and transparently shrinks every request — prompt compression, semantic caching, model routing, prefix-cache alignment, structured pruning, and **23 more techniques**. Point your existing OpenAI client at it and keep your code exactly as-is.
 
 🎯 **54.1% quality-gated** token savings in live ablation &nbsp;·&nbsp; 🔌 **10 first-class providers** + any OpenAI-compatible API &nbsp;·&nbsp; 🧩 **28 techniques** (G0–G28) &nbsp;·&nbsp; 📊 **10 Grafana dashboards** &nbsp;·&nbsp; 🏷️ **100% open source** (Apache-2.0) &nbsp;·&nbsp; 💸 **scales to zero** (~$2/mo idle on Cloud Run)
 
@@ -49,7 +49,7 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 
 **Why teams use it:**
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation
-- 📉 **Broad reduction** — 27 stacked techniques from the Token Optimisation Playbook v7, not just caching
+- 📉 **Broad reduction** — 28 stacked techniques from the Token Optimisation Playbook v7, not just caching
 - 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown **and machine-readable `x-tokenlean-*` headers** (routed model, cache hit, tokens/%/$ saved, latency) — emitted **even on cache hits and bypasses** — so your FinOps pipeline attributes cost per call without parsing the body; per-call → quarterly Grafana dashboards; plus a separate **application-quality** metrics surface (retrieval hit-rate, context freshness, grounding coverage) kept distinct from operational health
 - 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
 - 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown + optional **per-model lockout** that quarantines one degraded model while the provider's others keep serving) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII / G31 context-trust) run non-bypassably before any tokens are spent
@@ -66,7 +66,7 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 Most LLM infrastructure operates at the **gateway** layer — unified routing, key
 management, observability, guardrails. This project is deliberately different: it
 is the **transparent optimisation layer** that targets the one thing gateways
-don't prioritise — **breadth of token reduction** (27 techniques, 30–70% / up to
+don't prioritise — **breadth of token reduction** (28 techniques, 30–70% / up to
 **54.1% quality-gated**) — and drops in *in front of, or inside,* any gateway.
 
 ### vs LLM gateways
@@ -115,7 +115,7 @@ You could assemble these yourself — LLMLingua for compression, GPTCache for ca
 > space moves fast, so **verify against each project's current docs** — and please
 > [open an issue or PR](https://github.com/sumitdevgupto/TokenLean/issues) if any cell is out of date.
 >
-> TokenLean's own figures (**54.1%**, up to **~84%** on cached prefix, **27 techniques**) are **self-measured**
+> TokenLean's own figures (**54.1%**, up to **~84%** on cached prefix, **28 techniques**) are **self-measured**
 > on our live-ablation harness — directional estimates, not an independent third-party benchmark.
 >
 > **Sources:** [LiteLLM](https://docs.litellm.ai/) · [Portkey](https://portkey.ai/) ·
@@ -737,9 +737,10 @@ never gate the optimisations.
 
 | Capability | FREE (self-host) | ENTERPRISE (managed) |
 |---|---|---|
-| All 27 optimisations + G29/G30/G31 trust & safety | ✅ | ✅ (operated for you, SLA-backed) |
+| All 28 optimisations + G29/G30/G31 trust & safety | ✅ | ✅ (operated for you, SLA-backed) |
 | Measured savings, 10 dashboards, multi-tenancy, provider failover | ✅ | ✅ |
 | Native multi-protocol ingress + structural tool round-tripping | ✅ | ✅ |
+| **Context-budget compaction (G26)** — compact a long conversation before it overflows the model's context window | ✅ OSS engine, all thresholds + per-step switches in `config.yaml` (default off) | ✅ same engine, tuned per tenant from the portal's Groups tab — no config files, no redeploy |
 | Intent-orchestration **engine** (config-driven agent registry) | ✅ OSS | ✅ + **Agents console** (declare/govern agents from the portal) + routing-decision audit + ML intent classifier |
 | **Self-tuning learning loop** — auto-switches off optimisations that stop paying off per tenant | rule-**applying** engine (G24) ✅ | ✅ managed miner that **learns** the rules from your usage (with a safety denylist — cache/routing/safety are never skipped) |
 | **Free trials** — days AND requests (whichever first), 402 on expiry, trial traffic never invoiced | gate + `/portal/trial` status ✅ OSS (default-off) | ✅ admin-console lifecycle (start/extend/convert/cancel + audit), fleet view, portal trial card/banner + 80/90% `trial.threshold`/`trial.expired` webhooks |
