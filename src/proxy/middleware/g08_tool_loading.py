@@ -23,7 +23,7 @@ import yaml
 
 from middleware import RequestContext
 from middleware.prose_compress import compress_descriptions_in_place
-from savings.calculator import estimate_tokens
+from savings.calculator import count_tools_tokens, estimate_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G08"
@@ -394,9 +394,10 @@ class G08ToolLoading:
         if not existing_tools:
             return ctx  # No tools in request — nothing to prune
 
-        tokens_before = sum(
-            estimate_tokens(str(t), ctx.model) for t in existing_tools
-        )
+        # Shared packed-form estimator (2026-08-08): raw str(t) counting ran ~2.4x
+        # over provider billing, so G08's recorded savings could exceed the tools'
+        # entire baseline contribution. One estimator, one truth (same as G16).
+        tokens_before = count_tools_tokens(existing_tools, ctx.model)
 
         # Load tools from registry and MCP manifests
         registry = _load_registry(cfg)
@@ -461,7 +462,7 @@ class G08ToolLoading:
         pruned = len(existing_tools) - len(relevant)
         if pruned > 0 or desc_saved_chars > 0:
             ctx.params["tools"] = relevant
-            tokens_after = sum(estimate_tokens(str(t), ctx.model) for t in relevant)
+            tokens_after = count_tools_tokens(relevant, ctx.model)
             notes: List[str] = []
             if pruned > 0:
                 notes.append(f"pruned {pruned}/{len(existing_tools)} tools (intents={intents})")

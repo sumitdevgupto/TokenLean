@@ -11,7 +11,7 @@ import copy
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,19 @@ class ProviderAdapter(ABC):
         sibling provider's key here is harmless.
         """
         return {"reasoning_effort", "thinking"}
+
+    def render_tools_for_counting(self, tools: List[Dict]) -> Optional[Tuple[str, int]]:
+        """(body_text, constant_overhead) approximating how THIS provider bills tool
+        definitions, or None to use the calculator's default (OpenAI packed-TS form).
+
+        Measured 2026-08-08 (free count_tokens endpoints, DS13's 11-tool set): the same
+        tools bill ~270-300 on OpenAI, 625 on Gemini, and 1,307 on Anthropic — provider
+        serialisation differs up to 4.4x, so one render cannot serve all (review S10).
+        Default None keeps every adapter byte-identical to the pre-S10 behaviour unless
+        it overrides. The caller counts body_text with its own estimator and adds the
+        constant (fixed prompt overhead the provider injects for tool use).
+        """
+        return None
 
     def inject_cache_control(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -478,6 +491,46 @@ def apply_context_management(
     )
     ce_cfg = {**base, **tenant_cfg}
     return adapter.apply_context_management(params, ce_cfg)
+
+
+# Body params consumed by middleware for routing/retrieval/loop-control —
+# not recognized by the provider's completion API and must not be forwarded.
+# (Relocated from main.py 2026-08-08 so the deferred G06 cascade shares the
+# same hygiene without a middleware→main circular import.)
+INTERNAL_PARAM_KEYS = {"template_id", "workflow_id", "rag_query", "batch_id", "burst_block"}
+
+
+def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
+                        eff_cfg: Dict[str, Any], request_id: str = "") -> Dict[str, Any]:
+    """Build provider-hygienic outgoing params for `model` under `adapter`.
+
+    THE single source of the provider param-hygiene contract — used by main.py's
+    primary path, every failover target, and the deferred G06 cascade tiers alike
+    (reviews K4 + S2: no divergent copies). Steps: strip internal keys, strip
+    reasoning-only params on non-reasoning models, strip service_tier / unsupported
+    params, cap the thinking budget, apply native context editing.
+    """
+    outgoing = {
+        k: v for k, v in ctx.params.items()
+        if not k.startswith("_") and not k.startswith("x_") and k not in INTERNAL_PARAM_KEYS
+    }
+    if not adapter.supports_reasoning(model):
+        for rk in adapter.reasoning_param_keys():
+            if outgoing.pop(rk, None) is not None and request_id:
+                logger.debug(
+                    "[%s] Stripped reasoning param '%s' — model %s does not support reasoning",
+                    request_id, rk, model,
+                )
+    if "service_tier" in outgoing and not adapter.supports_service_tier():
+        outgoing.pop("service_tier", None)
+        if request_id:
+            logger.debug("[%s] Stripped service_tier — %s does not support it", request_id, model)
+    for _uk in adapter.unsupported_params():
+        if outgoing.pop(_uk, None) is not None and request_id:
+            logger.debug("[%s] Stripped unsupported param '%s' for %s", request_id, _uk, model)
+    outgoing = adapter.cap_reasoning_params(outgoing, outgoing.get("max_tokens"))
+    outgoing = apply_context_management(outgoing, adapter, eff_cfg, ctx.tenant_id)
+    return outgoing
 
 
 def get_adapter_by_name(name: str) -> ProviderAdapter:

@@ -22,7 +22,7 @@ from middleware import langfuse_tracing
 from middleware.g06_rules import effective_cfg, match_for_ctx
 from savings.calculator import count_messages_tokens, estimate_cost
 from config_loader import get_default_model, get_known_models, get_providers
-from providers import build_litellm_call
+from providers import build_litellm_call, get_adapter, outgoing_params_for
 
 logger = logging.getLogger(__name__)
 GROUP = "G06"
@@ -482,7 +482,8 @@ async def _classify_cascade(
 
 
 async def _execute_three_tier_cascade(
-    ctx: RequestContext, tiers: Dict[str, List[str]], cfg: Dict[str, Any]
+    ctx: RequestContext, tiers: Dict[str, List[str]], cfg: Dict[str, Any],
+    tier1_model: Optional[str] = None, max_tier_idx: Optional[int] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     True 3-tier cascading execution:
@@ -492,6 +493,14 @@ async def _execute_three_tier_cascade(
     4. Cost-based rollback if escalation fails
 
     Returns (final_model, response_dict) or (None, error_dict) on failure.
+
+    `tier1_model` / `max_tier_idx` are the PLAN-TIME decisions carried in
+    ctx.cascade_plan (reviews S4/S5): by deferred-call time the pipeline has
+    compressed ctx.messages — re-classifying here would cap a compressed complex
+    prompt at the simple tier — and re-consulting a stateful strategy
+    (round_robin/EWMA) would advance it twice and execute a different model than
+    the one planned/guarded. When omitted (direct callers), both are derived here
+    exactly as before.
     """
     simple_models = tiers.get("simple", [])
     medium_models = tiers.get("medium", [])
@@ -509,10 +518,25 @@ async def _execute_three_tier_cascade(
     # itself classifies as (x_complexity override bypasses the cascade upstream in
     # process_request), and — unless explicitly allowed — never into a model costlier
     # than the one the caller requested.
-    cap_enabled = cfg.get("cascade_cap_to_classified_tier", True)
     allow_above_requested = cfg.get("allow_escalation_above_requested", False)
-    request_tier, _ = _classify_heuristic(ctx.messages, ctx.params)
-    max_tier_idx = _TIER_ORDER[request_tier] if cap_enabled else 2
+    if max_tier_idx is None:
+        cap_enabled = cfg.get("cascade_cap_to_classified_tier", True)
+        request_tier, _ = _classify_heuristic(ctx.messages, ctx.params)
+        max_tier_idx = _TIER_ORDER[request_tier] if cap_enabled else 2
+
+    def _tier_params(model: str) -> Dict[str, Any]:
+        """Provider-hygienic params for a tier call (review S2): the deferred cascade
+        runs AFTER G11/G12/G25/G21 mutate ctx.params, so tier calls need the same
+        outgoing hygiene as the normal call site — reused, never reimplemented."""
+        out = outgoing_params_for(
+            ctx, get_adapter(model, get_providers()), model, ctx.config or {}, ctx.request_id
+        )
+        # G21's primary-scoped cache params must not leak onto cascade tiers, and
+        # cascade probes are non-streaming by construction (plan-time stream guard).
+        out.pop("prompt_cache_key", None)
+        out.pop("prompt_cache_retention", None)
+        out.pop("stream", None)
+        return out
 
     # Cost is judged as input + expected output (0-output undercounts reasoning tiers,
     # whose output tokens dominate cost), as a delta vs the previous tier and against
@@ -522,8 +546,10 @@ async def _execute_three_tier_cascade(
     )
     requested_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, ctx.model)
 
-    # Tier 1: Try cheap model
-    tier1_model = _select_from_tier(simple_models, cfg, ctx, "simple")
+    # Tier 1: Try cheap model — the PLAN's pick when deferred (review S5), so a
+    # stateful strategy is consulted exactly once per request.
+    if tier1_model is None:
+        tier1_model = _select_from_tier(simple_models, cfg, ctx, "simple")
     tier1_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, tier1_model)
 
     try:
@@ -547,7 +573,7 @@ async def _execute_three_tier_cascade(
         _cap_cfg = int(cfg.get("cascade_tier1_max_tokens", 512) or 0)
         injected_cap: Optional[int] = None
         tier1_temperature = ctx.params.get("temperature", 0.0)
-        _t1_passthrough = {k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")}
+        _t1_passthrough = _tier_params(tier1_model)
         if caller_max_tokens:
             _t1_passthrough.setdefault("max_tokens", caller_max_tokens)
         elif _cap_cfg > 0:
@@ -654,7 +680,7 @@ async def _execute_three_tier_cascade(
                         model=_t2_model,
                         messages=ctx.messages,
                         **_t2_kwargs,
-                        **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
+                        **_tier_params(tier2_model),
                     ), model=tier2_model)
                     logger.info("G06 cascade: escalated to tier2 model %s", tier2_model)
                     # Tier2 succeeded — promote it as the best fallback before confidence check
@@ -694,7 +720,7 @@ async def _execute_three_tier_cascade(
                     model=_t3_model,
                     messages=ctx.messages,
                     **_t3_kwargs,
-                    **{k: v for k, v in ctx.params.items() if not k.startswith("_") and not k.startswith("x_")},
+                    **_tier_params(tier3_model),
                 ), model=tier3_model)
                 logger.info("G06 cascade: escalated to tier3 model %s", tier3_model)
                 return await _serve(tier3_model, tier3_response)
@@ -1068,12 +1094,31 @@ class G06Routing:
             # stores the plan; main.py executes it at the normal LLM-call site with the
             # fully optimised prompt. Tier-1 pick doubles as the fallback route should the
             # deferred execution error out (it is the cheap model, guards below still apply).
-            if classifier == "cascade" and eff_cfg.get("cascade_execution", False):
+            # Streaming is excluded (review S9): the cascade's confidence probe cannot
+            # read a stream, so it would burn 1-3 abandoned provider generations before
+            # the real streaming call. Stream requests take the classifier path instead.
+            if (classifier == "cascade" and eff_cfg.get("cascade_execution", False)
+                    and not ctx.params.get("stream")):
                 simple_models = tiers.get("simple") or []
                 if simple_models:
-                    ctx.cascade_plan = {"tiers": tiers, "cfg": eff_cfg}
-                    ctx.savings.routing_mode = "cascade_execution"
-                    selected_model = _select_from_tier(simple_models, eff_cfg, ctx, "simple")
+                    # Every plan-time decision is CARRIED in the plan and never re-derived
+                    # at execution (review S4/S5): by call time the pipeline has compressed
+                    # ctx.messages (a shrunk prompt would reclassify as "simple" and cap
+                    # escalation) and stateful strategies (round_robin/EWMA) must not be
+                    # consulted twice or the executed model diverges from the planned one.
+                    tier1_model = _select_from_tier(simple_models, eff_cfg, ctx, "simple")
+                    cap_enabled = eff_cfg.get("cascade_cap_to_classified_tier", True)
+                    request_tier, _ = _classify_heuristic(ctx.messages, ctx.params)
+                    ctx.cascade_plan = {
+                        "tiers": tiers,
+                        "cfg": eff_cfg,
+                        "tier1_model": tier1_model,
+                        "max_tier_idx": _TIER_ORDER[request_tier] if cap_enabled else 2,
+                    }
+                    # Honest stamp (review S6): 'planned', not 'execution' — main.py flips
+                    # it to cascade_execution only when the deferred run actually succeeds.
+                    ctx.savings.routing_mode = "cascade_planned"
+                    selected_model = tier1_model
                     logger.debug(
                         "[%s] G06 cascade planned (deferred to LLM-call site): tier1=%s",
                         ctx.request_id,
@@ -1146,6 +1191,18 @@ class G06Routing:
                 selected_model = model_requested
                 ctx.savings.routing_mode = (
                     getattr(ctx.savings, "routing_mode", None) or "route") + "+cost_floor"
+
+        # 2d. Plan consistency (review S7): if 2b/2c rerouted away from the planned
+        # tier-1 (unreachable provider, or a pricier-than-requested pick), a cascade
+        # from that tier must not execute — otherwise main.py re-attempts a doomed
+        # cascade on every request and the routing metadata reports one that never ran.
+        if (ctx.cascade_plan is not None
+                and selected_model != ctx.cascade_plan.get("tier1_model")):
+            logger.debug(
+                "[%s] G06 clearing cascade plan — guards rerouted %r → %r",
+                ctx.request_id, ctx.cascade_plan.get("tier1_model"), selected_model,
+            )
+            ctx.cascade_plan = None
 
         # 3. Savings logic
         if selected_model != ctx.model:

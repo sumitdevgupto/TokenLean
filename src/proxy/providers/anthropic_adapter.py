@@ -107,6 +107,34 @@ class AnthropicAdapter(ProviderAdapter):
         thinking["budget_tokens"] = max_tokens - 1
         return params
 
+    def render_tools_for_counting(self, tools: List[Dict]):
+        """Anthropic bills tools as their NATIVE shape (name/description/input_schema)
+        plus a tool-use system prompt it injects server-side. Calibrated 2026-08-08
+        against /v1/messages/count_tokens (claude-sonnet-4-5, DS13 toolset):
+        n=1 → 562, n=5 → 850, n=11 → 1,307 actual; char/4(native JSON) + 490 + 17·n
+        fits all three within ~1%. The OpenAI packed-TS default under-counted 3.7x —
+        G26 window math would compact too late and disclosed savings skewed (review S10).
+        Constants are sonnet-4-5-calibrated; other Claude models may vary slightly.
+        """
+        import json as _json
+        native = []
+        for t in tools:
+            fn = t.get("function") if isinstance(t, dict) else None
+            if isinstance(fn, dict) and fn.get("name"):
+                native.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", "") or "",
+                    "input_schema": fn.get("parameters")
+                    if isinstance(fn.get("parameters"), dict) else {"type": "object"},
+                })
+            else:
+                native.append(t)
+        try:
+            body = _json.dumps(native, separators=(",", ":"))
+        except (TypeError, ValueError):
+            body = str(native)
+        return body, 490 + 17 * len(native)
+
     def inject_cache_control(self, messages: List[Dict]) -> List[Dict]:
         """
         Annotate the first system message with cache_control so the Anthropic

@@ -39,6 +39,32 @@ class GeminiAdapter(ProviderAdapter):
             reasoning = usage.get("thinking_tokens", 0) or 0
         return {"cached_tokens": cached, "reasoning_tokens": reasoning}
 
+    def render_tools_for_counting(self, tools: List[Dict]):
+        """Gemini bills tools ≈ the compact JSON of their native functionDeclarations
+        shape — no fixed prompt overhead. Calibrated 2026-08-08 against countTokens
+        (gemini-2.0-flash, DS13 toolset): n=1 → 57, n=5 → 270, n=11 → 625 actual vs
+        char/4(native JSON) 53/282/626 — within ±12 tokens, constant 0. The OpenAI
+        packed-TS default under-counted 1.8x (review S10).
+        """
+        import json as _json
+        native = []
+        for t in tools:
+            fn = t.get("function") if isinstance(t, dict) else None
+            if isinstance(fn, dict) and fn.get("name"):
+                native.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", "") or "",
+                    "parameters": fn.get("parameters")
+                    if isinstance(fn.get("parameters"), dict) else {"type": "object"},
+                })
+            else:
+                native.append(t)
+        try:
+            body = _json.dumps(native, separators=(",", ":"))
+        except (TypeError, ValueError):
+            body = str(native)
+        return body, 0
+
     def map_structured_output(
         self,
         format_type: str,

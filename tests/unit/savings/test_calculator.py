@@ -329,3 +329,32 @@ class TestCountToolsTokens:
             req = _json.loads(fh.readline())
         est = count_tools_tokens(req["params"]["tools"], "gpt-4o-mini")
         assert 160 <= est <= 420, f"tool estimate {est} drifted from the billed ~267-298"
+
+
+class TestMalformedToolSchemas:
+    """Review S1: malformed-but-JSON schemas the old json.dumps path tolerated must
+    never crash — count_tools_tokens runs at RequestContext creation, OUTSIDE the
+    pipeline try, so an exception here is a raw 500."""
+
+    @pytest.mark.parametrize("params", [
+        ["a"],                       # parameters as a list
+        "not-a-dict",                # parameters as a string
+        {"properties": ["x"]},       # properties as a list
+        {"properties": {"p": {"enum": 5}}},        # enum as an int
+        {"properties": {"p": {"enum": None}}},     # enum as None
+        {"properties": {"p": {"enum": {"a": 1}}}}, # enum as a dict
+        {"required": "service"},     # required as a string
+    ])
+    def test_malformed_schema_never_crashes(self, params):
+        tool = {"type": "function", "function": {"name": "f", "parameters": params}}
+        assert count_tools_tokens([tool], "gpt-4o-mini") > 0
+
+    def test_unserializable_tool_never_crashes(self):
+        assert count_tools_tokens([{"type": "x", "blob": object()}], "gpt-4o-mini") > 0
+
+    def test_g08_delegates_to_shared_estimator(self):
+        """Review S8: G08 and G16 must count tools with the SAME estimator as the
+        baseline, or per-group savings can exceed the tools' entire contribution."""
+        import middleware.g08_tool_loading as g08
+        import savings.calculator as calc
+        assert g08.count_tools_tokens is calc.count_tools_tokens

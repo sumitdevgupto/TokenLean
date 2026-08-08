@@ -63,7 +63,9 @@ async def _drive_deferred_cascade(ctx):
     from middleware.g06_routing import _execute_three_tier_cascade
     try:
         model, resp = await _execute_three_tier_cascade(
-            ctx, ctx.cascade_plan.get("tiers") or {}, ctx.cascade_plan.get("cfg") or {}
+            ctx, ctx.cascade_plan.get("tiers") or {}, ctx.cascade_plan.get("cfg") or {},
+            tier1_model=ctx.cascade_plan.get("tier1_model"),
+            max_tier_idx=ctx.cascade_plan.get("max_tier_idx"),
         )
     except Exception as exc:  # noqa: BLE001 — mirror main.py's never-500 guard
         model, resp = None, {"error": f"{type(exc).__name__}: {exc}"}
@@ -71,6 +73,13 @@ async def _drive_deferred_cascade(ctx):
         ctx.routed_model = model
         ctx.savings.routed_model = model
         ctx.cascade_response = resp
+        ctx.savings.routing_mode = "cascade_execution"   # earned only on success (S6)
+    else:
+        failed_tier1 = ctx.cascade_plan.get("tier1_model")
+        if ctx.model and ctx.routed_model == failed_tier1 and ctx.model != failed_tier1:
+            ctx.routed_model = ctx.model                 # never retry the failed tier (S3)
+            ctx.savings.routed_model = ctx.model
+        ctx.savings.routing_mode = "cascade_planned+exec_error"
     return ctx
 
 
@@ -729,13 +738,14 @@ class TestG06CascadeExecution:
             ctx = await G06Routing().process_request(ctx)
             ctx = await _drive_deferred_cascade(ctx)
 
-        # Deferred contract (2026-08-08): the plan was made, the execution errored,
-        # so no cascade_response — main.py falls back to a normal single call on the
-        # tier-1 route G06 already selected (never a 500, never a duplicate call).
+        # Deferred contract (2026-08-08, hardened per review S3/S6): the plan was
+        # made, the execution errored, so no cascade_response — and the fallback must
+        # NEVER retry the tier-1 model that just failed. The caller's own model is the
+        # safe re-route, and the stamp says honestly that no cascade ran.
         assert ctx.cascade_plan is not None
         assert ctx.cascade_response is None
-        assert ctx.savings.routing_mode == "cascade_execution"
-        assert ctx.routed_model == "gpt-4o-mini"  # tier-1 pick = the fallback route
+        assert ctx.savings.routing_mode == "cascade_planned+exec_error"
+        assert ctx.routed_model == "gpt-4o"  # requested model, NOT the failed tier-1
 
 
 @pytest.mark.asyncio
@@ -1318,8 +1328,13 @@ class TestG06CascadeDeferral:
         assert calls == 0, "cascade executed inside G06 — the Stage-2 regression is back"
         assert ctx.cascade_plan is not None
         assert ctx.cascade_response is None
-        assert ctx.savings.routing_mode == "cascade_execution"
+        # Plan-time stamp is 'planned' — 'cascade_execution' is earned only when the
+        # deferred run succeeds (review S6).
+        assert ctx.savings.routing_mode == "cascade_planned"
         assert ctx.routed_model == "gpt-4o-mini"  # tier-1 pick doubles as fallback route
+        # The plan carries every plan-time decision (reviews S4/S5).
+        assert ctx.cascade_plan["tier1_model"] == "gpt-4o-mini"
+        assert isinstance(ctx.cascade_plan["max_tier_idx"], int)
 
     async def test_deferred_execution_sends_the_optimised_prompt(self, make_ctx):
         """Mutations made AFTER G06 (G01/G16/G11 …) must reach the cascade's wire."""
@@ -1359,3 +1374,117 @@ class TestG06CascadeDeferral:
             {"id": "billing", "keywords": ["billing"], "endpoint": "http://x/v1/chat/completions"}]}
         ctx = await IntentOrchestration().process_request(ctx)
         assert not ctx.agent_dispatched
+
+
+@pytest.mark.asyncio
+class TestG06CascadeDeferralHardening:
+    """Review-2 fixes S2/S4/S5/S7/S9 on the deferred cascade."""
+
+    def _cfg(self, ctx, **overrides):
+        g = ctx.config["groups"]["G6_routing"]
+        g["enabled"] = True
+        g["classifier"] = "cascade"
+        g["cascade_execution"] = True
+        g["judge_model"] = ""
+        g["cascade_confidence_threshold"] = 0.70
+        g["tiers"] = {"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["gpt-4-5"]}
+        g.update(overrides)
+        return g
+
+    async def test_stream_requests_never_plan_a_cascade(self, make_ctx):
+        """S9: the confidence probe can't read a stream — streaming burns abandoned
+        generations, so stream:true takes the classifier path."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cfg(ctx)
+        ctx.params["stream"] = True
+        from middleware.g06_routing import G06Routing
+        ctx = await G06Routing().process_request(ctx)
+        assert ctx.cascade_plan is None
+        assert ctx.savings.routing_mode != "cascade_planned"
+
+    async def test_tier_calls_get_outgoing_param_hygiene(self, make_ctx):
+        """S2: post-pipeline params (internal keys, G21 primary-scoped cache keys,
+        stream) must be stripped from tier calls exactly like the normal call site."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cfg(ctx)
+        seen = {}
+
+        async def mock(*a, **k):
+            seen.update(k)
+            return _mk_resp(k.get("model", ""), "4")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+            # Simulate what reaches the deferred call site after Stage 3/4:
+            ctx.params["workflow_id"] = "wf-1"           # INTERNAL_PARAM_KEYS
+            ctx.params["prompt_cache_key"] = "tenant:k"  # G21 primary-scoped
+            ctx.params["_verbosity_tag"] = "x"           # underscore-internal
+            ctx.params["x_complexity"] = "simple"        # x_-prefixed
+            ctx = await _drive_deferred_cascade(ctx)
+
+        assert ctx.cascade_response is not None
+        for bad in ("workflow_id", "prompt_cache_key", "_verbosity_tag", "x_complexity", "stream"):
+            assert bad not in seen, f"{bad} leaked onto the cascade tier call"
+
+    async def test_plan_carries_cap_tier_classified_on_plan_time_messages(self, make_ctx):
+        """S4: a complex prompt compressed below the word threshold AFTER planning must
+        keep its plan-time escalation cap — execution never re-classifies."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx)
+        from middleware.g06_routing import G06Routing, _TIER_ORDER
+        ctx = await G06Routing().process_request(ctx)
+        assert ctx.cascade_plan["max_tier_idx"] == _TIER_ORDER["medium"]
+        # Pipeline compresses the prompt to something that would classify "simple"...
+        ctx.messages = [{"role": "user", "content": "short now"}]
+        calls = []
+
+        async def mock(*a, **k):
+            calls.append(k.get("model", ""))
+            # tier1 truncates -> must be ALLOWED to escalate to tier2 (medium cap)
+            if "mini" in k.get("model", ""):
+                return _mk_resp(k.get("model", ""), "partial...", "length")
+            return _mk_resp(k.get("model", ""), "Full answer.", "stop")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            ctx = await _drive_deferred_cascade(ctx)
+
+        assert ctx.routed_model == "gpt-4o", (
+            "escalation was capped by a re-classification of the compressed prompt")
+
+    async def test_round_robin_executes_the_planned_tier1(self, make_ctx):
+        """S5: stateful strategies are consulted once — the executed model must equal
+        the planned/guarded one, and rotation must not double-advance."""
+        executed = []
+
+        async def mock(*a, **k):
+            executed.append(k.get("model", ""))
+            return _mk_resp(k.get("model", ""), "A clear, complete answer.", "stop")
+
+        from middleware.g06_routing import G06Routing
+        for _ in range(2):
+            ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+            self._cfg(ctx, strategy="round_robin",
+                      tiers={"simple": ["gpt-4o-mini", "gpt-4.1-mini"],
+                             "medium": ["gpt-4o"], "complex": ["gpt-4-5"]})
+            with patch("middleware.g06_routing.litellm.acompletion", mock), \
+                 patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+                ctx = await G06Routing().process_request(ctx)
+                planned = ctx.cascade_plan["tier1_model"]
+                ctx = await _drive_deferred_cascade(ctx)
+            assert executed[-1].endswith(planned), (
+                f"planned {planned} but the wire saw {executed[-1]}")
+            assert ctx.routed_model == planned
+
+    async def test_unreachable_tier1_clears_the_plan(self, make_ctx):
+        """S7: when the reachability guard reroutes away from tier-1, the plan must be
+        cleared — otherwise main.py re-attempts a doomed cascade on every request."""
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cfg(ctx)
+        from middleware.g06_routing import G06Routing
+        with patch("middleware.g06_routing._tier_reachable", return_value=False):
+            ctx = await G06Routing().process_request(ctx)
+        assert ctx.routed_model == "gpt-4o"          # guard fell back to requested
+        assert ctx.cascade_plan is None              # doomed plan disarmed

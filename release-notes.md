@@ -23,6 +23,31 @@ date changes.
 
 ## 2026-08-08
 
+### Tool token estimates are now provider-aware — Bug fix
+Measured against the providers' own token-counting endpoints, the same 11 tool
+definitions bill ~285 tokens on OpenAI, 625 on Gemini and 1,307 on Anthropic (which
+injects a tool-use system prompt server-side) — up to 4.4x apart, so no single
+serialisation can estimate all three. Each provider adapter now reports its own billing
+shape (calibrated against measured actuals and pinned by tests that fail on ±15% drift);
+providers without a specific shape keep the packed OpenAI form unchanged. This corrects
+disclosed savings on tool-heavy Claude/Gemini traffic and, more importantly, context-budget
+window math: Anthropic tool overhead was under-counted ~3.7x, which could have delayed
+compaction until a request actually overflowed. Estimates only — billing is request-count
+and never affected.
+
+### Deferred cascade hardened after code review — Bug fix
+Same-day review of the cascade deferral found nine defects, all fixed before any deploy.
+The ones that mattered: tier calls skipped the provider param-hygiene the normal call site
+applies (mixed-provider ladders could silently fail to escalate); the escalation cap was
+re-derived from the *compressed* prompt, so a long request could get locked to the cheap
+tier — every plan-time decision (tier pick, cap, routing label) is now carried in the plan
+and never re-derived; a failed tier-1 was retried instead of re-routing to the caller's own
+model; stateful tier rotation was consulted twice per request; routing metadata claimed a
+cascade before it had actually run; an unreachable tier left a doomed plan re-attempting on
+every request; and streaming requests are now excluded up front (the confidence probe cannot
+read a stream). Separately, malformed tool schemas no longer crash the token estimator, and
+tool-catalogue pruning now uses the same packed tool counting as everything else.
+
 ### Cascade routing now applies every optimisation before calling the model — Bug fix
 With cascade execution enabled, the tier-1 model call was made at the routing stage —
 *before* prompt compression, tool pruning, output-format control and the other

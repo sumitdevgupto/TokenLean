@@ -114,15 +114,24 @@ def _render_tool_signature(fn: Dict[str, Any]) -> str:
     """
     name = fn.get("name", "")
     desc = (fn.get("description") or "").strip()
-    params = fn.get("parameters") or {}
-    props = params.get("properties") or {}
-    required = set(params.get("required") or [])
+    # Malformed-but-present schema shapes must never crash: the old json.dumps path
+    # tolerated them, and this runs at RequestContext creation — OUTSIDE the pipeline
+    # try — so an exception here is a raw 500 where the provider would have 400'd.
+    params = fn.get("parameters")
+    if not isinstance(params, dict):
+        params = {}
+    props = params.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    req_raw = params.get("required")
+    required = set(req_raw) if isinstance(req_raw, (list, tuple, set)) else set()
 
     def _ts_type(schema: Dict[str, Any]) -> str:
         if not isinstance(schema, dict):
             return "any"
-        if "enum" in schema:
-            return " | ".join(f'"{v}"' for v in schema["enum"])
+        enum = schema.get("enum")
+        if isinstance(enum, (list, tuple)) and enum:
+            return " | ".join(f'"{v}"' for v in enum)
         t = schema.get("type")
         if t == "array":
             return f"{_ts_type(schema.get('items') or {})}[]"
@@ -160,17 +169,37 @@ def count_tools_tokens(tools: List[Dict[str, Any]], model: str) -> int:
     """
     if not tools:
         return 0
+    # Per-provider render (review S10): billed tool serialisation differs up to 4.4x
+    # across providers (measured 2026-08-08: OpenAI ~270-300 / Gemini 625 / Anthropic
+    # 1,307 for the same 11 tools). The model's adapter knows its provider's shape;
+    # base adapters return None → the OpenAI packed-TS default below, byte-identical
+    # to pre-S10. Lazy + exception-guarded: the estimator must never fail a request.
+    try:
+        from config_loader import get_providers
+        from providers import get_adapter
+        _pc = get_adapter(model, get_providers()).render_tools_for_counting(tools)
+        if _pc is not None:
+            _body, _const = _pc
+            return estimate_tokens(_body, model) + int(_const)
+    except Exception:  # noqa: BLE001
+        pass
     import json
     rendered: List[str] = []
     n_json_fallback = 0
     for tool in tools:
         fn = tool.get("function") if isinstance(tool, dict) else None
         if isinstance(fn, dict) and fn.get("name"):
-            # Signature syntax is part of the render — no extra per-tool pad.
-            rendered.append(_render_tool_signature(fn))
-        else:
+            try:
+                # Signature syntax is part of the render — no extra per-tool pad.
+                rendered.append(_render_tool_signature(fn))
+                continue
+            except Exception:  # noqa: BLE001 — estimator must never fail a request
+                pass
+        try:
             rendered.append(json.dumps(tool, separators=(',', ':')))
-            n_json_fallback += 1
+        except (TypeError, ValueError):
+            rendered.append(str(tool))
+        n_json_fallback += 1
     body = "\n\n".join(rendered)
     # "namespace functions { ... }" wrapper + tools-section preamble, once per request.
     total = estimate_tokens(body, model) + _TOOLS_WRAPPER_OVERHEAD

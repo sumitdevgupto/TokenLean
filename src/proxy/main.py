@@ -693,9 +693,11 @@ async def ingest_doc(request: Request):
 # Main proxy endpoint — OpenAI-compatible
 # ---------------------------------------------------------------------------
 
-# Body params consumed by middleware for routing/retrieval/loop-control —
-# not recognized by the provider's completion API and must not be forwarded.
-_INTERNAL_PARAM_KEYS = {"template_id", "workflow_id", "rag_query", "batch_id", "burst_block"}
+# Body params consumed by middleware for routing/retrieval/loop-control — the
+# canonical set + hygiene builder now live in providers (shared with the deferred
+# G06 cascade, review S2); these aliases keep main.py's call sites/tests stable.
+from providers import INTERNAL_PARAM_KEYS as _INTERNAL_PARAM_KEYS
+from providers import outgoing_params_for as _outgoing_params_for
 _usage_meter = None  # initialised in the lifespan startup once pg pool is ready
 _audit_logger = None  # core AuditLogger for G29/G30 security events (lifespan-wired)
 
@@ -1444,7 +1446,14 @@ async def _serve_core(
                 _execute_three_tier_cascade as g06_execute_cascade,
             )
             _c_model, _c_resp = await g06_execute_cascade(
-                ctx, ctx.cascade_plan.get("tiers") or {}, ctx.cascade_plan.get("cfg") or {}
+                ctx,
+                ctx.cascade_plan.get("tiers") or {},
+                ctx.cascade_plan.get("cfg") or {},
+                # Plan-time decisions, never re-derived at call time (reviews S4/S5):
+                # the pipeline has since compressed ctx.messages, and stateful tier
+                # strategies must not be consulted twice.
+                tier1_model=ctx.cascade_plan.get("tier1_model"),
+                max_tier_idx=ctx.cascade_plan.get("max_tier_idx"),
             )
         except Exception as _c_exc:  # noqa: BLE001 — cascade failure must never 500
             _c_model, _c_resp = None, {"error": f"{type(_c_exc).__name__}: {_c_exc}"}
@@ -1452,7 +1461,20 @@ async def _serve_core(
             ctx.routed_model = _c_model
             ctx.savings.routed_model = _c_model
             ctx.cascade_response = _c_resp
+            # The plan-time stamp was 'cascade_planned' — only a successful execution
+            # earns 'cascade_execution' (review S6: metadata must not claim a cascade
+            # that never ran, and the F1 learning loop cohorts on this field).
+            ctx.savings.routing_mode = "cascade_execution"
         else:
+            # Never retry the model that just failed (review S3): tier-1-call failures
+            # are exactly the error class that reaches this path, and ctx.routed_model
+            # IS the tier-1 pick. The caller's own model is the safe re-route — its key
+            # is present (they chose it) and it can never violate the cost floor.
+            _failed_tier1 = ctx.cascade_plan.get("tier1_model")
+            if ctx.model and ctx.routed_model == _failed_tier1 and ctx.model != _failed_tier1:
+                ctx.routed_model = ctx.model
+                ctx.savings.routed_model = ctx.model
+            ctx.savings.routing_mode = "cascade_planned+exec_error"
             logger.warning(
                 "[%s] G06 deferred cascade errored (%s) — falling back to a normal "
                 "call on %s", request_id,
@@ -1988,37 +2010,8 @@ def _resolve_provider(model: str, cfg: Dict[str, Any]) -> str:
     return ""
 
 
-def _outgoing_params_for(ctx, adapter, model: str, eff_cfg: Dict[str, Any],
-                         request_id: str = "") -> Dict[str, Any]:
-    """Build provider-hygienic outgoing params for `model` under `adapter`.
-
-    THE single source of the provider param-hygiene contract — used by the primary
-    path and every failover target alike (review K4: no divergent copies). Steps:
-    strip internal keys, strip reasoning-only params on non-reasoning models, strip
-    service_tier / unsupported params, cap the thinking budget, apply native context
-    editing.
-    """
-    outgoing = {
-        k: v for k, v in ctx.params.items()
-        if not k.startswith("_") and not k.startswith("x_") and k not in _INTERNAL_PARAM_KEYS
-    }
-    if not adapter.supports_reasoning(model):
-        for rk in adapter.reasoning_param_keys():
-            if outgoing.pop(rk, None) is not None and request_id:
-                logger.debug(
-                    "[%s] Stripped reasoning param '%s' — model %s does not support reasoning",
-                    request_id, rk, model,
-                )
-    if "service_tier" in outgoing and not adapter.supports_service_tier():
-        outgoing.pop("service_tier", None)
-        if request_id:
-            logger.debug("[%s] Stripped service_tier — %s does not support it", request_id, model)
-    for _uk in adapter.unsupported_params():
-        if outgoing.pop(_uk, None) is not None and request_id:
-            logger.debug("[%s] Stripped unsupported param '%s' for %s", request_id, _uk, model)
-    outgoing = adapter.cap_reasoning_params(outgoing, outgoing.get("max_tokens"))
-    outgoing = apply_context_management(outgoing, adapter, eff_cfg, ctx.tenant_id)
-    return outgoing
+# (_outgoing_params_for now lives in providers.outgoing_params_for — imported above
+# as an alias. Relocated 2026-08-08 so the deferred G06 cascade shares it, review S2.)
 
 
 # Provider-scoped request params injected by G21 for the PRIMARY provider — they must
