@@ -1,8 +1,11 @@
 """Regression tests for G11 max_tokens capping — Phase 5.
 
-Verifies that max_tokens never exceeds model limits, even for large prompts.
+Verifies that any cap G11 sets (evidence-based p95 or the configured
+fallback_max_tokens) never exceeds model limits, even for large prompts.
 This prevents 502 Bad Gateway errors from providers rejecting requests with
-max_tokens above their model limits.
+max_tokens above their model limits. Also pins the DS18 cold-start contract
+(2026-08-09): with no completion-size evidence and no configured fallback,
+G11 applies NO cap — output length is not derivable from input length.
 """
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -35,13 +38,16 @@ _MODEL_LIMITS_CONFIG = {
 
 @pytest.fixture
 def g11_config():
-    """Standard G11 config for testing — includes model_max_tokens (T37: no hardcoded fallback)."""
+    """Standard G11 config for testing — includes model_max_tokens (T37: no hardcoded fallback).
+
+    fallback_max_tokens is set ABOVE every model limit so these tests exercise the
+    model-limit clamp (the contract this file exists for)."""
     return {
         "groups": {
             "G11_output": {
                 "enabled": True,
                 "enforce_max_tokens": True,
-                "default_max_tokens_multiplier": 2.0,
+                "fallback_max_tokens": 999999,
                 "max_tokens_auto_tighten": False,
                 "provider_structured_output": False,
                 "model_max_tokens": dict(_MODEL_LIMITS_CONFIG),
@@ -121,13 +127,16 @@ class TestG11MaxTokensCapping:
         assert ctx.params["max_tokens"] > 0
 
     @pytest.mark.asyncio
-    async def test_small_prompt_uncapped(self, g11_config):
-        """Small prompt should have max_tokens = 2x * 30% of input (well below limit)."""
+    async def test_no_evidence_no_fallback_leaves_unset(self, g11_config):
+        """DS18 cold-start contract: a short prompt must NOT get an input-derived
+        cap. A ~200-token question can need a ~1300-token proof — with no
+        completion-size history and no configured fallback, G11 applies no cap."""
+        g11_config["groups"]["G11_output"]["fallback_max_tokens"] = None
         ctx = RequestContext.create(
             request_id="small-prompt",
             user_id="test-user",
             messages=[
-                {"role": "user", "content": "What is 2+2?"},
+                {"role": "user", "content": "Prove that the sum of two even numbers is even."},
             ],
             model="gpt-4o-mini",
             params={},
@@ -135,9 +144,7 @@ class TestG11MaxTokensCapping:
         )
         g11 = G11OutputFormat()
         ctx = await g11.process_request(ctx)
-        # Should be 2 * 30% of small input, much less than 16384
-        assert ctx.params["max_tokens"] < 16384
-        assert ctx.params["max_tokens"] >= 64  # minimum floor
+        assert "max_tokens" not in ctx.params
 
     @pytest.mark.asyncio
     async def test_model_specific_cap_claude(self, g11_config):
@@ -192,7 +199,7 @@ class TestG11MaxTokensCapping:
             config=g11_config,
         )
 
-        # Mock Redis returning a historical p95 of 50000 (way over model limit)
+        # Mock Redis history whose completion-size p95 is ~46000 (way over model limit)
         mock_redis = AsyncMock()
         mock_redis.zrevrange = AsyncMock(return_value=[
             b'{"max_tokens": 50000, "completion_tokens": 45000}',
@@ -206,7 +213,7 @@ class TestG11MaxTokensCapping:
             g11 = G11OutputFormat()
             ctx = await g11.process_request(ctx)
 
-        # Even with p95 = 50000, max_tokens must be capped at 4096 for gpt-3.5-turbo
+        # Even with completion p95 ≈ 46000, max_tokens must be capped at 4096 for gpt-3.5-turbo
         assert ctx.params["max_tokens"] <= 4096
 
     @pytest.mark.asyncio

@@ -21,6 +21,19 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-09
+
+### Fresh deployments no longer truncate long-form answers — Bug fix
+The output-length control derived its `max_tokens` cap from INPUT size (≈30% × 2,
+ceiling 1024) whenever no usage history existed, so a short question needing a long
+answer — a proof, an algorithm design — was cut off mid-sentence on any cold start
+(fresh deploy, or expired 7-day history). Worse, the truncated completions were then
+recorded as history and re-taught the low cap permanently. Caps now come only from
+evidence: the p95 of observed **completed** answers; an answer cut off by our own cap
+re-enters the evidence escalated (`truncation_backoff_multiplier`) so caps climb out of
+a bad guess; with no evidence, no cap is applied (opt-in static `fallback_max_tokens`
+for operators who want one), and history is tenant-scoped so workloads never cross.
+
 ## 2026-08-08
 
 ### Tool token estimates are now provider-aware — Bug fix

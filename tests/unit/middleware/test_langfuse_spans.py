@@ -142,6 +142,9 @@ class TestG10MemorySpan:
 class TestG11OutputFormatSpan:
     async def test_span_emitted_when_max_tokens_set(self, mock_trace_ctx):
         ctx, mock_trace = mock_trace_ctx
+        # G11 no longer invents a cap without completion-size evidence; give it the
+        # configured static fallback so the max_tokens change (and its span) fires.
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         from middleware.g11_output_format import G11OutputFormat
         await G11OutputFormat().process_request(ctx)
 

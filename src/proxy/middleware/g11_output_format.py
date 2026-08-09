@@ -3,7 +3,9 @@ G11 · Output Length & Format Control
 Stage: Inside the LLM (parameter injection)
 Saving: 30–60% output tokens
 Technique:
-  1. Enforce max_tokens on every call (default: 2× expected if not set).
+  1. Enforce max_tokens from OBSERVED completion-size evidence: p95 of completed
+     answers × tighten_multiplier. No evidence → no cap (output length is not
+     derivable from input length), unless `fallback_max_tokens` is configured.
   2. Inject JSON schema / response_format via ctx.provider_adapter.map_structured_output().
 """
 import hashlib
@@ -18,9 +20,8 @@ from middleware import langfuse_tracing
 logger = logging.getLogger(__name__)
 GROUP = "G11"
 
-_DEFAULT_MAX_TOKENS_MULTIPLIER = 2.0
-_ABSOLUTE_DEFAULT_MAX_TOKENS = 1024
 _DEFAULT_MODEL_MAX_TOKENS = 4096  # Safe default for unknown models
+_DEFAULT_TRUNCATION_BACKOFF = 2.0
 
 
 def _get_model_max_tokens(model: Optional[str], cfg: Optional[Dict[str, Any]] = None) -> int:
@@ -58,29 +59,41 @@ def _get_redis():
 def _history_key(ctx: RequestContext) -> str:
     workflow_id = ctx.params.get("workflow_id") or ctx.params.get("x_workflow_id") or "default"
     template_id = ctx.params.get("template_id") or ctx.params.get("x_template_id") or "default"
-    return f"tok_opt:max_tokens_history:{workflow_id}:{template_id}"
+    return f"{getattr(ctx, 'redis_prefix', '')}tok_opt:max_tokens_history:{workflow_id}:{template_id}"
 
 
 async def _get_historical_p95(
-    redis, key: str, quantile: float = 0.95, min_entries: int = 5
+    redis, key: str, quantile: float = 0.95, min_entries: int = 5,
+    truncation_backoff: float = _DEFAULT_TRUNCATION_BACKOFF,
 ) -> Optional[int]:
-    """Fetch historical max_tokens values from Redis ZSET and compute p95."""
+    """p95 of OBSERVED completion sizes from the Redis ZSET history.
+
+    The evidence is completion_tokens, never the caps that were applied — a p95
+    over past caps only echoes past caps back. Entries marked `truncated` (an
+    answer cut off by a G11-set cap) count as `completion × truncation_backoff`:
+    a truncation only proves the answer wanted MORE than the cap, so it must push
+    the estimate up, never anchor it down.
+    """
     try:
         entries = await redis.zrevrange(key, 0, min_entries * 2 - 1, withscores=False)
         if not entries or len(entries) < min_entries:
             return None
-        max_tokens_values: List[int] = []
+        completion_values: List[int] = []
         for raw in entries:
             try:
                 data = json.loads(raw)
-                mt = data.get("max_tokens")
-                if isinstance(mt, int):
-                    max_tokens_values.append(mt)
+                ct = data.get("completion_tokens")
+                if not isinstance(ct, int) or ct <= 0:
+                    continue
+                if data.get("truncated"):
+                    completion_values.append(int(ct * max(1.0, truncation_backoff)))
+                else:
+                    completion_values.append(ct)
             except Exception:
                 continue
-        if len(max_tokens_values) < min_entries:
+        if len(completion_values) < min_entries:
             return None
-        sorted_vals = sorted(max_tokens_values)
+        sorted_vals = sorted(completion_values)
         idx = int((len(sorted_vals) - 1) * quantile)
         return sorted_vals[idx]
     except Exception as exc:
@@ -89,11 +102,15 @@ async def _get_historical_p95(
 
 
 async def _record_max_tokens_pair(
-    redis, key: str, max_tokens: int, completion_tokens: int, ttl_seconds: int
+    redis, key: str, max_tokens: int, completion_tokens: int, ttl_seconds: int,
+    truncated: bool = False,
 ) -> None:
     """Record a (max_tokens, completion_tokens) pair to Redis ZSET with TTL."""
     try:
-        member = json.dumps({"max_tokens": max_tokens, "completion_tokens": completion_tokens})
+        pair: Dict[str, Any] = {"max_tokens": max_tokens, "completion_tokens": completion_tokens}
+        if truncated:
+            pair["truncated"] = True
+        member = json.dumps(pair)
         score = time.time()
         await redis.zadd(key, {member: score})
         await redis.expire(key, ttl_seconds)
@@ -426,38 +443,51 @@ class G11OutputFormat:
             elif ("max_tokens" not in ctx.params or ctx.params.get("max_tokens") is None) and \
                     "max_completion_tokens" not in ctx.params:
                 auto_tighten = cfg.get("max_tokens_auto_tighten", False)
-                historical_max = None
+                historical_p95 = None
                 if auto_tighten:
                     try:
                         redis = _get_redis()
                         key = _history_key(ctx)
                         tighten_q = cfg.get("tighten_quantile", 0.95)
-                        historical_max = await _get_historical_p95(redis, key, quantile=tighten_q)
+                        backoff = cfg.get("truncation_backoff_multiplier", _DEFAULT_TRUNCATION_BACKOFF)
+                        historical_p95 = await _get_historical_p95(
+                            redis, key, quantile=tighten_q, truncation_backoff=backoff
+                        )
                     except Exception as exc:
                         logger.warning("G11 auto_tighten lookup failed: %s", exc)
 
-                if historical_max:
+                model_limit = _get_model_max_tokens(ctx.params.get("model"), cfg)
+                if historical_p95:
                     tighten_mult = cfg.get("tighten_multiplier", 1.2)
-                    model_limit = _get_model_max_tokens(ctx.params.get("model"), cfg)
-                    ctx.params["max_tokens"] = min(max(64, int(historical_max * tighten_mult)), model_limit)
-                    notes.append(f"max_tokens tightened to {ctx.params['max_tokens']} (p95×{tighten_mult}, cap={model_limit})")
-                else:
-                    multiplier = cfg.get("default_max_tokens_multiplier", _DEFAULT_MAX_TOKENS_MULTIPLIER)
-                    # Estimate expected output ≈ 30% of input as a conservative baseline
-                    expected_output = max(64, int(tokens_before * 0.3))
-                    model_limit = _get_model_max_tokens(ctx.params.get("model"), cfg)
-                    # Without historical data to tighten against, cap the heuristic
-                    # at _ABSOLUTE_DEFAULT_MAX_TOKENS too — otherwise a single huge
-                    # input (e.g. a large document) inflates max_tokens far past any
-                    # reasonable default just because 30%-of-input*2 is still big.
-                    absolute_cap = cfg.get("absolute_default_max_tokens", _ABSOLUTE_DEFAULT_MAX_TOKENS)
-                    ctx.params["max_tokens"] = min(
-                        int(expected_output * multiplier),
-                        model_limit,
-                        absolute_cap,
+                    ctx.params["max_tokens"] = min(max(64, int(historical_p95 * tighten_mult)), model_limit)
+                    ctx.params["_g11_max_tokens_set"] = True
+                    notes.append(
+                        f"max_tokens tightened to {ctx.params['max_tokens']} "
+                        f"(completion p95×{tighten_mult}, cap={model_limit})"
                     )
-                    notes.append(f"max_tokens set to {ctx.params['max_tokens']} (cap={model_limit}, absolute_cap={absolute_cap})")
-                changed = True
+                    changed = True
+                else:
+                    # No completion-size evidence for this workload. Output length is
+                    # not derivable from input length (a one-line question can need a
+                    # proof-length answer), and a guessed cap truncates exactly those
+                    # answers — the truncated completions would then re-teach the low
+                    # cap. No evidence → no cap, unless the operator configured an
+                    # explicit static fallback.
+                    fallback_cap = cfg.get("fallback_max_tokens")
+                    if isinstance(fallback_cap, int) and not isinstance(fallback_cap, bool) \
+                            and fallback_cap > 0:
+                        ctx.params["max_tokens"] = min(fallback_cap, model_limit)
+                        ctx.params["_g11_max_tokens_set"] = True
+                        notes.append(
+                            f"max_tokens set to {ctx.params['max_tokens']} "
+                            f"(configured fallback_max_tokens, cap={model_limit})"
+                        )
+                        changed = True
+                    else:
+                        logger.debug(
+                            "[%s] G11: max_tokens left unset (no completion-size history)",
+                            ctx.request_id,
+                        )
 
         # 2. Apply provider-specific structured output mapping via adapter
         adapter = _get_adapter(ctx)
@@ -537,7 +567,9 @@ class G11OutputFormat:
     async def process_response(self, ctx: RequestContext, response: Dict[str, Any]) -> Tuple[RequestContext, Dict[str, Any]]:
         """
         Process response to implement max_tokens feedback loop.
-        Record (max_tokens, completion_tokens) pair to Redis ZSET for future tightening.
+        Record completed answers' (max_tokens, completion_tokens) pairs to Redis
+        ZSET for future tightening; G11-capped truncations enter with a `truncated`
+        marker so they escalate the estimate rather than anchor it.
         """
         cfg = ctx.config.get("groups", {}).get("G11_output", {})
         if not cfg.get("enabled", False):
@@ -562,6 +594,8 @@ class G11OutputFormat:
             return ctx, response
 
         max_tokens = ctx.params.get("max_tokens")
+        choices = response.get("choices") or []
+        finish_reason = (choices[0] or {}).get("finish_reason") if choices else None
 
         if max_tokens and completion_tokens:
             utilization = completion_tokens / max_tokens
@@ -572,20 +606,32 @@ class G11OutputFormat:
                 max_tokens,
                 utilization * 100,
             )
-
-            # Record to Redis ZSET for historical p95 analysis
-            try:
-                redis = _get_redis()
-                key = _history_key(ctx)
-                ttl_days = cfg.get("max_tokens_history_ttl_days", 7)
-                await _record_max_tokens_pair(
-                    redis, key, max_tokens, completion_tokens, ttl_days * 86400
-                )
-            except Exception as exc:
-                logger.warning("[%s] G11 failed to record max_tokens pair: %s", ctx.request_id, exc)
-
             # Retain ephemeral feedback for backward compatibility
             ctx.params.setdefault("_token_opt_feedback", {})["max_tokens_utilization"] = utilization
+
+        # Evidence recording: only COMPLETED answers teach future caps. An answer
+        # cut off by a G11-set cap is recorded with the `truncated` marker (read
+        # back as completion × truncation_backoff_multiplier) so the estimate
+        # climbs out of a bad cap instead of re-learning it. Anything else that
+        # is not `stop` (caller-capped truncation, tool_calls, content_filter,
+        # missing finish_reason) is no evidence at all.
+        if completion_tokens:
+            truncated_by_us = (
+                finish_reason == "length"
+                and bool(max_tokens)
+                and bool(ctx.params.get("_g11_max_tokens_set"))
+            )
+            if finish_reason == "stop" or truncated_by_us:
+                try:
+                    redis = _get_redis()
+                    key = _history_key(ctx)
+                    ttl_days = cfg.get("max_tokens_history_ttl_days", 7)
+                    await _record_max_tokens_pair(
+                        redis, key, int(max_tokens or 0), completion_tokens,
+                        ttl_days * 86400, truncated=truncated_by_us,
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] G11 failed to record max_tokens pair: %s", ctx.request_id, exc)
 
         return ctx, response
 

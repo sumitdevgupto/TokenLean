@@ -51,16 +51,20 @@ class TestG11FeedbackLoop:
         ctx.model = "gpt-4o-mini"
         ctx.request_id = "test-req-001"
         ctx.user_id = "user-001"
+        ctx.redis_prefix = ""
         return ctx
 
     @pytest.mark.asyncio
     async def test_process_response_records_to_redis(self, g11, mock_redis, ctx_with_config):
-        """Test that process_response records max_tokens pair to Redis ZSET."""
+        """Test that process_response records max_tokens pair to Redis ZSET
+        for a COMPLETED (finish_reason=stop) answer."""
         response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "done"}}],
             "usage": {
                 "completion_tokens": 300,
                 "total_tokens": 800,
-            }
+            },
         }
 
         with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
@@ -134,6 +138,41 @@ class TestG11FeedbackLoop:
         assert ctx.params["_token_opt_feedback"]["max_tokens_utilization"] == 0.5
 
     @pytest.mark.asyncio
+    async def test_truncated_length_response_without_g11_marker_not_recorded(
+        self, g11, mock_redis, ctx_with_config
+    ):
+        """A truncated (finish_reason=length) answer under a CALLER-set cap is not
+        evidence of anything — it must not be recorded (recording it is how the
+        DS18 self-seal re-taught a bad cap forever)."""
+        response = {
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "cut of"}}],
+            "usage": {"completion_tokens": 500},
+        }
+
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx, resp = await g11.process_response(ctx_with_config, response)
+
+        mock_redis.zadd.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tenant_prefix_scopes_the_history_key(self, g11, mock_redis, ctx_with_config):
+        """Tenant isolation: the history key must carry ctx.redis_prefix so one
+        tenant's answer lengths can never shape another tenant's caps."""
+        ctx_with_config.redis_prefix = "t:ACME-PRD-01:"
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "done"}}],
+            "usage": {"completion_tokens": 300},
+        }
+
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx, resp = await g11.process_response(ctx_with_config, response)
+
+        key = mock_redis.zadd.call_args[0][0]
+        assert key.startswith("t:ACME-PRD-01:tok_opt:max_tokens_history:")
+
+    @pytest.mark.asyncio
     async def test_get_historical_p95_with_data(self):
         """Test p95 calculation from historical data."""
         redis = AsyncMock()
@@ -193,8 +232,9 @@ class TestG11FeedbackLoop:
         redis.expire.assert_called_once_with("test:key", 604800)
 
     def test_history_key_generation(self):
-        """Test history key includes workflow and template IDs."""
+        """Test history key includes the tenant prefix plus workflow and template IDs."""
         ctx = MagicMock(spec=RequestContext)
+        ctx.redis_prefix = "t:NOVA-STG-01:"
         ctx.params = {
             "workflow_id": "wf-123",
             "template_id": "tpl-456",
@@ -202,16 +242,28 @@ class TestG11FeedbackLoop:
 
         key = _history_key(ctx)
 
-        assert key == "tok_opt:max_tokens_history:wf-123:tpl-456"
+        assert key == "t:NOVA-STG-01:tok_opt:max_tokens_history:wf-123:tpl-456"
 
     def test_history_key_defaults(self):
         """Test history key uses defaults when IDs not provided."""
         ctx = MagicMock(spec=RequestContext)
+        ctx.redis_prefix = ""
         ctx.params = {}
 
         key = _history_key(ctx)
 
         assert key == "tok_opt:max_tokens_history:default:default"
+
+    def test_history_key_differs_across_tenants(self):
+        """Two tenants sending the same workload must never share a history bucket."""
+        a = MagicMock(spec=RequestContext)
+        a.redis_prefix = "t:NOVA-STG-01:"
+        a.params = {}
+        b = MagicMock(spec=RequestContext)
+        b.redis_prefix = "t:SHOP-STG-01:"
+        b.params = {}
+
+        assert _history_key(a) != _history_key(b)
 
 
 class TestG11AutoTighten:
@@ -240,6 +292,7 @@ class TestG11AutoTighten:
         ctx.model = "gpt-4o-mini"
         ctx.current_token_count = 1000
         ctx.request_id = "test-auto-001"
+        ctx.redis_prefix = ""
         ctx.savings = MagicMock()
         ctx.savings.add_step = MagicMock()
         return ctx
@@ -262,16 +315,18 @@ class TestG11AutoTighten:
         assert 800 <= ctx_auto_tighten.params["max_tokens"] <= 1200
 
     @pytest.mark.asyncio
-    async def test_auto_tighten_fallback_without_history(self, g11, ctx_auto_tighten):
-        """Test fallback to default multiplier when no historical data."""
+    async def test_no_history_leaves_max_tokens_unset(self, g11, ctx_auto_tighten):
+        """DS18 cold-start contract: with no historical completion-size data (and
+        no configured fallback), G11 must NOT derive a cap from the input size —
+        the old 30%-of-input×2 guess capped proof-length answers at 128 tokens
+        and the truncated completions then re-taught the low cap forever."""
         redis = AsyncMock()
         redis.zrevrange = AsyncMock(return_value=[])  # No history
 
         with patch("middleware.g11_output_format._get_redis", return_value=redis):
             result = await g11.process_request(ctx_auto_tighten)
 
-        # Should use default: 30% of input * 2.0 = 600, capped at 1024
-        assert ctx_auto_tighten.params["max_tokens"] == 600
+        assert "max_tokens" not in ctx_auto_tighten.params
 
 
 if __name__ == "__main__":

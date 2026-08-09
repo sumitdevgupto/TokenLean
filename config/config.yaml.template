@@ -900,8 +900,12 @@ groups:
     enabled: true
     enforce_max_tokens: true
     skip_max_tokens_for_reasoning: true
-    default_max_tokens_multiplier: 2.0
-    absolute_default_max_tokens: 1024   # ⚠ absolute cap on the heuristic max_tokens (raise if long answers get cut)
+    # Cap discovery is EVIDENCE-based: p95 of observed COMPLETED answer sizes ×
+    # tighten_multiplier (needs ≥5 recorded completions per tenant/workflow/template).
+    # With no evidence yet, NO cap is applied — output length is not derivable from
+    # input length, and a guessed cap truncates long-form answers on fresh deploys.
+    fallback_max_tokens: null           # optional static cap (int, e.g. 2048) used ONLY while no evidence exists; null = uncapped until evidence
+    truncation_backoff_multiplier: 2.0  # an answer cut off by a G11-set cap re-enters the evidence at cap×this, so caps climb out of a bad guess
     force_json_for_all: false
     provider_structured_output: true
     max_tokens_feedback_loop: true

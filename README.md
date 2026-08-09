@@ -457,7 +457,7 @@ On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **eve
 | **G8** Tool Loading | `max_tools_per_agent` 20 | fewer tools injected | raise cap so no needed tool is pruned |
 | **G9** Context Schema | `enabled` false; `prose_min_length_chars` 80 | enable prose→schema compaction | keep off, or raise min length |
 | **G10** Memory | `sliding_window_turns` 6; `skills_top_k` 2; `skills_similarity_threshold` 0.7 | fewer verbatim turns; fewer skills | keep more turns verbatim; lower skill threshold |
-| **G11** Output Format | `enforce_max_tokens` true; `default_max_tokens_multiplier` 2.0; `tighten_quantile` 0.95; `tighten_multiplier` 1.2 | lower multiplier/quantile → tighter caps | raise multiplier so long answers aren't truncated |
+| **G11** Output Format | `enforce_max_tokens` true; `tighten_quantile` 0.95; `tighten_multiplier` 1.2; `fallback_max_tokens` null | lower quantile/multiplier → tighter caps; set `fallback_max_tokens` to cap cold starts | caps come only from observed completed-answer sizes — no evidence, no cap — so long answers aren't guessed short |
 | **G12** Reasoning Budget | `default_effort` medium; `effort_map.*` per-provider thinking budgets | lower effort / smaller budgets | raise effort for hard reasoning tasks |
 | **G13** Batch / TOON | `toon_require_net_savings` true; `toon_uniform_threshold` 1.0; `provider_native` false | relax uniformity; enable native batch lane | keep `toon_require_net_savings` on (never inflates) |
 | **G14** Tool Output | `field_whitelist.*`; `spreadsheet_compression` true | whitelist fewer fields; keep compression on | whitelist all fields the model needs downstream |

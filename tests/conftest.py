@@ -138,7 +138,6 @@ def _minimal_config() -> Dict[str, Any]:
             "G11_output": {
                 "enabled": True,
                 "enforce_max_tokens": True,
-                "default_max_tokens_multiplier": 2.0,
                 "force_json_for_all": False,
                 "provider_structured_output": True,
                 "max_tokens_feedback_loop": True,

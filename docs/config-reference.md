@@ -454,10 +454,10 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable output format control |
-| `enforce_max_tokens` | `true` | Auto-set max_tokens if not provided |
-| `default_max_tokens_multiplier` | `2.0` | ⚠ max_tokens = 2× estimated output (lower = tighter caps) |
-| `absolute_default_max_tokens` | `1024` | ⚠ Absolute cap on the heuristic max_tokens (raise if long answers get cut) |
-| `tighten_quantile` / `tighten_multiplier` | `0.95` / `1.2` | ⚠ Historical-p95 auto-tightening of max_tokens |
+| `enforce_max_tokens` | `true` | Auto-set max_tokens if not provided — from completion-size evidence only |
+| `fallback_max_tokens` | `null` | Optional static cap used ONLY while no completion-size evidence exists; `null` = leave uncapped until evidence (output length is not derivable from input length) |
+| `truncation_backoff_multiplier` | `2.0` | An answer cut off by a G11-set cap re-enters the evidence at cap×this, so caps climb out of a bad guess instead of re-learning it |
+| `tighten_quantile` / `tighten_multiplier` | `0.95` / `1.2` | ⚠ Auto-tightening from the p95 of observed **completed** answer sizes (tenant-scoped history; truncated/tool-call answers are never evidence) |
 | `verbosity_steering.enabled` | `false` | Append a terseness suffix to steer shorter output (biggest uncovered savings axis; folded into the G05 cache key so terse/verbose answers never mix) |
 | `verbosity_steering.level` | `''` | Bundled preset: `lite` \| `full` \| `ultra` (adapted from caveman-shrink, MIT). Safety carve-outs keep security/destructive-action text in normal prose. ⚠ SAVINGS feature — prove with a pitch-test-plan quality-gate run before enabling by default |
 | `verbosity_steering.default_suffix` / `per_tenant_suffix` | `''` / `{}` | Explicit suffix overrides (per-tenant wins > default_suffix > preset) |
@@ -837,7 +837,7 @@ for reference (all now appear in their group's section above):
 | `G2_template_registry` | `budget.truncate_enabled` / `budget.truncate_strategy` / `budget.min_keep_user_turns` | `false` / `tail_system` / `1` | ⚠ Truncate over-budget prompts (`budget` singular ≠ `budgets` registry) |
 | `G4_bypass` | `db_cache_ttl_seconds` | `60` | DB-rule cache TTL (was a hardcoded constant) |
 | `G10_memory` | `skills_qdrant_enabled` | `true` | `false` → non-Qdrant skill-injection fallback |
-| `G11_output` | `absolute_default_max_tokens` | `1024` | ⚠ Absolute cap on the heuristic `max_tokens` |
+| `G11_output` | `fallback_max_tokens` | `null` | Optional static `max_tokens` cap while no completion-size evidence exists (replaces the removed input-derived heuristic + `absolute_default_max_tokens`) |
 | `G14_tool_output` | `max_field_tokens` / `max_result_tokens` | `200` / `500` | ⚠ Per-field / whole-result truncation caps (were module constants) |
 | `G16_agent_arch` | *(fallback alignment)* | — | `_MAX_SYSTEM_PROMPT_TOKENS`/`_MAX_TOOLS_COUNT` absent-key fallbacks realigned 800→4096 / 10→20 to match the template |
 | `G27_multimodal` | `provider` | `null` | Override the Headroom provider hint (else auto-detected) |

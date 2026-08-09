@@ -16,13 +16,18 @@ class TestG11OutputFormat:
         ctx = await G11OutputFormat().process_request(ctx)
         assert "max_tokens" not in ctx.params
 
-    async def test_injects_max_tokens_when_absent(self, make_ctx):
+    async def test_no_evidence_leaves_max_tokens_unset(self, make_ctx):
+        """DS18 cold-start regression (2026-08-09): output length is NOT derivable
+        from input length — a ~200-token question can need a ~1300-token proof.
+        With no completion-size history and no configured fallback, G11 must not
+        invent a cap (the old input-proportional guess capped such answers at 128
+        and the truncated completions then re-taught the low cap, permanently)."""
         ctx = make_ctx()
         assert "max_tokens" not in ctx.params
         from middleware.g11_output_format import G11OutputFormat
-        ctx = await G11OutputFormat().process_request(ctx)
-        assert "max_tokens" in ctx.params
-        assert ctx.params["max_tokens"] > 0
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        assert "max_tokens" not in ctx.params
 
     async def test_does_not_override_existing_max_tokens(self, make_ctx):
         ctx = make_ctx(params={"max_tokens": 42})
@@ -33,8 +38,11 @@ class TestG11OutputFormat:
     async def test_skips_max_tokens_for_reasoning_model(self, make_ctx):
         """Reasoning models (routed_model=o3-mini → adapter.supports_reasoning) spend
         max_tokens on hidden reasoning; tightening it empties the visible answer.
-        G11 must NOT set max_tokens for them."""
+        G11 must NOT set max_tokens for them — even when a fallback cap is
+        configured (so the absence below proves the reasoning skip, not the
+        no-evidence skip)."""
         ctx = make_ctx(model="o3-mini")
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         assert "max_tokens" not in ctx.params
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
@@ -44,23 +52,36 @@ class TestG11OutputFormat:
     async def test_reasoning_skip_can_be_disabled_via_config(self, make_ctx):
         ctx = make_ctx(model="o3-mini")
         ctx.config["groups"]["G11_output"]["skip_max_tokens_for_reasoning"] = False
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
             ctx = await G11OutputFormat().process_request(ctx)
-        assert "max_tokens" in ctx.params  # explicit opt-out → tighten anyway
+        assert ctx.params["max_tokens"] == 512  # explicit opt-out → enforcement anyway
 
     async def test_non_reasoning_model_still_gets_max_tokens(self, make_ctx):
         ctx = make_ctx(model="gpt-4o")  # not a reasoning model
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
             ctx = await G11OutputFormat().process_request(ctx)
-        assert "max_tokens" in ctx.params  # unchanged behaviour for normal models
+        assert ctx.params["max_tokens"] == 512  # unchanged behaviour for normal models
 
     async def test_records_step_saving(self, make_ctx):
         ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         from middleware.g11_output_format import G11OutputFormat
-        ctx = await G11OutputFormat().process_request(ctx)
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
         assert any(s.group == "G11" for s in ctx.savings.step_savings)
+
+    async def test_no_evidence_skip_records_no_step_saving(self, make_ctx):
+        """Fire-only honesty: when G11 declines to set a cap it must not claim a
+        savings step for it."""
+        ctx = make_ctx()
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        assert not any(s.group == "G11" for s in ctx.savings.step_savings)
 
     async def test_injects_json_response_format_on_x_json_output(self, make_ctx):
         ctx = make_ctx(params={"x_json_output": True})
@@ -75,32 +96,39 @@ class TestG11OutputFormat:
         ctx = await G11OutputFormat().process_request(ctx)
         assert ctx.params.get("response_format", {}).get("type") == "json_object"
 
-    async def test_max_tokens_capped_at_absolute_default(self, make_ctx):
-        # Even with a very long input, max_tokens should not exceed 1024.
-        # auto_tighten is on by default (minimal_config) so this must force
-        # the historical-lookup path to miss — otherwise, against a real
-        # local Redis with leftover max_tokens_history data from other runs,
-        # this test becomes order/environment-dependent (it picks up stale
-        # historical data and takes the tightening branch instead of the
-        # absolute-cap heuristic branch this test exists to verify).
+    async def test_fallback_max_tokens_respects_model_limit(self, make_ctx):
+        # A configured fallback larger than the model limit must be clamped to it
+        # (prevents 502s from providers rejecting over-limit max_tokens).
         ctx = make_ctx([{"role": "user", "content": "word " * 2000}])
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 999999
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis in this test")):
             ctx = await G11OutputFormat().process_request(ctx)
-        assert ctx.params["max_tokens"] <= 1024
+        assert ctx.params["max_tokens"] == 4096  # default_model_max_tokens clamp
 
-    async def test_absolute_default_max_tokens_config_override(self, make_ctx):
-        # absolute_default_max_tokens is now a template knob; overriding it must move the cap.
+    async def test_fallback_max_tokens_config_applies(self, make_ctx):
         ctx = make_ctx([{"role": "user", "content": "word " * 2000}])
-        ctx.config["groups"]["G11_output"]["absolute_default_max_tokens"] = 256
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 256
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis in this test")):
             ctx = await G11OutputFormat().process_request(ctx)
-        assert ctx.params["max_tokens"] <= 256
+        assert ctx.params["max_tokens"] == 256
+
+    async def test_fallback_max_tokens_bool_is_ignored(self, make_ctx):
+        # YAML `fallback_max_tokens: true` must not become max_tokens=1.
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = True
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis in this test")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        assert "max_tokens" not in ctx.params
 
     async def test_p95_historical_tightens_max_tokens(self, make_ctx):
-        """With 10 mocked Redis entries, assert max_tokens is tightened to p95×1.2."""
-        # Build 10 Redis ZSET entries with max_tokens = 100..190
+        """With 10 mocked Redis entries, max_tokens = completion-p95 × 1.2.
+
+        The evidence is the OBSERVED completion sizes, never the caps that were
+        applied — a p95 over past caps only echoes past caps back (that echo
+        chamber is how a bad 128 cap re-taught itself in the DS18 incident)."""
         mock_entries = [
             json.dumps({"max_tokens": 100 + i * 10, "completion_tokens": 50 + i * 5})
             for i in range(10)
@@ -119,14 +147,40 @@ class TestG11OutputFormat:
         with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
             ctx = await G11OutputFormat().process_request(ctx)
 
-        # p95 of [100, 110, 120, 130, 140, 150, 160, 170, 180, 190] = index 8 = 180
-        # 180 * 1.2 = 216
-        expected = max(64, int(180 * 1.2))
+        # completions are [50, 55, ..., 95]; p95 index 8 → 90; 90 × 1.2 = 108.
+        # (The caps in the entries are 100..190 — if the implementation regressed
+        # to reading caps, this would come out 216 and fail.)
+        expected = max(64, int(90 * 1.2))
         assert ctx.params["max_tokens"] == expected
         mock_redis.zrevrange.assert_called_once()
 
-    async def test_insufficient_history_falls_back_to_multiplier(self, make_ctx):
-        """With fewer than 5 Redis entries, fall back to static multiplier."""
+    async def test_truncated_history_entries_escalate_the_estimate(self, make_ctx):
+        """A truncation only proves the answer wanted MORE than the cap: entries
+        marked `truncated` must count as completion × truncation_backoff so the
+        cap climbs out of a bad guess instead of re-learning it."""
+        mock_entries = [
+            json.dumps({"max_tokens": 128, "completion_tokens": 128, "truncated": True})
+            for _ in range(5)
+        ]
+        mock_redis = AsyncMock()
+        mock_redis.zrevrange = AsyncMock(return_value=mock_entries)
+
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.config["groups"]["G11_output"]["truncation_backoff_multiplier"] = 2.0
+        ctx.params["workflow_id"] = "wf-test"
+        ctx.params["template_id"] = "tmpl-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        # 128 × 2.0 backoff = 256 evidence → 256 × 1.2 tighten = 307 (> the 128
+        # that a cap-echo implementation would keep applying forever).
+        assert ctx.params["max_tokens"] == int(256 * 1.2)
+
+    async def test_insufficient_history_leaves_max_tokens_unset(self, make_ctx):
+        """With no usable history and no fallback configured, G11 applies no cap."""
         mock_redis = AsyncMock()
         mock_redis.zrevrange = AsyncMock(return_value=[])
 
@@ -139,12 +193,11 @@ class TestG11OutputFormat:
         with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
             ctx = await G11OutputFormat().process_request(ctx)
 
-        # Should use static multiplier fallback, not p95
-        assert "max_tokens" in ctx.params
-        assert ctx.params["max_tokens"] > 0
+        assert "max_tokens" not in ctx.params
 
-    async def test_process_response_records_to_redis(self, make_ctx):
-        """process_response should record (max_tokens, completion_tokens) to Redis ZSET."""
+    async def test_process_response_records_completed_answers(self, make_ctx):
+        """process_response records (max_tokens, completion_tokens) for a COMPLETED
+        (finish_reason=stop) answer."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
@@ -152,7 +205,11 @@ class TestG11OutputFormat:
         ctx.params["workflow_id"] = "wf-test"
         ctx.params["template_id"] = "tmpl-test"
 
-        response = {"usage": {"completion_tokens": 128}}
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "done"}}],
+            "usage": {"completion_tokens": 128},
+        }
 
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
@@ -167,7 +224,102 @@ class TestG11OutputFormat:
         data = json.loads(member)
         assert data["max_tokens"] == 256
         assert data["completion_tokens"] == 128
+        assert "truncated" not in data
         mock_redis.expire.assert_called_once()
+
+    async def test_uncapped_completions_still_teach_the_history(self, make_ctx):
+        """Cold-start bootstrap: an answer that completed with NO cap set is the
+        most valuable evidence there is (its natural length). It must be recorded
+        — otherwise a cold deployment that skips capping never accumulates the
+        history that lets capping activate."""
+        mock_redis = AsyncMock()
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        assert "max_tokens" not in ctx.params
+
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "a full proof"}}],
+            "usage": {"completion_tokens": 1300},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx, resp = await G11OutputFormat().process_response(ctx, response)
+
+        assert mock_redis.zadd.called
+        zadd_call = mock_redis.zadd.call_args
+        mapping = zadd_call.args[1] if len(zadd_call.args) > 1 else zadd_call.kwargs.get("mapping", {})
+        data = json.loads(list(mapping.keys())[0])
+        assert data["completion_tokens"] == 1300
+
+    async def test_truncated_by_caller_cap_is_not_recorded(self, make_ctx):
+        """A caller-capped truncation is neither a completed answer nor a G11
+        mistake — it must contribute no evidence at all."""
+        mock_redis = AsyncMock()
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        ctx.params["max_tokens"] = 100  # caller-set: no _g11_max_tokens_set marker
+
+        response = {
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "cut off mi"}}],
+            "usage": {"completion_tokens": 100},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx, resp = await G11OutputFormat().process_response(ctx, response)
+
+        mock_redis.zadd.assert_not_called()
+
+    async def test_g11_capped_truncation_recorded_with_marker(self, make_ctx):
+        """DS18 anti-seal: an answer truncated by a cap G11 itself set must enter
+        the history with the `truncated` marker (read back escalated), so the cap
+        climbs after a bad guess instead of the truncated size re-teaching it."""
+        mock_redis = AsyncMock()
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        ctx.params["max_tokens"] = 128
+        ctx.params["_g11_max_tokens_set"] = True
+
+        response = {
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "cut off mi"}}],
+            "usage": {"completion_tokens": 128},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx, resp = await G11OutputFormat().process_response(ctx, response)
+
+        assert mock_redis.zadd.called
+        zadd_call = mock_redis.zadd.call_args
+        mapping = zadd_call.args[1] if len(zadd_call.args) > 1 else zadd_call.kwargs.get("mapping", {})
+        data = json.loads(list(mapping.keys())[0])
+        assert data["truncated"] is True
+        assert data["completion_tokens"] == 128
+
+    async def test_tool_calls_finish_is_not_recorded(self, make_ctx):
+        """Tool-call turns are structurally short; letting them teach the prose
+        cap would drag the p95 down for mixed workloads."""
+        mock_redis = AsyncMock()
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        ctx.params["max_tokens"] = 256
+
+        response = {
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": None,
+                                     "tool_calls": [{"id": "c1"}]}}],
+            "usage": {"completion_tokens": 40},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx, resp = await G11OutputFormat().process_response(ctx, response)
+
+        mock_redis.zadd.assert_not_called()
 
     async def test_process_response_feedback_loop_disabled_skips_recording(self, make_ctx):
         """When max_tokens_feedback_loop is false, process_response should skip recording."""
@@ -176,7 +328,11 @@ class TestG11OutputFormat:
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = False
         ctx.params["max_tokens"] = 256
 
-        response = {"usage": {"completion_tokens": 128}}
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "done"}}],
+            "usage": {"completion_tokens": 128},
+        }
 
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
@@ -198,6 +354,7 @@ class TestG11OutputHoldout:
 
     async def test_holdout_disabled_applies_shaping(self, make_ctx):
         ctx = make_ctx(model="gpt-4o")
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
             ctx = await G11OutputFormat().process_request(ctx)
@@ -206,6 +363,7 @@ class TestG11OutputHoldout:
 
     async def test_holdout_full_skips_shaping(self, make_ctx):
         ctx = make_ctx(model="gpt-4o")
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         self._enable_holdout(ctx, 1.0)
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
@@ -215,6 +373,7 @@ class TestG11OutputHoldout:
 
     async def test_holdout_zero_fraction_is_treatment(self, make_ctx):
         ctx = make_ctx(model="gpt-4o")
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         self._enable_holdout(ctx, 0.0)
         from middleware.g11_output_format import G11OutputFormat
         with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
@@ -275,6 +434,7 @@ class TestG11OutputHoldout:
     async def test_holdout_preserves_structured_output(self, make_ctx):
         """Even in the control cohort, correctness (JSON response_format) is NOT skipped."""
         ctx = make_ctx(model="gpt-4o")
+        ctx.config["groups"]["G11_output"]["fallback_max_tokens"] = 512
         self._enable_holdout(ctx, 1.0)
         ctx.config["groups"]["G11_output"]["force_json_for_all"] = True
         from middleware.g11_output_format import G11OutputFormat
