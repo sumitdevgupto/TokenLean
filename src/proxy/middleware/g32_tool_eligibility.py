@@ -40,7 +40,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext, resolve_group_config
+from middleware import RequestContext, coerce_mode, resolve_group_config
 from guardrails.tool_policy import (
     ToolPolicy,
     ToolPolicyError,
@@ -53,6 +53,8 @@ GROUP = "G32"
 
 _VALID_MODES = ("off", "flag", "block")
 _NOOP_POLICY = ToolPolicy()
+# Upper bound on distinct tenants cached at once (see _get_policy).
+_POLICY_CACHE_MAX = 512
 _DEFAULT_BLOCK_MESSAGE = (
     "A tool the model requested is not permitted by this workspace's tool policy, "
     "so it was not carried out."
@@ -63,11 +65,13 @@ class G32ToolEligibility:
     """Apply the per-tenant tool-eligibility policy to each response."""
 
     def __init__(self) -> None:
-        # (signature, ToolPolicy) in ONE attribute so a concurrent hot-reload swaps it
-        # atomically (GIL) — a snapshot read can never return a torn pair and therefore
-        # can never evaluate tenant A's tool call against tenant B's policy. Same shape
-        # as G30's `_scanner_cache`; rebuilt only when the policy config changes.
-        self._policy_cache: Optional[Tuple[str, ToolPolicy]] = None
+        # tenant_id -> (signature, ToolPolicy). Keyed by TENANT, not by signature alone:
+        # one G32 instance serves every tenant, so a single slot both thrashed (each
+        # tenant evicting the last) and — on the malformed-policy path below — could hand
+        # tenant B the last-good policy compiled for tenant A. Each value is still a
+        # single tuple, so a read is one atomic dict lookup returning a consistent pair
+        # (GIL) and a hot-reload swap can never be observed torn.
+        self._policy_cache: Dict[str, Tuple[str, ToolPolicy]] = {}
 
     # ── config / policy ──────────────────────────────────────────────────────
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
@@ -76,38 +80,51 @@ class G32ToolEligibility:
     def _get_policy(self, cfg: Dict[str, Any], ctx: RequestContext) -> ToolPolicy:
         """Compile (and cache) this tenant's policy.
 
-        On a malformed policy the LAST-GOOD compiled policy is retained — a bad pattern
-        arriving via hot-reload must not silently widen the gate. When there is no
-        last-good (the very first load is already broken, which the portal's write-time
-        422 makes an operator-only path) we fall back to a no-op and log at ERROR: the
-        alternative, denying every tool call across the tenant on a config typo, is an
-        outage rather than a safeguard. The ERROR line is the signal; readiness surfaces
-        it too.
+        On a malformed policy **this tenant's** last-good compiled policy is retained — a
+        bad pattern arriving via hot-reload must not silently widen the gate. The
+        last-good lookup is tenant-scoped: falling back to whatever policy another tenant
+        last compiled would be an isolation break, applying one workspace's rules to
+        another's traffic and making the verdict depend on request interleaving.
+
+        When this tenant has no last-good (its very first load is already broken, which
+        the portal's write-time 422 makes an operator-only path) we fall back to a no-op
+        and log at ERROR: the alternative, denying every tool call across the tenant on a
+        config typo, is an outage rather than a safeguard. The ERROR line is the signal;
+        readiness surfaces it too.
         """
         raw = cfg.get("policy") or {}
+        tenant_id = getattr(ctx, "tenant_id", "default")
         try:
             sig = json.dumps(raw, sort_keys=True, default=str)
         except (TypeError, ValueError):
             sig = repr(raw)
-        cache = self._policy_cache               # single atomic read (no torn pair)
-        if cache is not None and cache[0] == sig:
-            return cache[1]
+        cached = self._policy_cache.get(tenant_id)   # one atomic lookup (no torn pair)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
         try:
             policy = normalize_policy(raw)
         except ToolPolicyError as exc:
-            if cache is not None:
+            if cached is not None:
                 logger.warning(
-                    "[%s] G32 invalid tool policy (%s) — retaining last-good policy",
-                    ctx.request_id, exc,
+                    "[%s] G32 invalid tool policy for tenant %s (%s) — retaining that "
+                    "tenant's last-good policy",
+                    ctx.request_id, tenant_id, exc,
                 )
-                return cache[1]
+                return cached[1]
             logger.error(
-                "[%s] G32 invalid tool policy (%s) and no previously-valid policy to "
-                "fall back on — the gate is INERT for this tenant until the config is fixed",
-                ctx.request_id, exc,
+                "[%s] G32 invalid tool policy for tenant %s (%s) and no previously-valid "
+                "policy for it to fall back on — the gate is INERT for this tenant until "
+                "the config is fixed",
+                ctx.request_id, tenant_id, exc,
             )
             return _NOOP_POLICY
-        self._policy_cache = (sig, policy)       # single atomic swap
+        if len(self._policy_cache) >= _POLICY_CACHE_MAX and tenant_id not in self._policy_cache:
+            # Bounded so a key-enumeration probe cannot grow this without limit. Rebuild
+            # rather than pop so the swap stays a single atomic assignment; a dropped
+            # entry only costs one recompile.
+            self._policy_cache = {tenant_id: (sig, policy)}
+        else:
+            self._policy_cache[tenant_id] = (sig, policy)
         return policy
 
     # ── main entry point ─────────────────────────────────────────────────────
@@ -117,9 +134,7 @@ class G32ToolEligibility:
         cfg = self._config(ctx)
         if not cfg.get("enabled", True):
             return response
-        mode = str(cfg.get("mode", "flag")).lower()
-        if mode not in _VALID_MODES:
-            mode = "flag"
+        mode = coerce_mode(cfg.get("mode"), _VALID_MODES, "flag")
         if mode == "off":
             return response
         if not isinstance(response, dict):

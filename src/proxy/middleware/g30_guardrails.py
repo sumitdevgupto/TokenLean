@@ -30,7 +30,7 @@ Reference: #3 in the TokenLean vs OmniRoute commercial-gap roadmap.
 import logging
 from typing import Any, Dict, List, Optional
 
-from middleware import RequestContext, resolve_group_config
+from middleware import RequestContext, coerce_mode, resolve_group_config
 from guardrails import content_filter_response
 from guardrails.injection import InjectionScanner, InjectionVerdict
 
@@ -71,9 +71,7 @@ class G30Guardrails:
         if not cfg.get("enabled", True):
             return ctx
 
-        mode = str(cfg.get("mode", "flag")).lower()
-        if mode not in _VALID_MODES:
-            mode = "flag"
+        mode = coerce_mode(cfg.get("mode"), _VALID_MODES, "flag")
         if mode == "allow":
             return ctx  # passthrough — scanner does not run
 
@@ -111,9 +109,7 @@ class G30Guardrails:
         if not cfg.get("scan_response", False):
             return response
 
-        resp_mode = str(cfg.get("response_mode", "flag")).lower()
-        if resp_mode not in ("flag", "block"):
-            resp_mode = "flag"
+        resp_mode = coerce_mode(cfg.get("response_mode"), ("flag", "block"), "flag")
 
         scanner = self._get_scanner(cfg)
         categories: List[str] = []

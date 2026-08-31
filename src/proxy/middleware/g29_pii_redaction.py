@@ -36,7 +36,7 @@ Reference: #2 in the TokenLean vs OmniRoute commercial-gap roadmap.
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext, resolve_group_config
+from middleware import RequestContext, coerce_mode, resolve_group_config
 from guardrails import content_filter_response
 from guardrails.pii import PiiDetector, mask_matches, unmask_text, PHI_ENTITIES, DEFAULT_ENTITIES
 
@@ -63,8 +63,9 @@ class G29PiiRedaction:
         return resolve_group_config(ctx, "G29_pii_redaction")
 
     def _mode(self, cfg: Dict[str, Any]) -> str:
-        mode = str(cfg.get("mode", "flag")).lower()
-        return mode if mode in _VALID_MODES else "flag"
+        # coerce_mode, not str(): YAML resolves an unquoted `mode: off` to the
+        # boolean False, which str() turns into "false" -> silently back to "flag".
+        return coerce_mode(cfg.get("mode"), _VALID_MODES, "flag")
 
     @staticmethod
     def _resolve_entities(cfg: Dict[str, Any]):

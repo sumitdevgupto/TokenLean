@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from savings.models import SavingsRecord
 from savings.calculator import count_messages_tokens, count_request_tokens
@@ -230,18 +230,57 @@ def resolve_group_config(ctx, config_key: str) -> Dict[str, Any]:
     Returns ``base`` unchanged when the tenant has no overlay, so a config with no
     ``tenants:`` block behaves exactly as before. Never mutates ``ctx.config``:
     ``deep_merge`` writes in place, so the base is copied first.
+
+    **Every level is type-checked.** ``config.yaml`` is operator-edited YAML, so a
+    mis-indented key can make any node a string or a list instead of a mapping. An
+    unguarded ``.get()`` chain then raises ``AttributeError`` inside middleware and
+    500s every request for that tenant — a whole-tenant outage from a typo. A
+    malformed node is ignored (and the caller falls back to the base config) rather
+    than propagated, because degrading one group's tuning beats refusing all traffic.
     """
-    groups = ctx.config.get("groups", {}) or {}
-    base = groups.get(config_key, {}) or {}
-    tenants = ctx.config.get("tenants", {}) or {}
+    config = getattr(ctx, "config", None)
+    if not isinstance(config, dict):
+        return {}
+    groups = config.get("groups")
+    base = groups.get(config_key) if isinstance(groups, dict) else None
+    if not isinstance(base, dict):
+        base = {}
+    tenants = config.get("tenants")
     if not isinstance(tenants, dict):
         return base
-    tenant_block = tenants.get(getattr(ctx, "tenant_id", "default")) or {}
+    tenant_block = tenants.get(getattr(ctx, "tenant_id", "default"))
     if not isinstance(tenant_block, dict):
         return base
-    overlay = (tenant_block.get("groups", {}) or {}).get(config_key, {}) or {}
+    tenant_groups = tenant_block.get("groups")
+    if not isinstance(tenant_groups, dict):
+        return base
+    overlay = tenant_groups.get(config_key)
     if not overlay or not isinstance(overlay, dict):
         return base
     import copy as _copy
     from tenancy.config import deep_merge
     return deep_merge(_copy.deepcopy(base), overlay)
+
+
+def coerce_mode(raw: Any, valid: Sequence[str], default: str) -> str:
+    """Normalise a group's ``mode``-style config value against its allowed set.
+
+    YAML 1.1 resolves an unquoted ``off`` / ``no`` to the boolean ``False`` (and
+    ``on`` / ``yes`` to ``True``) **before** any of this code runs. So a documented
+    ``mode: off`` reaches the middleware as ``False``, and ``str(False).lower()``
+    yields ``"false"`` — not in any group's valid set, so it silently fell back to
+    the default. For G29 and G32 that meant a documented way to switch the group off
+    did nothing, leaving the operator with unexplained audit rows and metric series.
+
+    A boolean is therefore mapped back to what the operator wrote: ``False`` selects
+    the group's disabled mode when it has one (``off``), else the default; ``True``
+    selects the default (there is no "on" mode — enabling is what the default means).
+    Groups whose passthrough is spelled ``allow`` (G30/G31) have no ``off`` in their
+    valid set, so ``mode: off`` keeps falling back to the safe default for them.
+    """
+    if isinstance(raw, bool):
+        if raw is False and "off" in valid:
+            return "off"
+        return default
+    mode = str(default if raw is None else raw).strip().lower()
+    return mode if mode in valid else default

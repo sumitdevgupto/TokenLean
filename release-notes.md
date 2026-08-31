@@ -23,6 +23,63 @@ date changes.
 
 ## 2026-08-31
 
+### One workspace's tool policy could be applied to another's traffic — Bug fix
+The tool-eligibility gate cached each workspace's compiled policy in a single shared slot
+rather than one per workspace. If a policy failed to compile — a mistyped wildcard, say —
+the gate fell back to "the last policy that worked", which could be a *different*
+workspace's. The result was a workspace being judged by rules it never wrote, with the
+outcome depending on which requests happened to run first. The cache is now keyed per
+workspace, so a fallback can only ever reach that workspace's own last-good policy; if it
+has none, the gate reports the misconfiguration loudly and stops enforcing rather than
+guessing. This also removes the cache contention that made busy multi-tenant deployments
+recompile policies on nearly every request.
+
+### Turning PII redaction or the tool-eligibility gate "off" in config.yaml did nothing — Bug fix
+YAML treats an unquoted `off` as the value `false`, not as the word "off". Both controls
+compared it against their list of valid settings, found no match, and quietly fell back to
+their default. Nothing unsafe happened — the fallback is a detect-and-record setting that
+changes no traffic — but an operator who had switched a control off still saw its audit
+entries and metrics accumulate, with nothing anywhere explaining why. Both spellings now
+work, for these controls and for context trust's PII setting. The config template and
+reference call the gotcha out.
+
+### A malformed tenant block in config.yaml took a whole workspace offline — Bug fix
+config.yaml is edited by hand, so a mis-indented `tenants:` block can leave a section
+holding text where the proxy expects settings. Eight groups then failed while reading it
+and returned an error for every request from that workspace — a full outage from a typo.
+Configuration reading is now type-checked at every level: a malformed section costs that
+workspace its custom settings for that group and is logged, while traffic keeps flowing on
+the defaults. The four groups that carried their own near-duplicate copy of this logic now
+share the single hardened one, which also fixes batching quietly discarding sibling
+settings when a workspace overrode one value inside a nested block.
+
+### Batched requests skipped the tool-eligibility gate — Bug fix
+Batching answers a request out of band and delivers the result through a separate endpoint,
+neither of which runs the response checks. A batched request that came back asking to call
+a tool therefore reached the caller without being checked against the workspace's tool
+policy — a silent hole in a control whose entire guarantee is that it runs before anything
+can act. Requests that declare tools are no longer batched: they run normally, through the
+full set of checks. Bulk prose batching, which is what the feature exists for, is
+unaffected.
+
+### Context-trust decisions left no audit trail — Bug fix
+When the context-trust control found an injection attempt inside retrieved documents and
+flagged, stripped or blocked it, no audit entry was written — the decision was missing from
+both the audit writer and the code that schedules it, so it was the one trust & safety
+verdict with no compliance record. It now writes an entry like every sibling control, kept
+distinct from the user-prompt guardrail because the two mean different things: one says a
+user attacked you, the other says your own knowledge base is carrying an attack. Blocked,
+stripped and flagged stay separate outcomes, since a stripped request was still answered.
+- **[Enterprise]:** the events appear in the portal's Trust & Safety tab and the operator
+  console under a new *context trust* filter — <https://tokenlean.cbeyond.cloud/>
+
+### A broken tool-eligibility gate on cached responses looked identical to a working one — Bug fix
+Cached and bypassed responses are checked by a separate call to the tool-eligibility gate.
+If that call failed it was logged as a warning and the response served unchecked — the
+right trade-off, since failing a cache hit closed would be an outage, but indistinguishable
+on any dashboard from the gate passing cleanly. Failures are now logged as errors and
+counted on a dedicated metric, so a permanently broken gate is visible instead of silent.
+
 ### Per-tenant configuration now works for all four trust & safety controls — Bug fix
 Every group is meant to be configurable per tenant through two routes: the settings a
 tenant edits in the portal, and a `tenants.<id>.groups.<group>` block an operator sets in

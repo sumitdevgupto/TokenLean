@@ -19,19 +19,52 @@ from datetime import datetime, timezone
 
 import pytest
 
-from middleware import RequestContext, resolve_group_config
+import io
+
+from middleware import RequestContext, coerce_mode, resolve_group_config
+import middleware.g29_pii_redaction as g29_mod
+import middleware.g30_guardrails as g30_mod
+import middleware.g31_context_trust as g31_mod
+import middleware.g32_tool_eligibility as g32_mod
 from middleware.g29_pii_redaction import G29PiiRedaction
 from middleware.g30_guardrails import G30Guardrails
 from middleware.g31_context_trust import G31ContextTrust
 from middleware.g32_tool_eligibility import G32ToolEligibility
 from savings.models import SavingsRecord
 
-CASES = [
-    ("G29_pii_redaction", G29PiiRedaction, "off"),
-    ("G30_guardrails", G30Guardrails, "allow"),
-    ("G31_context_trust", G31ContextTrust, "allow"),
-    ("G32_tool_eligibility", G32ToolEligibility, "off"),
+# Derived from each group's OWN `_VALID_MODES`, not hand-listed: a hand-written table
+# silently stops covering a group whose modes change, and silently omits the next safety
+# group entirely — which is the same drift this file exists to catch. The disable value is
+# whichever passthrough mode that group actually declares (`off` for G29/G32, `allow` for
+# G30/G31), so the parametrisation cannot disagree with the implementation.
+_SAFETY_GROUPS = [
+    ("G29_pii_redaction", G29PiiRedaction, g29_mod),
+    ("G30_guardrails", G30Guardrails, g30_mod),
+    ("G31_context_trust", G31ContextTrust, g31_mod),
+    ("G32_tool_eligibility", G32ToolEligibility, g32_mod),
 ]
+
+
+def _passthrough_mode(module):
+    """The mode that means 'do not act' for this group, read off its valid set."""
+    valid = module._VALID_MODES
+    for candidate in ("off", "allow"):
+        if candidate in valid:
+            return candidate
+    raise AssertionError(f"{module.__name__} declares no passthrough mode in {valid!r}")
+
+
+CASES = [(key, cls, _passthrough_mode(mod)) for key, cls, mod in _SAFETY_GROUPS]
+
+
+def test_every_safety_group_is_covered():
+    """The pipeline's safety groups and this file's CASES must not drift apart."""
+    import middleware.pipeline as pipeline_mod
+    src = io.open(pipeline_mod.__file__, encoding="utf-8").read()
+    declared = {k for k, _, _ in CASES}
+    for n in (29, 30, 31, 32):
+        assert any(k.startswith(f"G{n}_") for k in declared), f"G{n} missing from CASES"
+        assert f"g{n}." in src or f"self.g{n}" in src, f"G{n} not wired into the pipeline"
 
 
 def _ctx(config, tenant_id="acme"):

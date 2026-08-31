@@ -46,7 +46,7 @@ Reference: G31 in the Input-Safety / Context-Quality / Output-Reliability plan;
 import logging
 from typing import Any, Dict, List, Optional
 
-from middleware import RequestContext, resolve_group_config
+from middleware import RequestContext, coerce_mode, resolve_group_config
 from guardrails import content_filter_response
 from guardrails.injection import InjectionScanner, InjectionVerdict
 from guardrails.pii import PiiDetector, mask_matches, PHI_ENTITIES, DEFAULT_ENTITIES
@@ -117,9 +117,7 @@ class G31ContextTrust:
 
     # ── Injection pass ──────────────────────────────────────────────────────────
     def _run_injection(self, ctx: RequestContext, cfg: Dict[str, Any]) -> None:
-        mode = str(cfg.get("mode", "flag")).lower()
-        if mode not in _VALID_MODES:
-            mode = "flag"
+        mode = coerce_mode(cfg.get("mode"), _VALID_MODES, "flag")
         if mode == "allow":
             return  # passthrough — scanner does not run
 
@@ -153,8 +151,10 @@ class G31ContextTrust:
         Masking is IRREVERSIBLE by construction (no vault) — retrieved PII must never be
         restored into the answer (see module docstring). Records on ctx.context_trust_pii_*
         (separate from G29's pii_*)."""
-        pii_mode = str(cfg.get("pii_mode", "off")).lower()
-        if pii_mode not in _VALID_PII_MODES or pii_mode == "off":
+        # `off` is both this knob's default AND a YAML boolean, so coerce_mode is
+        # what makes an explicit `pii_mode: off` mean off rather than fall back.
+        pii_mode = coerce_mode(cfg.get("pii_mode"), _VALID_PII_MODES, "off")
+        if pii_mode == "off":
             return
 
         detector = self._get_detector(cfg)

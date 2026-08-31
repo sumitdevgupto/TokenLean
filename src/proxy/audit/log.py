@@ -27,6 +27,17 @@ def _redaction_action(mode: str) -> str:
     return _REDACTION_ACTION.get(mode, "redaction.flagged")
 
 
+# G31's injection verdict. `strip` has no G30 equivalent (G30 blocks or flags; G31 can
+# also excise the matched span and continue) so it gets its own action name rather than
+# being folded into "blocked" — a stripped request WAS served, and a compliance reviewer
+# reading the ledger must be able to tell those two outcomes apart.
+_CONTEXT_TRUST_ACTIONS = {
+    "flag": "context_trust.flagged",
+    "block": "context_trust.blocked",
+    "strip": "context_trust.stripped",
+}
+
+
 # Mirrors the Terraform heredoc (infra/main.tf audit_events_schema_migration) so local /
 # self-host deployments get the table without Terraform; the ALTER back-fills `details`
 # on GCP databases created at schema_version=1. All statements are idempotent.
@@ -176,6 +187,22 @@ class AuditLogger:
                     "entities": list(getattr(ctx, "pii_entities", []) or []),
                     "count": int(getattr(ctx, "pii_redactions", 0) or 0),
                     "mode": p_action,
+                },
+            ))
+        # G31 INJECTION verdict over retrieved context. Distinct action names from G30's
+        # (`context_trust.*` vs `guardrail.*`) because they answer different compliance
+        # questions: G30 is "a user tried to attack us", G31 is "our own corpus carried an
+        # attack" — which is an incident in the knowledge base, not the user population.
+        # Without this, G31's primary verdict was the one trust & safety decision that
+        # left no audit trail at all.
+        cti_action = getattr(ctx, "context_trust_action", None)
+        if cti_action in ("flag", "block", "strip"):
+            events.append((
+                _CONTEXT_TRUST_ACTIONS[cti_action],
+                {
+                    "categories": list(getattr(ctx, "context_trust_categories", []) or []),
+                    "mode": cti_action,
+                    "source": "retrieved",
                 },
             ))
         # G31 PII pass over RETRIEVED context — distinct `source` so a compliance reviewer

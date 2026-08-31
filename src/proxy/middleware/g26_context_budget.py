@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from middleware import langfuse_tracing
 from middleware.history_utils import safe_window_split, summarise_turns
 from middleware.prose_compress import compress_text
@@ -59,33 +59,19 @@ _WARNED: set = set()
 
 # ─── Config helpers ───────────────────────────────────────────────────────────
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    result = dict(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = _deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
 
 
 def _resolve_g26_cfg(ctx: RequestContext) -> Dict[str, Any]:
     """G26 config with the per-tenant override deep-merged in (tenant wins).
 
-    Lets a tenant tune ``compact_at_pct`` / rung toggles under
-    ``tenants.<id>.groups.G26_context_budget`` without re-declaring the block.
-    Mirrors G28's ``_resolve_g28_cfg``.
+    Delegates to the shared ``middleware.resolve_group_config`` so every group
+    resolves the tenant overlay identically AND inherits its type guards:
+    ``config.yaml`` is operator-edited, and an unguarded ``.get()`` chain over a
+    mis-indented ``tenants:`` block raised ``AttributeError`` here — a 500 on every
+    request for that tenant.
     """
-    base = ctx.config.get("groups", {}).get("G26_context_budget", {})
-    tenant_cfg = (
-        ctx.config.get("tenants", {})
-        .get(getattr(ctx, "tenant_id", "default"), {})
-        .get("groups", {})
-        .get("G26_context_budget", {})
-    )
-    if not tenant_cfg:
-        return base
-    return _deep_merge(base, tenant_cfg)
+    return resolve_group_config(ctx, "G26_context_budget")
+
 
 
 def _get_model_context_window(model: Optional[str], cfg: Dict[str, Any]) -> int:

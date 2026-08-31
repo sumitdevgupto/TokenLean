@@ -761,7 +761,9 @@ prompt-injected model could otherwise trigger a tool it should never reach.
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `enabled` | bool | `true` | Master switch. |
-| `mode` | enum | `flag` | `off` = policy not evaluated; `flag` = record ineligible calls, serve unchanged; `block` = strip the call. **`off`, not `allow`** — this group's own config already uses "allow" twice below, so `mode: allow` would be ambiguous (G29 uses `off` for the same reason). |
+| `mode` | enum | `flag` | `off` = policy not evaluated; `flag` = record ineligible calls, serve unchanged; `block` = strip the call. **`off`, not `allow`** — this group's own config already uses "allow" twice below, so `mode: allow` would be ambiguous (G29 uses `off` for the same reason). YAML resolves an unquoted `off` to the boolean `false`; the proxy maps it back, so `off` and `"off"` both work. |
+
+> **`off` and YAML booleans.** YAML 1.1 resolves an unquoted `off` / `no` to `false` (and `on` / `yes` to `true`) before the proxy sees it. For the groups that have an `off` mode — G29 `mode`, G31 `pii_mode`, G32 `mode` — the proxy maps the boolean back to `off`, so both spellings work. Quoting (`mode: "off"`) is still the clearer habit. G30 and G31's `mode` spell passthrough `allow`, which is not a YAML boolean and needs no quoting.
 | `policy.allow` | list | `[]` | fnmatch globs, **case-sensitive** (e.g. `db_read_*`). |
 | `policy.deny` | list | `[]` | Globs that are always ineligible. **Deny wins over allow**, so adding a tool to `allow` can never re-open something denied. |
 | `policy.default` | enum | `allow` | What an unmatched tool gets. `deny` turns the policy into an **allowlist**. |

@@ -67,6 +67,15 @@ TOOL_ELIGIBILITY_DENIED_TOTAL = Counter(
     "stripped before any auto-executing group could dispatch it.",
     ["tenant_id", "mode"],
 )
+TOOL_ELIGIBILITY_FAILURES_TOTAL = Counter(
+    "token_opt_tool_eligibility_failures_total",
+    "Times the G32 eligibility gate could not be applied to a response it was "
+    "supposed to gate. `path` names where: short_circuit = the cache-hit / bypass "
+    "hoist in main.py, which degrades to serving the response ungated so a broken "
+    "gate cannot turn a cache hit into an error. A non-zero rate means responses "
+    "are being served WITHOUT tool-call enforcement — alert on it.",
+    ["tenant_id", "path"],
+)
 OUTPUT_VERIFY_SCORE = Histogram(
     "token_opt_output_verify_score",
     "Faithfulness/accuracy score (1-5) from the sampled inline judge (G33, Task 7).",
@@ -106,6 +115,13 @@ def record_schema_failure(tenant_id: str, mode: str) -> None:
 def record_tool_denied(tenant_id: str, mode: str = "block", n: int = 1) -> None:
     _safe(lambda: TOOL_ELIGIBILITY_DENIED_TOTAL.labels(
         tenant_id=tenant_id or "default", mode=mode or "block").inc(n))
+
+
+def record_tool_gate_failure(tenant_id: str, path: str = "short_circuit") -> None:
+    """The gate was supposed to run and did not. Distinct from `record_tool_denied`:
+    that one means the gate worked, this one means it did not."""
+    _safe(lambda: TOOL_ELIGIBILITY_FAILURES_TOTAL.labels(
+        tenant_id=tenant_id or "default", path=path or "unknown").inc())
 
 
 def record_verify_score(tenant_id: str, score: float) -> None:

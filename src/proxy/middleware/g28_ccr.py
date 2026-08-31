@@ -34,7 +34,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from middleware import langfuse_tracing
 from savings.calculator import estimate_tokens
 
@@ -286,33 +286,19 @@ def dispatch_mcp_tool(
 
 # ─── Per-tenant config resolution ─────────────────────────────────────────────
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    result = dict(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = _deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
 
 
 def _resolve_g28_cfg(ctx: RequestContext) -> Dict[str, Any]:
     """G28 config with the per-tenant override deep-merged in (tenant wins).
 
-    Lets a tenant flip a single key (e.g. ``enabled`` for a cooperating agent client,
-    or ``compress_system_prompt``) under ``tenants.<id>.groups.G28_ccr`` without
-    re-declaring the whole block. Mirrors G21's ``_resolve_g21_cfg``.
+    Delegates to the shared ``middleware.resolve_group_config`` so every group
+    resolves the tenant overlay identically AND inherits its type guards:
+    ``config.yaml`` is operator-edited, and an unguarded ``.get()`` chain over a
+    mis-indented ``tenants:`` block raised ``AttributeError`` here — a 500 on every
+    request for that tenant.
     """
-    base = ctx.config.get("groups", {}).get("G28_ccr", {})
-    tenant_cfg = (
-        ctx.config.get("tenants", {})
-        .get(ctx.tenant_id, {})
-        .get("groups", {})
-        .get("G28_ccr", {})
-    )
-    if not tenant_cfg:
-        return base
-    return _deep_merge(base, tenant_cfg)
+    return resolve_group_config(ctx, "G28_ccr")
+
 
 
 # ─── G28 Middleware ───────────────────────────────────────────────────────────

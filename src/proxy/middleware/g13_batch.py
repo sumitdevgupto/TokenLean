@@ -16,7 +16,7 @@ import time
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from savings.calculator import count_messages_tokens, estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,22 @@ class G13Batch:
 
         # 2. Batch accumulation via Redis Streams (only for explicitly tagged requests)
         batch_topic = ctx.params.get("batch_topic")
+        if batch_topic and _tool_bearing(ctx):
+            # A batched request is answered out-of-band by the flush worker and its result
+            # is handed to the caller by /v1/batch/results/{id} — neither path runs the
+            # response pipeline, so G32 never sees the tool calls the model asks for. That
+            # would make batching a silent bypass of a trust & safety gate whose whole
+            # guarantee is that it runs before anything can auto-execute a tool.
+            #
+            # Refusing to batch is the honest resolution: batching exists for fire-and-
+            # forget bulk prompts, and a request that can make the proxy ACT is not that.
+            # The request still runs — just synchronously, through the full gated pipeline.
+            logger.info(
+                "[%s] G13 not batching a tool-bearing request (topic=%s) — batch results "
+                "skip the response pipeline, which would bypass the G32 eligibility gate",
+                ctx.request_id, batch_topic,
+            )
+            batch_topic = None
         if batch_topic:
             await _accumulate(ctx, batch_topic)
             ctx.batch_deferred = True  # response will be delivered async
@@ -57,16 +73,28 @@ class G13Batch:
         return ctx
 
 
+def _tool_bearing(ctx: RequestContext) -> bool:
+    """True when this request could come back with tool calls.
+
+    Checked against the request rather than the response because the decision has to be
+    made BEFORE the request is deferred. `tools` is the OpenAI field; `functions` is its
+    deprecated predecessor, still accepted by providers, so both count.
+    """
+    params = getattr(ctx, "params", None) or {}
+    return bool(params.get("tools") or params.get("functions"))
+
+
 def _resolve_toon_cfg(ctx: RequestContext) -> Dict[str, Any]:
-    """G13_batch config with the per-tenant override merged in (tenant wins)."""
-    base = ctx.config.get("groups", {}).get("G13_batch", {})
-    tenant_cfg = (
-        ctx.config.get("tenants", {})
-        .get(ctx.tenant_id, {})
-        .get("groups", {})
-        .get("G13_batch", {})
-    )
-    return {**base, **tenant_cfg}
+    """G13_batch config with the per-tenant override merged in (tenant wins).
+
+    Delegates to the shared ``middleware.resolve_group_config`` so every group resolves
+    the tenant overlay identically. Two things change here: the merge is now DEEP (this
+    was the only group shallow-merging, so a tenant overriding one key of a nested block
+    silently dropped its siblings), and every level is type-guarded — ``config.yaml`` is
+    operator-edited, and an unguarded ``.get()`` chain over a mis-indented ``tenants:``
+    block raised ``AttributeError`` here, 500-ing every request for that tenant.
+    """
+    return resolve_group_config(ctx, "G13_batch")
 
 
 async def _apply_toon(

@@ -710,6 +710,7 @@ def _schedule_security_audit(ctx) -> None:
     if ctx is None or _audit_logger is None:
         return
     if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)
+            or getattr(ctx, "context_trust_action", None)
             or getattr(ctx, "context_trust_pii_action", None)
             or getattr(ctx, "tool_eligibility_action", None)):
         return
@@ -741,9 +742,21 @@ async def _apply_tool_eligibility_on_short_circuit(ctx, response: Dict) -> Dict:
     try:
         return await g32.process_response(ctx, response)
     except Exception as exc:
-        logger.warning(
-            "[%s] G32 on short-circuit path failed: %s", getattr(ctx, "request_id", "?"), exc
+        # ERROR + a dedicated counter, not a WARNING: this branch serves a response the
+        # gate was supposed to check and did NOT. Staying fail-open here is deliberate
+        # (the gate already ran on the miss that populated the entry, and failing a cache
+        # hit closed would be an outage), but "gate broke" must be distinguishable from
+        # "gate passed" — otherwise a permanently-broken gate looks identical to a clean
+        # one on every dashboard.
+        logger.error(
+            "[%s] G32 FAILED on the short-circuit path — response served WITHOUT "
+            "tool-call enforcement: %s", getattr(ctx, "request_id", "?"), exc,
         )
+        try:
+            from middleware.quality_metrics import record_tool_gate_failure
+            record_tool_gate_failure(getattr(ctx, "tenant_id", "default"), path="short_circuit")
+        except Exception:  # metrics must never break the served response
+            pass
         return response
 
 

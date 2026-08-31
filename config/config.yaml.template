@@ -1225,6 +1225,11 @@ groups:
   # them, bypass/cache traffic is still covered, and redaction precedes every
   # content-persisting stage (G05 key/embedding, G07 RAG, G10 memory, G28 CCR).
   # Defaults are NON-MUTATING (mode: flag) so the shipped config is safe and its
+  #
+  # NOTE ON `off`: YAML resolves an unquoted `off` (and `no`) to the boolean false.
+  # The proxy maps that back to the string "off" for the groups that have an `off`
+  # mode (G29, G32), so both `mode: off` and `mode: "off"` work. Quoting is still
+  # clearer, and is what every example below uses.
   # token accounting is unchanged. Override per-tenant under
   # tenants.<id>.groups.G29_pii_redaction / .G30_guardrails.
   G30_guardrails:

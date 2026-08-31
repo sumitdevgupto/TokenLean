@@ -17,7 +17,7 @@ import copy
 import logging
 from typing import Any, Dict, List, Optional
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from middleware import langfuse_tracing
 from savings.calculator import count_messages_tokens
 
@@ -32,34 +32,19 @@ GROUP = "G21"
 # system-first reordering here. Revisit as a dedicated enhancement if measured.
 
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively merge ``override`` into a copy of ``base`` (override wins at the leaves)."""
-    result = copy.deepcopy(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = _deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
 
 
 def _resolve_g21_cfg(ctx: RequestContext) -> Dict[str, Any]:
     """G21 config with the per-tenant override deep-merged in.
 
-    Lets a Claude-heavy tenant flip just ``providers.anthropic.marker: true`` (to
-    capture the 90% Anthropic cache discount) while inheriting every other default —
-    without affecting OpenAI tenants, where the global default stays ``marker: false``.
+    Delegates to the shared ``middleware.resolve_group_config`` so every group
+    resolves the tenant overlay identically AND inherits its type guards:
+    ``config.yaml`` is operator-edited, and an unguarded ``.get()`` chain over a
+    mis-indented ``tenants:`` block raised ``AttributeError`` here — a 500 on every
+    request for that tenant.
     """
-    base = ctx.config.get("groups", {}).get("G21_cache_alignment", {})
-    tenant_cfg = (
-        ctx.config.get("tenants", {})
-        .get(ctx.tenant_id, {})
-        .get("groups", {})
-        .get("G21_cache_alignment", {})
-    )
-    if not tenant_cfg:
-        return base
-    return _deep_merge(base, tenant_cfg)
+    return resolve_group_config(ctx, "G21_cache_alignment")
+
 
 
 class G21CacheAlignment:
