@@ -30,7 +30,7 @@ Reference: #3 in the TokenLean vs OmniRoute commercial-gap roadmap.
 import logging
 from typing import Any, Dict, List, Optional
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from guardrails import content_filter_response
 from guardrails.injection import InjectionScanner, InjectionVerdict
 
@@ -51,7 +51,7 @@ class G30Guardrails:
         self._scanner_cache: Optional[tuple] = None
 
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
-        return ctx.config.get("groups", {}).get("G30_guardrails", {}) or {}
+        return resolve_group_config(ctx, "G30_guardrails")
 
     def _get_scanner(self, cfg: Dict[str, Any]) -> InjectionScanner:
         threshold = float(cfg.get("threshold", 0.5))

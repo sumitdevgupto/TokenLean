@@ -36,7 +36,7 @@ Reference: #2 in the TokenLean vs OmniRoute commercial-gap roadmap.
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from guardrails import content_filter_response
 from guardrails.pii import PiiDetector, mask_matches, unmask_text, PHI_ENTITIES, DEFAULT_ENTITIES
 
@@ -60,7 +60,7 @@ class G29PiiRedaction:
         self._detector_cache: Optional[tuple] = None
 
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
-        return ctx.config.get("groups", {}).get("G29_pii_redaction", {}) or {}
+        return resolve_group_config(ctx, "G29_pii_redaction")
 
     def _mode(self, cfg: Dict[str, Any]) -> str:
         mode = str(cfg.get("mode", "flag")).lower()

@@ -40,7 +40,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from guardrails.tool_policy import (
     ToolPolicy,
     ToolPolicyError,
@@ -71,7 +71,7 @@ class G32ToolEligibility:
 
     # ── config / policy ──────────────────────────────────────────────────────
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
-        return ctx.config.get("groups", {}).get("G32_tool_eligibility", {}) or {}
+        return resolve_group_config(ctx, "G32_tool_eligibility")
 
     def _get_policy(self, cfg: Dict[str, Any], ctx: RequestContext) -> ToolPolicy:
         """Compile (and cache) this tenant's policy.

@@ -211,3 +211,37 @@ class RequestContext:
             qdrant_collection=qdrant_collection,
             pricing_tier=pricing_tier,
         )
+
+
+def resolve_group_config(ctx, config_key: str) -> Dict[str, Any]:
+    """Effective config for one group, with the per-tenant YAML overlay applied.
+
+    Two per-tenant mechanisms exist and a group must honour BOTH:
+
+    * ``tenant_configs.config_overrides`` (the DB path the portal writes) is already
+      deep-merged into ``ctx.config["groups"]`` by ``TenantConfigLoader`` before any
+      middleware runs — so reading ``groups.<key>`` alone picks that up for free;
+    * ``tenants.<id>.groups.<key>`` in ``config.yaml`` is the OPERATOR path, and it is
+      resolved here, at read time. It is the only way to configure one tenant
+      differently without a database write, which matters most for the trust & safety
+      groups: a tenant is (correctly) refused permission to disable them, so an
+      operator needs somewhere to do it per tenant rather than globally.
+
+    Returns ``base`` unchanged when the tenant has no overlay, so a config with no
+    ``tenants:`` block behaves exactly as before. Never mutates ``ctx.config``:
+    ``deep_merge`` writes in place, so the base is copied first.
+    """
+    groups = ctx.config.get("groups", {}) or {}
+    base = groups.get(config_key, {}) or {}
+    tenants = ctx.config.get("tenants", {}) or {}
+    if not isinstance(tenants, dict):
+        return base
+    tenant_block = tenants.get(getattr(ctx, "tenant_id", "default")) or {}
+    if not isinstance(tenant_block, dict):
+        return base
+    overlay = (tenant_block.get("groups", {}) or {}).get(config_key, {}) or {}
+    if not overlay or not isinstance(overlay, dict):
+        return base
+    import copy as _copy
+    from tenancy.config import deep_merge
+    return deep_merge(_copy.deepcopy(base), overlay)

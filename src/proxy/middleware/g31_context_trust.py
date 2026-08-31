@@ -46,7 +46,7 @@ Reference: G31 in the Input-Safety / Context-Quality / Output-Reliability plan;
 import logging
 from typing import Any, Dict, List, Optional
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from guardrails import content_filter_response
 from guardrails.injection import InjectionScanner, InjectionVerdict
 from guardrails.pii import PiiDetector, mask_matches, PHI_ENTITIES, DEFAULT_ENTITIES
@@ -85,7 +85,7 @@ class G31ContextTrust:
         self._detector_cache: Optional[tuple] = None
 
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
-        return ctx.config.get("groups", {}).get("G31_context_trust", {}) or {}
+        return resolve_group_config(ctx, "G31_context_trust")
 
     def _get_scanner(self, cfg: Dict[str, Any]) -> InjectionScanner:
         threshold = float(cfg.get("threshold", 0.5))

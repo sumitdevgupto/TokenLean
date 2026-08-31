@@ -23,6 +23,20 @@ date changes.
 
 ## 2026-08-31
 
+### Per-tenant configuration now works for all four trust & safety controls — Bug fix
+Every group is meant to be configurable per tenant through two routes: the settings a
+tenant edits in the portal, and a `tenants.<id>.groups.<group>` block an operator sets in
+config.yaml. The second route was documented for PII redaction, injection guardrails,
+context trust and tool eligibility but implemented for none of them — those four read the
+global block only, silently ignoring a per-tenant operator override. That gap bit hardest
+exactly where it mattered: a tenant is deliberately refused permission to switch a safety
+control off, so with the operator route inert there was nowhere to configure one tenant
+differently short of editing the database directly. All four now resolve the overlay
+through one shared helper, merging key-by-key so overriding one setting never drops its
+siblings, and never mutating the shared config other tenants are reading. Deployments
+with no `tenants:` block behave exactly as before.
+
+
 ### Tool-call events now shown correctly in the portal and operator console — Bug fix [Enterprise]
 Tool-eligibility events were being recorded but mis-presented. Both the tenant Security
 tab and the cross-tenant operator summary bucketed trust & safety events into exactly two
