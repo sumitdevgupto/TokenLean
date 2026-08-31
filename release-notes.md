@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-08-31
 
+### Tool-call eligibility added to the never-auto-skip safety list — Bug fix
+The self-tuning learning loop keeps a denylist of groups it may never emit a bypass rule
+for (rate limiting, cache, routing, observability, and the trust & safety groups). G32
+shipped earlier the same day without being added to it. No live exposure — the response
+chain has no `skip_groups` guard, so G32 was unreachable by adaptive bypass regardless —
+but the denylist is the registry that keeps the invariant true if that ever changes, and
+a safety control that could be switched off by a learned rule is not a safety control.
+The replacement test asserts the property by class (every trust & safety group is
+denylisted) rather than by re-listing today's groups, so the next one to land fails until
+it is covered. Also completes the G32 documentation pass: the group table, response-chain
+order, RequestContext fields, Free-vs-Enterprise matrix, and the remaining `G0–G31` spans.
+
+
 ### Tool-call eligibility — decide which tools a model is allowed to ask for — Enhancement (OSS + Enterprise)
 Server-side tool execution previously had **no authorization**: G15 dispatched handlers by
 bare name match against a hardcoded set, so a prompt-injected model could make the proxy

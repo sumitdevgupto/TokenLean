@@ -446,7 +446,7 @@ See [docs/request-flow-diagram.md](docs/request-flow-diagram.md) for the full pi
 
 **Savings never come at the cost of quality by default.** Every group is config-driven (`groups.<G>` in [config/config.yaml.template](config/config.yaml.template)), and each ships a **quality-safe default**. The knobs below are the ones that trade token savings against output quality — turn them up for more savings, or leave them at (or below) the default to protect quality. Every knob is per-tenant overridable and hot-reloaded (~60s, no redeploy). This table lists the highest-impact knob(s) per group; the **complete parameter list with every default lives in [docs/config-reference.md](docs/config-reference.md).**
 
-On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **every** step — G00–G31, including rate limiting (G00) and context trust (G31) — has an enable toggle and its key knobs in the self-service **Optimisation Settings** tab (whitelisted + clamped server-side). Trust & safety (G29/G30/G31) are **operator-safe**: tenants tune the policy mode/threshold, but the hard enable/disable is operator-only. Self-host tenants set the same knobs directly in `config.yaml`.
+On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **every** step — G00–G32, including rate limiting (G00), context trust (G31) and tool eligibility (G32) — has an enable toggle and its key knobs in the self-service **Optimisation Settings** tab (whitelisted + clamped server-side). Trust & safety (G29/G30/G31) are **operator-safe**: tenants tune the policy mode/threshold, but the hard enable/disable is operator-only. Self-host tenants set the same knobs directly in `config.yaml`.
 
 | Group | Key quality knob(s) — default | Turn **up** savings → | Protect **quality** ← |
 |-------|-------------------------------|------------------------|------------------------|
@@ -740,10 +740,11 @@ never gate the optimisations.
 
 | Capability | FREE (self-host) | ENTERPRISE (managed) |
 |---|---|---|
-| All 28 optimisations + G29/G30/G31 trust & safety | ✅ | ✅ (operated for you, SLA-backed) |
+| All 28 optimisations + G29/G30/G31/G32 trust & safety | ✅ | ✅ (operated for you, SLA-backed) |
 | Measured savings, 10 dashboards, multi-tenancy, provider failover | ✅ | ✅ |
 | Native multi-protocol ingress + structural tool round-tripping | ✅ | ✅ |
 | **Context-budget compaction (G26)** — compact a long conversation before it overflows the model's context window | ✅ OSS engine, all thresholds + per-step switches in `config.yaml` (default off) | ✅ same engine, tuned per tenant from the portal's Groups tab — no config files, no redeploy |
+| **Tool-call eligibility engine** (allow/deny policy over the tools a model may invoke) | ✅ OSS | ✅ + **Tool Policy console** (edit the policy per tenant, dry-run it before saving, audited change trail) |
 | Intent-orchestration **engine** (config-driven agent registry) | ✅ OSS | ✅ + **Agents console** (declare/govern agents from the portal) + routing-decision audit + ML intent classifier |
 | **Self-tuning learning loop** — auto-switches off optimisations that stop paying off per tenant | rule-**applying** engine (G24) ✅ | ✅ managed miner that **learns** the rules from your usage (with a safety denylist — cache/routing/safety are never skipped) |
 | **Free trials** — days AND requests (whichever first), 402 on expiry, trial traffic never invoiced | gate + `/portal/trial` status ✅ OSS (default-off) | ✅ admin-console lifecycle (start/extend/convert/cancel + audit), fleet view, portal trial card/banner + 80/90% `trial.threshold`/`trial.expired` webhooks |

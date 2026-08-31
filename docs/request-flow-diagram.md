@@ -595,7 +595,7 @@ class RequestContext:
     agent_response: Optional[Dict] = None
     agent_id: str = ""                 # which registered agent handled it (observability)
 
-    # ── Trust & Safety (G29 PII / G30 injection / G31 context-trust) ────────
+    # ── Trust & Safety (G29 PII / G30 injection / G31 context-trust / G32 tools) ──
     security_blocked: bool = False     # G30/G29/G31 hard block → content-filter 200
     security_block_response: Optional[Dict] = None
     guardrail_action: Optional[str] = None            # G30 request verdict: allow|flag|block
@@ -604,6 +604,9 @@ class RequestContext:
     context_trust_pii_action: Optional[str] = None    # G31 opt-in PII pass: flag|mask|block
     pii_action: Optional[str] = None                  # G29: flag|mask|block
     pii_vault: Dict[str, str] = {}     # in-memory reversible-mask store (never persisted)
+    tool_eligibility_action: Optional[str] = None     # G32 response verdict: flag|block
+    tool_eligibility_denied: List[str] = []           # denied tool NAMES (no prompt content)
+    tool_eligibility_count: int = 0                   # ineligible calls seen this response
     no_cache: bool = False             # G29 masked PII → must not read/write shared cache
 
     # ── Multi-protocol ingress (#4) ─────────────────────────────────────────
@@ -736,15 +739,17 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G29** | `g29_pii_redaction.py`, `guardrails/pii.py` | **Trust & Safety** — PII/PHI detection + redaction (request + response); modes off/flag/mask/block |
 | **G30** | `g30_guardrails.py`, `guardrails/injection.py` | **Trust & Safety** — prompt-injection / jailbreak guardrails over the user prompt (+ opt-in response scan); modes allow/flag/block |
 | **G31** | `g31_context_trust.py`, `guardrails/injection.py`, `guardrails/pii.py` | **Trust & Safety** — indirect / RAG-injection defence over the assembled context (+ opt-in irreversible PII pass); allow/flag/block/strip |
+| **G32** | `g32_tool_eligibility.py`, `guardrails/tool_policy.py` | **Trust & Safety** — allow/deny policy over the tool calls the model REQUESTS; runs on the response before G14/G28/G15, the only thing gating G15's unauthenticated auto-exec; `off\|flag\|block`; non-streaming only |
 | **F2** | `intent_orchestration.py` | Intent-based downstream-agent dispatch (OSS core; default off) |
-| — | `pipeline.py` | Orchestrates the G0–G28 + F2 + G29/G30/G31 request/response pipeline |
+| — | `pipeline.py` | Orchestrates the G0–G28 + F2 + G29/G30/G31/G32 request/response pipeline |
 | — | `__init__.py` | RequestContext dataclass definition |
 
-## Implementation Status: 28 optimisation groups (G0–G28) + 3 trust & safety (G29/G30/G31) + F2
+## Implementation Status: 28 optimisation groups (G0–G28) + 4 trust & safety (G29/G30/G31/G32) + F2
 
 All 28 optimisation slots are implemented — G26 filled the last reserved slot with budget-aware
-context management — plus the three non-savings **trust & safety** groups
-(G29 PII, G30 injection, G31 context-trust) and the OSS-core **F2 Intent Orchestration** stage.
+context management — plus the four non-savings **trust & safety** groups
+(G29 PII, G30 injection, G31 context-trust, G32 tool-call eligibility) and the OSS-core
+**F2 Intent Orchestration** stage.
 Optional integrations (headroom, Mem0, Zep, Kafka, Temporal, Instructor, Presidio) degrade
 gracefully when their packages or backing services are absent.
 
