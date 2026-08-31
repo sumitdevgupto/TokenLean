@@ -23,6 +23,21 @@ date changes.
 
 ## 2026-08-31
 
+### Tool-call events now shown correctly in the portal and operator console — Bug fix [Enterprise]
+Tool-eligibility events were being recorded but mis-presented. Both the tenant Security
+tab and the cross-tenant operator summary bucketed trust & safety events into exactly two
+kinds, so every tool-call event was counted and labelled as a guardrail event — the data
+was right, the reporting was not. Bucketing is now three-way, and the incident log gained
+a "Tool call" label, a matching filter, and a readable summary line naming the tools that
+were blocked or flagged. The operator console gained a "Tool calls stopped" tile. Also
+fixes a nearby gap: the deployment readiness check verified the tool-eligibility gate but
+never counted that result toward the READY verdict, so a broken gate could have been
+reported alongside a passing deploy. Self-hosters are unaffected — the engine, its metric
+and its audit rows were always correct; only the managed presentation layer was wrong.
+- **[Enterprise]:** Security tab, operator console and readiness verdict —
+  <https://tokenlean.cbeyond.cloud/>
+
+
 ### Tool-call eligibility added to the never-auto-skip safety list — Bug fix
 The self-tuning learning loop keeps a denylist of groups it may never emit a bypass rule
 for (rate limiting, cache, routing, observability, and the trust & safety groups). G32
