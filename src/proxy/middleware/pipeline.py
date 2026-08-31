@@ -40,6 +40,7 @@ from middleware.g28_ccr import G28CCR
 from middleware.g29_pii_redaction import G29PiiRedaction
 from middleware.g30_guardrails import G30Guardrails
 from middleware.g31_context_trust import G31ContextTrust
+from middleware.g32_tool_eligibility import G32ToolEligibility
 from middleware import langfuse_tracing
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ class OptimisationPipeline:
         self.g29 = G29PiiRedaction()
         self.g30 = G30Guardrails()
         self.g31 = G31ContextTrust()
+        self.g32 = G32ToolEligibility()
 
     def set_db_pool(self, pool) -> None:
         """Inject the asyncpg pool into the tenant-config loader after startup.
@@ -324,6 +326,11 @@ class OptimisationPipeline:
         for _name, _fn in [
             ("G29-pii-redaction-resp", lambda r: self.g29.process_response(ctx, r)),
             ("G30-guardrails-resp", lambda r: self.g30.process_response(ctx, r)),
+            # G32 MUST stay ahead of G14/G28/G15 — those three auto-execute or rewrite
+            # tool calls (G15 dispatches server-side handlers by bare name match, with
+            # no authorization of its own), so the ordering IS the security guarantee.
+            # Asserted by tests/unit/test_pipeline_order.py.
+            ("G32-tool-eligibility", lambda r: self.g32.process_response(ctx, r)),
             ("G14-tool-output", lambda r: self.g14.process_response(ctx, r)),
             ("G28-ccr-resp", lambda r: self.g28.process_response(ctx, r)),
             ("G23-streaming-compression", lambda r: self.g23.process_response(ctx, r)),

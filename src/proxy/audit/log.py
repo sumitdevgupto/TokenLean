@@ -150,7 +150,8 @@ class AuditLogger:
             return False
 
     async def log_security_events(self, ctx) -> None:
-        """Append PII-free audit rows for G29 (PII redaction) / G30 (guardrail) activity.
+        """Append PII-free audit rows for G29 (PII redaction) / G30 (guardrail) /
+        G31 (context-trust) / G32 (tool eligibility) activity.
 
         Reuses the config-change insert shape (``action`` + ``details`` JSONB). The
         details carry entity TYPES / attack CATEGORIES + counts ONLY — never the matched
@@ -189,6 +190,20 @@ class AuditLogger:
                     "count": int(getattr(ctx, "context_trust_pii_redactions", 0) or 0),
                     "mode": ct_action,
                     "source": "retrieved",
+                },
+            ))
+        # G32 tool-call eligibility. `tools` holds function IDENTIFIERS the model asked
+        # for — never prompt content — so this row is PII-free on the same basis as
+        # G30's attack `categories`. `.flagged` = recorded and served; `.denied` = the
+        # call was stripped before anything could execute it.
+        te_action = getattr(ctx, "tool_eligibility_action", None)
+        if te_action in ("flag", "block") and int(getattr(ctx, "tool_eligibility_count", 0) or 0) > 0:
+            events.append((
+                "tool_eligibility.flagged" if te_action == "flag" else "tool_eligibility.denied",
+                {
+                    "tools": list(getattr(ctx, "tool_eligibility_denied", []) or []),
+                    "count": int(getattr(ctx, "tool_eligibility_count", 0) or 0),
+                    "mode": te_action,
                 },
             ))
         if not events:

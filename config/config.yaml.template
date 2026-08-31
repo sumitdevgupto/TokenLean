@@ -1288,6 +1288,33 @@ groups:
     # pii_use_presidio: false  # augment regex with Presidio recognisers when installed
     # pii_block_message: "Retrieved context contained personal data."
 
+  G32_tool_eligibility:
+    enabled: true
+    mode: flag                 # off | flag | block. flag = record ineligible tool calls
+                               # and serve the response unchanged (default, non-mutating).
+                               # block = STRIP the ineligible call before any group can
+                               # auto-execute it. off = passthrough (policy not evaluated).
+                               # NB `off` (not `allow`) because `allow` is already used
+                               # twice below — mode:allow would be ambiguous to read.
+                               # NON-STREAMING only: a streamed response bypasses the
+                               # whole response pipeline, so streamed tool calls are NOT
+                               # gated (same limitation as the G29/G30 response scans).
+    metrics_enabled: true
+    # Which tool calls the model may ask for. Evaluation order is deny → allow →
+    # default, so an explicit deny always wins. Patterns are fnmatch globs and are
+    # CASE-SENSITIVE. Empty lists + `default: allow` (the shipped state) can never deny
+    # anything, so G32 is a no-op until you write a policy here.
+    policy:
+      allow: []                # e.g. ["db_read_*", "search_docs"]
+      deny: []                 # e.g. ["*_delete", "shell_exec"] — wins over allow
+      default: allow           # allow | deny. `deny` turns this into an ALLOWLIST:
+                               # anything not matched by `allow` is ineligible.
+    # block_message: "A tool the model requested is not permitted by this workspace's
+    #                 tool policy, so it was not carried out."
+                               # Used as the assistant message when block mode strips
+                               # EVERY tool call from a response (a message with neither
+                               # content nor tool_calls is invalid for most clients).
+
 # ── Agentic Learning Loop (F1) — [Enterprise] managed, opt-in ──────────────────
 # A managed background job (wired only by the commercial app) that periodically mines
 # the OSS-core usage_events ledger and, for each (tenant, routed_model), finds

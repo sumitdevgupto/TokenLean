@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation groups (G0–G28), all fully operational** — plus three **trust & safety** groups, **G30 (injection guardrails)** and **G29 (PII redaction)** that run unconditionally right after G24 (never skippable), and **G31 (context-trust — indirect/RAG injection)** that runs after retrieval/memory have assembled the context — across the files in `src/proxy/middleware/`.
+This document illustrates the complete end-to-end flow when a developer sends a prompt to the token optimisation proxy and receives a response. The framework implements **28 optimisation groups (G0–G28), all fully operational** — plus four **trust & safety** groups: **G30 (injection guardrails)** and **G29 (PII redaction)** run unconditionally right after G24 (never skippable), **G31 (context-trust — indirect/RAG injection)** runs after retrieval/memory have assembled the context, and **G32 (tool-call eligibility)** runs on the response ahead of every auto-executing stage — across the files in `src/proxy/middleware/`.
 
 It also carries an **OSS-core F2 Intent Orchestration** stage (`middleware/intent_orchestration.py`) right after G06: it classifies the request's intent and, if it matches a registered downstream agent, dispatches to that agent's OpenAI-compatible endpoint INSTEAD of the LLM and short-circuits. Default off / byte-identical when no agents are registered.
 
@@ -92,6 +92,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
 │  │  G29 PII (resp)     → mask/restore PII in the model output (runs first)              │       │
 │  │  G30 Guardrails(rsp)→ opt-in scan of model OUTPUT → flag | block (scan_response)     │       │
+│  │  G32 Tool Eligibility→ allow/deny policy over requested tool_calls → flag | block   │       │
 │  │  G14 Tool Output    → field projection + truncation + parallel combining            │       │
 │  │  G28 CCR (resp)     → compress repeated response blocks for downstream reuse         │       │
 │  │  G23 Streaming Comp.→ collapse repeated n-grams → response["x_compressed_content"]  │       │
@@ -136,7 +137,7 @@ Request path:
 `G0 → G24 → G30 → G29 → G4 → G5 → G6 → F2 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G26 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21`
 
 Response path:
-`G29(resp) → G30(resp) → G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → emit_grounding → G18 → G5(store)`
+`G29(resp) → G30(resp) → G32 → G14 → G28(resp) → G23 → G19(resp) → G15 → G11(feedback) → emit_grounding → G18 → G5(store)`
 
 > **G24 runs first** to populate `ctx.skip_groups`. Every Stage-2/Stage-3 group is wrapped in a
 > `if _group in ctx.skip_groups: continue` guard, so G24 can disable any of them per request.
@@ -289,6 +290,25 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
   `GROUPS` registry so the 54.1% baseline stays reproducible
 
 **STAGE 3 — Parameter Injection (Inside the LLM)** *(honours `ctx.skip_groups`)*
+
+
+**G32: Tool-Call Eligibility** (`g32_tool_eligibility.py` + `guardrails/tool_policy.py`) — *trust & safety, NOT a savings group* — *runs on the RESPONSE, before G14/G28/G15*
+  G30 guards what comes in and G31 guards retrieved context, but nothing guarded what the model
+  is about to **do**. G15 dispatches server-side handlers by bare tool-name match against a
+  hardcoded set with no authorization, and G28 CCR has the same auto-exec shape — so a
+  prompt-injected model could make the proxy *act*. G32 evaluates every requested `tool_calls`
+  entry against a per-tenant allow/deny glob policy (deny wins; `default: deny` makes it an
+  allowlist) and, in `block` mode, strips the ineligible call while keeping the message
+  well-formed — `finish_reason` corrected only when it actually said `tool_calls`, `content`
+  never left null, the `tool_calls` key dropped rather than emptied. **Its position ahead of
+  G14/G28/G15 in the response chain IS the guarantee**, and `tests/unit/test_pipeline_order.py`
+  asserts it. Also applied on the cache/bypass short-circuit, which returns without running the
+  response pipeline at all. Stripping sets `ctx.no_cache` so G05 never stores a policy-specific
+  answer. Metric `token_opt_tool_eligibility_denied_total{tenant_id,mode}` + PII-free
+  `tool_eligibility.flagged`/`.denied` audit rows (tool names are function identifiers, never
+  prompt content). **Non-streaming only** — a streamed response bypasses the response pipeline,
+  the same limitation the G29/G30 response scans carry. Default `mode: flag` with an empty
+  policy, which can never deny anything, so a default install is byte-identical.
 
 **G16: Agent Architecture** (`g16_agent_arch.py` + `g16_langgraph_runtime.py` + `g16_temporal_runtime.py`)
 - Anti-pattern advisories (role stacking, oversized system prompts, tool sprawl)

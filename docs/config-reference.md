@@ -750,6 +750,41 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `pii_use_presidio` | `false` | Augment the regex tier with Presidio recognisers when installed |
 | `pii_block_message` | *(built-in)* | Optional custom refusal text for a `pii_mode: block` |
 
+
+### G32_tool_eligibility
+**Trust & Safety (Action Eligibility).** Checks every tool call the model *requests* against a
+per-tenant allow/deny policy, on the response path and **ahead of every stage that could execute
+one** (G14 → G28 → G15). This closes a real gap: `g15_server_compute.py` dispatches server-side
+handlers by bare name match against a hardcoded set with no authorization of its own, so a
+prompt-injected model could otherwise trigger a tool it should never reach.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | bool | `true` | Master switch. |
+| `mode` | enum | `flag` | `off` = policy not evaluated; `flag` = record ineligible calls, serve unchanged; `block` = strip the call. **`off`, not `allow`** — this group's own config already uses "allow" twice below, so `mode: allow` would be ambiguous (G29 uses `off` for the same reason). |
+| `policy.allow` | list | `[]` | fnmatch globs, **case-sensitive** (e.g. `db_read_*`). |
+| `policy.deny` | list | `[]` | Globs that are always ineligible. **Deny wins over allow**, so adding a tool to `allow` can never re-open something denied. |
+| `policy.default` | enum | `allow` | What an unmatched tool gets. `deny` turns the policy into an **allowlist**. |
+| `block_message` | str | *(built-in)* | Assistant text used when `block` strips EVERY call from a response (a message with neither content nor `tool_calls` is invalid for most clients). |
+| `metrics_enabled` | bool | `true` | Emit `token_opt_tool_eligibility_denied_total{tenant_id,mode}`. |
+
+Shipped `enabled: true, mode: flag` with empty lists and `default: allow` — that combination can
+never deny anything, so the default install is byte-identical until you write a policy.
+
+**Malformed globs are rejected, not ignored.** `fnmatch` never raises on a bad pattern, it
+silently matches nothing — fail-safe in `allow` but fail-*dangerous* in `deny`, where a typo would
+quietly stop denying. Patterns are validated at write time (the portal returns 422 naming the
+offending pattern) and at load time (WARNING + the last-good policy is retained).
+
+**Limitation — streamed responses are NOT gated.** `_stream_response` relays provider chunks
+unchanged and skips the response pipeline, so a streaming client's tool calls bypass this group.
+Same limitation the G29/G30 response scans carry. Keep tool-capable calls non-streaming if you
+need the gate.
+
+Stripping a call sets `ctx.no_cache`, so G05 never stores a policy-specific answer that would
+outlive a policy change. Per-tenant via `tenants.<id>.groups.G32_tool_eligibility`; the
+**[Enterprise]** portal ships a Tool Policy tab with a dry-run tester.
+
 ### G29_pii_redaction
 **Trust & Safety.** PII detection + redaction (`guardrails/pii.py`): email, US SSN (separated forms only), Luhn-validated credit card, North-American phone, IPv4 — plus an optional Microsoft Presidio backend for higher recall. Runs **right after G30, before G04/G05** so cache keys/embeddings, RAG, memory, and CCR only ever see redacted content; in `mask` mode it also scrubs the raw `rag_query` snapshot and the `original_messages` copy. Reversible masking (default) shows the model numbered placeholders (`[PII:EMAIL:1]`) and the **non-streaming** response restores them for the data owner (response-side redaction is non-streaming-only in this version). Metrics: `token_opt_pii_redactions_total{entity_type,action}`; PII-free audit rows (`redaction.flagged` / `redaction.applied` — entity types + counts only, never the matched value). Per-tenant via `tenants.<id>.groups.G29_pii_redaction`.
 

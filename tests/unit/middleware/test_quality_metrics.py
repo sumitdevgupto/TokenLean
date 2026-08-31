@@ -69,16 +69,21 @@ class TestEmitHelpers:
         Q.record_verify_score("t2", 4)
 
     def test_record_schema_failure_and_tool_denied(self):
-        before = _val(Q.TOOL_ELIGIBILITY_DENIED_TOTAL, tenant_id="t3")
-        Q.record_tool_denied("t3")
-        assert _val(Q.TOOL_ELIGIBILITY_DENIED_TOTAL, tenant_id="t3") == before + 1
+        # `mode` separates a G32 flag (recorded, call served) from a block (call
+        # stripped) — without it the two are indistinguishable on the counter.
+        before = _val(Q.TOOL_ELIGIBILITY_DENIED_TOTAL, tenant_id="t3", mode="block")
+        Q.record_tool_denied("t3")               # defaults to mode="block"
+        assert _val(Q.TOOL_ELIGIBILITY_DENIED_TOTAL, tenant_id="t3", mode="block") == before + 1
+        flagged = _val(Q.TOOL_ELIGIBILITY_DENIED_TOTAL, tenant_id="t3", mode="flag")
+        Q.record_tool_denied("t3", mode="flag", n=2)
+        assert _val(Q.TOOL_ELIGIBILITY_DENIED_TOTAL, tenant_id="t3", mode="flag") == flagged + 2
         Q.record_schema_failure("t3", "block")   # must not raise
 
     def test_helpers_never_raise_on_bad_input(self):
         # None tenant, weird values — helpers swallow errors (metrics must not break requests).
         Q.record_retrieval(None, n_chunks=1)
         Q.record_grounding(None, float("nan"))
-        Q.record_tool_denied(None, 0)
+        Q.record_tool_denied(None, n=0)
 
 
 # ── emit_grounding (response-path wiring) ─────────────────────────────────────

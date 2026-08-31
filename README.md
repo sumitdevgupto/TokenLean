@@ -371,8 +371,8 @@ The defaults reproduce the standard deploy; flip these to shrink the footprint o
 
 ```
 src/
-├── proxy/                  # Core LiteLLM proxy + G0–G31 middleware pipeline
-│   ├── middleware/         # G0–G31 files + intent_orchestration.py (F2) + quality_metrics.py
+├── proxy/                  # Core LiteLLM proxy + G0–G32 middleware pipeline
+│   ├── middleware/         # G0–G32 files + intent_orchestration.py (F2) + quality_metrics.py
 │   ├── protocols/          # Native multi-protocol ingress (OpenAI · Anthropic · Gemini translators)
 │   ├── guardrails/         # Trust & safety engines — G29 PII + G30 injection + G31 context-trust
 │   ├── providers/          # Auto-discovered adapters + resilience.py (breaker / retry / failover)
@@ -393,9 +393,9 @@ docs/                       # Developer and operator documentation
 tests/                      # Unit and integration tests (pytest)
 ```
 
-## G0–G31 Optimisation and Safety Groups
+## G0–G32 Optimisation and Safety Groups
 
-28 token-optimisation techniques (G0–G28) plus **three** trust & safety groups (G29 PII, G30 injection guardrails, G31 context-trust). The Savings column applies to the optimisation groups; G29/G30/G31 are safety controls, not token-savers.
+28 token-optimisation techniques (G0–G28) plus **four** trust & safety groups (G29 PII, G30 injection guardrails, G31 context-trust, G32 tool-call eligibility). The Savings column applies to the optimisation groups; G29/G30/G31/G32 are safety controls, not token-savers.
 
 | Group | Technique | Savings | Key Implementation |
 |-------|-----------|---------|-------------------|
@@ -430,10 +430,13 @@ tests/                      # Unit and integration tests (pytest)
 | **G29** | PII Redaction *(trust & safety)* | — | Detect + `off\|flag\|mask\|block` personal data (email/SSN/card/phone/IP + optional Presidio) before the provider call. Opt-in **PHI** (DEA/NPI/MRN/ICD-10) via `phi: true` |
 | **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts in the user prompt; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens. Optional response-side scan (`scan_response`) also checks the model's **output** |
 | **G31** | Context-Trust *(trust & safety)* | — | Indirect / RAG prompt-injection defence — re-scans retrieved documents + memories (injected after G30) for injection; `allow\|flag\|block\|strip`; non-bypassable. Opt-in **`pii_mode: off\|flag\|mask\|block`** over retrieved content (irreversible masking) |
+| **G32** | Tool-Call Eligibility *(trust & safety)* | — | Checks each tool call the model REQUESTS against a per-tenant allow/deny policy (globs, deny-wins, `default: allow\|deny` for allowlist mode) and runs **before every auto-executing stage** — G15 dispatches server-side handlers by bare name match with no authz of its own. `off\|flag\|block`; `block` strips the call and keeps the message well-formed. **Non-streaming responses only**² |
 
 ¹ On long multi-turn conversations only — G26 is inert until a prompt approaches the context window, so it contributes nothing to the 54.1% headline (which predates its DS21 dataset).
 
-> **G29/G30/G31 are trust & safety groups, not token-savings optimisations** — they don't contribute to the 54.1% headline and are kept out of the ablation harness. All groups are OSS (Apache-2.0) and never tier-gated; the managed red-team ruleset feed, the portal Security tab, and the compliance attestation are the commercial layer.
+² Streamed responses relay provider chunks unchanged and skip the response-side pipeline, so a streamed tool call is not gated — the same limitation the G29/G30 response scans carry. Gate non-streamed traffic, or keep tool-capable calls non-streaming.
+
+> **G29/G30/G31/G32 are trust & safety groups, not token-savings optimisations** — they don't contribute to the 54.1% headline and are kept out of the ablation harness. All groups are OSS (Apache-2.0) and never tier-gated; the managed red-team ruleset feed, the portal Security tab, and the compliance attestation are the commercial layer.
 >
 > **F2 intent orchestration** runs in-pipeline right after G6 but is **not a G-group** — see [Intent-based agent orchestration](#-intent-based-agent-orchestration-oss-engine). The managed **learning loop** (F1) that auto-tunes which optimisations run per tenant and the **Agents console** (F3) are the [Enterprise](#free-self-host-vs-enterprise-managed) layer.
 
@@ -722,7 +725,7 @@ pytest --cov=src/proxy --cov-report=html
 |----------|---------|
 | [docs/client-onboarding.md](docs/client-onboarding.md) | Client integration guide (Python/Java/Go) |
 | [docs/config-reference.md](docs/config-reference.md) | Complete configuration parameter reference |
-| [docs/request-flow-diagram.md](docs/request-flow-diagram.md) | Full request/response pipeline (G0–G31 + native ingress) and per-group flow |
+| [docs/request-flow-diagram.md](docs/request-flow-diagram.md) | Full request/response pipeline (G0–G32 + native ingress) and per-group flow |
 | [docs/oss-licenses.md](docs/oss-licenses.md) | Dependency licenses (SPDX) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Complete deployment and troubleshooting guide |
 | [Token Optimisation Blog](https://sumitdevgupto.github.io/token-optimisation-blog/) | Reference article — background and walkthrough of the framework |

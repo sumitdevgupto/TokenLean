@@ -21,6 +21,28 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-08-31
+
+### Tool-call eligibility — decide which tools a model is allowed to ask for — Enhancement (OSS + Enterprise)
+Server-side tool execution previously had **no authorization**: G15 dispatched handlers by
+bare name match against a hardcoded set, so a prompt-injected model could make the proxy
+*act*, not merely answer. The new gate checks every requested `tool_calls` entry against a
+per-tenant allow/deny policy and runs **ahead of every auto-executing stage**, so an
+ineligible call is stopped before anything can dispatch it. `flag` records and serves
+unchanged; `block` strips the call and repairs the message (`finish_reason` corrected,
+`content` never null, no dangling `tool_calls`). Shipped enabled in `flag` with an empty
+policy — byte-identical until you write one. Also non-bypassable on the cache/bypass
+short-circuit, which previously returned without running any response-side group.
+Malformed glob patterns are rejected at write and load time: `fnmatch` silently matches
+nothing, so an unvalidated typo in a **deny** rule would quietly stop denying.
+**Known limitation, stated plainly:** streamed responses bypass the response pipeline and
+are **not** gated — same limitation the G29/G30 response scans carry.
+Built ahead of its recorded trigger (untrusted-tenant server-side execution) deliberately.
+- **OSS:** policy engine + gate + `token_opt_tool_eligibility_denied_total{mode}` +
+  PII-free `tool_eligibility.*` audit rows + config block + Grafana panels.
+- **[Enterprise]:** Tool Policy console — per-tenant policy CRUD with `tenant|base|none`
+  inheritance, a dry-run tester, and a change-audit trail — <https://tokenlean.cbeyond.cloud/>
+
 ## 2026-08-09
 
 ### Fresh deployments no longer truncate long-form answers — Bug fix

@@ -40,7 +40,12 @@
       "type": "row",
       "title": "PII Redaction (G29)",
       "collapsed": false,
-      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
       "panels": []
     },
     {
@@ -48,8 +53,15 @@
       "type": "stat",
       "title": "PII spans redacted",
       "description": "Total PII spans detected & redacted over the selected time range.",
-      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 3 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(increase(token_opt_pii_redactions_total{tenant_id=~\"$tenant\"}[$__range])) or vector(0)",
@@ -57,18 +69,29 @@
         }
       ],
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
         "justifyMode": "center",
-        "text": { "valueSize": 36 }
+        "text": {
+          "valueSize": 36
+        }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "decimals": 0,
-          "color": { "mode": "fixed", "fixedColor": "blue" }
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
         }
       }
     },
@@ -77,8 +100,15 @@
       "type": "stat",
       "title": "Requests scanned",
       "description": "Total requests G29 inspected for PII over the selected time range.",
-      "gridPos": { "x": 0, "y": 4, "w": 6, "h": 3 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 6,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(increase(token_opt_requests_total{tenant_id=~\"$tenant\"}[$__range])) or vector(0)",
@@ -86,18 +116,29 @@
         }
       ],
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
         "justifyMode": "center",
-        "text": { "valueSize": 28 }
+        "text": {
+          "valueSize": 28
+        }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "decimals": 0,
-          "color": { "mode": "fixed", "fixedColor": "text" }
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         }
       }
     },
@@ -105,8 +146,15 @@
       "id": 3,
       "type": "timeseries",
       "title": "PII spans by entity type",
-      "gridPos": { "x": 6, "y": 1, "w": 10, "h": 6 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 10,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (entity_type) (increase(token_opt_pii_redactions_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
@@ -114,8 +162,17 @@
         }
       ],
       "options": {
-        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "fieldConfig": {
         "defaults": {
@@ -125,7 +182,10 @@
             "drawStyle": "bars",
             "fillOpacity": 80,
             "lineWidth": 1,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         }
       }
@@ -134,8 +194,15 @@
       "id": 4,
       "type": "timeseries",
       "title": "PII spans by policy action",
-      "gridPos": { "x": 16, "y": 1, "w": 8, "h": 6 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (action) (increase(token_opt_pii_redactions_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
@@ -143,8 +210,17 @@
         }
       ],
       "options": {
-        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "fieldConfig": {
         "defaults": {
@@ -154,7 +230,10 @@
             "drawStyle": "bars",
             "fillOpacity": 80,
             "lineWidth": 1,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         }
       }
@@ -164,7 +243,12 @@
       "type": "row",
       "title": "Injection Guardrails (G30)",
       "collapsed": false,
-      "gridPos": { "x": 0, "y": 7, "w": 24, "h": 1 },
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 1
+      },
       "panels": []
     },
     {
@@ -172,8 +256,15 @@
       "type": "stat",
       "title": "Injections blocked",
       "description": "Total prompt-injection / jailbreak attempts blocked (action=block) over the selected time range.",
-      "gridPos": { "x": 0, "y": 8, "w": 6, "h": 3 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 6,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(increase(token_opt_guardrail_events_total{tenant_id=~\"$tenant\",action=\"block\"}[$__range])) or vector(0)",
@@ -181,23 +272,39 @@
         }
       ],
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value",
         "justifyMode": "center",
-        "text": { "valueSize": 36 }
+        "text": {
+          "valueSize": 36
+        }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "decimals": 0,
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": 0 },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           }
         }
@@ -208,8 +315,15 @@
       "type": "stat",
       "title": "Attempts flagged",
       "description": "Total guardrail events flagged (action=flag) over the selected time range.",
-      "gridPos": { "x": 0, "y": 11, "w": 6, "h": 3 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 6,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(increase(token_opt_guardrail_events_total{tenant_id=~\"$tenant\",action=\"flag\"}[$__range])) or vector(0)",
@@ -217,18 +331,29 @@
         }
       ],
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "value",
         "justifyMode": "center",
-        "text": { "valueSize": 28 }
+        "text": {
+          "valueSize": 28
+        }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "decimals": 0,
-          "color": { "mode": "fixed", "fixedColor": "orange" }
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
         }
       }
     },
@@ -236,8 +361,15 @@
       "id": 12,
       "type": "timeseries",
       "title": "Guardrail events by attack category",
-      "gridPos": { "x": 6, "y": 8, "w": 10, "h": 6 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 6,
+        "y": 8,
+        "w": 10,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (category) (increase(token_opt_guardrail_events_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
@@ -245,8 +377,17 @@
         }
       ],
       "options": {
-        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "fieldConfig": {
         "defaults": {
@@ -256,7 +397,10 @@
             "drawStyle": "bars",
             "fillOpacity": 80,
             "lineWidth": 1,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         }
       }
@@ -265,8 +409,15 @@
       "id": 13,
       "type": "timeseries",
       "title": "Guardrail events by action (flag vs block)",
-      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 6 },
-      "datasource": { "uid": "prometheus" },
+      "gridPos": {
+        "x": 16,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (action) (increase(token_opt_guardrail_events_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
@@ -274,8 +425,17 @@
         }
       ],
       "options": {
-        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "fieldConfig": {
         "defaults": {
@@ -285,7 +445,238 @@
             "drawStyle": "bars",
             "fillOpacity": 80,
             "lineWidth": 1,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Tool-Call Eligibility (G32)",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Tool calls stopped",
+      "description": "Ineligible tool calls STRIPPED before any auto-executing group could dispatch them (mode=block). Non-streaming responses only.",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 6,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_tool_eligibility_denied_total{tenant_id=~\"$tenant\",mode=\"block\"}[$__range])) or vector(0)",
+          "legendFormat": "stopped"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 36
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Tool calls flagged only",
+      "description": "Ineligible tool calls RECORDED but still served (mode=flag). A non-zero value here is the queue of things block mode would have stopped.",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 6,
+        "h": 3
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_tool_eligibility_denied_total{tenant_id=~\"$tenant\",mode=\"flag\"}[$__range])) or vector(0)",
+          "legendFormat": "flagged"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 36
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Ineligible tool calls over time",
+      "gridPos": {
+        "x": 6,
+        "y": 15,
+        "w": 10,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(token_opt_tool_eligibility_denied_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
+          "legendFormat": "ineligible calls"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Eligibility events by mode (flag vs block)",
+      "description": "flag = recorded and served; block = stripped. Watch flag before promoting a policy to block.",
+      "gridPos": {
+        "x": 16,
+        "y": 15,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode) (increase(token_opt_tool_eligibility_denied_total{tenant_id=~\"$tenant\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         }
       }

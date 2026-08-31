@@ -321,6 +321,7 @@ class TestPipelineStageOrdering:
         pipeline.g23 = _make_resp_mock("G23")
         pipeline.g19 = _make_resp_mock("G19")
         pipeline.g15 = _make_resp_mock("G15")
+        pipeline.g32 = _make_resp_mock("G32")
         pipeline.g11 = MagicMock()
         pipeline.g11.process_response = AsyncMock(side_effect=lambda ctx, r: (ctx, r))
         pipeline.g18 = MagicMock()
@@ -341,6 +342,54 @@ class TestPipelineStageOrdering:
         assert g14_pos < g23_pos, (
             f"Expected G14({g14_pos}) < G23({g23_pos}) in response path, got: {resp_log}"
         )
+
+    @pytest.mark.asyncio
+    async def test_g32_runs_before_every_auto_executing_group(self):
+        """G32 tool-eligibility MUST precede G14, G28 and G15 in the response path.
+
+        This ordering IS the security guarantee, not a stylistic preference: G15
+        dispatches server-side handlers by bare tool-name match with no authorization
+        of its own (``_HEADROOM_MCP_TOOLS``), and G28 CCR has the same auto-exec shape.
+        If G32 ever slides behind one of them, an ineligible tool call is executed
+        before the gate can strip it — so this test failing means a real hole, not a
+        refactor to accommodate.
+        """
+        from middleware.pipeline import OptimisationPipeline
+
+        resp_log = []
+
+        def _make_resp_mock(name):
+            m = MagicMock()
+            async def _side(ctx, response):
+                resp_log.append(name)
+                return response
+            m.process_response.side_effect = _side
+            return m
+
+        pipeline = OptimisationPipeline.__new__(OptimisationPipeline)
+        for attr, name in (("g29", "G29"), ("g30", "G30"), ("g32", "G32"), ("g14", "G14"),
+                           ("g28", "G28"), ("g23", "G23"), ("g19", "G19"), ("g15", "G15")):
+            setattr(pipeline, attr, _make_resp_mock(name))
+        pipeline.g11 = MagicMock()
+        pipeline.g11.process_response = AsyncMock(side_effect=lambda ctx, r: (ctx, r))
+        pipeline.g18 = MagicMock()
+        pipeline.g18.record = AsyncMock()
+        pipeline.g05 = MagicMock()
+        pipeline.g05.store_response = AsyncMock()
+
+        ctx = _make_ctx()
+        with patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            await pipeline.process_response(ctx, {"choices": []})
+
+        assert "G32" in resp_log, f"G32 did not run in the response path: {resp_log}"
+        g32_pos = resp_log.index("G32")
+        for auto_exec in ("G14", "G28", "G15"):
+            assert g32_pos < resp_log.index(auto_exec), (
+                f"G32({g32_pos}) MUST run before {auto_exec}"
+                f"({resp_log.index(auto_exec)}) — a tool call would execute before the "
+                f"eligibility gate could strip it. Order was: {resp_log}"
+            )
 
 
 def _build_stubbed_pipeline(call_log):

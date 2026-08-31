@@ -131,6 +131,14 @@ class RequestContext:
     pii_action: Optional[str] = None
     pii_entities: List[str] = field(default_factory=list)
     pii_redactions: int = 0
+    # G32 tool-call eligibility verdict (RESPONSE side). action ∈ {None,"flag","block"}
+    # — None = the gate did not run or nothing was ineligible. `denied` holds the tool
+    # NAMES the policy rejected: those are function identifiers, never user content, so
+    # they are safe to carry into metrics/audit (unlike a prompt span). In `flag` the
+    # call is left in the response and only recorded; in `block` it is stripped.
+    tool_eligibility_action: Optional[str] = None
+    tool_eligibility_denied: List[str] = field(default_factory=list)
+    tool_eligibility_count: int = 0
     # Ingress protocol the client used (default = the OpenAI identity protocol;
     # "anthropic" for /v1/messages, "gemini" for …:generateContent). The pipeline is
     # protocol-agnostic (OpenAI-shaped internally) — this only flows into

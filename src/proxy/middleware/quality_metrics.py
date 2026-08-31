@@ -62,8 +62,10 @@ OUTPUT_SCHEMA_FAILURES_TOTAL = Counter(
 TOOL_ELIGIBILITY_DENIED_TOTAL = Counter(
     "token_opt_tool_eligibility_denied_total",
     "Tool calls the model requested that were denied by the eligibility gate "
-    "(G32, Task 6), one increment per denied call.",
-    ["tenant_id"],
+    "(G32), one increment per denied call. `mode` is the policy that applied: "
+    "flag = recorded but the call was left in the response; block = the call was "
+    "stripped before any auto-executing group could dispatch it.",
+    ["tenant_id", "mode"],
 )
 OUTPUT_VERIFY_SCORE = Histogram(
     "token_opt_output_verify_score",
@@ -101,8 +103,9 @@ def record_schema_failure(tenant_id: str, mode: str) -> None:
     _safe(lambda: OUTPUT_SCHEMA_FAILURES_TOTAL.labels(tenant_id=tenant_id or "default", mode=mode).inc())
 
 
-def record_tool_denied(tenant_id: str, n: int = 1) -> None:
-    _safe(lambda: TOOL_ELIGIBILITY_DENIED_TOTAL.labels(tenant_id=tenant_id or "default").inc(n))
+def record_tool_denied(tenant_id: str, mode: str = "block", n: int = 1) -> None:
+    _safe(lambda: TOOL_ELIGIBILITY_DENIED_TOTAL.labels(
+        tenant_id=tenant_id or "default", mode=mode or "block").inc(n))
 
 
 def record_verify_score(tenant_id: str, score: float) -> None:

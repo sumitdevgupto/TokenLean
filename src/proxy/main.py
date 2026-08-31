@@ -703,19 +703,48 @@ _audit_logger = None  # core AuditLogger for G29/G30 security events (lifespan-w
 
 
 def _schedule_security_audit(ctx) -> None:
-    """Fire-and-forget one or two PII-free ``audit_events`` rows for any G29 redaction /
-    G30 guardrail activity on this request. No-op without ctx / a wired audit logger /
-    a running loop, and skips the task entirely when nothing was flagged. Best-effort:
-    audit must never block or break the response path."""
+    """Fire-and-forget PII-free ``audit_events`` rows for any G29 redaction / G30
+    guardrail / G31 context-trust / G32 tool-eligibility activity on this request. No-op
+    without ctx / a wired audit logger / a running loop, and skips the task entirely when
+    nothing was flagged. Best-effort: audit must never block or break the response path."""
     if ctx is None or _audit_logger is None:
         return
     if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)
-            or getattr(ctx, "context_trust_pii_action", None)):
+            or getattr(ctx, "context_trust_pii_action", None)
+            or getattr(ctx, "tool_eligibility_action", None)):
         return
     try:
         asyncio.create_task(_audit_logger.log_security_events(ctx))
     except RuntimeError:  # no running loop (not the request path) — skip
         logger.debug("[%s] security audit skipped: no loop", getattr(ctx, "request_id", "?"))
+
+
+async def _apply_tool_eligibility_on_short_circuit(ctx, response: Dict) -> Dict:
+    """Run ONLY G32 over a bypassed / cache-hit response.
+
+    Those paths return without touching the response pipeline, so without this a cached
+    answer carrying a tool call would never be gated — and because the gate also runs
+    when the entry is *stored*, a policy tightened afterwards would never reach it. G32
+    is a trust & safety group: it must not be bypassable, exactly like G29/G30 on the
+    request side.
+
+    Calling the single group rather than ``_pipeline.process_response`` is deliberate —
+    see the call site. Best-effort: an unexpected failure here must not turn a served
+    cache hit into an error, so it degrades to the response as-is (the gate still ran
+    on the miss that populated the entry).
+    """
+    if ctx is None or not isinstance(response, dict) or _pipeline is None:
+        return response
+    g32 = getattr(_pipeline, "g32", None)
+    if g32 is None:
+        return response
+    try:
+        return await g32.process_response(ctx, response)
+    except Exception as exc:
+        logger.warning(
+            "[%s] G32 on short-circuit path failed: %s", getattr(ctx, "request_id", "?"), exc
+        )
+        return response
 
 
 def _schedule_notifications(ctx) -> None:
@@ -1413,6 +1442,17 @@ async def _serve_core(
     # Short-circuit: bypass or cache hit
     if ctx.bypassed or ctx.cache_hit:
         response = ctx.cache_response or {}
+        # G32 tool-eligibility is NOT bypassable. This branch returns without running
+        # the response pipeline at all, so a cached answer carrying a tool call would
+        # otherwise sail past the gate — and a policy tightened after the entry was
+        # cached would never apply. Mirrors how G29/G30 are hoisted outside the
+        # skip_groups loops on the request side.
+        #
+        # Deliberately ONE targeted call, never the full process_response: that chain
+        # also re-runs G18 observability, re-applies G29 response redaction to
+        # already-redacted content, and ends in g05.store_response — turning a security
+        # fix into a double-record/double-store bug.
+        response = await _apply_tool_eligibility_on_short_circuit(ctx, response)
         response.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
         langfuse_tracing.finish_trace(ctx, response)
         _record_outcome(ctx, _request_start, "200", response)  # C1: bill cache hit / bypass
