@@ -259,7 +259,8 @@ flowchart TB
     resilience: circuit breaker → retry → failover to a fallback provider`"}}
 
     Resp2["`**5 · Response-side**
-    G29 PII-restore → G30 Response-scan → G14 Tool-output → G28 CCR → G23 Stream-compress →
+    G29 PII-restore → G30 Response-scan → G32 Tool-eligibility (non-bypassable — 3rd trust boundary) →
+    G14 Tool-output → G28 CCR → G23 Stream-compress →
     G19 Headroom → G15 Server-compute → G11 Format-feedback → grounding check → G18 Observability → G5 Cache-store`"]
 
     Out(["`Response
@@ -267,7 +268,7 @@ flowchart TB
 
     Req --> Ingress --> Gate --> ReqOpt --> CtxTrust --> Params --> Align --> LLM --> Resp2 --> Out
 
-    Gate -.->|G4 bypass · cache hit · agent dispatch| Out
+    Gate -.->|G4 bypass · cache hit · agent dispatch — G32 still gates tool calls| Out
     Ingest["`G3 Knowledge ingestion
     offline Cloud Run Job`"] -.->|feeds| ReqOpt
     Resp2 -.->|traces and metrics| Dash["Langfuse · Grafana · Prometheus"]
@@ -284,15 +285,20 @@ flowchart TB
 > then re-serialises the response — so the pipeline stays protocol-agnostic and the OpenAI path is
 > unchanged. **G24 runs first** and can skip any later stage per request; **G21** is the last step
 > before the provider call. **G4 bypass**, an **L1/L2/L3 cache hit**, and an **F2 agent dispatch**
-> short-circuit straight to the response. **G3** is an offline ingestion job that feeds the G7 RAG index.
+> short-circuit straight to the response — but **G32 still runs on them**, so a cached answer
+> carrying a tool call cannot escape the policy. **G3** is an offline ingestion job that feeds the G7 RAG index.
 > **G26** is the budget backstop: it runs last in the prompt-optimisation stage and compacts
 > conversation history only when what remains still exceeds its configured share of the window.
-> **Two trust boundaries, both non-bypassable.** **G30 (injection guardrails) + G29 (PII redaction)** run
+> **Three trust boundaries, all non-bypassable.** **G30 (injection guardrails) + G29 (PII redaction)** run
 > right after G24 over the **user prompt** — never skipped by G24, covering bypass/cache traffic, and
 > redacting before any content-persisting stage. Then **G31 (context-trust)** runs after RAG/memory have
 > injected documents into the context, re-scanning that **assembled context** for indirect / RAG injection
-> and (opt-in) retrieved PII — the boundary G30 structurally can't see. A block at either boundary returns
-> an OpenAI content-filter 200.
+> and (opt-in) retrieved PII — the boundary G30 structurally can't see. A block at either of those two
+> boundaries returns an OpenAI content-filter 200. Finally **G32 (tool-call eligibility)** guards the
+> response: it checks the tool calls the model *requested* against your allow/deny policy before
+> G14/G28/G15 — the stages that auto-execute them — so the third boundary is about what the model is
+> about to **do**, not what it says. An ineligible call is stripped (the answer is still served), and
+> streamed responses are not gated.
 > **F2 intent-orchestration** runs right after routing (G6): when a request's intent matches a registered
 > downstream agent it dispatches there instead of the LLM; it is default-off and byte-identical when no
 > agents are registered.
