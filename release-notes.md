@@ -23,6 +23,18 @@ date changes.
 
 ## 2026-08-31
 
+### One workspace could read another's server-side compressed text — Bug fix
+The context-compression feature can store a block of text server-side and hand back a
+short reference the model uses to fetch it later. Storage is scoped per workspace, and
+the retrieval scan is written to stay inside that scope — but the server-side compute
+path called it without saying which workspace was asking. With no workspace named, the
+scan matched every stored block, so a reference from one workspace resolved to another
+workspace's text. The compression group's own copy of this call passed the workspace
+correctly; the server-side compute copy, which is the one enabled by default, did not.
+Both now pass it, and stored keys are namespaced per workspace so two workspaces
+compressing identical text no longer share a single entry. Found while reviewing which
+code paths can act on a tool call without checking it first.
+
 ### One workspace's tool policy could be applied to another's traffic — Bug fix
 The tool-eligibility gate cached each workspace's compiled policy in a single shared slot
 rather than one per workspace. If a policy failed to compile — a mistyped wildcard, say —

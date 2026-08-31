@@ -81,7 +81,13 @@ def _dispatch_headroom_tool(tc: Dict, ctx: RequestContext) -> None:
         arguments = {}
     redis_client = getattr(ctx, "redis_client", None)
     ttl = ctx.config.get("groups", {}).get("G28_ccr", {}).get("ttl_seconds", 86400)
-    result = dispatch_mcp_tool(tool_name, arguments, redis_client, ttl)
+    # `prefix` is NOT optional here. Omitting it defaults to "" — and the retrieve path
+    # then scans with `key.startswith("")`, which is true of every key, so an 8-char
+    # [CCR:...] reference resolved to ANY tenant's stored block. G28's own call site
+    # passes it (g28_ccr.py, WS21); this one silently did not, and G15 is the path that
+    # ships enabled by default while G28 does not.
+    result = dispatch_mcp_tool(tool_name, arguments, redis_client, ttl,
+                               prefix=getattr(ctx, "redis_prefix", ""))
     fn["result"] = result
     logger.debug("[%s] G15 headroom MCP server: %s → %r", ctx.request_id, tool_name, result)
 
