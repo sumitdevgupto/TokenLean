@@ -51,15 +51,24 @@ class TestREADMEGroups:
     def test_readme_exists(self):
         assert README_PATH.exists(), "README.md not found"
 
-    @pytest.mark.parametrize("group", ["G19", "G20", "G21", "G22", "G23", "G24", "G25", "G27", "G28", "G29", "G30"])
-    def test_readme_mentions_group(self, group):
-        content = _read(README_PATH)
-        assert group in content, f"README should document {group}"
+    # Per-group README coverage is derived from pipeline.py in
+    # tests/unit/test_docs_pipeline_sync.py, NOT hand-listed here - the old list
+    # stopped at G30 and silently missed G31 and G32 when they landed.
 
-    def test_readme_states_g26_reserved(self):
-        content = _read(README_PATH).lower()
-        assert "g26" in content and "reserved" in content, (
-            "README should note G26 is the reserved slot"
+    def test_readme_documents_every_slot_as_shipped(self):
+        """G26 was the last reserved slot and SHIPPED on 2026-08-07.
+
+        The assertion this replaces ("README should note G26 is the reserved slot")
+        outlived that change and kept passing only because the word 'reserved'
+        happens to appear in the unrelated G1/G8 table rows - it was asserting
+        something no longer true. What matters now is that G26 is documented and the
+        hero copy no longer describes any slot as pending.
+        """
+        content = _read(README_PATH)
+        assert "G26" in content, "README should document G26"
+        hero = content.split("## G0")[0].lower()
+        assert "reserved slot" not in hero, (
+            "README hero should no longer describe a slot as reserved - all 28 ship"
         )
 
 
