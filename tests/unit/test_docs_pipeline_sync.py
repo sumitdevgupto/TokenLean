@@ -31,6 +31,20 @@ def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
+def _read_or_skip(p: Path) -> str:
+    """Read a doc, or skip when it is not part of this tree.
+
+    `AGENTS.md` is COMMERCIAL (gitignored), so it is absent from the OSS tree the
+    open-core gate builds with `git archive HEAD`. A public test that hard-requires it
+    is a barricade violation — it makes the OSS checkout fail on a file it is not
+    entitled to have. Skipping keeps the guard fully effective in the full tree, where
+    the file exists and drift actually happens.
+    """
+    if not p.exists():
+        pytest.skip(f"{p.name} is not present in this tree (OSS checkout) — nothing to check")
+    return p.read_text(encoding="utf-8")
+
+
 # ── derive the truth from pipeline.py ─────────────────────────────────────────
 
 def _registered_groups() -> set:
@@ -85,7 +99,7 @@ class TestDocsCoverEveryGroup:
 
     @pytest.mark.parametrize("doc", ["README.md", "docs/request-flow-diagram.md", "AGENTS.md"])
     def test_every_registered_group_is_documented(self, doc):
-        content = _read(ROOT / doc)
+        content = _read_or_skip(ROOT / doc)
         missing = sorted(g for g in _registered_groups() if not _mentions(content, g))
         assert not missing, (
             f"{doc} does not mention {missing}. A group wired into pipeline.py but absent "
@@ -123,7 +137,7 @@ class TestResponseChainOrderMatchesDocs:
         self._assert_order(line, "request-flow-diagram canonical response order")
 
     def test_agents_md_response_pipeline_line(self):
-        content = _read(AGENTS)
+        content = _read_or_skip(AGENTS)
         line = next((l for l in content.splitlines()
                      if "G29(resp)" in l and "G18 Observe" in l), None)
         assert line, "AGENTS.md lost its response-pipeline line"
