@@ -51,7 +51,31 @@ _ccr_available = False
 _ccr_compress_fn = None
 _ccr_retrieve_fn = None
 
-# ─── In-process fallback store (used when Redis unavailable) ─────────────────
+# ─── Content store ────────────────────────────────────────────────────────────
+#
+# NOT a "fallback". `ctx.redis_client` is never assigned anywhere in the codebase (dead
+# since initial import), so this in-process dict is the ONLY store CCR has ever used.
+# That makes the feature unsafe to enable, and the guard below refuses to run it:
+#
+#   * a [CCR:ref] is resolvable only on the instance that created it, so any deployment
+#     with more than one instance fails cross-turn retrieves ~(1 - 1/N) of the time;
+#   * `--min-instances=0` tears the instance down when idle, so even a single-instance
+#     deployment loses parked content across a pause — an agent that waits on a human
+#     comes back to an empty store;
+#   * the `ttl` argument is honoured only on the (never-taken) Redis branch, so nothing
+#     expires and nothing is evicted, while `headroom_compress` writes model-supplied
+#     text of arbitrary length;
+#   * a miss returns `{"error": "Reference not found"}` with NO metric and only a debug
+#     log, so the request is a billed HTTP 200 and the model quietly answers from
+#     whatever it remembers instead of the content it parked.
+#
+# Wiring Redis in naively makes it strictly WORSE: these helpers are sync while
+# `cache/redis_pool.get_redis()` is async, so `setex` would write nothing and `get` would
+# return a coroutine object treated as the stored text. Fixing this properly is
+# `internal-docs/demand-driven-features.md` #28 (+ #29 for the 8-char ref collisions).
+# Flip _STORE_IS_DURABLE only as part of that work.
+_STORE_IS_DURABLE = False
+
 
 _local_store: Dict[str, str] = {}
 # hits/misses per tenant prefix. A single global pair was readable by any tenant via
@@ -61,6 +85,34 @@ _stats: Dict[str, Dict[str, int]] = {}
 
 def _stats_for(prefix: str = "") -> Dict[str, int]:
     return _stats.setdefault(prefix, {"hits": 0, "misses": 0})
+
+
+_UNAVAILABLE_LOGGED = False
+
+
+def _ccr_enabled(cfg: Dict[str, Any], ctx) -> bool:
+    """True only if G28 is both configured on AND safe to run.
+
+    The config toggle alone is not enough. CCR replaces content the model needs with a
+    reference it can only resolve from a store that does not survive an instance
+    recycle — so honouring `enabled: true` today means silently degrading answers on a
+    billed 200, which is worse than the feature being unavailable. Refusing is loud;
+    the failure it prevents is not.
+    """
+    if not cfg.get("enabled", False):
+        return False
+    if _STORE_IS_DURABLE:
+        return True
+    global _UNAVAILABLE_LOGGED
+    if not _UNAVAILABLE_LOGGED:
+        _UNAVAILABLE_LOGGED = True
+        logger.error(
+            "G28 CCR is enabled in config but REFUSED: its content store is in-process "
+            "only, so a [CCR:ref] does not survive a scale-out, a restart, or an idle "
+            "scale-to-zero. Enabling it would silently degrade answers on billed 200s. "
+            "Treating G28 as disabled. See demand-driven-features.md #28."
+        )
+    return False
 
 
 def authorize_dispatch(ctx, tool_name: str):
@@ -341,7 +393,7 @@ class G28CCR:
 
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         cfg = _resolve_g28_cfg(ctx)
-        if not cfg.get("enabled", False):
+        if not _ccr_enabled(cfg, ctx):
             return ctx
 
         min_tokens: int = cfg.get("min_tokens", 300)
@@ -398,7 +450,7 @@ class G28CCR:
     ) -> Dict[str, Any]:
         """Dispatch any CCR tool calls the model made during this turn."""
         cfg = _resolve_g28_cfg(ctx)
-        if not cfg.get("enabled", False):
+        if not _ccr_enabled(cfg, ctx):
             return response
 
         redis_client = getattr(ctx, "redis_client", None)

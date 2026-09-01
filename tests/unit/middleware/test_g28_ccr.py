@@ -9,6 +9,20 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import pytest
 
+
+@pytest.fixture
+def ccr_available(monkeypatch):
+    """G28 refuses to run while its store is in-process only (see _STORE_IS_DURABLE).
+
+    Tests of G28's own behaviour need the store treated as usable, so they opt in here.
+    Availability is a separate guarantee, covered by TestCcrRefusesWhileStoreIsEphemeral —
+    keeping them apart means flipping the real flag during the #28 work does not quietly
+    turn the availability tests into no-ops.
+    """
+    import middleware.g28_ccr as g28
+    monkeypatch.setattr(g28, "_STORE_IS_DURABLE", True)
+    monkeypatch.setattr(g28, "_UNAVAILABLE_LOGGED", False)
+
 # A block comfortably over the default min_tokens (300) regardless of the estimator.
 _BIG = "Policy: eu-west and eu-central are GDPR-compliant for EU data residency. " * 100
 
@@ -69,7 +83,7 @@ class TestG28ProcessRequest:
         assert ctx.messages[0]["role"] == "system"
         assert ctx.messages[0]["content"] == _BIG  # verbatim, not a [CCR:...] reference
 
-    async def test_compress_system_prompt_flag_wired(self, make_ctx):
+    async def test_compress_system_prompt_flag_wired(self, make_ctx, ccr_available):
         ctx = make_ctx([{"role": "system", "content": _BIG}], model="gpt-4o-mini")
         ctx.config["groups"]["G28_ccr"] = {
             "enabled": True, "min_tokens": 300, "compress_system_prompt": True,
@@ -78,7 +92,7 @@ class TestG28ProcessRequest:
         ctx = await G28CCR().process_request(ctx)
         assert ctx.messages[0]["content"].startswith("[CCR:")
 
-    async def test_per_tenant_override_deep_merges(self, make_ctx):
+    async def test_per_tenant_override_deep_merges(self, make_ctx, ccr_available):
         # A tenant flips compress_system_prompt without re-declaring the block; the
         # base keys (enabled/min_tokens) must survive the merge or G28 would no-op.
         ctx = make_ctx([{"role": "system", "content": _BIG}], model="gpt-4o-mini")
@@ -121,21 +135,21 @@ class TestG28ProcessResponse:
         ctx.ccr_tools_injected = injected
         return ctx, await G28CCR().process_response(ctx, self._resp())
 
-    async def test_refuses_when_not_injected(self, make_ctx):
+    async def test_refuses_when_not_injected(self, make_ctx, ccr_available):
         ctx, out = await self._run(make_ctx, injected=False)
         assert not self._executed(out)
         assert ctx.tool_dispatch_blocked == ["headroom_compress"]
 
-    async def test_refuses_a_policy_denied_tool_in_flag_mode(self, make_ctx):
+    async def test_refuses_a_policy_denied_tool_in_flag_mode(self, make_ctx, ccr_available):
         ctx, out = await self._run(
             make_ctx, injected=True, mode="flag", policy={"deny": ["headroom_*"]})
         assert not self._executed(out)
 
-    async def test_dispatches_when_injected_and_permitted(self, make_ctx):
+    async def test_dispatches_when_injected_and_permitted(self, make_ctx, ccr_available):
         _, out = await self._run(make_ctx, injected=True)
         assert self._executed(out)
 
-    async def test_parity_with_g15(self, make_ctx):
+    async def test_parity_with_g15(self, make_ctx, ccr_available):
         """Both loops must reach the same verdict for the same input."""
         from middleware.g32_tool_eligibility import authorize_dispatch
         ctx, _ = await self._run(make_ctx, injected=False)
@@ -188,3 +202,58 @@ class TestHeadroomStatsIsTenantScoped:
             "globex reads acme's retrieval activity — an activity-timing side channel"
         )
         assert dispatch_mcp_tool("headroom_stats", {}, None, 60, prefix="t:acme:")["hits"] == 3
+
+
+class TestCcrRefusesWhileStoreIsEphemeral:
+    """G28 must refuse to run while its store cannot outlive the process.
+
+    The config toggle is tenant-reachable and the portal copy used to recommend turning
+    it on, so `enabled: true` was a supported thing to ask for — while the store is a
+    module-level dict that dies with the instance. Honouring that request replaces content
+    the model needs with a reference that resolves only on the instance that made it, and
+    fails on a billed HTTP 200 with no metric. Refusing loudly is the honest state until
+    demand-driven-features.md #28 lands.
+    """
+
+    async def test_enabled_is_not_honoured(self, make_ctx):
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "min_tokens": 300}
+        out = await G28CCR().process_request(ctx)
+        assert not out.messages[0]["content"].startswith("[CCR:"), (
+            "content was replaced with a reference the store cannot durably resolve"
+        )
+        assert out.messages[0]["content"] == _BIG
+
+    async def test_mcp_tools_are_not_advertised(self, make_ctx):
+        """If the tools are never offered, nothing can ask the proxy to execute them —
+        this is also what keeps the G15 dispatch surface dormant."""
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "expose_mcp_tools": True}
+        out = await G28CCR().process_request(ctx)
+        names = {t.get("function", {}).get("name") for t in (out.params.get("tools") or [])}
+        assert not (names & {"headroom_compress", "headroom_retrieve", "headroom_stats"})
+        assert out.ccr_tools_injected is False
+
+    async def test_refusal_is_logged_at_error_once(self, make_ctx, caplog):
+        import logging
+        import middleware.g28_ccr as g28
+        from middleware.g28_ccr import G28CCR
+        g28._UNAVAILABLE_LOGGED = False
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True}
+        with caplog.at_level(logging.ERROR):
+            await G28CCR().process_request(ctx)
+            await G28CCR().process_request(ctx)
+        hits = [r for r in caplog.records
+                if r.levelno >= logging.ERROR and "REFUSED" in r.getMessage()]
+        assert len(hits) == 1, "the refusal must be visible, but must not spam every request"
+
+    async def test_opting_in_restores_the_feature(self, make_ctx, ccr_available):
+        """The guard is a gate, not a removal — #28 flips one flag."""
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "min_tokens": 300}
+        out = await G28CCR().process_request(ctx)
+        assert out.messages[0]["content"].startswith("[CCR:")

@@ -432,7 +432,7 @@ tests/                      # Unit and integration tests (pytest)
 | **G25** | Adaptive Reasoning | 10-30% | Classify complexity → set reasoning_effort before G12 |
 | **G26** | Context Budget Compaction | 20-60%¹ | Compact history when the prompt passes X% of the usable context window: prune duplicates/stale tool output → compress wording → cached summary → opt-in drop-oldest. Default off |
 | **G27** | Multimodal Optimizer | Variable | Compress inline base64 images (Headroom + LRU cache) |
-| **G28** | Context Compression & Reuse | 20-50% | Replace repeated blocks with `[CCR:sha256]` + headroom MCP tools |
+| **G28** | Context Compression & Reuse | *not measured* | Replace repeated blocks with `[CCR:sha256]` + headroom MCP tools. **Unavailable in this release** — the content store does not survive a restart, an idle scale-to-zero, or a second instance, so the proxy refuses to run it. For long conversations use **G26** instead. |
 | **G29** | PII Redaction *(trust & safety)* | — | Detect + `off\|flag\|mask\|block` personal data (email/SSN/card/phone/IP + optional Presidio) before the provider call. Opt-in **PHI** (DEA/NPI/MRN/ICD-10) via `phi: true` |
 | **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts in the user prompt; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens. Optional response-side scan (`scan_response`) also checks the model's **output** |
 | **G31** | Context-Trust *(trust & safety)* | — | Indirect / RAG prompt-injection defence — re-scans retrieved documents + memories (injected after G30) for injection; `allow\|flag\|block\|strip`; non-bypassable. Opt-in **`pii_mode: off\|flag\|mask\|block`** over retrieved content (irreversible masking) |

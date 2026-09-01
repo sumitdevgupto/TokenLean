@@ -23,6 +23,24 @@ date changes.
 
 ## 2026-09-01
 
+### Context Compression & Reuse is now refused rather than quietly unreliable — Bug fix
+This optimisation swaps a large block of text in your prompt for a short reference the
+model fetches back on demand. The text was only ever held in the memory of the single
+process that stored it — so the reference stopped resolving as soon as that process was
+replaced, which happens on any restart, on a second instance, and on the idle shutdown
+that the default deployment relies on to scale to zero. The failure was silent: the model
+got a short "not found" back, no error reached your dashboards, the request was billed as
+a success, and the model would typically carry on from its own earlier summary rather
+than say it had lost the text — a confident answer reconstructed from a paraphrase
+instead of the source. The proxy now refuses to run it, says so once in the logs, and the
+setting can no longer be switched on from the portal, which until now recommended it. The
+README's savings figure for it has been corrected to "not measured", because it never ran.
+For long conversations, Budget-Aware Context Management does the same job and is measured.
+This is a gate, not a removal — the feature comes back when its storage is durable.
+- **OSS:** the runtime refusal and the corrected documentation.
+- **[Enterprise]:** the portal explains why the toggle is unavailable instead of
+  accepting a change that would not take effect — <https://tokenlean.cbeyond.cloud/>
+
 ### The proxy no longer runs a tool it was told not to run — Bug fix
 The proxy can carry out a handful of tool calls itself, server-side, rather than handing
 them back to your application. It decided whether to do so by matching the tool's name,

@@ -704,6 +704,8 @@ Compresses inline base64 image blocks before the LLM call via `headroom.compress
 | `provider` | `null` | Optional Headroom provider hint; `null` = auto-detect from the active adapter |
 
 ### G28_ccr
+> **Unavailable in this release.** The proxy refuses to run G28 regardless of `enabled`, and logs at ERROR if you set it. Its content store is in-process only, so a `[CCR:ref]` is resolvable only on the instance that created it and only until that instance recycles — `--min-instances=0` alone is enough to lose it across an idle gap. Enabling it would replace content the model needs with a reference that can fail to resolve mid-conversation, on a billed HTTP 200 with no metric. `ttl_seconds` is likewise not honoured. For long conversations use **G26 Budget-Aware Context Management**, which does the same job and is measured. Tracked as `demand-driven-features.md` #28.
+
 Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token before the call, then exposes MCP tools (`headroom_compress`/`retrieve`/`stats`) so the model can fetch the full text on demand. Runs on both request and response paths. Falls back gracefully without `headroom.ccr` or Redis.
 
 **Off by default.** A `[CCR:ref]` is only resolvable by a client that runs the `headroom_retrieve` agent loop (calls the tool, re-sends the result). In a plain pass-through chat completion the model can't resolve the reference and answers from a gutted context, so enable G28 only for cooperating agent clients. The **system instruction is never replaced** unless `compress_system_prompt` is explicitly set true — losing it silently strips the policy/facts the answer depends on.
