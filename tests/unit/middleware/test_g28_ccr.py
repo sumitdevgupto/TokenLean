@@ -90,3 +90,101 @@ class TestG28ProcessRequest:
         from middleware.g28_ccr import G28CCR
         ctx = await G28CCR().process_request(ctx)
         assert ctx.messages[0]["content"].startswith("[CCR:")
+
+
+class TestG28ProcessResponse:
+    """G28 has a SECOND dispatch loop, near-identical to G15's, that had no test at all.
+
+    Two loops executing the same sink must gate identically or the weaker one becomes the
+    way in — which is exactly how the missing tenant prefix survived in G15 while G28's
+    copy had it right (public 2768392).
+    """
+
+    @staticmethod
+    def _resp(name="headroom_compress", args='{"text": "xxxxxxxxxxxxxxxxxxxx"}'):
+        return {"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": name, "arguments": args}}]}}]}
+
+    @staticmethod
+    def _executed(out):
+        return "result" in out["choices"][0]["message"]["tool_calls"][0]["function"]
+
+    async def _run(self, make_ctx, *, injected, policy=None, mode="flag"):
+        from middleware.g28_ccr import G28CCR, _local_store
+        _local_store.clear()
+        ctx = make_ctx([{"role": "user", "content": "hi"}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "ttl_seconds": 60}
+        ctx.config["groups"]["G32_tool_eligibility"] = {
+            "enabled": True, "mode": mode, "policy": policy or {}}
+        ctx.ccr_tools_injected = injected
+        return ctx, await G28CCR().process_response(ctx, self._resp())
+
+    async def test_refuses_when_not_injected(self, make_ctx):
+        ctx, out = await self._run(make_ctx, injected=False)
+        assert not self._executed(out)
+        assert ctx.tool_dispatch_blocked == ["headroom_compress"]
+
+    async def test_refuses_a_policy_denied_tool_in_flag_mode(self, make_ctx):
+        ctx, out = await self._run(
+            make_ctx, injected=True, mode="flag", policy={"deny": ["headroom_*"]})
+        assert not self._executed(out)
+
+    async def test_dispatches_when_injected_and_permitted(self, make_ctx):
+        _, out = await self._run(make_ctx, injected=True)
+        assert self._executed(out)
+
+    async def test_parity_with_g15(self, make_ctx):
+        """Both loops must reach the same verdict for the same input."""
+        from middleware.g32_tool_eligibility import authorize_dispatch
+        ctx, _ = await self._run(make_ctx, injected=False)
+        assert authorize_dispatch(ctx, "headroom_compress") == "not_injected"
+
+
+class TestHeadroomStatsIsTenantScoped:
+    """`headroom_stats` returned process-global numbers — a cross-tenant side channel.
+
+    `len(_local_store)` counted every tenant's blocks and `_stats` was one module-level
+    pair, so polling the tool across turns revealed co-tenants' request volume, block-size
+    distribution and activity timing. Content was safe after the prefix fix; the counts
+    were not.
+    """
+
+    def test_stats_report_only_the_calling_tenants_blocks(self):
+        from middleware.g28_ccr import _local_store, _stats, dispatch_mcp_tool
+        _local_store.clear()
+        _stats.clear()
+
+        dispatch_mcp_tool("headroom_compress", {"text": "acme one"}, None, 60, prefix="t:acme:")
+        dispatch_mcp_tool("headroom_compress", {"text": "acme two"}, None, 60, prefix="t:acme:")
+        for i in range(5):
+            dispatch_mcp_tool("headroom_compress", {"text": f"globex {i}"}, None, 60,
+                              prefix="t:globex:")
+
+        acme = dispatch_mcp_tool("headroom_stats", {}, None, 60, prefix="t:acme:")
+        globex = dispatch_mcp_tool("headroom_stats", {}, None, 60, prefix="t:globex:")
+
+        assert acme["local_store_size"] == 2, (
+            f"acme sees {acme['local_store_size']} blocks — the process holds 7, so it is "
+            f"reading globex's traffic volume"
+        )
+        assert globex["local_store_size"] == 5
+        assert len(_local_store) == 7, "sanity: the process really does hold both tenants"
+
+    def test_hit_miss_counters_do_not_leak_across_tenants(self):
+        from middleware.g28_ccr import _local_store, _stats, dispatch_mcp_tool
+        _local_store.clear()
+        _stats.clear()
+
+        stored = dispatch_mcp_tool("headroom_compress", {"text": "acme secret"}, None, 60,
+                                   prefix="t:acme:")
+        for _ in range(3):
+            dispatch_mcp_tool("headroom_retrieve", {"ref": stored["ref"]}, None, 60,
+                              prefix="t:acme:")
+
+        globex = dispatch_mcp_tool("headroom_stats", {}, None, 60, prefix="t:globex:")
+        assert globex["hits"] == 0 and globex["misses"] == 0, (
+            "globex reads acme's retrieval activity — an activity-timing side channel"
+        )
+        assert dispatch_mcp_tool("headroom_stats", {}, None, 60, prefix="t:acme:")["hits"] == 3

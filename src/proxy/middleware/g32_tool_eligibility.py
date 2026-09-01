@@ -61,6 +61,94 @@ _DEFAULT_BLOCK_MESSAGE = (
 )
 
 
+REASON_NOT_INJECTED = "not_injected"
+REASON_POLICY_DENIED = "policy_denied"
+REASON_EVALUATION_ERROR = "evaluation_error"
+
+
+def authorize_dispatch(ctx: RequestContext, tool_name: str) -> Optional[str]:
+    """Second, INDEPENDENT authorization check at an auto-EXECUTION site.
+
+    ``process_response`` above gates what the caller SEES. This gates what the proxy
+    itself DOES, at the point of doing it — ``g15_server_compute`` and ``g28_ccr`` both
+    dispatch server-side handlers by bare tool-name match. Until now that ordering
+    (G32 runs before G14/G28/G15) was the only thing standing between a prompt-injected
+    model and the proxy acting on its behalf, and ordering is a property of
+    ``pipeline.py``, not of the dispatch site. Now the sink refuses on its own.
+
+    Returns ``None`` to allow, else a short machine reason for the refusal.
+
+    Three rules, in order:
+
+    1. **Not advertised by us → refuse** (``not_injected``). Checked before policy and
+       regardless of mode, because this is not policy — it is identity. Only G28's
+       ``expose_mcp_tools`` path puts these names in front of a model, so a call to one
+       we never offered is an injection, a hallucination, or a tenant's own same-named
+       tool being hijacked. None of the three should execute.
+    2. **``mode: off`` → allow.** ``off`` means the policy is not evaluated, and the
+       dispatch site honours that so operators keep a real kill switch. Rule 1 still
+       applies — no mode licenses running a name we never advertised.
+    3. **Policy denies → refuse** (``policy_denied``) **in every mode, ``flag``
+       included.** Deliberate: ``flag`` is documented as leaving the *response*
+       untouched, which is not the same as declining to *act*. Recording a call as
+       denied and then executing it anyway is worse than not checking at all — the audit
+       row testifies that we knew.
+
+    **Fail-CLOSED** on an unexpected error (``evaluation_error``) — the opposite of the
+    cache/bypass hoist in ``main.py``, and safe here for a concrete reason: refusing to
+    dispatch leaves the tool call sitting in the response unexecuted, which is the normal
+    path for every tool the proxy does not host. The caller still receives it. There is
+    no outage mode, so the availability argument that justifies failing open there buys
+    nothing here.
+    """
+    if not getattr(ctx, "ccr_tools_injected", False):
+        return REASON_NOT_INJECTED
+    try:
+        cfg = resolve_group_config(ctx, "G32_tool_eligibility")
+        if not cfg.get("enabled", True):
+            return None
+        if coerce_mode(cfg.get("mode"), _VALID_MODES, "flag") == "off":
+            return None
+        policy = normalize_policy(cfg.get("policy") or {})
+        if policy.is_noop:
+            return None
+        return None if evaluate_tool(policy, tool_name).allowed else REASON_POLICY_DENIED
+    except Exception as exc:
+        logger.error(
+            "[%s] G32 dispatch authorization failed for tool %r (%s) — refusing to "
+            "execute it (the call is still returned to the caller, unexecuted)",
+            getattr(ctx, "request_id", "?"), tool_name, exc,
+        )
+        return REASON_EVALUATION_ERROR
+
+
+def record_dispatch_block(ctx: RequestContext, tool_name: str, reason: str) -> None:
+    """Observability for a refused auto-execution.
+
+    Uses its OWN ctx field, counter and audit action rather than G32's response-path
+    ones. ``ctx.tool_eligibility_*`` are assigned by ``process_response``, so writing
+    them here would clobber G32's ``denied`` list in the audit row, and
+    ``record_tool_denied`` is a bare ``Counter.inc`` that would double-count a call
+    denied at both sites.
+    """
+    blocked = getattr(ctx, "tool_dispatch_blocked", None)
+    if blocked is None:
+        ctx.tool_dispatch_blocked = blocked = []
+    if tool_name not in blocked:
+        blocked.append(tool_name)
+    try:
+        from middleware.quality_metrics import record_dispatch_blocked
+        record_dispatch_blocked(getattr(ctx, "tenant_id", "default"), reason=reason)
+    except Exception as exc:  # never let metrics break the response
+        logger.debug("[%s] G32 dispatch-block metric failed: %s",
+                     getattr(ctx, "request_id", "?"), exc)
+    logger.warning(
+        "[%s] G32 refused server-side dispatch of %r (%s) — the call is returned to the "
+        "caller unexecuted",
+        getattr(ctx, "request_id", "?"), tool_name, reason,
+    )
+
+
 class G32ToolEligibility:
     """Apply the per-tenant tool-eligibility policy to each response."""
 

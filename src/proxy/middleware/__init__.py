@@ -139,6 +139,18 @@ class RequestContext:
     tool_eligibility_action: Optional[str] = None
     tool_eligibility_denied: List[str] = field(default_factory=list)
     tool_eligibility_count: int = 0
+    # True once G28 has injected the CCR tools (headroom_compress/retrieve/stats) into
+    # this request's `tools`. It is the ONLY thing that makes an auto-execution of those
+    # names legitimate: G15 matches them by bare name, so without this a tenant declaring
+    # its own tool called `headroom_compress` had it silently executed server-side — and
+    # a model naming one unprompted was dispatched too, even with G28 disabled. The
+    # dispatch sites refuse anything the proxy did not itself advertise.
+    ccr_tools_injected: bool = False
+    # Tool names an auto-EXECUTION site refused to dispatch. Kept SEPARATE from
+    # tool_eligibility_* on purpose: those are G32's response-path verdict and are
+    # ASSIGNED (not appended), so writing them from a dispatch site would erase G32's own
+    # list from the audit row. Distinct field -> distinct metric + distinct audit action.
+    tool_dispatch_blocked: List[str] = field(default_factory=list)
     # Ingress protocol the client used (default = the OpenAI identity protocol;
     # "anthropic" for /v1/messages, "gemini" for …:generateContent). The pipeline is
     # protocol-agnostic (OpenAI-shaped internally) — this only flows into

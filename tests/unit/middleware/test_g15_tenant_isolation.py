@@ -45,6 +45,12 @@ def _ctx(tenant_id):
         config={"groups": {"G15_server_compute": {"enabled": True, "headroom_mcp_server": True},
                            "G28_ccr": {"ttl_seconds": 60}}},
         tenant_id=tenant_id, redis_prefix=f"t:{tenant_id}:",
+        # These tests are about the STORE's tenant scoping, which only matters for a
+        # dispatch that is allowed to happen at all. Authorization is a separate
+        # guarantee, covered in test_g15_dispatch_authz.py; set the flag the proxy sets
+        # when it advertises the CCR tools so the dispatch proceeds and the prefix
+        # behaviour is what is actually under test.
+        ccr_tools_injected=True,
         savings=SavingsRecord(request_id=f"req-{tenant_id}", user_id="u",
                               timestamp=datetime.now(timezone.utc),
                               model_requested="gpt-4o-mini", routed_model="gpt-4o-mini",

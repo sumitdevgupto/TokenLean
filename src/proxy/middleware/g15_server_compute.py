@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from middleware import RequestContext
+from middleware import RequestContext, resolve_group_config
 from savings.calculator import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -22,11 +22,29 @@ GROUP = "G15"
 _HEADROOM_MCP_TOOLS = frozenset({"headroom_compress", "headroom_retrieve", "headroom_stats"})
 
 
+def authorize_dispatch(ctx: RequestContext, tool_name: str):
+    """Thin re-export so the dispatch loop reads straightforwardly; the policy lives
+    in G32, which owns tool authorization. Imported lazily to keep module import order
+    free of a G15<->G32 cycle."""
+    from middleware.g32_tool_eligibility import authorize_dispatch as _authz
+    return _authz(ctx, tool_name)
+
+
+def record_dispatch_block(ctx: RequestContext, tool_name: str, reason: str) -> None:
+    from middleware.g32_tool_eligibility import record_dispatch_block as _rec
+    _rec(ctx, tool_name, reason)
+
+
 class G15ServerCompute:
     async def process_response(
         self, ctx: RequestContext, response: Dict[str, Any]
     ) -> Dict[str, Any]:
-        cfg = ctx.config.get("groups", {}).get("G15_server_compute", {})
+        # resolve_group_config, not a raw .get() chain: the OPERATOR overlay
+        # (tenants.<id>.groups.G15_server_compute in config.yaml) was silently
+        # ignored here, so an operator could not disable headroom_mcp_server for a
+        # single tenant. It also carries the type guards that stop a mis-indented
+        # tenants: block raising AttributeError and 500-ing every request.
+        cfg = resolve_group_config(ctx, "G15_server_compute")
         if not cfg.get("enabled", False):
             return response
 
@@ -43,6 +61,16 @@ class G15ServerCompute:
 
                 # ── Headroom MCP server dispatch ─────────────────────────────
                 if headroom_mcp_enabled and fn_name in _HEADROOM_MCP_TOOLS:
+                    # Matching by bare name is not enough to justify EXECUTING.
+                    # authorize_dispatch refuses anything the proxy did not itself
+                    # advertise (a tenant's own same-named tool, or a name a model
+                    # produced unprompted) and anything the tenant's tool policy
+                    # denies. A refused call is left in the response untouched and
+                    # simply not acted on — stripping is the response gate's job.
+                    reason = authorize_dispatch(ctx, fn_name)
+                    if reason:
+                        record_dispatch_block(ctx, fn_name, reason)
+                        continue
                     _dispatch_headroom_tool(tc, ctx)
                     continue
 
@@ -80,7 +108,7 @@ def _dispatch_headroom_tool(tc: Dict, ctx: RequestContext) -> None:
     except (json.JSONDecodeError, TypeError):
         arguments = {}
     redis_client = getattr(ctx, "redis_client", None)
-    ttl = ctx.config.get("groups", {}).get("G28_ccr", {}).get("ttl_seconds", 86400)
+    ttl = resolve_group_config(ctx, "G28_ccr").get("ttl_seconds", 86400)
     # `prefix` is NOT optional here. Omitting it defaults to "" — and the retrieve path
     # then scans with `key.startswith("")`, which is true of every key, so an 8-char
     # [CCR:...] reference resolved to ANY tenant's stored block. G28's own call site

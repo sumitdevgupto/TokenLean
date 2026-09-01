@@ -233,6 +233,16 @@ class AuditLogger:
                     "mode": te_action,
                 },
             ))
+        # An auto-EXECUTION site refused to run a tool. Distinct action from
+        # `tool_eligibility.*`: that records what the RESPONSE gate denied the caller,
+        # this records what the proxy declined to DO on the caller's behalf. Tool
+        # names only — function identifiers, never prompt content.
+        dispatch_blocked = list(getattr(ctx, "tool_dispatch_blocked", []) or [])
+        if dispatch_blocked:
+            events.append((
+                "tool_dispatch.blocked",
+                {"tools": dispatch_blocked, "count": len(dispatch_blocked)},
+            ))
         if not events:
             return
         tenant_id = getattr(ctx, "tenant_id", "default")

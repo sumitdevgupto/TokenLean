@@ -76,6 +76,17 @@ TOOL_ELIGIBILITY_FAILURES_TOTAL = Counter(
     "are being served WITHOUT tool-call enforcement — alert on it.",
     ["tenant_id", "path"],
 )
+TOOL_DISPATCH_BLOCKED_TOTAL = Counter(
+    "token_opt_tool_dispatch_blocked_total",
+    "Server-side tool executions the proxy refused to perform (G15/G28 auto-exec sites). "
+    "Distinct from token_opt_tool_eligibility_denied_total, which counts what the "
+    "RESPONSE gate denied: this counts what an EXECUTION site declined to run. `reason`: "
+    "not_injected = the proxy never advertised that tool (an injected, hallucinated or "
+    "colliding name); policy_denied = the tenant's tool policy rejects it; "
+    "evaluation_error = the check itself failed and the site failed closed. The refused "
+    "call is still returned to the caller, unexecuted.",
+    ["tenant_id", "reason"],
+)
 OUTPUT_VERIFY_SCORE = Histogram(
     "token_opt_output_verify_score",
     "Faithfulness/accuracy score (1-5) from the sampled inline judge (G33, Task 7).",
@@ -122,6 +133,13 @@ def record_tool_gate_failure(tenant_id: str, path: str = "short_circuit") -> Non
     that one means the gate worked, this one means it did not."""
     _safe(lambda: TOOL_ELIGIBILITY_FAILURES_TOTAL.labels(
         tenant_id=tenant_id or "default", path=path or "unknown").inc())
+
+
+def record_dispatch_blocked(tenant_id: str, reason: str = "policy_denied") -> None:
+    """An auto-execution site declined to run a tool. See TOOL_DISPATCH_BLOCKED_TOTAL —
+    this is 'the proxy did not act', not 'the caller was denied a result'."""
+    _safe(lambda: TOOL_DISPATCH_BLOCKED_TOTAL.labels(
+        tenant_id=tenant_id or "default", reason=reason or "unknown").inc())
 
 
 def record_verify_score(tenant_id: str, score: float) -> None:

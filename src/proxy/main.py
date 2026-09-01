@@ -712,7 +712,8 @@ def _schedule_security_audit(ctx) -> None:
     if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)
             or getattr(ctx, "context_trust_action", None)
             or getattr(ctx, "context_trust_pii_action", None)
-            or getattr(ctx, "tool_eligibility_action", None)):
+            or getattr(ctx, "tool_eligibility_action", None)
+            or getattr(ctx, "tool_dispatch_blocked", None)):
         return
     try:
         asyncio.create_task(_audit_logger.log_security_events(ctx))

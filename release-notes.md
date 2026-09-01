@@ -21,6 +21,42 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-01
+
+### The proxy no longer runs a tool it was told not to run — Bug fix
+The proxy can carry out a handful of tool calls itself, server-side, rather than handing
+them back to your application. It decided whether to do so by matching the tool's name,
+and nothing else. The tool policy was checked earlier, when the response was assembled —
+but its default setting is "record what you would have blocked, and change nothing", so a
+tool call the policy had already flagged as not permitted was recorded as such and then
+carried out anyway. That is worse than not checking: the audit entry proved we knew.
+Server-side execution now checks the policy at the moment of acting, and refuses in every
+mode. It also refuses to run any tool the proxy did not itself offer to the model — so a
+tool of your own that happens to share a name with one of ours is passed back to your
+application untouched instead of being intercepted, and a name a model invents or is
+tricked into producing is not run at all. A refused call is still returned to you, just
+not acted on. Refusals are counted and audited separately from policy decisions, so
+"we declined to act" and "you were denied a result" stay distinguishable.
+- **OSS:** the check, the refusal reasons and the metric ship in the core proxy.
+- **[Enterprise]:** refusals appear in the portal's Trust & Safety tab and the operator
+  console under a new filter — <https://tokenlean.cbeyond.cloud/>
+
+### One workspace could infer another's traffic volume from a usage-stats tool — Bug fix
+The server-side `headroom_stats` tool reported how many stored text blocks the proxy held
+and how many lookups had hit or missed. Both numbers covered every workspace sharing the
+process, not the one asking. No content was exposed, but polling the tool across turns
+revealed other workspaces' request volume, the size profile of what they were sending,
+and when they were active — enough to read a competitor's working hours or batch
+schedule off a shared deployment. The numbers are now scoped to the workspace asking.
+Anyone who was reading the larger figure will see it drop; it was never theirs to see.
+
+### Server-side compute settings can now be set per workspace — Bug fix
+The `G15_server_compute` block was documented as configurable per workspace in
+config.yaml, like every other group, but read only the global block — so an operator had
+no way to turn server-side tool execution off for a single workspace short of editing the
+database. It now resolves the per-workspace override like its siblings, and tolerates a
+mis-indented config section instead of failing every request for that workspace.
+
 ## 2026-08-31
 
 ### One workspace could read another's server-side compressed text — Bug fix

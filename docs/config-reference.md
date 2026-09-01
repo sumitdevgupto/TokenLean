@@ -512,7 +512,7 @@ Server-side compute dispatch + Headroom MCP tool hosting.
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable server-side compute hooks |
-| `headroom_mcp_server` | `true` | Host Headroom MCP tools (`headroom_compress`/`retrieve`/`stats`) |
+| `headroom_mcp_server` | `true` | Host Headroom MCP tools (`headroom_compress`/`retrieve`/`stats`) — the proxy executes these **server-side** rather than returning them to the caller. Only tools **G28 itself injected** are ever executed: a same-named tool you declare, or a name the model produces unprompted, is passed back to you untouched. Each execution is also re-checked against the G32 tool policy at the moment of acting. Honours the per-tenant overlay. |
 | `hooks` | `[]` | ⚠ Config-driven transforms (filter/sort/project) applied to tool results before they return |
 
 ### G16_agent_arch
@@ -762,6 +762,8 @@ prompt-injected model could otherwise trigger a tool it should never reach.
 |-----|------|---------|---------|
 | `enabled` | bool | `true` | Master switch. |
 | `mode` | enum | `flag` | `off` = policy not evaluated; `flag` = record ineligible calls, serve unchanged; `block` = strip the call. **`off`, not `allow`** — this group's own config already uses "allow" twice below, so `mode: allow` would be ambiguous (G29 uses `off` for the same reason). YAML resolves an unquoted `off` to the boolean `false`; the proxy maps it back, so `off` and `"off"` both work. |
+
+> **`mode` also governs server-side execution.** `flag` leaves the *response* untouched, but it does **not** mean the proxy will act on a call the policy denies: the auto-execution sites (`G15_server_compute`, `G28_ccr`) refuse a denied tool in every mode except `off`. Recording a call as denied and then executing it is the failure this closes. A refused call is still returned to the caller, unexecuted, and is counted on `token_opt_tool_dispatch_blocked_total{reason}` (`not_injected` / `policy_denied` / `evaluation_error`) with a `tool_dispatch.blocked` audit row — deliberately separate from `token_opt_tool_eligibility_denied_total`, which counts what the *response* gate denied.
 
 > **`off` and YAML booleans.** YAML 1.1 resolves an unquoted `off` / `no` to `false` (and `on` / `yes` to `true`) before the proxy sees it. For the groups that have an `off` mode — G29 `mode`, G31 `pii_mode`, G32 `mode` — the proxy maps the boolean back to `off`, so both spellings work. Quoting (`mode: "off"`) is still the clearer habit. G30 and G31's `mode` spell passthrough `allow`, which is not a YAML boolean and needs no quoting.
 | `policy.allow` | list | `[]` | fnmatch globs, **case-sensitive** (e.g. `db_read_*`). |

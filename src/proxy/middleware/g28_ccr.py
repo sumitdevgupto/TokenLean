@@ -54,7 +54,31 @@ _ccr_retrieve_fn = None
 # ─── In-process fallback store (used when Redis unavailable) ─────────────────
 
 _local_store: Dict[str, str] = {}
-_stats = {"hits": 0, "misses": 0}
+# hits/misses per tenant prefix. A single global pair was readable by any tenant via
+# headroom_stats (see that branch below).
+_stats: Dict[str, Dict[str, int]] = {}
+
+
+def _stats_for(prefix: str = "") -> Dict[str, int]:
+    return _stats.setdefault(prefix, {"hits": 0, "misses": 0})
+
+
+def authorize_dispatch(ctx, tool_name: str):
+    """See middleware.g32_tool_eligibility.authorize_dispatch. Lazy import: G32 owns
+    tool authorization, and a module-level import here would be circular."""
+    from middleware.g32_tool_eligibility import authorize_dispatch as _authz
+    return _authz(ctx, tool_name)
+
+
+def record_dispatch_block(ctx, tool_name: str, reason: str) -> None:
+    from middleware.g32_tool_eligibility import record_dispatch_block as _rec
+    _rec(ctx, tool_name, reason)
+
+# The three CCR tools the proxy hosts server-side. ONE definition: G15 imports this
+# rather than keeping its own copy, and G28's response loop uses it instead of the
+# inline string tuple it used to re-list — two independent lists of the same names is
+# exactly the drift that produced the missing-tenant-prefix bug (public 2768392).
+_CCR_MCP_TOOLS = frozenset({"headroom_compress", "headroom_retrieve", "headroom_stats"})
 
 # Reference token format: [CCR:hex8]
 _REF_PREFIX = "[CCR:"
@@ -88,15 +112,15 @@ def _retrieve_stored(redis_client: Optional[Any], key: str, prefix: str = "") ->
         try:
             val = redis_client.get(f"{prefix}ccr:{key}")
             if val is not None:
-                _stats["hits"] += 1
+                _stats_for(prefix)["hits"] += 1
                 return val.decode() if isinstance(val, bytes) else val
         except Exception as exc:
             logger.debug("G28 Redis retrieve failed: %s — falling back to local", exc)
     val = _local_store.get(f"{prefix}{key}")
     if val is not None:
-        _stats["hits"] += 1
+        _stats_for(prefix)["hits"] += 1
     else:
-        _stats["misses"] += 1
+        _stats_for(prefix)["misses"] += 1
     return val
 
 
@@ -263,22 +287,28 @@ def dispatch_mcp_tool(
                         if key.startswith(prefix) and key[len(prefix):].startswith(sha_prefix):
                             return {"text": _local_store[key]}
                     return {"error": "Reference not found"}
-                _stats["hits"] += 1
+                _stats_for(prefix)["hits"] += 1
                 return {"text": val.decode() if isinstance(val, bytes) else val}
             except Exception:
                 pass
         for key in _local_store:
             if key.startswith(prefix) and key[len(prefix):].startswith(sha_prefix):
-                _stats["hits"] += 1
+                _stats_for(prefix)["hits"] += 1
                 return {"text": _local_store[key]}
-        _stats["misses"] += 1
+        _stats_for(prefix)["misses"] += 1
         return {"error": "Reference not found"}
 
     if tool_name == "headroom_stats":
+        # Tenant-scoped. These were process-global: len(_local_store) and a single
+        # module-level _stats counted every tenant sharing the process, so polling
+        # this tool across turns leaked co-tenants' request volume, block-size
+        # distribution and activity timing. Same isolation family as the prefix bug
+        # above; the counters are keyed by prefix for the same reason the store is.
+        tenant_stats = _stats_for(prefix)
         return {
-            "local_store_size": len(_local_store),
-            "hits": _stats["hits"],
-            "misses": _stats["misses"],
+            "local_store_size": sum(1 for k in _local_store if k.startswith(prefix)),
+            "hits": tenant_stats["hits"],
+            "misses": tenant_stats["misses"],
         }
 
     return {"error": f"Unknown CCR tool: {tool_name}"}
@@ -355,6 +385,11 @@ class G28CCR:
             merged = [t for t in existing_tools if t.get("function", {}).get("name") not in ccr_names]
             merged.extend(ccr_tools)
             ctx.params["tools"] = merged
+            # The dispatch sites refuse to auto-execute a CCR tool unless this is
+            # set. It is the difference between "the model called a tool we offered"
+            # and "the model named one we never mentioned" — only the first is a
+            # legitimate reason for the proxy to act.
+            ctx.ccr_tools_injected = True
 
         return ctx
 
@@ -376,7 +411,14 @@ class G28CCR:
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 tool_name = fn.get("name", "")
-                if tool_name not in ("headroom_compress", "headroom_retrieve", "headroom_stats"):
+                if tool_name not in _CCR_MCP_TOOLS:
+                    continue
+                # Same authorization as G15's dispatch site. Both loops execute the
+                # same sink, so both must gate identically or the weaker one becomes
+                # the way in.
+                reason = authorize_dispatch(ctx, tool_name)
+                if reason:
+                    record_dispatch_block(ctx, tool_name, reason)
                     continue
                 try:
                     arguments = json.loads(fn.get("arguments", "{}"))

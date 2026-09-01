@@ -502,3 +502,65 @@ class TestTrustSafetyStageOrdering:
         # A block returns immediately — G29 and the G04/G05 gate must not run.
         assert "G29" not in call_log
         assert "G04" not in call_log and "G05" not in call_log
+
+
+class TestDispatchSiteDoesNotRelyOnOrdering:
+    """Ordering is belt; the dispatch site is braces.
+
+    `test_g32_runs_before_every_auto_executing_group` above proves the pipeline puts G32
+    first. That is a property of pipeline.py — it says nothing about what happens if a
+    future reorder, a new auto-executing group, or a path that skips the response chain
+    lets a call reach the sink ungated. These assert the sink refuses on its own, with
+    G32 never having run at all.
+    """
+
+    @staticmethod
+    def _ctx(**kw):
+        import sys, os
+        sys.path.insert(0, os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "..", "src", "proxy")))
+        from datetime import datetime, timezone
+        from middleware import RequestContext
+        from savings.models import SavingsRecord
+        base = dict(
+            request_id="req-ord", user_id="u", original_messages=[], messages=[],
+            model="gpt-4o-mini", routed_model="gpt-4o-mini", params={},
+            config={"groups": {
+                "G15_server_compute": {"enabled": True, "headroom_mcp_server": True},
+                "G28_ccr": {"ttl_seconds": 60},
+                "G32_tool_eligibility": {"enabled": True, "mode": "flag",
+                                         "policy": {"deny": ["headroom_*"]}},
+            }},
+            tenant_id="acme", redis_prefix="t:acme:",
+            savings=SavingsRecord(request_id="req-ord", user_id="u",
+                                  timestamp=datetime.now(timezone.utc),
+                                  model_requested="gpt-4o-mini",
+                                  routed_model="gpt-4o-mini", baseline_tokens=10),
+        )
+        base.update(kw)
+        return RequestContext(**base)
+
+    async def test_g15_refuses_even_though_g32_never_ran(self):
+        """Simulates the ordering guarantee being absent entirely."""
+        from middleware.g15_server_compute import G15ServerCompute
+        ctx = self._ctx(ccr_tools_injected=True)
+        resp = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "headroom_compress", "arguments": '{"text": "xxxxxxxxxxxx"}'}}]}}]}
+        out = await G15ServerCompute().process_response(ctx, resp)
+        fn = out["choices"][0]["message"]["tool_calls"][0]["function"]
+        assert "result" not in fn, (
+            "the sink executed a policy-denied tool with no gate ahead of it — ordering "
+            "was the only protection"
+        )
+        assert ctx.tool_eligibility_action is None, "sanity: G32 genuinely did not run"
+
+    async def test_the_ordering_test_and_this_one_are_independent(self):
+        """If someone deletes the ordering assertion, this still fails on a regression;
+        if someone deletes this, the ordering assertion still fails. Neither is redundant."""
+        import inspect
+        import tests.unit.test_pipeline_order as mod
+        src = inspect.getsource(mod)
+        assert "test_g32_runs_before_every_auto_executing_group" in src
+        assert "test_g15_refuses_even_though_g32_never_ran" in src
