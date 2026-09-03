@@ -62,6 +62,12 @@ CCR_MISSES = Counter(
     "CCR references the model asked for that could not be resolved (answer quality risk)",
     ["tenant_id"],
 )
+CCR_IGNORED_REFS = Counter(
+    "token_opt_ccr_reference_ignored_total",
+    "Turns where a CCR reference was substituted and the model answered WITHOUT resolving it "
+    "(the answer was produced from a summary, on a billed 200 - direct answer-quality risk)",
+    ["tenant_id"],
+)
 EFFECTIVE_TOKENS = Counter(
     "token_opt_effective_tokens_total",
     "Effective token cost (ET metric)",

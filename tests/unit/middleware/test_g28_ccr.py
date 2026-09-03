@@ -4,6 +4,7 @@ Focus: the system-role guard. In a pass-through chat completion there is no agen
 loop to resolve a [CCR:ref] via headroom_retrieve, so G28 must never replace the
 system instruction by default (doing so strips the policy/facts the answer needs).
 """
+import json
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
@@ -384,6 +385,106 @@ class TestResolveCapabilityHandshake:
         ctx.config["groups"]["G28_ccr"] = {"enabled": True, "require_proven_resolver": False}
         out = await G28CCR().process_request(ctx)
         assert out.messages[0]["content"].startswith("[CCR:")
+
+
+@pytest.mark.asyncio
+class TestProofIsRevokedWhenTheModelIgnoresAReference:
+    """The handshake used to be write-once: resolve once, trusted until the TTL expired.
+
+    Proven live on 2026-09-03 (DS22, the first real ablation run of G28): with the CCR tools
+    advertised and the handshake force-declared, gpt-4o-mini returned `tool_calls: []` /
+    `finish_reason: stop` and answered from the one-line summary, inventing the maintenance
+    window and region that lived in the parked document. Every graded thread lost both
+    planted facts while the run recorded 44.99% savings. A saving that buys a wrong answer
+    is not a saving, and nothing detected it.
+
+    So the proof now decays on evidence: substitute a reference, get a FINAL answer back
+    that never resolved it, and the tenant returns to full content until it resolves one
+    again. Costs at most one honest full-content turn; the alternative costs the answer.
+    """
+
+    @staticmethod
+    def _final_answer(content="the window is 2am-4am"):
+        return {"choices": [{"finish_reason": "stop",
+                             "message": {"role": "assistant", "content": content}}]}
+
+    @staticmethod
+    def _retrieve_call(ref):
+        return {"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "headroom_retrieve",
+                    "arguments": json.dumps({"ref": ref})}}]}}]}
+
+    async def _ctx(self, make_ctx, *, substituted):
+        ctx = make_ctx([{"role": "user", "content": "hi"}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "ttl_seconds": 60}
+        ctx.ccr_tools_injected = True
+        ctx.ccr_refs_substituted = substituted
+        return ctx
+
+    async def test_answering_without_resolving_revokes_the_proof(self, make_ctx, ccr_available):
+        from middleware.g28_ccr import G28CCR, _mark_resolver_proven, _resolver_proven
+        ctx = await self._ctx(make_ctx, substituted=True)
+        _mark_resolver_proven(ctx.redis_prefix)
+        assert _resolver_proven(ctx.redis_prefix)
+        await G28CCR().process_response(ctx, self._final_answer())
+        assert not _resolver_proven(ctx.redis_prefix), (
+            "the model answered from the summary — it must not keep receiving references")
+
+    async def test_next_turn_gets_full_content_again(self, make_ctx, ccr_available):
+        """The revocation has to CHANGE something, not just clear a flag."""
+        from middleware.g28_ccr import G28CCR, _mark_resolver_proven
+        ctx = await self._ctx(make_ctx, substituted=True)
+        _mark_resolver_proven(ctx.redis_prefix)
+        await G28CCR().process_response(ctx, self._final_answer())
+
+        nxt = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        nxt.config["groups"]["G28_ccr"] = {"enabled": True}
+        out = await G28CCR().process_request(nxt)
+        assert out.messages[0]["content"] == _BIG
+
+    async def test_a_resolving_turn_keeps_the_proof(self, make_ctx, ccr_available):
+        from middleware.g28_ccr import (G28CCR, dispatch_mcp_tool, _mark_resolver_proven,
+                                        _resolver_proven)
+        ctx = await self._ctx(make_ctx, substituted=True)
+        stored = await dispatch_mcp_tool("headroom_compress", {"text": "doc" * 50}, 60,
+                                         prefix=ctx.redis_prefix)
+        _mark_resolver_proven(ctx.redis_prefix)
+        await G28CCR().process_response(ctx, self._retrieve_call(stored["ref"]))
+        assert _resolver_proven(ctx.redis_prefix), "it DID resolve — do not punish it"
+
+    async def test_mid_loop_turn_is_not_judged(self, make_ctx, ccr_available):
+        """tool_calls present = the conversation is still running; it may retrieve next turn.
+        Revoking here would thrash a working agent on every non-CCR tool call it makes."""
+        from middleware.g28_ccr import G28CCR, _mark_resolver_proven, _resolver_proven
+        ctx = await self._ctx(make_ctx, substituted=True)
+        _mark_resolver_proven(ctx.redis_prefix)
+        other_tool = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "search_logs", "arguments": "{}"}}]}}]}
+        await G28CCR().process_response(ctx, other_tool)
+        assert _resolver_proven(ctx.redis_prefix)
+
+    async def test_no_substitution_means_nothing_to_ignore(self, make_ctx, ccr_available):
+        """A plain answer on a turn that sent no reference is not evidence of anything."""
+        from middleware.g28_ccr import G28CCR, _mark_resolver_proven, _resolver_proven
+        ctx = await self._ctx(make_ctx, substituted=False)
+        _mark_resolver_proven(ctx.redis_prefix)
+        await G28CCR().process_response(ctx, self._final_answer())
+        assert _resolver_proven(ctx.redis_prefix)
+
+    async def test_the_failure_is_counted(self, make_ctx, ccr_available, monkeypatch):
+        """Silent degradation is the whole problem: the request succeeds and only the answer
+        is wrong, so this must leave a countable trace."""
+        import middleware.g28_ccr as g28
+        seen = []
+        monkeypatch.setattr(g28, "_record_ignored_reference", lambda p: seen.append(p))
+        ctx = await self._ctx(make_ctx, substituted=True)
+        g28._mark_resolver_proven(ctx.redis_prefix)
+        await g28.G28CCR().process_response(ctx, self._final_answer())
+        assert seen == [ctx.redis_prefix]
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,23 @@ date changes.
 -->
 
 
+### A reference the model never reads no longer counts as a saving — Bug fix
+
+Context Compression & Reuse only pays off if the client actually fetches back the document
+it parked. It earns that trust by resolving a reference once — but that trust was permanent:
+after a single successful fetch the workspace kept receiving short references for an hour,
+whatever happened afterwards. A client that stopped fetching — a different model, a changed
+agent loop, or simply a turn where the model could not be bothered — kept answering from the
+one-line summary instead of the document, on requests that returned 200 and recorded a
+saving. The first live measurement run caught exactly that: with the tools offered, the model
+answered anyway and invented the details that lived in the parked document.
+
+Trust now decays on evidence. If a reference goes out and the model returns a final answer
+without ever reading it, the workspace goes back to full content until it fetches one again,
+the event is counted (`token_opt_ccr_reference_ignored_total`) and logged. A mid-conversation
+turn is never judged this way, since the model may fetch on a later turn. Worst case is one
+full-price turn; the alternative was a wrong answer billed as a success.
+
 ### A/B benchmark mis-reported cache tokens on two paths — Bug fix
 
 The cache read/write columns added earlier today were only correct for single-call slices. The

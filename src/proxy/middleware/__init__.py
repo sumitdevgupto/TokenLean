@@ -146,6 +146,11 @@ class RequestContext:
     # a model naming one unprompted was dispatched too, even with G28 disabled. The
     # dispatch sites refuse anything the proxy did not itself advertise.
     ccr_tools_injected: bool = False
+    # True when G28 actually replaced content with a [CCR:ref] on THIS turn. The response
+    # side needs it to distinguish "the model answered without resolving a reference we sent"
+    # (an answer built from a summary — a quality failure that still bills as a success) from
+    # "there was no reference to resolve".
+    ccr_refs_substituted: bool = False
     # Tool names an auto-EXECUTION site refused to dispatch. Kept SEPARATE from
     # tool_eligibility_* on purpose: those are G32's response-path verdict and are
     # ASSIGNED (not appended), so writing them from a dispatch site would erase G32's own

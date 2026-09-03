@@ -98,6 +98,36 @@ def _mark_resolver_proven(prefix: str) -> None:
     _resolvers_proven[prefix] = time.time()
 
 
+def _revoke_resolver_proof(prefix: str) -> None:
+    """Called when a client answered a turn WITHOUT resolving a reference we substituted.
+
+    The proof used to be write-once: resolve successfully a single time and the tenant was
+    trusted until the TTL expired, no matter what happened afterwards. So a client that
+    stopped resolving — a different model, a changed agent loop, or simply a turn where the
+    model could not be bothered — kept receiving references it never read, and answered from
+    the one-line summary on a billed 200. Proven live on 2026-09-03 (DS22): with the CCR
+    tools advertised, gpt-4o-mini returned `tool_calls: []` / `finish_reason: stop` and
+    invented the facts that lived in the parked document.
+
+    Revoking costs at most one honest full-content turn; NOT revoking costs a wrong answer
+    that reports as a saving. The trade is deliberately asymmetric, in the same direction as
+    every other guard in this module.
+    """
+    _resolvers_proven.pop(prefix, None)
+
+
+def _record_ignored_reference(prefix: str) -> None:
+    """Count a substituted reference the model never resolved. Without this the failure is
+    invisible: the request succeeds, the savings step is recorded, and only the answer is
+    wrong."""
+    try:
+        from middleware.g18_observability import CCR_IGNORED_REFS
+
+        CCR_IGNORED_REFS.labels(tenant_id=prefix or "default").inc()
+    except Exception:  # noqa: BLE001 — metrics must never break a request
+        logger.debug("G28: could not record ignored-reference metric", exc_info=True)
+
+
 def _record_miss(prefix: str) -> None:
     """Count an unresolvable reference. Silent misses are why this failure used to look
     like a model-quality problem instead of a storage problem."""
@@ -535,6 +565,10 @@ class G28CCR:
 
         if tokens_after < tokens_before:
             ctx.messages = new_messages
+            # The response side needs to know a reference actually went out this turn, so it
+            # can tell "the model answered without resolving" from "there was nothing to
+            # resolve". Only substitution counts — storing alone changes nothing the model sees.
+            ctx.ccr_refs_substituted = True
             ctx.savings.add_step(
                 GROUP,
                 f"G28 CCR: {tokens_before}t → {tokens_after}t (refs substituted)",
@@ -587,9 +621,14 @@ class G28CCR:
         ttl: int = cfg.get("ttl_seconds", 86400)
 
         choices = response.get("choices", [])
+        answered_without_tools = bool(choices)
+        resolved_this_turn = False
         for choice in choices:
             msg = choice.get("message", {})
             tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                # Still mid-loop: the model may retrieve on a later turn, so do not judge it.
+                answered_without_tools = False
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 tool_name = fn.get("name", "")
@@ -612,6 +651,24 @@ class G28CCR:
                     max_store_chars=int(cfg.get("max_store_chars", 200_000)),
                 )
                 tc["function"]["result"] = result
+                if tool_name == "headroom_retrieve" and "text" in (result or {}):
+                    resolved_this_turn = True
                 logger.debug("[%s] G28 MCP tool %s → %r", ctx.request_id, tool_name, result)
+
+        # Self-healing handshake. A reference went out and the model produced a FINAL answer
+        # without ever reading it — so that answer came from the summary, not the document,
+        # and the savings we just recorded bought a worse answer. Stop trusting this client:
+        # the next turn sends full content again, and it can re-earn substitution by actually
+        # resolving. Never inferred from a mid-loop turn (tool_calls present) — only from a
+        # completed answer.
+        if getattr(ctx, "ccr_refs_substituted", False) and answered_without_tools and not resolved_this_turn:
+            prefix = getattr(ctx, "redis_prefix", "")
+            _revoke_resolver_proof(prefix)
+            _record_ignored_reference(prefix)
+            logger.warning(
+                "[%s] G28 CCR: reference substituted but the model answered without resolving it "
+                "— reverting this tenant to full content until it resolves one again",
+                ctx.request_id,
+            )
 
         return response
