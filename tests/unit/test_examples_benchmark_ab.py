@@ -224,9 +224,10 @@ def _scripted_arm(turns_script):
     return arm
 
 
-def _turn(content="", pt=100, ct=10, tool=None):
+def _turn(content="", pt=100, ct=10, tool=None, cr=None, cw=None):
     tcs = ([{"id": "call_0", "function": {"name": tool, "arguments": "{}"}}] if tool else [])
     return {"content": content, "prompt_tokens": pt, "completion_tokens": ct, "cache_hit": False,
+            "cache_read_tokens": cr, "cache_write_tokens": cw,
             "routed_model": "gpt-4o-mini", "tool_calls": tcs,
             "assistant_msg": {"role": "assistant", "content": content or None,
                               **({"tool_calls": [{"id": "call_0", "type": "function",
@@ -255,6 +256,29 @@ def test_run_episode_max_turns():
                             tools=[{"type": "function", "function": {"name": "loop"}}],
                             tool_results={"loop": {}}, max_turns=4)
     assert ep["turns"] == 4, "episode stops at max_turns"
+
+
+def test_run_episode_sums_cache_halves_across_turns():
+    """The agentic slice is the multi-turn workload the cache columns exist for.
+
+    An episode is the billing unit, so the halves must be summed across turns like
+    prompt/completion are. Returning them per-turn only (or not at all) reports 0/0 for the
+    whole agentic workload - the one place a rebuilt prefix costs the most.
+    """
+    arm = _scripted_arm([_turn(tool="list_logs", pt=100, ct=20, cr=0, cw=900),
+                         _turn(content="done", pt=150, ct=10, cr=900, cw=0)])
+    ep = run_ab.run_episode(arm, [{"role": "user", "content": "check logs"}],
+                            tools=[{"type": "function", "function": {"name": "list_logs"}}],
+                            tool_results={"list_logs": {"errors": 3}})
+    assert ep["cache_write_tokens"] == 900, "turn 1 built the prefix"
+    assert ep["cache_read_tokens"] == 900, "turn 2 reused it"
+
+
+def test_run_episode_reports_none_when_no_turn_reported_cache():
+    """None (provider said nothing) must not collapse to a zero that reads as a measurement."""
+    arm = _scripted_arm([_turn(content="hi", pt=10, ct=5)])
+    ep = run_ab.run_episode(arm, [{"role": "user", "content": "hi"}], tools=[], tool_results={})
+    assert ep["cache_read_tokens"] is None and ep["cache_write_tokens"] is None
 
 
 def test_norm_tool_calls_dicts_and_objects():
@@ -937,3 +961,38 @@ class TestCacheTokenReporting:
         run_ab._accumulate(bucket, rec)
         assert bucket["a_prompt"] == 100 and bucket["b_prompt"] == 50
         assert bucket["a_cost"] == 0.1 and bucket["b_cost"] == 0.05
+
+    def test_memoised_direct_replay_does_not_re_report_its_cache_halves(self):
+        """The direct arm is memoised, and cache halves are NOT invariant under replay.
+
+        Prompt/completion tokens repeat identically on a real second call, so replaying them
+        is honest. A cache WRITE does not: the second real call would have been a discounted
+        READ. Counting the memoised write N times reports the direct arm building the cache
+        on every call of a burst and never reading it - the precise inverse of what a warm
+        cache does, in the workload built to measure exactly that.
+        """
+        bucket = run_ab._blank()
+        cold = {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.1,
+                "cache_read_tokens": 0, "cache_write_tokens": 800, "_billed": True}
+        replay = dict(cold, _billed=False)
+        b = {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.1, "cache_hit": True,
+             "cache_read_tokens": 800, "cache_write_tokens": 0}
+        facts = {"graded": False, "passed": True}
+        for a in (cold, replay, replay):
+            run_ab._accumulate(bucket, {"a": a, "b": b, "facts": facts})
+
+        assert bucket["a_cache_write"] == 800, "one real call, one real write"
+        assert bucket["a_cache_calls"] == 1, "only billed calls carry known cache numbers"
+        assert bucket["a_calls"] == 3, "token/cost accounting still covers every replay"
+        # The proxy arm really made all three calls, so all three count.
+        assert bucket["b_cache_read"] == 2400
+
+    def test_unmarked_records_still_count(self):
+        """Back-compat: a record without `_billed` is a real call, not a replay."""
+        bucket = run_ab._blank()
+        run_ab._accumulate(bucket, {
+            "a": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0,
+                  "cache_read_tokens": 7, "cache_write_tokens": 0},
+            "b": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0, "cache_hit": False},
+            "facts": {"graded": False, "passed": True}})
+        assert bucket["a_cache_read"] == 7 and bucket["a_cache_calls"] == 1

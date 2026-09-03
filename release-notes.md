@@ -36,6 +36,16 @@ date changes.
 -->
 
 
+### A/B benchmark mis-reported cache tokens on two paths — Bug fix
+
+The cache read/write columns added earlier today were only correct for single-call slices. The
+multi-turn agentic episode never summed them, so the workload those columns exist for reported
+zero on both arms; and the memoised direct arm re-counted its cold call's numbers on every
+replay, reporting a cache burst as N writes and no reads — the inverse of what a warm cache
+actually does. Episodes now sum both halves, and a replay counts nothing (`a_cache_calls` is the
+denominator for the direct arm, since only calls that really happened have known cache numbers).
+Savings percentages were never affected: they are computed from prompt/completion tokens only.
+
 ### Embed a document once, not once per app — Enhancement (OSS)
 
 Apps inside one tenant already shared a vector collection, but the sharing stopped at

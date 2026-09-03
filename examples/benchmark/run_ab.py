@@ -516,6 +516,10 @@ def run_episode(arm_fn, messages: list, tools: list, tool_results: dict,
     every tool_call made (for the trajectory gate), cache_hit (any turn), routed_model, turns."""
     convo = [dict(m) for m in messages]
     tot_pt = tot_ct = 0
+    # Cache halves are Optional across the whole harness: None means the provider reported
+    # nothing, which must stay distinguishable from a real zero. So sum only what was
+    # actually reported and leave the key absent when no turn reported it.
+    tot_cache: dict = {}
     all_calls, any_cache = [], False
     routed, final = None, ""
     turns = 0
@@ -523,6 +527,10 @@ def run_episode(arm_fn, messages: list, tools: list, tool_results: dict,
         r = arm_fn(convo, tools)
         tot_pt += r["prompt_tokens"]
         tot_ct += r["completion_tokens"]
+        for _half in ("cache_read_tokens", "cache_write_tokens"):
+            _v = r.get(_half)
+            if _v is not None:
+                tot_cache[_half] = tot_cache.get(_half, 0) + int(_v)
         any_cache = any_cache or bool(r.get("cache_hit"))
         routed = r.get("routed_model") or routed
         if r.get("content"):
@@ -539,7 +547,9 @@ def run_episode(arm_fn, messages: list, tools: list, tool_results: dict,
                           "content": result if isinstance(result, str) else json.dumps(result)})
     return {"content": final, "prompt_tokens": tot_pt, "completion_tokens": tot_ct,
             "tool_calls": all_calls, "cache_hit": any_cache, "routed_model": routed or "",
-            "turns": turns}
+            "turns": turns,
+            "cache_read_tokens": tot_cache.get("cache_read_tokens"),
+            "cache_write_tokens": tot_cache.get("cache_write_tokens")}
 
 
 # --------------------------------------------------------------------------- #
@@ -552,7 +562,10 @@ def _blank():
             # Provider prompt-cache halves, reported alongside the savings numbers but
             # deliberately NOT part of them: cache cost moves without token counts moving,
             # so folding it in would silently redefine the calibrated per-workload figures.
-            "a_cache_read": 0, "a_cache_write": 0,
+            # `a_cache_calls` is the denominator for the a_cache_* pair and is deliberately
+            # NOT `a_calls`: the direct arm is memoised, so its cache halves are only known
+            # for calls that were really made (see _accumulate).
+            "a_cache_read": 0, "a_cache_write": 0, "a_cache_calls": 0,
             "b_cache_read": 0, "b_cache_write": 0}
 
 
@@ -566,6 +579,17 @@ def _accumulate(bucket, rec):
     bucket["b_cost"] += rec["b"]["cost"]
     bucket["b_calls"] += 1
     for arm in ("a", "b"):
+        # The direct arm is memoised per (messages, max_tokens) so a replay is never billed
+        # twice. Prompt/completion tokens survive that replay because they are invariant under
+        # repetition; the cache halves are NOT. A real second call would bill a cache READ,
+        # not a second WRITE, so replaying the cold call's numbers would report the direct arm
+        # writing N times and reading zero - the exact opposite of what a cache burst does.
+        # We cannot know what the un-made calls would have billed, so we count only the calls
+        # that actually happened and leave the rest unmeasured rather than invented.
+        if arm == "a":
+            if not rec["a"].get("_billed", True):
+                continue
+            bucket["a_cache_calls"] += 1
         for half in ("cache_read", "cache_write"):
             # None (provider reported nothing) contributes nothing rather than a zero.
             val = rec[arm].get(half + "_tokens")
@@ -1024,7 +1048,9 @@ def main() -> int:
                     "provider": provider, "slice": slice_name, "kind": kind,
                     "profile": item["_profile"], "label": item.get("_label", ""),
                     "_messages": messages,
-                    "a": {**a, "cost": a_cost},
+                    # `_billed` marks a REAL direct call; a memo replay carries the cold
+                    # call's cache halves, which must not be counted again (see _accumulate).
+                    "a": {**a, "cost": a_cost, "_billed": a_billed},
                     "b": {**b, "cost": b_cost},
                     "facts": facts,
                 }
