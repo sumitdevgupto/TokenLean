@@ -73,6 +73,13 @@ def ccr_available(fake_redis):
 _BIG = "Policy: eu-west and eu-central are GDPR-compliant for EU data residency. " * 100
 
 
+# A reference is only substituted for a caller that ALREADY sends tools, because that is the
+# only caller the CCR tools get advertised to. Tests that expect substitution must therefore
+# look like an agent; tests that expect full content must not.
+_AGENT_TOOLS = [{"type": "function", "function": {"name": "search_logs",
+                                                  "description": "search", "parameters": {}}}]
+
+
 @pytest.mark.asyncio
 class TestProcessMessagesSystemGuard:
     """Direct tests for _process_messages role gating.
@@ -137,7 +144,8 @@ class TestG28ProcessRequest:
         assert ctx.messages[0]["content"] == _BIG  # verbatim, not a [CCR:...] reference
 
     async def test_compress_system_prompt_flag_wired(self, make_ctx, proven_resolver):
-        ctx = make_ctx([{"role": "system", "content": _BIG}], model="gpt-4o-mini")
+        ctx = make_ctx([{"role": "system", "content": _BIG}], model="gpt-4o-mini",
+                       params={"tools": _AGENT_TOOLS})
         ctx.config["groups"]["G28_ccr"] = {
             "enabled": True, "min_tokens": 300, "compress_system_prompt": True,
         }
@@ -148,7 +156,8 @@ class TestG28ProcessRequest:
     async def test_per_tenant_override_deep_merges(self, make_ctx, proven_resolver):
         # A tenant flips compress_system_prompt without re-declaring the block; the
         # base keys (enabled/min_tokens) must survive the merge or G28 would no-op.
-        ctx = make_ctx([{"role": "system", "content": _BIG}], model="gpt-4o-mini")
+        ctx = make_ctx([{"role": "system", "content": _BIG}], model="gpt-4o-mini",
+                       params={"tools": _AGENT_TOOLS})
         ctx.config["groups"]["G28_ccr"] = {"enabled": True, "min_tokens": 300}
         ctx.config.setdefault("tenants", {})["acme"] = {
             "groups": {"G28_ccr": {"compress_system_prompt": True}}
@@ -361,7 +370,8 @@ class TestResolveCapabilityHandshake:
 
     async def test_proven_client_gets_the_reference(self, proven_resolver, make_ctx):
         from middleware.g28_ccr import G28CCR
-        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini",
+                       params={"tools": _AGENT_TOOLS})
         ctx.config["groups"]["G28_ccr"] = {"enabled": True}
         out = await G28CCR().process_request(ctx)
         assert out.messages[0]["content"].startswith("[CCR:")
@@ -381,10 +391,61 @@ class TestResolveCapabilityHandshake:
 
     async def test_opt_out_restores_unconditional_substitution(self, fake_redis, make_ctx):
         from middleware.g28_ccr import G28CCR
-        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini",
+                       params={"tools": _AGENT_TOOLS})
         ctx.config["groups"]["G28_ccr"] = {"enabled": True, "require_proven_resolver": False}
         out = await G28CCR().process_request(ctx)
         assert out.messages[0]["content"].startswith("[CCR:")
+
+
+@pytest.mark.asyncio
+class TestNeverSubstituteWhatCannotBeResolved:
+    """A reference is only resolvable if the caller was offered headroom_retrieve.
+
+    The CCR tools are advertised only to callers that already send tools. So for a caller
+    that sends none, a [CCR:ref] is unresolvable BY CONSTRUCTION - there is no tool to call.
+    That is a physical impossibility, not a trust decision, so unlike the proven-resolver
+    handshake it is not overridable.
+
+    DS22's first two live runs (2026-09-03) are the evidence: no tools in the dataset,
+    `require_proven_resolver: false` waving the soft guard through, and the model answering
+    from its own summary with every planted fact gone - while the run recorded 44.99%
+    "savings". Wiring a retrieve loop into the harness did not help, because the model was
+    never given a tool to call.
+    """
+
+    async def test_toolless_caller_gets_full_content(self, proven_resolver, make_ctx):
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        out = await G28CCR().process_request(ctx)
+        assert out.messages[0]["content"] == _BIG
+
+    async def test_the_override_cannot_reach_this_guard(self, fake_redis, make_ctx):
+        """require_proven_resolver: false is an operator trust decision. It must not be able
+        to authorise a substitution that nothing could ever resolve."""
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "require_proven_resolver": False}
+        out = await G28CCR().process_request(ctx)
+        assert out.messages[0]["content"] == _BIG
+
+    async def test_content_is_still_stored(self, fake_redis, make_ctx):
+        """Refusing to substitute must not refuse to store - the parking is what makes a
+        later agentic turn cheap."""
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True}
+        await G28CCR().process_request(ctx)
+        assert fake_redis.data
+
+    async def test_expose_mcp_tools_off_also_blocks_substitution(self, proven_resolver, make_ctx):
+        """Tools sent, but advertising disabled — still nothing to call."""
+        from middleware.g28_ccr import G28CCR
+        ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini",
+                       params={"tools": _AGENT_TOOLS})
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True, "expose_mcp_tools": False}
+        out = await G28CCR().process_request(ctx)
+        assert out.messages[0]["content"] == _BIG
 
 
 @pytest.mark.asyncio

@@ -556,7 +556,28 @@ class G28CCR:
         # tenant resolving a reference do later turns get the savings. Storing regardless
         # is what makes that first turn cheap for everyone afterwards, including a second
         # artefact sending the same document.
-        may_substitute = _resolver_proven(prefix) if cfg.get("require_proven_resolver", True) else True
+        # HARD precondition, deliberately NOT overridable: never substitute a reference into
+        # a request that carries no means of resolving it. The CCR tools are advertised only
+        # to callers that already send tools (see the injection block below), so a caller
+        # sending none is handed a [CCR:ref] and no headroom_retrieve to call — the reference
+        # is unresolvable by construction, not by policy.
+        #
+        # DS22's first two live runs (2026-09-03) were exactly this: the dataset sent no
+        # tools, so nothing was advertised, `require_proven_resolver: false` waved the soft
+        # guard through, and the model answered from the summary with every planted fact
+        # gone while the run recorded 44.99% "savings". The soft handshake is a trust
+        # decision an operator may reasonably override; this one is a physical impossibility,
+        # so it is not offered as a knob.
+        will_advertise_tools = bool(cfg.get("expose_mcp_tools", True)) and bool(ctx.params.get("tools"))
+        may_substitute = (
+            will_advertise_tools
+            and (_resolver_proven(prefix) if cfg.get("require_proven_resolver", True) else True)
+        )
+        if not will_advertise_tools:
+            logger.debug(
+                "[%s] G28 CCR: caller sent no tools, so no reference can be resolved — "
+                "storing only, sending full content", ctx.request_id,
+            )
 
         new_messages, tokens_before, tokens_after = await _process_messages(
             ctx.messages, min_tokens, ctx.routed_model, ttl, compress_system,

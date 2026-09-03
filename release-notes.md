@@ -36,6 +36,21 @@ date changes.
 -->
 
 
+### A shortened reference is never sent to a caller that cannot expand it — Bug fix
+
+Context Compression & Reuse offers its lookup tools only to callers that already send tools.
+But it would still shorten a document for a caller that sent none — handing over a reference
+and no way to expand it. Nothing could resolve that reference, so the model answered from the
+short summary instead of the document, on a request that returned 200 and recorded a saving.
+
+Shortening now requires that the lookup tools are actually being offered on that request, and
+unlike the trust handshake this condition cannot be switched off: choosing to trust a client
+is a judgement an operator may reasonably make, but sending a reference nothing can expand is
+never correct. The document is still stored, so a later agentic turn is still cheap.
+
+Found by the first live measurement runs, which recorded 45% "savings" for answers that had
+lost the facts they were graded on.
+
 ### A reference the model never reads no longer counts as a saving — Bug fix
 
 Context Compression & Reuse only pays off if the client actually fetches back the document
