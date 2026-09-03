@@ -81,6 +81,20 @@ class GenericLiteLLMAdapter(ProviderAdapter):
         )
         return float(pcfg.get("cache_read_multiplier", 1.0))
 
+    def cache_write_cost_multiplier(self, config: Dict) -> float:
+        """Config-driven per-provider write rate; 1.0 = billed at the normal input rate.
+
+        Every config-only provider gets an honest, operator-settable write rate with no
+        per-provider code, the same way ``cache_read_multiplier`` already works.
+        """
+        pcfg = (
+            config.get("groups", {})
+            .get("G21_cache_alignment", {})
+            .get("providers", {})
+            .get(self._name, {})
+        )
+        return float(pcfg.get("cache_write_multiplier", 1.0))
+
     def supports_native_batch(self) -> bool:
         return bool(self._cfg.get("native_batch", False))
 

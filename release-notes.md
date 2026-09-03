@@ -21,6 +21,37 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-03
+
+### Cache reads *and* writes are now measured, priced and reported — Bug fix
+
+Cost reporting credited the provider cache half that is **discounted** (reads) and tracked
+the half that is **not** (writes) nowhere at all — `cache_creation_input_tokens` appeared
+nowhere in the product. A tenant whose prompt prefix changes each turn re-pays to build the
+cache on every call, sees identical token counts, and had no line anywhere that explained
+the invoice. Both halves are now captured from the provider response, priced at published
+per-provider rates, disclosed per call, and persisted per tenant and per day.
+
+Also fixed: **streamed** requests recorded no cached tokens and a cost of zero, because the
+response pipeline is skipped for streams — so the traffic most likely to use prompt caching
+(agentic clients) was the least visible. And G21 published a cache-discount percentage taken
+from config that was never checked against the response; on Anthropic it claimed a 90%
+discount even with the cache marker off, i.e. when nothing had been cached. It now reports
+only what was measured.
+
+**Reported cost changes for Anthropic tenants using cache markers** — writes were being
+priced at 1.0x and are really ~1.25x (5-minute) / ~2x (1-hour). This corrects a disclosed,
+never-billed estimate; it does not change what anyone is charged.
+
+- **OSS:** cache read/write tokens + their cost split in `_token_opt`, new
+  `x-tokenlean-cache-*` response headers, two Prometheus counters, four nullable
+  `usage_events` columns, published per-provider write rates in the config template, and a
+  read-vs-write **token** row on the billing dashboard.
+- **[Enterprise]:** the cost split and cache-share-of-bill percentage in the usage rollup,
+  chargeback export and billing dashboard — so a finance question ("how much of this
+  invoice is cache?") is answerable per tenant and per day —
+  <https://tokenlean.cbeyond.cloud/>
+
 ## 2026-09-01
 
 ### Context Compression & Reuse is now refused rather than quietly unreliable — Bug fix

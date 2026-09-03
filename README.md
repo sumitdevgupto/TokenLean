@@ -425,7 +425,7 @@ tests/                      # Unit and integration tests (pytest)
 | **G18** | Observability | N/A | Langfuse tracing + Grafana dashboards + admin webhooks |
 | **G19** | Structured Pruning | up to ~40% | AST-aware compression of code/JSON/logs/text (Headroom); request + response |
 | **G20** | Prompt Optimization | 5-15% | Inline application of offline-optimised prompts (Opik/DSPy) |
-| **G21** | Cache Alignment | up to ~84% on cached prefix | Reorder messages for provider prefix-caching (zero quality risk). **Cache policy v2**: deterministic tenant-scoped `prompt_cache_key` + per-provider `cache_read_multiplier` that credits the **real** cached-token discount into cost reporting; opt-in per-tenant Anthropic `cache_control` marker (90% cache-read discount) + native `context_editing` |
+| **G21** | Cache Alignment | measured per call (not modelled) | Reorder messages for provider prefix-caching (zero quality risk). **Cache policy v2**: deterministic tenant-scoped `prompt_cache_key` + per-provider `cache_read_multiplier`. **Cache accounting**: both halves of provider cache billing — reads *and* writes — are captured from the response and reported per call, per tenant and per day (`cache_read_tokens` / `cache_write_tokens` / `cache_share_of_bill_pct`), so a cost line can be reconciled against a provider invoice. Opt-in per-tenant Anthropic `cache_control` marker + native `context_editing` |
 | **G22** | Deduplication | 5-20% | Collapse near-duplicate conversation turns (cosine / n-gram) |
 | **G23** | Streaming Compression | Variable | Collapse repeated n-grams in response output |
 | **G24** | Adaptive Bypass | Variable | Skip groups with historically negative savings per request pattern |

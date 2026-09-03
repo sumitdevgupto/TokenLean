@@ -161,3 +161,96 @@ class TestUsdSavedCounterLabels:
         assert "user_id" not in USD_SAVED._labelnames
         assert "team" not in USD_SAVED._labelnames
         assert "feature" not in USD_SAVED._labelnames
+
+
+class TestCacheWriteCostAndMetrics:
+    """#34 — G18 must price cache WRITES and expose both halves as metrics.
+
+    Before this, G18 read only the discounted cached-READ count and applied a read
+    multiplier; cache creation — the expensive half, and the half that grows when a prefix
+    churns — was read by nothing at all.
+    """
+
+    @staticmethod
+    def _response(prompt=1000, completion=20, cached=600, written=300, written_1h=None):
+        details = {"cached_tokens": cached}
+        if written is not None:
+            details["cache_write_tokens"] = written
+        if written_1h is not None:
+            details["cache_creation_token_details"] = {"ephemeral_1h_input_tokens": written_1h}
+        return {
+            "id": "chatcmpl-cache",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
+                      "prompt_tokens_details": details},
+        }
+
+    async def _record(self, ctx, response):
+        from middleware.g18_observability import G18Observability
+        with patch("middleware.langfuse_tracing.finish_trace"),              patch("config_loader.get_pricing_table", return_value=_PRICING):
+            await G18Observability().record(ctx, response)
+
+    async def test_cache_counts_land_on_savings(self, make_ctx):
+        ctx = make_ctx(model="gpt-4o")
+        await self._record(ctx, self._response())
+        assert ctx.savings.cache_read_tokens == 600
+        assert ctx.savings.cache_write_tokens == 300
+
+    async def test_unreported_cache_stays_none_not_zero(self, make_ctx):
+        """A provider that says nothing must not be recorded as 'zero cache activity'."""
+        ctx = make_ctx(model="gpt-4o")
+        await self._record(ctx, _make_response())
+        assert ctx.savings.cache_write_tokens is None
+        assert ctx.savings.cost_cache_write_usd is None
+
+    async def test_cost_split_is_recorded_and_bounded_by_total(self, make_ctx):
+        ctx = make_ctx(model="gpt-4o")
+        await self._record(ctx, self._response())
+        read_usd = ctx.savings.cost_cache_read_usd
+        write_usd = ctx.savings.cost_cache_write_usd
+        assert read_usd is not None and write_usd is not None
+        assert read_usd + write_usd <= ctx.savings.cost_actual_usd + 1e-9
+
+    async def test_writes_raise_cost_above_a_read_only_call(self, make_ctx):
+        """The whole point: churn costs money even though token counts look identical."""
+        from providers.anthropic_adapter import AnthropicAdapter
+        read_ctx = make_ctx(model="gpt-4o")
+        read_ctx.provider_adapter = AnthropicAdapter()
+        await self._record(read_ctx, self._response(cached=900, written=None))
+
+        write_ctx = make_ctx(model="gpt-4o")
+        write_ctx.provider_adapter = AnthropicAdapter()
+        await self._record(write_ctx, self._response(cached=0, written=900))
+
+        assert write_ctx.savings.cost_actual_usd > read_ctx.savings.cost_actual_usd
+
+    async def test_share_of_bill_is_disclosed(self, make_ctx):
+        ctx = make_ctx(model="gpt-4o")
+        await self._record(ctx, self._response())
+        meta = ctx.savings.to_langfuse_metadata()
+        assert meta["cache_read_tokens"] == 600
+        assert meta["cache_write_tokens"] == 300
+        assert 0 < meta["cache_share_of_bill_pct"] <= 100
+
+    async def test_counters_increment(self, make_ctx):
+        from middleware.g18_observability import CACHE_READ_TOKENS, CACHE_WRITE_TOKENS
+        ctx = make_ctx(model="gpt-4o")
+        labels = dict(model="gpt-4o", team="default", feature="default", tenant_id=ctx.tenant_id)
+        before_r = CACHE_READ_TOKENS.labels(**labels)._value.get()
+        before_w = CACHE_WRITE_TOKENS.labels(**labels)._value.get()
+        await self._record(ctx, self._response())
+        assert CACHE_READ_TOKENS.labels(**labels)._value.get() == before_r + 600
+        assert CACHE_WRITE_TOKENS.labels(**labels)._value.get() == before_w + 300
+
+    async def test_adapter_failure_degrades_to_unknown_not_crash(self, make_ctx):
+        """A misbehaving adapter must never cost the caller their response."""
+        class Exploding:
+            name = "boom"
+            def extract_usage(self, response):
+                raise RuntimeError("adapter blew up")
+        ctx = make_ctx(model="gpt-4o")
+        ctx.provider_adapter = Exploding()
+        await self._record(ctx, self._response())
+        assert ctx.savings.cache_write_tokens is None
+        assert ctx.savings.cost_actual_usd >= 0
+

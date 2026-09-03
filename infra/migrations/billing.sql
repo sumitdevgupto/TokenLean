@@ -46,3 +46,16 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS status_code SMALLINT NOT NULL 
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS billable BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_duration_ms INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS llm_duration_ms INTEGER NOT NULL DEFAULT 0;
+-- Ingress protocol the client used (#4): openai | anthropic | gemini (observability only).
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'openai';
+-- F2/F3: downstream agent this request was dispatched to (observability; never billed).
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT '';
+-- Free trial: served 2xx made during an active trial; excluded from invoices.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS trial BOOLEAN NOT NULL DEFAULT false;
+-- #34: provider prompt-cache accounting — the half of cache billing (writes) that was
+-- previously reported nowhere, plus its cost split. NULLABLE with no DEFAULT on purpose:
+-- "the provider reported nothing" must stay distinguishable from "it reported zero".
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_read_tokens INTEGER;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_write_tokens INTEGER;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_cache_read_usd NUMERIC(12,6);
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_cache_write_usd NUMERIC(12,6);

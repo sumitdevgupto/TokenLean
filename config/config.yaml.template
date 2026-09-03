@@ -1115,13 +1115,23 @@ groups:
         prompt_cache_key: true
         prompt_cache_key_len: 32
         cache_read_multiplier: 0.5
+        # OpenAI does not surcharge cache writes - they bill at the normal input rate.
+        cache_write_multiplier: 1.0
       anthropic:
         marker: false
         cache_type: ephemeral
         discount_pct: 90
         cache_read_multiplier: 0.1
+        # Anthropic bills cache CREATION at a premium: ~1.25x input on the 5-minute tier,
+        # ~2x on the 1-hour tier. Reporting these as 1.0 understated the cost of exactly
+        # the traffic that churns its prefix every turn.
+        cache_write_multiplier: 1.25
+        cache_write_multiplier_1h: 2.0
       gemini:
         cache_read_multiplier: 0.25
+        # Implicit caching is free to populate; explicit caching bills storage per
+        # token-hour, a different meter - so no per-write token surcharge.
+        cache_write_multiplier: 1.0
       # New providers — cached-input discount for cost reporting (default 1.0 = none).
       deepseek:
         cache_read_multiplier: 0.1

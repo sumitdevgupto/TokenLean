@@ -232,9 +232,17 @@ class TestUsageMeterRecord:
         # First arg is the SQL, remaining are positional params
         assert "acme" in call_args  # tenant_id
         assert "req-meter" in call_args  # request_id
-        # C1/C2: SQL + 31 bound params (24 legacy + group_savings + status_code +
-        # billable + total_duration_ms + llm_duration_ms + agent_id [F3] + trial).
-        assert len(call_args) == 1 + 31
+        # SQL + one bound param per column. Derived from the statement itself rather than
+        # hard-coded: the column list, the $N placeholders and the execute() args live in
+        # three separate places, and this assertion exists to catch them drifting apart --
+        # not to be hand-edited every time a column is added.
+        import re as _re
+        _m = _re.search(r"INSERT INTO usage_events\s*\((.*?)\)\s*VALUES", call_args[0], _re.S)
+        _cols = [c.strip() for c in _m.group(1).replace(chr(10), " ").split(",") if c.strip()]
+        assert len(call_args) == 1 + len(_cols), (
+            f"{len(call_args) - 1} bound params for {len(_cols)} columns")
+        # #34: the cache-accounting columns are present and bound.
+        assert "cache_write_tokens" in _cols and "cost_cache_write_usd" in _cols
         # group_savings is serialised to a JSON string for the ::jsonb bind.
         assert '"G01": 200' in call_args or '{"G01": 200}' in call_args
 

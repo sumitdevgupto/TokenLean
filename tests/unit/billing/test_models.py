@@ -136,3 +136,92 @@ class TestUsageEventsDDL:
 
     def test_ddl_has_create_index(self):
         assert "CREATE INDEX" in USAGE_EVENTS_DDL
+
+
+class TestDDLMatchesShippedMigration:
+    """The app self-heals its own DDL at startup, but the in-VPC deploy runs
+    ``infra/migrations/billing.sql`` instead. Nothing compared the two, which is exactly
+    how ``agent_id``/``trial``/``protocol`` came to be missing from the migration file
+    while the app DDL had them: a fresh migrated database would be missing columns the
+    metering INSERT writes, and every usage row would fail to persist.
+    """
+
+    @staticmethod
+    def _self_heal_columns(sql: str):
+        import re
+        return set(re.findall(r"ADD COLUMN IF NOT EXISTS\s+(\w+)", sql))
+
+    def test_every_app_ddl_column_is_in_the_migration_file(self):
+        from pathlib import Path
+        migration = Path(__file__).resolve().parents[3] / "infra" / "migrations" / "billing.sql"
+        assert migration.exists(), "infra/migrations/billing.sql not found"
+        app_cols = self._self_heal_columns(USAGE_EVENTS_DDL)
+        mig_sql = migration.read_text(encoding="utf-8")
+        mig_cols = self._self_heal_columns(mig_sql)
+        # A column may legitimately live in the migration's CREATE TABLE instead.
+        missing = {c for c in app_cols if c not in mig_cols and c not in mig_sql}
+        assert not missing, (
+            f"columns self-healed by the app but absent from infra/migrations/billing.sql: "
+            f"{sorted(missing)} — a migrated database would 500 the metering INSERT"
+        )
+
+    def test_cache_columns_are_nullable_not_defaulted(self):
+        """None (provider said nothing) must stay distinguishable from 0 (said zero)."""
+        for col in ("cache_read_tokens", "cache_write_tokens",
+                    "cost_cache_read_usd", "cost_cache_write_usd"):
+            line = [l for l in USAGE_EVENTS_DDL.splitlines()
+                    if f"ADD COLUMN IF NOT EXISTS {col}" in l]
+            assert line, f"{col} missing from the self-heal block"
+            assert "DEFAULT" not in line[0].upper(), (
+                f"{col} must not carry a DEFAULT — a defaulted 0 would assert 'no cache "
+                f"activity' for every provider that reports nothing"
+            )
+
+
+class TestCacheAccountingFields:
+    def _make_event(self, **kw) -> UsageEvent:
+        from datetime import datetime, timezone
+        defaults = dict(
+            tenant_id="acme", request_id="req-cache-001",
+            timestamp=datetime.now(timezone.utc),
+            baseline_tokens=500, optimised_tokens=300, tokens_saved=200,
+            cost_saved_usd=0.004, groups_applied=["G01"], pricing_tier="enterprise",
+        )
+        defaults.update(kw)
+        return UsageEvent(**defaults)
+
+    def test_cache_fields_default_to_none(self):
+        e = self._make_event()
+        assert e.cache_read_tokens is None
+        assert e.cache_write_tokens is None
+        assert e.cost_cache_read_usd is None
+        assert e.cost_cache_write_usd is None
+
+    def test_cache_fields_are_settable_and_serialised(self):
+        e = self._make_event()
+        e.cache_read_tokens, e.cache_write_tokens = 800, 200
+        e.cost_cache_read_usd, e.cost_cache_write_usd = 0.001, 0.004
+        d = e.to_dict()
+        assert d["cache_read_tokens"] == 800
+        assert d["cache_write_tokens"] == 200
+        assert d["cost_cache_write_usd"] == 0.004
+
+
+class TestMeteringInsertArity:
+    """Column list, placeholders and the execute() args must move together — they live in
+    three separate places in _persist_postgres and a mismatch is a runtime-only failure."""
+
+    def test_insert_columns_placeholders_and_args_agree(self):
+        import inspect, re
+        from billing.metering import UsageMeter
+        src = inspect.getsource(UsageMeter._persist_postgres)
+        m = re.search(r"INSERT INTO usage_events\s*\((.*?)\)\s*VALUES\s*\((.*?)\)\s*ON CONFLICT",
+                      src, re.S)
+        assert m, "could not locate the usage_events INSERT"
+        flat = m.group(1).replace(chr(10), " ")
+        cols = [c.strip() for c in flat.split(",") if c.strip()]
+        placeholders = re.findall(r"\$\d+", m.group(2))
+        assert len(cols) == len(placeholders), (
+            f"{len(cols)} columns vs {len(placeholders)} placeholders")
+        assert max(int(p[1:]) for p in placeholders) == len(cols)
+

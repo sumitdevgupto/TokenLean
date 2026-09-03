@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +283,59 @@ def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
     )
 
 
+def _partition_input_tokens(
+    input_tokens: int,
+    cached_tokens: int,
+    cache_write_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
+) -> Tuple[int, int, int, int]:
+    """Split ``input_tokens`` into (plain, cache-read, 5m-write, 1h-write) disjoint spans.
+
+    litellm folds cache reads and cache-creation tokens INTO ``prompt_tokens``, so the three
+    cache spans are subsets of the input total, not additions to it. Clamping each against
+    what the previous one left means a provider reporting counts that overrun the total can
+    never cause double-billing — it degrades to "all input was cache activity" instead.
+
+    Shared by the cost total and the per-half cost split so the two can never disagree,
+    which is what makes ``cost_cache_read_usd + cost_cache_write_usd <= cost_actual_usd``
+    an invariant rather than a hope.
+    """
+    cached = max(0, min(cached_tokens, input_tokens))
+    written = max(0, min(cache_write_tokens, input_tokens - cached))
+    written_1h = max(0, min(cache_write_1h_tokens, written))
+    return input_tokens - cached - written, cached, written - written_1h, written_1h
+
+
+def cache_cost_split(
+    input_tokens: int,
+    cached_tokens: int,
+    model: str,
+    cache_read_multiplier: float = 1.0,
+    *,
+    cache_write_tokens: int = 0,
+    cache_write_multiplier: float = 1.0,
+    cache_write_1h_tokens: int = 0,
+    cache_write_1h_multiplier: float = 1.0,
+    batch_discount: float = 1.0,
+) -> Tuple[float, float]:
+    """USD attributable to provider cache reads and cache writes, as ``(read, write)``.
+
+    The components of the same sum ``estimate_cost_with_cache`` returns — computed here so
+    a cost line can say how much of the bill was cache, which is the question the FinOps
+    critique actually asked and the one token counts cannot answer.
+    """
+    inp_cost, _ = get_cost_per_1k(model)
+    _, cached, written_5m, written_1h = _partition_input_tokens(
+        input_tokens, cached_tokens, cache_write_tokens, cache_write_1h_tokens
+    )
+    read_usd = cached / 1000.0 * inp_cost * cache_read_multiplier * batch_discount
+    write_usd = (
+        (written_5m / 1000.0 * inp_cost * cache_write_multiplier)
+        + (written_1h / 1000.0 * inp_cost * cache_write_1h_multiplier)
+    ) * batch_discount
+    return round(read_usd, 8), round(write_usd, 8)
+
+
 def estimate_cost_with_cache(
     input_tokens: int,
     cached_tokens: int,
@@ -293,6 +346,10 @@ def estimate_cost_with_cache(
     batch_discount: float = 1.0,
     reasoning_tokens: int = 0,
     reasoning_rate_multiplier: float = 1.0,
+    cache_write_tokens: int = 0,
+    cache_write_multiplier: float = 1.0,
+    cache_write_1h_tokens: int = 0,
+    cache_write_1h_multiplier: float = 1.0,
 ) -> float:
     """USD cost crediting the provider cached-input discount.
 
@@ -310,13 +367,26 @@ def estimate_cost_with_cache(
                                         *delta* above the standard output rate is added,
                                         so there is no double counting.
       * ``reasoning_rate_multiplier`` — >1.0 models a reasoning surcharge; 1.0 = none.
+
+    Cache WRITES (#34). ``cache_write_tokens`` are cache-creation tokens, also a subset of
+    ``input_tokens``: litellm folds Anthropic's sibling ``cache_creation_input_tokens`` into
+    ``prompt_tokens`` before we see the response, so reads, writes and plain input partition
+    the same total. They are billed at ``cache_write_multiplier`` x the input rate (1.0 for
+    OpenAI, which does not surcharge writes; ~1.25 for Anthropic's 5-minute tier).
+    ``cache_write_1h_tokens`` is the sub-portion stored on a 1-hour TTL, billed at
+    ``cache_write_1h_multiplier`` (~2.0 on Anthropic) — pass 0 when the provider reports no
+    split and the whole write span bills at the 5-minute rate. All four default to a no-op,
+    so this stays a byte-identical drop-in until a deployment opts in.
     """
     inp_cost, out_cost = get_cost_per_1k(model)
-    cached = max(0, min(cached_tokens, input_tokens))
-    non_cached = input_tokens - cached
+    non_cached, cached, written_5m, written_1h = _partition_input_tokens(
+        input_tokens, cached_tokens, cache_write_tokens, cache_write_1h_tokens
+    )
     base = (
         (non_cached / 1000.0 * inp_cost)
         + (cached / 1000.0 * inp_cost * cache_read_multiplier)
+        + (written_5m / 1000.0 * inp_cost * cache_write_multiplier)
+        + (written_1h / 1000.0 * inp_cost * cache_write_1h_multiplier)
         + (output_tokens / 1000.0 * out_cost)
     )
     # Reasoning surcharge: reasoning tokens are already billed within output_tokens,

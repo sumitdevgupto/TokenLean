@@ -120,3 +120,93 @@ def test_apply_stream_g23_noop_when_disabled():
         config = {"groups": {"G23_streaming_compression": {"enabled": False}}}
         savings = None  # must not be touched when disabled
     main._apply_stream_g23(_C(), "alpha beta gamma delta epsilon " * 4)  # no exception
+
+
+@pytest.mark.asyncio
+async def test_stream_records_cache_tokens_and_cost(monkeypatch):
+    """#34 — a STREAMED call must record provider cache tokens and an actual cost.
+
+    The response pipeline (and therefore G18, the single source of truth for cost) is
+    skipped for streamed calls, so before this a streamed request recorded no cached-read
+    tokens, no cache-write tokens and cost_actual_usd = 0. That matters most for agentic
+    clients, which stream nearly everything and are the heaviest users of prompt caching —
+    precisely the traffic whose cache bill was invisible.
+    """
+    from datetime import datetime
+    from savings.models import SavingsRecord
+    from providers.openai_adapter import OpenAIAdapter
+
+    fake_chunks = [
+        {"choices": [{"delta": {"content": "hi"}}]},
+        {"choices": [{"delta": {}}], "usage": {
+            "prompt_tokens": 1000, "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 200},
+        }},
+    ]
+
+    async def fake_acompletion(**kwargs):
+        async def gen():
+            for c in fake_chunks:
+                yield c
+        return gen()
+
+    ctx = _Ctx()
+    ctx.savings = SavingsRecord(
+        request_id="req-cache", user_id="u", timestamp=datetime.now(),
+        model_requested="gpt-4o-mini", routed_model="gpt-4o-mini", baseline_tokens=1200,
+    )
+    ctx.provider_adapter = OpenAIAdapter()
+    ctx.params = {}
+
+    monkeypatch.setattr(main.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(main, "_record_outcome", lambda *a, **k: None)
+
+    resp = main._stream_response(ctx, "gpt-4o-mini", {"api_key": "sk"}, {"stream": True},
+                                 "req-cache", 0.0, provider="openai", provider_key="sk")
+    await _collect(resp)
+
+    assert ctx.savings.cache_read_tokens == 600
+    assert ctx.savings.cache_write_tokens == 200
+    assert ctx.savings.cost_actual_usd > 0, "a streamed call must record a real cost"
+    assert ctx.savings.cost_cache_write_usd is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_cache_accounting_never_breaks_the_stream(monkeypatch):
+    """Accounting is best-effort: a broken adapter must not cost the caller their stream."""
+    from datetime import datetime
+    from savings.models import SavingsRecord
+
+    class Exploding:
+        name = "boom"
+        def extract_usage(self, response):
+            raise RuntimeError("adapter blew up")
+
+    fake_chunks = [
+        {"choices": [{"delta": {"content": "ok"}}]},
+        {"choices": [{"delta": {}}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+    ]
+
+    async def fake_acompletion(**kwargs):
+        async def gen():
+            for c in fake_chunks:
+                yield c
+        return gen()
+
+    ctx = _Ctx()
+    ctx.savings = SavingsRecord(
+        request_id="req-boom", user_id="u", timestamp=datetime.now(),
+        model_requested="gpt-4o-mini", routed_model="gpt-4o-mini", baseline_tokens=10,
+    )
+    ctx.provider_adapter = Exploding()
+    ctx.params = {}
+
+    monkeypatch.setattr(main.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(main, "_record_outcome", lambda *a, **k: None)
+
+    resp = main._stream_response(ctx, "gpt-4o-mini", {}, {"stream": True}, "req-boom", 0.0,
+                                 provider="openai", provider_key="sk")
+    body = await _collect(resp)
+    assert body.strip().endswith("data: [DONE]")
+    assert ctx.savings.cache_write_tokens is None
+

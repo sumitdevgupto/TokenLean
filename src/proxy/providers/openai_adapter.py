@@ -72,6 +72,21 @@ class OpenAIAdapter(ProviderAdapter):
             out["prompt_cache_retention"] = retention
         return out
 
+    def cache_write_cost_multiplier(self, config: Dict) -> float:
+        """OpenAI does not surcharge cache writes — they bill at the normal input rate.
+
+        Explicit 1.0 (not merely inherited) so the shipped template can carry the real
+        published rate for every provider side by side, and a future OpenAI change is a
+        config edit rather than a code change.
+        """
+        pcfg = (
+            config.get("groups", {})
+            .get("G21_cache_alignment", {})
+            .get("providers", {})
+            .get("openai", {})
+        )
+        return float(pcfg.get("cache_write_multiplier", 1.0))
+
     def cache_read_cost_multiplier(self, config: Dict) -> float:
         """OpenAI bills cached input tokens at ~50% (config-overridable)."""
         pcfg = (

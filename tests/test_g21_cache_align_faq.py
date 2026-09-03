@@ -84,12 +84,17 @@ async def test_faq_openai_reorder_and_cost_step():
     assert result.messages[0]["role"] == "system"
     assert result.messages[0]["content"] == "You are an FAQ bot for Acme Corp. Be concise."
 
-    # Cost-discount step recorded
+    # Alignment step recorded. It deliberately no longer quotes a modelled discount
+    # percentage: that number came straight from config and was never checked against the
+    # provider response, so it asserted a saving that may not have happened. The real
+    # figure is the provider-reported cache read/write split recorded by G18.
     steps = result.savings.step_savings
     assert len(steps) == 1
     assert steps[0].group == "G21"
-    assert "cost discount" in steps[0].description.lower()
-    assert "50%" in steps[0].description  # OpenAI discount
+    assert "cache-aligned" in steps[0].description.lower()
+    assert "measured per call" in steps[0].description
+    assert "%" not in steps[0].description, (
+        "G21 must not publish a modelled cache-discount percentage")
 
 
 @pytest.mark.asyncio
@@ -114,7 +119,10 @@ async def test_faq_anthropic_cache_markers():
 
     steps = result.savings.step_savings
     assert len(steps) == 1
-    assert "90%" in steps[0].description  # Anthropic discount
+    # Previously asserted "90%" — which G21 emitted even when the Anthropic marker was
+    # off and nothing had been cached at all. Now it states only what it actually did.
+    assert "cache-aligned anthropic" in steps[0].description.lower()
+    assert "90%" not in steps[0].description
 
 
 @pytest.mark.asyncio

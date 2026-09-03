@@ -19,6 +19,7 @@ from savings.calculator import (
     estimate_cost,
     estimate_cost_with_cache,
     get_cost_per_1k,
+    cache_cost_split,
 )
 from cache.redis_pool import get_redis as _get_redis
 
@@ -44,6 +45,16 @@ COMPLETION_TOKENS = Counter(
 REASONING_TOKENS = Counter(
     "token_opt_reasoning_tokens_total",
     "Total reasoning tokens processed (for models with reasoning_effort/thinking)",
+    ["model", "team", "feature", "tenant_id"],
+)
+CACHE_READ_TOKENS = Counter(
+    "token_opt_cache_read_tokens_total",
+    "Provider prompt-cache READ tokens (billed at a discount)",
+    ["model", "team", "feature", "tenant_id"],
+)
+CACHE_WRITE_TOKENS = Counter(
+    "token_opt_cache_write_tokens_total",
+    "Provider prompt-cache WRITE/creation tokens (billed at full rate or a premium)",
     ["model", "team", "feature", "tenant_id"],
 )
 EFFECTIVE_TOKENS = Counter(
@@ -229,6 +240,74 @@ FINETUNE_JOBS_TOTAL = Counter(
 )
 
 
+def resolve_cache_usage(ctx, response: Dict) -> Dict[str, Any]:
+    """Provider cache read/write counts + their cost multipliers for one response.
+
+    Shared by the response pipeline and the STREAMING path. Streaming skips the response
+    pipeline entirely, so without a shared helper a streamed request reports no cached
+    tokens and no cost at all — the reads were already being lost that way before #34, and
+    duplicating this logic would have let the two paths drift apart silently.
+
+    Never raises: an adapter that misbehaves must not cost anyone their response, so every
+    failure degrades to "unknown" (None) rather than to a fabricated zero.
+    """
+    usage = (response or {}).get("usage") or {}
+    adapter = getattr(ctx, "provider_adapter", None)
+    extracted: Dict[str, Any] = {}
+    if adapter is not None:
+        try:
+            extracted = adapter.extract_usage(response) or {}
+        except Exception as exc:
+            logger.debug("[%s] G18: extract_usage failed: %s", getattr(ctx, "request_id", "?"), exc)
+            extracted = {}
+    else:
+        details = usage.get("prompt_tokens_details") or {}
+        extracted = {
+            "cached_tokens": details.get("cached_tokens", 0),
+            "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+            or usage.get("thinking_tokens", 0),
+            "cache_read_tokens": details.get("cached_tokens"),
+            "cache_write_tokens": details.get("cache_write_tokens"),
+        }
+
+    read_tokens = extracted.get("cache_read_tokens")
+    write_tokens = extracted.get("cache_write_tokens")
+    write_1h = extracted.get("cache_write_1h_tokens")
+
+    def _mult(method: str, default: float = 1.0) -> float:
+        if adapter is None:
+            return default
+        try:
+            return float(getattr(adapter, method)(getattr(ctx, "config", {}) or {}))
+        except Exception as exc:
+            logger.debug("[%s] G18: %s failed: %s", getattr(ctx, "request_id", "?"), method, exc)
+            return default
+
+    cached = extracted.get("cached_tokens", 0) or 0
+    written = write_tokens or 0
+    return {
+        "cached_tokens": cached,
+        "reasoning_tokens": extracted.get("reasoning_tokens", 0) or 0,
+        "cache_read_tokens": read_tokens,
+        "cache_write_tokens": write_tokens,
+        "cache_write_1h_tokens": write_1h,
+        # Multipliers are only resolved when there is something to price, matching the
+        # existing read-side behaviour (and keeping adapter calls off the zero path).
+        "cache_read_multiplier": _mult("cache_read_cost_multiplier") if cached else 1.0,
+        "cache_write_multiplier": _mult("cache_write_cost_multiplier") if written else 1.0,
+        "cache_write_1h_multiplier": _mult("cache_write_1h_cost_multiplier") if (write_1h or 0) else 1.0,
+    }
+
+
+def apply_cache_usage_to_savings(ctx, usage_info: Dict[str, Any]) -> None:
+    """Record the cache token counts on ``ctx.savings`` (None stays None — unknown != 0)."""
+    savings = getattr(ctx, "savings", None)
+    if savings is None:
+        return
+    savings.cache_read_tokens = usage_info.get("cache_read_tokens")
+    savings.cache_write_tokens = usage_info.get("cache_write_tokens")
+
+
 class G18Observability:
     def __init__(self, usage_meter=None, audit_logger=None):
         self._usage_meter = usage_meter
@@ -249,20 +328,10 @@ class G18Observability:
         # Anthropic cache_read_input_tokens, Gemini cached_content_token_count, etc.). The
         # base/default reads the OpenAI shape, so this is a no-op for OpenAI and for the
         # legacy adapter-less path below.
-        if ctx.provider_adapter is not None:
-            try:
-                _u = ctx.provider_adapter.extract_usage(response)
-            except Exception as _exc:
-                logger.debug("[%s] G18: extract_usage failed: %s", ctx.request_id, _exc)
-                _u = {}
-        else:
-            _u = {
-                "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
-                "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
-                or usage.get("thinking_tokens", 0),
-            }
+        _u = resolve_cache_usage(ctx, response)
         cache_read_tokens = _u.get("cached_tokens", 0) or 0
         reasoning_tokens = _u.get("reasoning_tokens", 0) or 0
+        apply_cache_usage_to_savings(ctx, _u)
 
         # Labels
         team = ctx.params.get("x_team", "default")
@@ -285,13 +354,11 @@ class G18Observability:
         # response-reported cached tokens (G21 P1). Provider-agnostic: the per-provider
         # multiplier comes from the adapter (Gate 3 — no provider strings here). With
         # cache_read_tokens == 0 this is identical to estimate_cost().
-        cache_read_multiplier = 1.0
-        if cache_read_tokens and ctx.provider_adapter is not None:
-            try:
-                cache_read_multiplier = ctx.provider_adapter.cache_read_cost_multiplier(ctx.config)
-            except Exception as _exc:
-                logger.debug("[%s] G18: cache_read_cost_multiplier failed: %s", ctx.request_id, _exc)
-                cache_read_multiplier = 1.0
+        cache_read_multiplier = _u.get("cache_read_multiplier", 1.0)
+        cache_write_tokens = _u.get("cache_write_tokens") or 0
+        cache_write_1h_tokens = _u.get("cache_write_1h_tokens") or 0
+        cache_write_multiplier = _u.get("cache_write_multiplier", 1.0)
+        cache_write_1h_multiplier = _u.get("cache_write_1h_multiplier", 1.0)
         # B3: discount-aware price book (reporting-only) — optional reasoning surcharge
         # and a provider-native batch discount, both config-gated (default 1.0 = no-op,
         # so cost_actual is unchanged unless a deployment opts in). The batch discount
@@ -302,12 +369,31 @@ class G18Observability:
             if ctx.params.get("_native_batch")
             else 1.0
         )
+        _cache_cost_kwargs = dict(
+            cache_write_tokens=cache_write_tokens,
+            cache_write_multiplier=cache_write_multiplier,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+            cache_write_1h_multiplier=cache_write_1h_multiplier,
+        )
         ctx.savings.cost_actual_usd = estimate_cost_with_cache(
             prompt_tokens, cache_read_tokens, completion_tokens, model, cache_read_multiplier,
             batch_discount=batch_discount,
             reasoning_tokens=reasoning_tokens,
             reasoning_rate_multiplier=reasoning_rate_multiplier,
+            **_cache_cost_kwargs,
         )
+        # Decompose the same total so a cost line can answer "how much of this was cache?".
+        # Only recorded when the provider actually reported a count — an unreported half
+        # stays None so it reads as unknown rather than as a genuine zero.
+        if _u.get("cache_read_tokens") is not None or _u.get("cache_write_tokens") is not None:
+            _read_usd, _write_usd = cache_cost_split(
+                prompt_tokens, cache_read_tokens, model, cache_read_multiplier,
+                batch_discount=batch_discount, **_cache_cost_kwargs,
+            )
+            if _u.get("cache_read_tokens") is not None:
+                ctx.savings.cost_cache_read_usd = _read_usd
+            if _u.get("cache_write_tokens") is not None:
+                ctx.savings.cost_cache_write_usd = _write_usd
         ctx.savings.cost_baseline_usd = estimate_cost(
             ctx.savings.baseline_tokens, completion_tokens, ctx.savings.model_requested
         )
@@ -326,6 +412,10 @@ class G18Observability:
             COMPLETION_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(completion_tokens)
             if reasoning_tokens > 0:
                 REASONING_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(reasoning_tokens)
+            if cache_read_tokens > 0:
+                CACHE_READ_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_read_tokens)
+            if cache_write_tokens > 0:
+                CACHE_WRITE_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_write_tokens)
             EFFECTIVE_TOKENS.labels(model=model, tenant_id=tenant_id).inc(et)
             COST_USD.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(ctx.savings.cost_actual_usd)
             if ctx.savings.cache_hit:

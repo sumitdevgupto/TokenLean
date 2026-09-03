@@ -45,6 +45,13 @@ class UsageEvent:
     # Ingress protocol the client used (#4): openai | anthropic | gemini. Observability
     # only — billing is one row per served request regardless of protocol.
     protocol: str = DEFAULT_PROTOCOL_NAME
+    # #34 — provider prompt-cache accounting. Nullable on purpose: None means the provider
+    # reported nothing, 0 means it reported zero. Storing an unknown as 0 would make the
+    # cache columns claim a fact we do not have — the exact defect this closes.
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    cost_cache_read_usd: Optional[float] = None
+    cost_cache_write_usd: Optional[float] = None
     # C1 — per-G-group realised token savings {group: tokens_saved}, non-zero steps only.
     # Lets the indexed usage_events table answer "savings by optimisation" without parsing
     # the unindexed Langfuse traces blob. Compact (~2–8 keys). Observability; never billed.
@@ -106,7 +113,11 @@ CREATE TABLE IF NOT EXISTS usage_events (
     total_duration_ms INTEGER   NOT NULL DEFAULT 0,
     llm_duration_ms INTEGER     NOT NULL DEFAULT 0,
     agent_id        TEXT        NOT NULL DEFAULT '',
-    trial           BOOLEAN     NOT NULL DEFAULT false
+    trial           BOOLEAN     NOT NULL DEFAULT false,
+    cache_read_tokens  INTEGER,
+    cache_write_tokens INTEGER,
+    cost_cache_read_usd  NUMERIC(12,6),
+    cost_cache_write_usd NUMERIC(12,6)
 );
 
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_idx
@@ -153,6 +164,13 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT
 -- Free trial: flags a served 2xx made during an active trial; EXCLUDED from invoices
 -- (invoice/usage-agg SQL filters `AND NOT COALESCE(trial, false)`) but kept for visibility.
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS trial BOOLEAN NOT NULL DEFAULT false;
+-- #34: provider prompt-cache accounting. Deliberately NULLABLE with no DEFAULT — a row
+-- written before this shipped, or by a provider that reports no cache counts, must stay
+-- distinguishable from one that genuinely saw zero cache activity.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_read_tokens INTEGER;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cache_write_tokens INTEGER;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_cache_read_usd NUMERIC(12,6);
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost_cache_write_usd NUMERIC(12,6);
 CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_id, user_id);
 -- C2: keep the error-rate / latency-percentile queries index-only over the hot window.
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_status_idx

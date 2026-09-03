@@ -93,6 +93,27 @@ def register_adapter(name: str):
     return _decorator
 
 
+def _first_present(source: Dict, keys: tuple) -> Optional[int]:
+    """First key actually present in ``source``, coerced to int — else ``None``.
+
+    Distinguishes "the provider reported zero" from "the provider reported nothing".
+    Every cache-token field uses this: reporting an unknown as 0 would state a fact we
+    do not have, which is the exact reporting defect these fields were added to close.
+    """
+    if not isinstance(source, dict):
+        return None
+    for key in keys:
+        if key in source:
+            value = source[key]
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 class ProviderAdapter(ABC):
     """Base interface every provider adapter must implement."""
 
@@ -204,6 +225,29 @@ class ProviderAdapter(ABC):
         """
         return 1.0
 
+    def cache_write_cost_multiplier(self, config: Dict) -> float:
+        """
+        Multiplier applied to provider-reported cache-WRITE (cache-creation) tokens when
+        computing actual cost, read from
+        ``groups.G21_cache_alignment.providers.<name>.cache_write_multiplier``.
+
+        ``1.0`` = billed at the normal input rate (correct for OpenAI, which does not
+        surcharge cache writes, and the safe default for unknown providers). Anthropic
+        charges a premium for writes (~1.25x on the 5-minute tier, ~2x on the 1-hour
+        tier), which is why this exists at all: without it a write-heavy tenant's cost
+        line understates their invoice while the token counts look identical.
+        """
+        return 1.0
+
+    def cache_write_1h_cost_multiplier(self, config: Dict) -> float:
+        """Multiplier for the subset of cache-write tokens stored on a 1-hour TTL.
+
+        Only meaningful where a provider prices cache-creation by TTL tier (Anthropic).
+        Defaults to :meth:`cache_write_cost_multiplier` so providers with a single write
+        rate need no override and the split is a no-op for them.
+        """
+        return self.cache_write_cost_multiplier(config)
+
     def supports_service_tier(self) -> bool:
         """True if the provider accepts the OpenAI ``service_tier`` param (e.g. Flex).
 
@@ -287,7 +331,7 @@ class ProviderAdapter(ABC):
         return params
 
     def extract_usage(self, response: Dict) -> Dict:
-        """Normalise provider usage into ``{"cached_tokens", "reasoning_tokens"}``.
+        """Normalise provider usage into cached/reasoning/cache-write counts.
 
         Default reads the OpenAI shape (``prompt_tokens_details.cached_tokens`` and
         ``completion_tokens_details.reasoning_tokens``), with ``thinking_tokens`` honoured
@@ -295,13 +339,34 @@ class ProviderAdapter(ABC):
         to G18's current inline logic, so switching G18 to this is a no-op for OpenAI.
         Subclasses override for provider-specific fields (Anthropic ``cache_read_input_tokens``,
         Gemini ``cached_content_token_count``).
+
+        Returns four keys:
+          * ``cached_tokens`` / ``reasoning_tokens`` — ints, unchanged back-compat aliases
+            (load-bearing in G18's cost math, which treats a missing value as 0);
+          * ``cache_read_tokens`` / ``cache_write_tokens`` — ``Optional[int]``, where
+            **None means the provider reported nothing** and 0 means it reported zero.
+            A silent zero here is precisely the defect this field exists to fix: it would
+            claim "no cache writes happened" when the truth is "we do not know".
+
+        litellm normalises cache writes onto ``prompt_tokens_details.cache_write_tokens``
+        (mirrored to ``cache_creation_tokens``) for every provider it routes, so the base
+        implementation covers them all; the Anthropic/Gemini overrides only add a
+        native-shape fallback for responses that never passed through litellm.
         """
         usage = response.get("usage", {}) or {}
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens", 0) or 0
         reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
         if not reasoning and usage.get("thinking_tokens"):
             reasoning = usage.get("thinking_tokens", 0) or 0
-        return {"cached_tokens": cached, "reasoning_tokens": reasoning}
+        return {
+            "cached_tokens": cached,
+            "reasoning_tokens": reasoning,
+            "cache_read_tokens": _first_present(details, ("cached_tokens",)),
+            "cache_write_tokens": _first_present(
+                details, ("cache_write_tokens", "cache_creation_tokens")
+            ),
+        }
 
     def align_prefix(
         self,

@@ -98,12 +98,17 @@ class G21CacheAlignment:
             # Cost saving only (reorder doesn't change token count).
             # Provider discount is config-driven; defaults reflect published rates
             # (OpenAI ~50% on cached prefix, Anthropic ~90%).
-            provider_cfg = cfg.get("providers", {}).get(provider, {})
-            default_discounts = {"anthropic": cfg.get("anthropic_cache_discount_pct", 90), "openai": cfg.get("openai_cache_discount_pct", 50)}
-            discount_pct = provider_cfg.get("discount_pct", default_discounts.get(provider, 50))
+            # Report what the prefix cache actually DID, not what config predicts it
+            # would do. The old text interpolated `discount_pct` straight from config and
+            # was never reconciled against the response — so the single number the proxy
+            # published about prefix caching was an assumption. On Anthropic the marker is
+            # off by default, meaning it routinely claimed a 90% discount on a prefix that
+            # had not been cached at all. The measured counts arrive on the response (G18),
+            # after this request-side step, so this step now states only what it did.
             ctx.savings.add_step(
                 GROUP,
-                f"Cache-aligned {provider} prefix={prefix_tokens}t (cost discount ~{discount_pct}% on prefix)",
+                f"Cache-aligned {provider} prefix={prefix_tokens}t "
+                f"(cost effect measured per call — see cache_read_tokens/cache_write_tokens)",
                 tokens_before,
                 tokens_after,
             )

@@ -6,6 +6,25 @@ from providers import ProviderAdapter, register_adapter
 _THINKING_DEFAULTS = {"low": 1024, "medium": 4096, "high": 16000}
 
 
+def _cache_write_1h_tokens(usage: Dict, details: Dict) -> Optional[int]:
+    """Cache-write tokens stored on the 1-hour TTL, when the provider splits them out.
+
+    Anthropic prices 5-minute and 1-hour cache creation differently (~1.25x vs ~2x input),
+    and litellm surfaces the split as ``cache_creation_token_details``. Returns None when
+    no split was reported, so the caller bills the whole write span at the 5-minute rate
+    rather than inventing a tier.
+    """
+    from providers import _first_present  # local: avoid a circular import at module load
+
+    for source in (details, usage):
+        if not isinstance(source, dict):
+            continue
+        split = source.get("cache_creation_token_details")
+        if isinstance(split, dict):
+            return _first_present(split, ("ephemeral_1h_input_tokens",))
+    return None
+
+
 @register_adapter("anthropic")
 class AnthropicAdapter(ProviderAdapter):
     @property
@@ -17,15 +36,38 @@ class AnthropicAdapter(ProviderAdapter):
         return {"parallel_tool_calls", "logprobs", "top_logprobs"}
 
     def extract_usage(self, response: Dict) -> Dict:
-        """Prefer litellm's normalised OpenAI shape; fall back to Anthropic-native fields."""
+        """Prefer litellm's normalised OpenAI shape; fall back to Anthropic-native fields.
+
+        Anthropic reports ``input_tokens``, ``cache_read_input_tokens`` and
+        ``cache_creation_input_tokens`` as SIBLINGS, but litellm folds the two cache counts
+        INTO ``prompt_tokens`` before we ever see the response, so the subset assumption in
+        ``estimate_cost_with_cache`` holds on the normalised path. The native fallback below
+        exists only for responses that never passed through litellm.
+        """
+        from providers import _first_present  # local: avoid a circular import at module load
+
         usage = response.get("usage", {}) or {}
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens", 0) or 0
         if not cached:
             cached = usage.get("cache_read_input_tokens", 0) or 0
         reasoning = usage.get("thinking_tokens", 0) or 0
         if not reasoning:
             reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
-        return {"cached_tokens": cached, "reasoning_tokens": reasoning}
+
+        read = _first_present(details, ("cached_tokens",))
+        if read is None:
+            read = _first_present(usage, ("cache_read_input_tokens",))
+        write = _first_present(details, ("cache_write_tokens", "cache_creation_tokens"))
+        if write is None:
+            write = _first_present(usage, ("cache_creation_input_tokens",))
+        return {
+            "cached_tokens": cached,
+            "reasoning_tokens": reasoning,
+            "cache_read_tokens": read,
+            "cache_write_tokens": write,
+            "cache_write_1h_tokens": _cache_write_1h_tokens(usage, details),
+        }
 
     def align_prefix(self, ctx, system_msgs, variable_msgs, cfg) -> bool:
         """G21: Anthropic prompt caching — mark the last system message (and last tool)
@@ -180,6 +222,26 @@ class AnthropicAdapter(ProviderAdapter):
             )
         out["extra_headers"] = extra
         return out
+
+    def cache_write_cost_multiplier(self, config: Dict) -> float:
+        """Anthropic bills 5-minute cache writes at ~1.25x the input rate (config-overridable)."""
+        pcfg = (
+            config.get("groups", {})
+            .get("G21_cache_alignment", {})
+            .get("providers", {})
+            .get("anthropic", {})
+        )
+        return float(pcfg.get("cache_write_multiplier", 1.25))
+
+    def cache_write_1h_cost_multiplier(self, config: Dict) -> float:
+        """Anthropic bills 1-hour cache writes at ~2x the input rate (config-overridable)."""
+        pcfg = (
+            config.get("groups", {})
+            .get("G21_cache_alignment", {})
+            .get("providers", {})
+            .get("anthropic", {})
+        )
+        return float(pcfg.get("cache_write_multiplier_1h", 2.0))
 
     def cache_read_cost_multiplier(self, config: Dict) -> float:
         """Anthropic bills cache-read tokens at ~10% (config-overridable)."""

@@ -10,6 +10,7 @@ from savings.calculator import (
     count_request_tokens,
     estimate_cost,
     estimate_cost_with_cache,
+    cache_cost_split,
     effective_token_cost,
     get_cost_per_1k,
     messages_to_text,
@@ -358,3 +359,83 @@ class TestMalformedToolSchemas:
         import middleware.g08_tool_loading as g08
         import savings.calculator as calc
         assert g08.count_tools_tokens is calc.count_tools_tokens
+
+
+class TestCacheWriteCostAccounting:
+    """#34 — cache-write pricing, and the accounting trap that had to be verified first.
+
+    Anthropic reports input_tokens / cache_read_input_tokens / cache_creation_input_tokens
+    as SIBLINGS, but litellm folds the two cache counts INTO prompt_tokens before the proxy
+    sees them. These fixtures pin that: if a future litellm release stops folding, the
+    subset assumption breaks and cost is silently misreported, so these must fail loudly.
+    """
+
+    # Captured usage shapes, one per provider (post-litellm normalisation).
+    OPENAI_USAGE = {"prompt_tokens": 1000, "completion_tokens": 100,
+                    "prompt_tokens_details": {"cached_tokens": 800}}
+    ANTHROPIC_USAGE = {"prompt_tokens": 1000, "completion_tokens": 100,
+                       "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300}}
+    GEMINI_USAGE = {"prompt_tokens": 1000, "completion_tokens": 100,
+                    "prompt_tokens_details": {"cached_tokens": 500}}
+
+    def test_defaults_are_a_byte_identical_drop_in(self):
+        model = "gpt-4o"
+        assert estimate_cost_with_cache(1000, 0, 100, model) == estimate_cost(1000, 100, model)
+
+    def test_cache_spans_are_subsets_not_additions(self):
+        """Reads + writes + plain input must partition prompt_tokens, never exceed it."""
+        model = "gpt-4o"
+        u = self.ANTHROPIC_USAGE
+        cost = estimate_cost_with_cache(
+            u["prompt_tokens"], u["prompt_tokens_details"]["cached_tokens"],
+            u["completion_tokens"], model, 0.1,
+            cache_write_tokens=u["prompt_tokens_details"]["cache_write_tokens"],
+            cache_write_multiplier=1.25,
+        )
+        # Every input token billed at full rate is the ceiling; discounted reads must
+        # make the real figure strictly cheaper, proving they were not double-counted.
+        assert cost < estimate_cost(u["prompt_tokens"], u["completion_tokens"], model)
+
+    def test_writes_cost_more_than_reads(self):
+        model = "gpt-4o"
+        reads = estimate_cost_with_cache(1000, 500, 100, model, 0.1)
+        writes = estimate_cost_with_cache(1000, 0, 100, model, 0.1,
+                                          cache_write_tokens=500, cache_write_multiplier=1.25)
+        assert writes > reads, "a cache write must never look cheaper than a cache read"
+
+    def test_1h_tier_is_dearer_than_5m_tier(self):
+        model = "gpt-4o"
+        base = dict(cache_write_tokens=400, cache_write_multiplier=1.25)
+        five_m = estimate_cost_with_cache(1000, 0, 100, model, 0.1, **base)
+        one_h = estimate_cost_with_cache(1000, 0, 100, model, 0.1,
+                                         cache_write_1h_tokens=400, cache_write_1h_multiplier=2.0,
+                                         **base)
+        assert one_h > five_m
+
+    def test_overrunning_counts_cannot_double_bill(self):
+        """A provider reporting more cache tokens than input must not inflate the bill."""
+        model = "gpt-4o"
+        cost = estimate_cost_with_cache(1000, 900, 100, model, 0.1,
+                                        cache_write_tokens=900, cache_write_multiplier=1.25)
+        assert cost <= estimate_cost(1000, 100, model)
+
+    def test_split_components_never_exceed_the_total(self):
+        model = "gpt-4o"
+        kw = dict(cache_write_tokens=300, cache_write_multiplier=1.25,
+                  cache_write_1h_tokens=100, cache_write_1h_multiplier=2.0)
+        total = estimate_cost_with_cache(1000, 200, 100, model, 0.1, **kw)
+        read_usd, write_usd = cache_cost_split(1000, 200, model, 0.1, **kw)
+        assert read_usd + write_usd <= total + 1e-9
+        assert write_usd > read_usd  # discounted reads, premium writes
+
+    def test_split_is_zero_when_no_cache_activity(self):
+        assert cache_cost_split(1000, 0, "gpt-4o", 0.5) == (0.0, 0.0)
+
+    def test_batch_discount_applies_to_both_halves(self):
+        model = "gpt-4o"
+        kw = dict(cache_write_tokens=300, cache_write_multiplier=1.25)
+        full = cache_cost_split(1000, 200, model, 0.1, **kw)
+        half = cache_cost_split(1000, 200, model, 0.1, batch_discount=0.5, **kw)
+        assert half[0] == pytest.approx(full[0] / 2)
+        assert half[1] == pytest.approx(full[1] / 2)
+

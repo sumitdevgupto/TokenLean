@@ -38,7 +38,7 @@
     {
       "id": 1,
       "type": "text",
-      "title": "Read me — billing paradigm",
+      "title": "Read me \u2014 billing paradigm",
       "gridPos": {
         "h": 3,
         "w": 24,
@@ -47,15 +47,14 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**Billable unit = one served 2xx request** (Row 1 count). Token figures (Rows 2-3) are the **free value layer** — disclosed estimates (chars/4) and real provider measurements, **never billed**. Turning counts into money (rate cards, invoices) is a separate, **non-OSS** concern. This dashboard carries **no dollar figures**."
+        "content": "**Billable unit = one served 2xx request** (Row 1 count). Token figures (Rows 2-3) are the **free value layer** \u2014 disclosed estimates (chars/4) and real provider measurements, **never billed**. Turning counts into money (rate cards, invoices) is a separate, **non-OSS** concern. This dashboard carries **no dollar figures**."
       },
       "transparent": true
     },
-
     {
       "id": 100,
       "type": "row",
-      "title": "Row 1 — Requests & Billing (billable unit = 1 served 2xx request)",
+      "title": "Row 1 \u2014 Requests & Billing (billable unit = 1 served 2xx request)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -198,9 +197,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "value": null, "color": "green" },
-              { "value": 0.01, "color": "yellow" },
-              { "value": 0.05, "color": "red" }
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 0.01,
+                "color": "yellow"
+              },
+              {
+                "value": 0.05,
+                "color": "red"
+              }
             ]
           }
         }
@@ -315,11 +323,10 @@
         }
       }
     },
-
     {
       "id": 200,
       "type": "row",
-      "title": "Row 2 — Estimated Tokens (chars/4 — disclosed estimate, never billed)",
+      "title": "Row 2 \u2014 Estimated Tokens (chars/4 \u2014 disclosed estimate, never billed)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -332,7 +339,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Input Tokens (actuals · chars/4)",
+      "title": "Input Tokens (actuals \u00b7 chars/4)",
       "description": "x = baseline: what the user sent, estimated at chars/4. From the OSS metering engine (usage_events, 2xx rows only).",
       "gridPos": {
         "x": 0,
@@ -379,7 +386,7 @@
     {
       "id": 8,
       "type": "stat",
-      "title": "Tokens Passed to LLM (optimised · chars/4)",
+      "title": "Tokens Passed to LLM (optimised \u00b7 chars/4)",
       "description": "y = proxy-optimised input, estimated at chars/4, symmetric with x.",
       "gridPos": {
         "x": 5,
@@ -555,11 +562,10 @@
         }
       }
     },
-
     {
       "id": 300,
       "type": "row",
-      "title": "Row 3 — Real Tokens (from actual LLM responses)",
+      "title": "Row 3 \u2014 Real Tokens (from actual LLM responses)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -620,7 +626,7 @@
       "id": 13,
       "type": "stat",
       "title": "Real Output Tokens",
-      "description": "Provider-reported completion tokens (usage_events.response_tokens). Backfills as 0 for rows written before this column was added — complete only for traffic after deploy.",
+      "description": "Provider-reported completion tokens (usage_events.response_tokens). Backfills as 0 for rows written before this column was added \u2014 complete only for traffic after deploy.",
       "gridPos": {
         "x": 7,
         "y": 29,
@@ -751,7 +757,7 @@
       "id": 16,
       "type": "timeseries",
       "title": "Live token throughput (Prometheus cross-check)",
-      "description": "Real input/output token rate from the G18 counters — a live cross-check against the per-day Postgres view.",
+      "description": "Real input/output token rate from the G18 counters \u2014 a live cross-check against the per-day Postgres view.",
       "gridPos": {
         "x": 12,
         "y": 32,
@@ -777,6 +783,148 @@
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 301,
+      "type": "row",
+      "title": "Row 4 - Provider prompt cache (read vs write tokens)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 302,
+      "type": "stat",
+      "title": "Cache READ tokens",
+      "description": "Provider prompt-cache reads \u2014 the DISCOUNTED half. NULL (provider reported nothing) is excluded, not counted as zero.",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 12,
+        "h": 3
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(cache_read_tokens) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND COALESCE(billable, true) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      }
+    },
+    {
+      "id": 303,
+      "type": "stat",
+      "title": "Cache WRITE tokens",
+      "description": "Provider cache creation \u2014 the EXPENSIVE half, and the one that grows when a prompt prefix churns every turn. Reported nowhere before this.",
+      "gridPos": {
+        "x": 12,
+        "y": 41,
+        "w": 12,
+        "h": 3
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT SUM(cache_write_tokens) AS value FROM usage_events WHERE $__timeFilter(timestamp) AND COALESCE(billable, true) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}')",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "text": {
+          "titleSize": 17,
+          "valueSize": 30
+        }
+      }
+    },
+    {
+      "id": 306,
+      "type": "timeseries",
+      "title": "Cache read vs write tokens per day",
+      "description": "A write-heavy line means the prefix is being rebuilt rather than reused \u2014 same token counts, higher invoice.",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "app-postgres"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('day', timestamp) AS time, SUM(cache_read_tokens) AS \"cache read\", SUM(cache_write_tokens) AS \"cache write\" FROM usage_events WHERE $__timeFilter(timestamp) AND COALESCE(billable, true) AND ('${tenant}' = '.*' OR tenant_id = '${tenant}') GROUP BY 1 ORDER BY 1",
+          "format": "time_series",
+          "datasource": {
+            "type": "postgres",
+            "uid": "app-postgres"
           }
         }
       ],

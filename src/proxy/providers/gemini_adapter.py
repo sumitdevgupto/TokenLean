@@ -37,7 +37,27 @@ class GeminiAdapter(ProviderAdapter):
         reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
         if not reasoning:
             reasoning = usage.get("thinking_tokens", 0) or 0
-        return {"cached_tokens": cached, "reasoning_tokens": reasoning}
+
+        from providers import _first_present  # local: avoid a circular import at module load
+
+        details = usage.get("prompt_tokens_details") or {}
+        read = _first_present(details, ("cached_tokens",))
+        if read is None:
+            read = _first_present(
+                usage, ("cached_content_token_count", "cached_content_input_tokens")
+            )
+        # Gemini has no per-write cache charge to report: implicit caching is free to
+        # populate, and explicit context caching is billed as storage per token-hour — a
+        # different meter entirely, not a cache-creation token count. So a write count is
+        # genuinely unknown here (None) rather than zero, unless litellm normalised one.
+        return {
+            "cached_tokens": cached,
+            "reasoning_tokens": reasoning,
+            "cache_read_tokens": read,
+            "cache_write_tokens": _first_present(
+                details, ("cache_write_tokens", "cache_creation_tokens")
+            ),
+        }
 
     def render_tools_for_counting(self, tools: List[Dict]):
         """Gemini bills tools ≈ the compact JSON of their native functionDeclarations

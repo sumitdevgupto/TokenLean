@@ -127,6 +127,13 @@ class UsageMeter:
             # Free trial: flag rows served while the tenant's trial is active so invoicing
             # can exclude them. Read from the tenant-merged ctx.config at write time.
             trial=(((getattr(ctx, "config", None) or {}).get("trial") or {}).get("status") == "active"),
+            # #34 — provider prompt-cache accounting. Passed through as-is so a None
+            # (provider reported nothing) persists as SQL NULL rather than a 0 that would
+            # read as "this call did no cache work".
+            cache_read_tokens=getattr(savings, "cache_read_tokens", None),
+            cache_write_tokens=getattr(savings, "cache_write_tokens", None),
+            cost_cache_read_usd=getattr(savings, "cost_cache_read_usd", None),
+            cost_cache_write_usd=getattr(savings, "cost_cache_write_usd", None),
         )
 
     async def _persist_postgres(self, event: UsageEvent) -> None:
@@ -141,10 +148,12 @@ class UsageMeter:
                  user_id, cache_hit, cache_level, complexity_tier, bypassed,
                  cost_actual_usd, cost_baseline_usd, provider, protocol,
                  group_savings, status_code, billable, total_duration_ms, llm_duration_ms,
-                 agent_id, trial)
+                 agent_id, trial,
+                 cache_read_tokens, cache_write_tokens,
+                 cost_cache_read_usd, cost_cache_write_usd)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                     $16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25::jsonb,$26,$27,$28,$29,$30,$31)
+                    $25::jsonb,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -166,6 +175,8 @@ class UsageMeter:
                     event.status_code, event.billable,
                     event.total_duration_ms, event.llm_duration_ms,
                     event.agent_id, event.trial,
+                    event.cache_read_tokens, event.cache_write_tokens,
+                    event.cost_cache_read_usd, event.cost_cache_write_usd,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

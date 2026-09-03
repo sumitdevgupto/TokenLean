@@ -169,14 +169,81 @@ class TestParamHygiene:
 
 class TestUsageNormalization:
     def test_base_openai_shape(self):
+        # Exact-equality is kept deliberately: extract_usage is a contract consumed by G18
+        # and the streaming path, so an accidental key change should fail loudly here.
         resp = {"usage": {"prompt_tokens_details": {"cached_tokens": 7},
                           "completion_tokens_details": {"reasoning_tokens": 3}}}
-        assert OpenAIAdapter().extract_usage(resp) == {"cached_tokens": 7, "reasoning_tokens": 3}
+        assert OpenAIAdapter().extract_usage(resp) == {
+            "cached_tokens": 7,
+            "reasoning_tokens": 3,
+            "cache_read_tokens": 7,
+            # OpenAI reported no cache-creation count, so it is unknown — NOT zero.
+            "cache_write_tokens": None,
+        }
 
     def test_anthropic_native_fields(self):
         resp = {"usage": {"cache_read_input_tokens": 11, "thinking_tokens": 5}}
         out = AnthropicAdapter().extract_usage(resp)
-        assert out == {"cached_tokens": 11, "reasoning_tokens": 5}
+        assert out == {
+            "cached_tokens": 11,
+            "reasoning_tokens": 5,
+            "cache_read_tokens": 11,
+            "cache_write_tokens": None,
+            "cache_write_1h_tokens": None,
+        }
+
+
+class TestCacheWriteExtraction:
+    """#34 — cache WRITES are the half of cache billing nothing used to report."""
+
+    def test_litellm_normalised_write_is_read_by_every_provider(self):
+        # litellm folds each provider's native cache-creation field onto this key, so the
+        # base implementation covers all of them without provider branching.
+        resp = {"usage": {"prompt_tokens_details": {"cache_write_tokens": 40}}}
+        for adapter in (OpenAIAdapter(), AnthropicAdapter(), GeminiAdapter()):
+            assert adapter.extract_usage(resp)["cache_write_tokens"] == 40
+
+    def test_anthropic_native_cache_creation_fallback(self):
+        resp = {"usage": {"cache_creation_input_tokens": 512}}
+        assert AnthropicAdapter().extract_usage(resp)["cache_write_tokens"] == 512
+
+    def test_anthropic_ttl_split_is_surfaced(self):
+        # Anthropic prices 5-minute and 1-hour cache creation differently, so the split
+        # has to survive extraction or the 1h span is silently billed at the 5m rate.
+        resp = {"usage": {"cache_creation_input_tokens": 300,
+                          "cache_creation_token_details": {"ephemeral_1h_input_tokens": 100}}}
+        out = AnthropicAdapter().extract_usage(resp)
+        assert out["cache_write_tokens"] == 300
+        assert out["cache_write_1h_tokens"] == 100
+
+    def test_unreported_is_none_not_zero(self):
+        """The whole point of the field: unknown must not masquerade as 'no writes'."""
+        out = OpenAIAdapter().extract_usage({"usage": {"prompt_tokens": 100}})
+        assert out["cache_write_tokens"] is None
+        assert out["cache_read_tokens"] is None
+
+    def test_explicit_zero_is_preserved_as_zero(self):
+        out = OpenAIAdapter().extract_usage(
+            {"usage": {"prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}}
+        )
+        assert out["cache_write_tokens"] == 0
+        assert out["cache_read_tokens"] == 0
+
+    def test_write_multipliers_follow_published_rates(self):
+        cfg = {}
+        # OpenAI does not surcharge writes; Anthropic charges a premium, dearer on 1h.
+        assert OpenAIAdapter().cache_write_cost_multiplier(cfg) == 1.0
+        assert AnthropicAdapter().cache_write_cost_multiplier(cfg) == 1.25
+        assert AnthropicAdapter().cache_write_1h_cost_multiplier(cfg) == 2.0
+
+    def test_write_multiplier_is_config_overridable(self):
+        cfg = {"groups": {"G21_cache_alignment": {"providers": {"anthropic": {
+            "cache_write_multiplier": 1.4}}}}}
+        assert AnthropicAdapter().cache_write_cost_multiplier(cfg) == 1.4
+
+    def test_unknown_provider_defaults_to_no_surcharge(self):
+        # Safe default: never invent a premium for a provider we have no rate for.
+        assert GeminiAdapter().cache_write_cost_multiplier({}) == 1.0
 
     def test_gemini_native_fields(self):
         resp = {"usage": {"cached_content_token_count": 9}}

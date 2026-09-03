@@ -38,6 +38,17 @@ class SavingsRecord:
     cost_baseline_usd: float = 0.0
     cost_actual_usd: float = 0.0
     effective_token_et: Optional[float] = None
+    # #34 — provider prompt-cache accounting. Optional/None because "the provider reported
+    # nothing" and "the provider reported zero" are different facts, and reporting the
+    # first as the second is the defect these fields exist to close. Mirrors the
+    # provider_prompt_tokens convention above (None until G18 sees usage).
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    # USD attributable to each half of provider cache billing. The post that prompted this
+    # argued in share-of-bill, not token counts, so the cost split is persisted rather than
+    # derived later: rates change, and re-deriving would misprice history.
+    cost_cache_read_usd: Optional[float] = None
+    cost_cache_write_usd: Optional[float] = None
     # G6 routing-specific fields
     # "heuristic" | "routellm" | "cascade" | "llm_judge" | "user_override" |
     # "cascade_execution" | "<classifier>_fallback" | "rules:<rule_id>" (tenant routing
@@ -101,6 +112,22 @@ class SavingsRecord:
     def cost_saving_usd(self) -> float:
         return round(self.cost_baseline_usd - self.cost_actual_usd, 6)
 
+    @property
+    def cache_share_of_bill_pct(self) -> Optional[float]:
+        """Percent of this call's actual cost attributable to provider cache read+write.
+
+        None when neither half was reported (unknown, not 0%) or when there is no cost to
+        take a share of. This is the number the FinOps critique was actually about — it
+        lets a tenant verify a claim like "80-95% of billing is cache" against their own
+        traffic instead of taking it on faith.
+        """
+        if self.cost_cache_read_usd is None and self.cost_cache_write_usd is None:
+            return None
+        if self.cost_actual_usd <= 0:
+            return None
+        cache_usd = (self.cost_cache_read_usd or 0.0) + (self.cost_cache_write_usd or 0.0)
+        return round(min(100.0, (cache_usd / self.cost_actual_usd) * 100.0), 2)
+
     def to_langfuse_metadata(self) -> Dict[str, Any]:
         steps_data: Dict[str, Any] = {}
         for s in self.step_savings:
@@ -145,6 +172,19 @@ class SavingsRecord:
         }
         if self.effective_token_et is not None:
             metadata["effective_token_et"] = self.effective_token_et
+        # Emitted only when the provider actually reported them, so an absent key means
+        # "unknown" rather than a zero the caller might read as "no cache activity".
+        if self.cache_read_tokens is not None:
+            metadata["cache_read_tokens"] = self.cache_read_tokens
+        if self.cache_write_tokens is not None:
+            metadata["cache_write_tokens"] = self.cache_write_tokens
+        if self.cost_cache_read_usd is not None:
+            metadata["cost_cache_read_usd"] = round(self.cost_cache_read_usd, 6)
+        if self.cost_cache_write_usd is not None:
+            metadata["cost_cache_write_usd"] = round(self.cost_cache_write_usd, 6)
+        share = self.cache_share_of_bill_pct
+        if share is not None:
+            metadata["cache_share_of_bill_pct"] = share
         # Add G6 routing-specific metadata if available
         if self.routing_mode:
             metadata["routing_mode"] = self.routing_mode

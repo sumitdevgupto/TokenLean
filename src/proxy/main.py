@@ -1140,6 +1140,7 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 try:
                     ctx.savings.provider_prompt_tokens = last_usage.get("prompt_tokens")
                     ctx.savings.response_tokens = last_usage.get("completion_tokens", 0) or 0
+                    _record_stream_cache_cost(ctx, last_usage)
                 except Exception:
                     pass
             try:
@@ -1159,6 +1160,51 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 logger.debug("[%s] streaming _record_outcome failed: %s", request_id, exc)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+def _record_stream_cache_cost(ctx, last_usage: Dict) -> None:
+    """Record provider cache tokens + actual cost for a STREAMED response.
+
+    The response pipeline (and therefore G18, the single source of truth for cost) is
+    skipped for streamed calls, so before this a streamed request recorded no cached-read
+    tokens, no cache-write tokens and a cost_actual_usd of 0 — while agentic clients, the
+    ones that benefit most from prompt caching, stream almost everything. Reuses G18's own
+    helpers so the streamed and non-streamed paths can never price the same usage
+    differently. Best-effort: never let accounting break a stream.
+    """
+    from middleware.g18_observability import apply_cache_usage_to_savings, resolve_cache_usage
+    from savings.calculator import cache_cost_split, estimate_cost, estimate_cost_with_cache
+
+    info = resolve_cache_usage(ctx, {"usage": last_usage})
+    apply_cache_usage_to_savings(ctx, info)
+
+    prompt_tokens = last_usage.get("prompt_tokens") or 0
+    completion_tokens = last_usage.get("completion_tokens", 0) or 0
+    model = ctx.routed_model
+    cache_kwargs = dict(
+        cache_write_tokens=info.get("cache_write_tokens") or 0,
+        cache_write_multiplier=info.get("cache_write_multiplier", 1.0),
+        cache_write_1h_tokens=info.get("cache_write_1h_tokens") or 0,
+        cache_write_1h_multiplier=info.get("cache_write_1h_multiplier", 1.0),
+    )
+    read_tokens = info.get("cached_tokens", 0) or 0
+    read_multiplier = info.get("cache_read_multiplier", 1.0)
+    ctx.savings.cost_actual_usd = estimate_cost_with_cache(
+        prompt_tokens, read_tokens, completion_tokens, model, read_multiplier,
+        reasoning_tokens=info.get("reasoning_tokens", 0) or 0,
+        **cache_kwargs,
+    )
+    ctx.savings.cost_baseline_usd = estimate_cost(
+        ctx.savings.baseline_tokens, completion_tokens, ctx.savings.model_requested
+    )
+    if info.get("cache_read_tokens") is not None or info.get("cache_write_tokens") is not None:
+        read_usd, write_usd = cache_cost_split(
+            prompt_tokens, read_tokens, model, read_multiplier, **cache_kwargs
+        )
+        if info.get("cache_read_tokens") is not None:
+            ctx.savings.cost_cache_read_usd = read_usd
+        if info.get("cache_write_tokens") is not None:
+            ctx.savings.cost_cache_write_usd = write_usd
 
 
 def _apply_stream_g23(ctx, content: str) -> None:
@@ -1218,6 +1264,12 @@ def _savings_headers(ctx, request_start: float) -> Dict[str, str]:
         ),
         "x-tokenlean-cost-saved-usd": f"{ctx.savings.cost_saving_usd:.6f}",
         "x-tokenlean-latency-ms": f"{(time.time() - request_start) * 1000:.1f}",
+        # Provider prompt-cache accounting (#34). Left out entirely when the provider
+        # reported nothing — an absent header reads as "unknown", a "0" would have
+        # asserted "no cache activity", which is the misreport this exists to end.
+        "x-tokenlean-cache-read-tokens": meta.get("cache_read_tokens"),
+        "x-tokenlean-cache-write-tokens": meta.get("cache_write_tokens"),
+        "x-tokenlean-cache-share-pct": meta.get("cache_share_of_bill_pct"),
     }
     for _k, _v in header_fields.items():
         if _v is not None:

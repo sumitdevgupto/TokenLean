@@ -590,11 +590,15 @@ Reorders messages so shared prefixes are contiguous for provider auto-caching, *
 | `providers.openai.prompt_cache_key_len` | `32` | Hex chars of the sha256 cache key |
 | `providers.openai.prompt_cache_retention` | *(unset)* | Optional OpenAI cache retention (`"24h"` \| `"in-memory"`); unset = provider default |
 | `providers.openai.cache_read_multiplier` | `0.5` | Cost weight for provider-reported cached input tokens (OpenAI bills cache reads at ~50%) |
-| `providers.openai.discount_pct` | `50` | Legacy cached-prefix discount % (savings reporting) |
+| `providers.openai.discount_pct` | `50` | **Legacy, inert.** A modelled discount that was never checked against the provider response; G21 no longer publishes it. Cost now uses the measured `cache_read_multiplier` / `cache_write_multiplier` |
+| `providers.openai.cache_write_multiplier` | `1.0` | Cost weight for provider-reported cache-WRITE (creation) tokens. OpenAI does not surcharge writes |
 | `providers.anthropic.marker` | `false` | Inject `cache_control` markers (requires Anthropic adapter). Tenant-overridable — set `true` per Claude-heavy tenant to capture the 90% discount. |
 | `providers.anthropic.cache_read_multiplier` | `0.1` | Anthropic bills cache reads at ~10% |
-| `providers.anthropic.discount_pct` | `90` | Legacy cached-prefix discount % (savings reporting) |
+| `providers.anthropic.discount_pct` | `90` | **Legacy, inert** (see above). Notably it claimed a 90% discount even with `marker: false`, i.e. when nothing was cached |
+| `providers.anthropic.cache_write_multiplier` | `1.25` | Anthropic bills 5-minute cache creation at ~1.25x the input rate |
+| `providers.anthropic.cache_write_multiplier_1h` | `2.0` | 1-hour cache creation is dearer (~2x); applied to the split litellm reports |
 | `providers.gemini.cache_read_multiplier` | `0.25` | Gemini implicit-cache hits bill at ~25% |
+| `providers.gemini.cache_write_multiplier` | `1.0` | No per-write token charge: implicit caching is free to populate, explicit caching bills storage per token-hour |
 
 ### context_editing
 Anthropic-native context editing — clears stale tool results / thinking blocks server-side as context fills. Per-tenant opt-in; the OpenAI/Gemini adapters treat it as a no-op, so it is safe to leave enabled cluster-wide and switch on per Claude-routed tenant (`tenants.<id>.groups.context_editing`).
