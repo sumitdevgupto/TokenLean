@@ -23,6 +23,24 @@ date changes.
 
 ## 2026-09-03
 
+### Embed a document once, not once per app — Enhancement (OSS)
+
+Apps inside one tenant already shared a vector collection, but the sharing stopped at
+storage: every ingest re-encoded identical content from scratch, and nothing anywhere cached
+a vector. Re-indexing an unchanged corpus paid the full encode again, and a second app
+indexing the same document paid it a third time.
+
+Two changes, both invisible to results:
+- **Unchanged content is skipped.** Each chunk stores a hash of its text, so re-ingesting a
+  document that has not changed does no work at all instead of re-encoding and re-writing it.
+- **Vectors are cached per tenant, keyed by content.** Identical text encodes once, however
+  many chunks, queries or apps ask for it. The cache is tenant-scoped like every other key,
+  and a cache outage simply falls back to computing.
+
+Embeddings are deterministic for a given model and text, so a cache hit returns a
+byte-identical vector — this can only skip work, never change what retrieval returns, and
+that is asserted rather than assumed.
+
 ### One stored copy instead of a copy per app — Enhancement (OSS + Enterprise)
 
 Context Compression & Reuse is available again. It parks a large recurring block once and

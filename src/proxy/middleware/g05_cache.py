@@ -852,7 +852,8 @@ class G05Cache:
             logger.warning("G05 step cache store failed: %s", exc)
 
 
-async def _embed(text: str, model_name: str = _DEFAULT_L2_EMBEDDING_MODEL) -> list:
+async def _embed(text: str, model_name: str = _DEFAULT_L2_EMBEDDING_MODEL,
+                 prefix: str = "") -> list:
     """Embed text using sentence-transformers (local, no API call).
 
     Model name is config-driven via G5_cache.l2_embedding_model.
@@ -861,14 +862,14 @@ async def _embed(text: str, model_name: str = _DEFAULT_L2_EMBEDDING_MODEL) -> li
     ``model.encode`` is a synchronous, CPU-bound call (and a cold load is 1–2s).
     Run it in a worker thread so it does not block the event loop and stall every
     other in-flight request behind this one embedding.
+    Vectors are cached per tenant and keyed by content hash (embedding_cache), so the same
+    query text asked twice - by the same app or a different one in the tenant - is encoded
+    once. Embeddings are deterministic for a given (model, text), so this can only skip
+    work, never change a retrieval result.
     """
-    from ml_models import get_sentence_transformer
+    from embedding_cache import embed_cached
 
-    def _encode() -> list:
-        model = get_sentence_transformer(model_name)
-        return model.encode(text).tolist()
-
-    return await asyncio.to_thread(_encode)
+    return await embed_cached(text, model_name, prefix=prefix)
 
 
 # Guard so the cache_l2 schema self-heal runs at most once per process.
@@ -957,7 +958,8 @@ async def _l2_lookup(ctx: "RequestContext", threshold: float, embedding_model: s
         )
         return None, 0.0
 
-    embedding = await _embed(query_text, embedding_model)
+    embedding = await _embed(query_text, embedding_model,
+                             prefix=getattr(ctx, "redis_prefix", ""))
 
     # asyncpg has no built-in pgvector codec — pass embedding as a string
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
@@ -1006,7 +1008,8 @@ async def _l2_store(ctx: "RequestContext", response: Dict, ttl: int, embedding_m
         )
         return
 
-    embedding = await _embed(query_text, embedding_model)
+    embedding = await _embed(query_text, embedding_model,
+                             prefix=getattr(ctx, "redis_prefix", ""))
 
     # asyncpg has no built-in pgvector codec — pass embedding as a string
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"

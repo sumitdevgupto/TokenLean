@@ -21,9 +21,12 @@ _PGVECTOR_URL = os.getenv("DATABASE_URL", "")
 class PGVectorRAG:
     """PostgreSQL/pgvector fallback RAG retrieval."""
     
-    def __init__(self, dsn: Optional[str] = None):
+    def __init__(self, dsn: Optional[str] = None, redis_prefix: str = ""):
         self.dsn = dsn or _PGVECTOR_URL
         self._pool: Optional[asyncpg.Pool] = None
+        # Scopes the embedding cache, like every other Redis key in the proxy. Empty is
+        # the default tenant, matching the convention in tenancy/context.py.
+        self._prefix = redis_prefix
     
     async def _get_pool(self) -> Optional[asyncpg.Pool]:
         """Lazy-init connection pool."""
@@ -60,6 +63,11 @@ class PGVectorRAG:
                 )
             """)
             
+            # Delta-sync key: lets add_chunk skip re-embedding content that has not
+            # changed. Self-healed here because the table may predate this column.
+            await conn.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS content_hash TEXT")
+
             # Create indexes
             await conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{table_name}_embedding 
@@ -163,27 +171,42 @@ class PGVectorRAG:
             return False
         
         try:
-            # Generate embedding — shared loader (cached singleton + HF_HUB_OFFLINE guard so
-            # the baked model loads without an HF-CDN metadata call that hangs under VPC egress).
-            from ml_models import get_sentence_transformer
-            model = get_sentence_transformer("all-MiniLM-L6-v2")
-            embedding = model.encode(text).tolist()
-            
+            from embedding_cache import content_hash, embed_cached
+
+            digest = content_hash(text)
+
             async with pool.acquire() as conn:
+                # Skip unchanged content entirely. Re-ingesting a corpus used to re-encode
+                # every chunk unconditionally, so an unchanged document cost a full pass on
+                # each run - and a second app indexing the same document paid it again.
+                existing = await conn.fetchval(
+                    f"SELECT content_hash FROM {table_name} WHERE chunk_id = $1", chunk_id)
+                if existing and existing == digest:
+                    logger.debug("PGVector add_chunk: %s unchanged, skipping embed", chunk_id)
+                    return True
+
+                # Cached, content-addressed embedding: identical text encodes once per
+                # tenant, however many chunks or apps reference it.
+                embedding = await embed_cached(
+                    text, "all-MiniLM-L6-v2", prefix=self._prefix)
+
                 await conn.execute(
                     f"""
-                    INSERT INTO {table_name} (chunk_id, text, embedding, metadata, search_vector)
-                    VALUES ($1, $2, $3::vector, $4, to_tsvector($2))
+                    INSERT INTO {table_name} (chunk_id, text, embedding, metadata,
+                                              search_vector, content_hash)
+                    VALUES ($1, $2, $3::vector, $4, to_tsvector($2), $5)
                     ON CONFLICT (chunk_id) DO UPDATE SET
                         text = EXCLUDED.text,
                         embedding = EXCLUDED.embedding,
                         metadata = EXCLUDED.metadata,
-                        search_vector = EXCLUDED.search_vector
+                        search_vector = EXCLUDED.search_vector,
+                        content_hash = EXCLUDED.content_hash
                     """,
                     chunk_id,
                     text,
                     embedding,
                     json.dumps(metadata or {}),
+                    digest,
                 )
                 return True
                 
