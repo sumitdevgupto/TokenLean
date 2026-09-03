@@ -37,6 +37,32 @@ date changes.
 -->
 
 
+### Context-budget compaction is lossy from rung 3, not just rung 4 — Bug fix
+
+The G26 documentation marked only `rungs.drop` (rung 4, opt-in, default off) as lossy, which
+reads as "leave drop off and nothing is lost". That is not true: rung 3 (`summarize`, **on by
+default**) replaces the old span with a cheap-model summary, and a summary keeps the gist rather
+than every detail. Measured 2026-09-03 — with `rungs.drop` off, `compress+summarize` cut a
+compacted policy document from 2,588 to 259 tokens and the model could then no longer answer a
+question about a value that existed only in that span, answering confidently on a normal 200.
+
+No behaviour change: compaction always worked this way and the trade is the point of a budget
+backstop. What was wrong was the disclosure, and an operator could reasonably have enabled G26
+believing the defaults were lossless. README and the config reference now say so, and point at
+`keep_recent_turns` / `target_pct` — or G28, whose reference comes back verbatim — when details
+in older turns must survive.
+
+### Ablation arms are now graded for answer quality, not just the all-on arm — Bug fix
+
+The measurement harness gated `all-on` against `all-off` and nothing else, so a per-technique
+savings figure could come from a run whose answers were wrong. Found with a live instance: one
+technique was credited with 84% savings on an arm that had lost the fact it was asked about,
+invisible because the combined arm recovered it. Every arm's own answers are now checked against
+its own baseline with the existing deterministic fact check (no extra model calls, no extra run
+cost); a figure from an arm that dropped a fact is recorded and reported, never averaged into a
+published number. No customer-facing behaviour changes — this is the harness that produces our
+published figures holding itself to the standard it already applied to the headline.
+
 ### Context Compression & Reuse now has a measured, two-sided savings figure — Enhancement (OSS)
 
 G28 (Context Compression & Reuse) shipped with its savings honestly marked "not measured". It now
