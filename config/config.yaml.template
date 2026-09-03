@@ -1188,7 +1188,19 @@ groups:
     enabled: false
     min_tokens: 300                # replace string content blocks at/above this token count
     ttl_seconds: 86400
+    # Advertised only to callers that ALREADY send tools: injecting tool definitions
+    # into every request would churn the cached prefix (tools are part of it) and could
+    # make a pass-through model emit tool_calls its client never asked for.
     expose_mcp_tools: true
+    # The store is Redis-backed and CONTENT-ADDRESSED (key = sha256 of the content), so
+    # identical content from different apps in one tenant resolves to a single stored
+    # copy and concurrent writers are idempotent by construction.
+    # Send full content until a client has PROVEN it can resolve a reference; the proxy
+    # also refuses to substitute at all when the durable store is unreachable, because
+    # an unresolvable reference degrades the answer on a request that still bills 200.
+    require_proven_resolver: true
+    # Cap on model-supplied text accepted into the shared store.
+    max_store_chars: 200000
     compress_system_prompt: false  # keep false — the system instruction must stay verbatim
                                    # (the model can't resolve a CCR ref for it in pass-through)
   G27_multimodal:

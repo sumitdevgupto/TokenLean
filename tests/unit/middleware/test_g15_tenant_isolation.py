@@ -43,7 +43,11 @@ def _ctx(tenant_id):
         request_id=f"req-{tenant_id}", user_id="u", original_messages=[], messages=[],
         model="gpt-4o-mini", routed_model="gpt-4o-mini", params={},
         config={"groups": {"G15_server_compute": {"enabled": True, "headroom_mcp_server": True},
-                           "G28_ccr": {"ttl_seconds": 60}}},
+                           # G15 now refuses to execute a CCR tool that G28 itself would
+                           # not run: it previously consulted neither `enabled` nor the
+                           # store-availability guard, so it could dispatch into a store
+                           # the owning group had disabled.
+                           "G28_ccr": {"enabled": True, "ttl_seconds": 60}}},
         tenant_id=tenant_id, redis_prefix=f"t:{tenant_id}:",
         # These tests are about the STORE's tenant scoping, which only matters for a
         # dispatch that is allowed to happen at all. Authorization is a separate
@@ -56,6 +60,31 @@ def _ctx(tenant_id):
                               model_requested="gpt-4o-mini", routed_model="gpt-4o-mini",
                               baseline_tokens=10),
     )
+
+
+class _FakeRedis:
+    """CCR now requires a DURABLE store and refuses to substitute without one, so these
+    isolation tests need a working store rather than the old process-memory dict."""
+
+    def __init__(self):
+        self.data = {}
+
+    async def set(self, key, value, ex=None):
+        self.data[key] = value
+
+    async def get(self, key):
+        return self.data.get(key)
+
+
+@pytest.fixture(autouse=True)
+def _durable_store(monkeypatch):
+    import middleware.g28_ccr as g28
+    r = _FakeRedis()
+    monkeypatch.setattr("cache.redis_pool.get_redis", lambda: r)
+    g28._local_store.clear()
+    g28._stats.clear()
+    g28._resolvers_proven.clear()
+    return r
 
 
 async def _dispatch(ctx, name, args):
@@ -83,7 +112,10 @@ class TestCcrStoreIsTenantScoped:
 
     async def test_store_keys_carry_the_tenant_prefix(self):
         await _dispatch(_ctx("acme"), "headroom_compress", {"text": SECRET})
-        assert all(k.startswith("t:acme:") for k in _local_store), (
+        # Non-vacuous: an empty store would make the all() below trivially true, which is
+        # exactly how this could pass while storing nothing at all.
+        assert _local_store, "nothing was stored, so the key-shape assertion proves nothing"
+        assert all(k.startswith("t:acme:ccr:") for k in _local_store), (
             f"unprefixed keys are readable by every tenant: {list(_local_store)}"
         )
 
@@ -93,3 +125,37 @@ class TestCcrStoreIsTenantScoped:
         await _dispatch(_ctx("acme"), "headroom_compress", {"text": SECRET})
         await _dispatch(_ctx("globex"), "headroom_compress", {"text": SECRET})
         assert len(_local_store) == 2, f"tenant stores collided: {list(_local_store)}"
+
+
+class TestG15HonoursCcrAvailability:
+    """G15 must not execute a CCR tool that G28 itself would refuse to run.
+
+    G15 ships ENABLED by default while G28 does not, and it used to consult neither the
+    group's `enabled` flag nor the store-availability guard — the only thing keeping it
+    dormant was that ctx.ccr_tools_injected is set solely by G28. One stray assignment of
+    that flag was therefore enough to start dispatching into a store the owning group had
+    disabled, or that was unavailable entirely.
+    """
+
+    async def test_refuses_when_g28_is_disabled(self):
+        ctx = _ctx("acme")
+        ctx.config["groups"]["G28_ccr"]["enabled"] = False
+        result = await _dispatch(ctx, "headroom_compress", {"text": SECRET})
+        assert "error" in result
+        assert "ref" not in result
+
+    async def test_refuses_even_though_tools_look_injected(self):
+        """ccr_tools_injected is an authorization signal, not an availability one."""
+        ctx = _ctx("acme")
+        ctx.config["groups"]["G28_ccr"]["enabled"] = False
+        ctx.ccr_tools_injected = True
+        result = await _dispatch(ctx, "headroom_retrieve", {"ref": "[CCR:" + "a" * 64 + "]"})
+        assert "error" in result
+
+    async def test_both_dispatch_sites_share_one_tool_name_set(self):
+        """Two copies of the same frozenset had already drifted in intent: G28's comment
+        claimed G15 imported it while G15 kept its own."""
+        from middleware.g15_server_compute import _HEADROOM_MCP_TOOLS
+        from middleware.g28_ccr import _CCR_MCP_TOOLS
+        assert _HEADROOM_MCP_TOOLS is _CCR_MCP_TOOLS
+

@@ -30,6 +30,7 @@ Technique (two-part):
 Config key: G28_ccr
 """
 import hashlib
+import time
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,34 +54,58 @@ _ccr_retrieve_fn = None
 
 # ─── Content store ────────────────────────────────────────────────────────────
 #
-# NOT a "fallback". `ctx.redis_client` is never assigned anywhere in the codebase (dead
-# since initial import), so this in-process dict is the ONLY store CCR has ever used.
-# That makes the feature unsafe to enable, and the guard below refuses to run it:
+# Redis-backed and content-addressed, with a bounded in-process read-through cache in
+# front (same shape as g26_context_budget's summary cache). Two properties make this safe
+# where the previous in-process dict was not:
 #
-#   * a [CCR:ref] is resolvable only on the instance that created it, so any deployment
-#     with more than one instance fails cross-turn retrieves ~(1 - 1/N) of the time;
-#   * `--min-instances=0` tears the instance down when idle, so even a single-instance
-#     deployment loses parked content across a pause — an agent that waits on a human
-#     comes back to an empty store;
-#   * the `ttl` argument is honoured only on the (never-taken) Redis branch, so nothing
-#     expires and nothing is evicted, while `headroom_compress` writes model-supplied
-#     text of arbitrary length;
-#   * a miss returns `{"error": "Reference not found"}` with NO metric and only a debug
-#     log, so the request is a billed HTTP 200 and the model quietly answers from
-#     whatever it remembers instead of the content it parked.
+#   * DURABLE — a [CCR:ref] resolves after a restart, an idle scale-to-zero, and from any
+#     instance. The old store was a module-level dict, so a reference died with the process
+#     that made it and a cross-turn retrieve failed silently on a billed 200.
+#   * CONTENT-ADDRESSED — the key IS sha256(value), so concurrent writers of identical
+#     content write identical bytes to the same key. Writes are idempotent by construction,
+#     which is what removes the concurrency problem a shared cross-artefact cache would
+#     otherwise have, and it means a second artefact sending the same document reuses the
+#     first one's block instead of storing its own copy.
 #
-# Wiring Redis in naively makes it strictly WORSE: these helpers are sync while
-# `cache/redis_pool.get_redis()` is async, so `setex` would write nothing and `get` would
-# return a coroutine object treated as the stored text. Fixing this properly is
-# `internal-docs/demand-driven-features.md` #28 (+ #29 for the 8-char ref collisions).
-# Flip _STORE_IS_DURABLE only as part of that work.
-_STORE_IS_DURABLE = False
+# If the durable store is unreachable we REFUSE TO SUBSTITUTE (see `_store`) rather than
+# falling back to process memory: a reference nothing can resolve is worse than sending the
+# content, because the request still bills as a 200 while the answer quietly degrades.
+_STORE_IS_DURABLE = True
 
 
-_local_store: Dict[str, str] = {}
+_local_store: Dict[str, Tuple[float, str]] = {}
 # hits/misses per tenant prefix. A single global pair was readable by any tenant via
 # headroom_stats (see that branch below).
 _stats: Dict[str, Dict[str, int]] = {}
+
+
+# Tenants observed actually resolving a CCR reference. A client only earns reference
+# substitution by demonstrating it can resolve one — see the handshake note in
+# process_request. Process-local and intentionally so: it is a conservative gate, and the
+# worst case of "forgot after a restart" is one honest full-content turn, whereas the worst
+# case of wrongly assuming capability is a silently degraded answer.
+_resolvers_proven: Dict[str, float] = {}
+_RESOLVER_PROOF_TTL = 3600.0
+
+
+def _resolver_proven(prefix: str) -> bool:
+    seen = _resolvers_proven.get(prefix)
+    return seen is not None and (time.time() - seen) < _RESOLVER_PROOF_TTL
+
+
+def _mark_resolver_proven(prefix: str) -> None:
+    """Called when a client successfully resolves a reference — it has an agent loop."""
+    _resolvers_proven[prefix] = time.time()
+
+
+def _record_miss(prefix: str) -> None:
+    """Count an unresolvable reference. Silent misses are why this failure used to look
+    like a model-quality problem instead of a storage problem."""
+    try:
+        from middleware.g18_observability import CCR_MISSES
+        CCR_MISSES.labels(tenant_id=(prefix or "default").strip(":") or "default").inc()
+    except Exception:
+        pass
 
 
 def _stats_for(prefix: str = "") -> Dict[str, int]:
@@ -88,6 +113,15 @@ def _stats_for(prefix: str = "") -> Dict[str, int]:
 
 
 _UNAVAILABLE_LOGGED = False
+
+
+def ccr_available(cfg: Dict[str, Any], ctx) -> bool:
+    """Public alias — is CCR both configured on AND safe to run for this request?
+
+    G15 auto-executes CCR tools and must ask the same question G28 asks, rather than
+    inferring it from a flag G28 happens to set.
+    """
+    return _ccr_enabled(cfg, ctx)
 
 
 def _ccr_enabled(cfg: Dict[str, Any], ctx) -> bool:
@@ -138,41 +172,102 @@ _REF_SUFFIX = "]"
 
 
 def _make_ref(sha: str) -> str:
-    return f"{_REF_PREFIX}{sha[:8]}{_REF_SUFFIX}"
+    """Reference token carrying the FULL sha256.
+
+    It used to carry only ``sha[:8]`` — 32 bits — and retrieval scanned for the first
+    insertion-order key with that prefix. Two blocks colliding on 8 hex chars (~1.2% at 10k
+    stored blocks) meant the model was handed a DIFFERENT document with a hit counted and
+    no error anywhere. The full sha makes retrieval an exact keyed GET: nothing to collide
+    with, nothing to scan, and no need to verify after the fact (backlog #29).
+    """
+    return f"{_REF_PREFIX}{sha}{_REF_SUFFIX}"
 
 
 def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _store_key(prefix: str, sha: str) -> str:
+    """Content-addressed, tenant-scoped key.
+
+    The key IS the hash of the value, so concurrent writers of identical content write
+    identical bytes to the same key — writes are idempotent by construction and there is no
+    lost-update to coordinate. That is what makes a shared cross-artefact store tractable
+    here rather than a distributed-systems project.
+
+    The tenant prefix is not optional: without it an 8-char reference used to resolve to
+    another tenant's block, and the default tenant's prefix is the EMPTY string, so a
+    ``startswith(prefix)`` scan matched every tenant's keys. Exact keys end that whole class.
+    """
+    return f"{prefix}ccr:{sha}"
+
+
 # ─── Storage helpers ─────────────────────────────────────────────────────────
+#
+# Redis-first with a BOUNDED in-process read-through cache, mirroring the proven shape in
+# g26_context_budget (_cached_summary_get/_local_cache_get). The local dict is a cache and
+# never the system of record: a reference that only exists in one process's memory cannot
+# be resolved by the next request, which is the failure that kept CCR switched off.
 
-def _store(redis_client: Optional[Any], key: str, text: str, ttl: int, prefix: str = "") -> None:
-    # WS21: prefix (t:<tenant>:) scopes both stores — without it any tenant could
-    # retrieve another tenant's stored blocks via an 8-char [CCR:...] reference.
-    if redis_client is not None:
-        try:
-            redis_client.setex(f"{prefix}ccr:{key}", ttl, text)
-            return
-        except Exception as exc:
-            logger.debug("G28 Redis store failed: %s — using local fallback", exc)
-    _local_store[f"{prefix}{key}"] = text
+_LOCAL_STORE_MAX = 512
 
 
-def _retrieve_stored(redis_client: Optional[Any], key: str, prefix: str = "") -> Optional[str]:
-    if redis_client is not None:
-        try:
-            val = redis_client.get(f"{prefix}ccr:{key}")
-            if val is not None:
-                _stats_for(prefix)["hits"] += 1
-                return val.decode() if isinstance(val, bytes) else val
-        except Exception as exc:
-            logger.debug("G28 Redis retrieve failed: %s — falling back to local", exc)
-    val = _local_store.get(f"{prefix}{key}")
-    if val is not None:
-        _stats_for(prefix)["hits"] += 1
-    else:
-        _stats_for(prefix)["misses"] += 1
+def _local_get(key: str) -> Optional[str]:
+    entry = _local_store.get(key)
+    if not entry:
+        return None
+    expires_at, value = entry
+    if expires_at <= time.time():
+        _local_store.pop(key, None)
+        return None
+    return value
+
+
+def _local_put(key: str, value: str, ttl: int) -> None:
+    """Expiry-aware put with purge-then-evict. The old dict honoured neither the ttl arg
+    nor any size cap, so a long-lived proxy accumulated model-supplied text forever."""
+    now = time.time()
+    for k in [k for k, (exp, _) in _local_store.items() if exp <= now]:
+        _local_store.pop(k, None)
+    while len(_local_store) >= _LOCAL_STORE_MAX:
+        oldest = min(_local_store, key=lambda k: _local_store[k][0])
+        _local_store.pop(oldest, None)
+    _local_store[key] = (now + max(1, ttl), value)
+
+
+async def _store(key: str, text: str, ttl: int, prefix: str = "") -> bool:
+    """Persist one content block. Returns True only if it reached the DURABLE store.
+
+    The caller must not substitute a reference when this returns False: a reference the
+    model cannot resolve later is worse than sending the content, because the request still
+    bills as a 200 while the answer quietly degrades.
+    """
+    full_key = _store_key(prefix, key)
+    try:
+        from cache.redis_pool import get_redis
+        await get_redis().set(full_key, text, ex=max(1, ttl))
+        _local_put(full_key, text, ttl)
+        return True
+    except Exception as exc:
+        logger.warning("G28 CCR durable store unavailable, refusing to substitute: %s", exc)
+        return False
+
+
+async def _retrieve_stored(key: str, prefix: str = "") -> Optional[str]:
+    full_key = _store_key(prefix, key)
+    cached = _local_get(full_key)
+    if cached is not None:
+        return cached
+    try:
+        from cache.redis_pool import get_redis
+        raw = await get_redis().get(full_key)
+    except Exception as exc:
+        logger.debug("G28 CCR retrieve failed: %s", exc)
+        return None
+    if raw is None:
+        return None
+    val = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    _local_put(full_key, val, 300)
     return val
 
 
@@ -230,37 +325,52 @@ def _build_mcp_tools() -> List[Dict[str, Any]]:
 
 # ─── Request-side content replacement ────────────────────────────────────────
 
-def _replace_content(
+async def _replace_content(
     content: str,
-    redis_client: Optional[Any],
     min_tokens: int,
     model: str,
     ttl: int,
     prefix: str = "",
+    may_substitute: bool = False,
 ) -> Tuple[str, bool]:
-    """Return (possibly_replaced_content, was_replaced)."""
+    """Return (possibly_replaced_content, was_replaced).
+
+    Storing and substituting are deliberately separate decisions:
+
+    * we ALWAYS store (cheap, content-addressed, deduplicates across artefacts — a second
+      app sending the same document reuses the first one's block rather than writing its
+      own copy);
+    * we substitute a reference ONLY when ``may_substitute`` says the caller has proven it
+      can resolve one, and only when the block actually reached the durable store.
+
+    That separation is the fix for the 2026-06-30 regression, where a reference replaced a
+    676-token system prompt in a pass-through completion that had no agent loop to call
+    ``headroom_retrieve`` — the model answered from generic knowledge on a billed 200.
+    """
     if estimate_tokens(content, model) < min_tokens:
         return content, False
 
     sha = _sha256_hex(content)
-    ref = _make_ref(sha)
 
-    # Check if it's already stored (repeat content → only one storage round-trip)
-    existing = _retrieve_stored(redis_client, sha, prefix=prefix)
-    if existing is None:
-        _store(redis_client, sha, content, ttl, prefix=prefix)
+    # Already stored? Content-addressed, so a hit means an identical block exists — no
+    # second write, and the miss counter is NOT bumped: a first-sight store is not a
+    # failed retrieval, and conflating them made headroom_stats unreadable.
+    existing = await _retrieve_stored(sha, prefix=prefix)
+    stored = True if existing is not None else await _store(sha, content, ttl, prefix=prefix)
 
-    return ref, True
+    if not (may_substitute and stored):
+        return content, False
+    return _make_ref(sha), True
 
 
-def _process_messages(
+async def _process_messages(
     messages: List[Dict],
-    redis_client: Optional[Any],
     min_tokens: int,
     model: str,
     ttl: int,
     compress_system: bool = False,
     prefix: str = "",
+    may_substitute: bool = False,
 ) -> Tuple[List[Dict], int, int]:
     """Walk messages and replace large text blocks with CCR references.
 
@@ -286,8 +396,9 @@ def _process_messages(
 
         if isinstance(content, str) and role in compressible_roles:
             t_before = estimate_tokens(content, model)
-            new_content, replaced = _replace_content(
-                content, redis_client, min_tokens, model, ttl, prefix=prefix)
+            new_content, replaced = await _replace_content(
+                content, min_tokens, model, ttl, prefix=prefix,
+                may_substitute=may_substitute)
             t_after = estimate_tokens(new_content, model)
             tokens_before += t_before
             tokens_after += t_after
@@ -305,12 +416,12 @@ def _process_messages(
 
 # ─── MCP tool dispatch ────────────────────────────────────────────────────────
 
-def dispatch_mcp_tool(
+async def dispatch_mcp_tool(
     tool_name: str,
     arguments: Dict[str, Any],
-    redis_client: Optional[Any] = None,
     ttl: int = 86400,
     prefix: str = "",
+    max_store_chars: int = 200_000,
 ) -> Any:
     """Dispatch a CCR MCP tool call; return the tool result as a JSON-serialisable value."""
     if tool_name == "headroom_compress":
@@ -318,44 +429,44 @@ def dispatch_mcp_tool(
         call_ttl = arguments.get("ttl", ttl)
         if not text:
             return {"error": "text is required"}
+        # Cap model-supplied input. This writes arbitrary-length text the model chose into
+        # shared storage; unbounded, one caller can fill the store for everyone.
+        if len(text) > max_store_chars:
+            return {"error": f"text exceeds {max_store_chars} characters"}
         sha = _sha256_hex(text)
-        ref = _make_ref(sha)
-        _store(redis_client, sha, text, call_ttl, prefix=prefix)
-        return {"ref": ref, "sha256": sha, "original_len": len(text)}
+        if not await _store(sha, text, call_ttl, prefix=prefix):
+            return {"error": "CCR store unavailable"}
+        return {"ref": _make_ref(sha), "sha256": sha, "original_len": len(text)}
 
     if tool_name == "headroom_retrieve":
         ref = arguments.get("ref", "")
-        if not ref.startswith(_REF_PREFIX):
+        if not ref.startswith(_REF_PREFIX) or not ref.endswith(_REF_SUFFIX):
             return {"error": f"Invalid CCR reference: {ref!r}"}
-        sha_prefix = ref[len(_REF_PREFIX):-len(_REF_SUFFIX)]
-        # Find matching key — scans stay INSIDE the tenant prefix (WS21): a short
-        # 8-char reference must never resolve to another tenant's stored block.
-        if redis_client is not None:
-            try:
-                val = redis_client.get(f"{prefix}ccr:{sha_prefix}")
-                if val is None:
-                    # Try full SHA scan — sha_prefix is only 8 chars
-                    for key in _local_store:
-                        if key.startswith(prefix) and key[len(prefix):].startswith(sha_prefix):
-                            return {"text": _local_store[key]}
-                    return {"error": "Reference not found"}
-                _stats_for(prefix)["hits"] += 1
-                return {"text": val.decode() if isinstance(val, bytes) else val}
-            except Exception:
-                pass
-        for key in _local_store:
-            if key.startswith(prefix) and key[len(prefix):].startswith(sha_prefix):
-                _stats_for(prefix)["hits"] += 1
-                return {"text": _local_store[key]}
-        _stats_for(prefix)["misses"] += 1
-        return {"error": "Reference not found"}
+        sha = ref[len(_REF_PREFIX):-len(_REF_SUFFIX)]
+        # Exact keyed GET on the full sha — no prefix scan. The old scan returned the first
+        # insertion-order match on 8 hex chars, so a collision silently handed the model a
+        # DIFFERENT document; and because the default tenant's prefix is the empty string,
+        # `startswith(prefix)` matched every tenant's keys.
+        if len(sha) != 64 or not all(c in "0123456789abcdef" for c in sha):
+            return {"error": f"Invalid CCR reference: {ref!r}"}
+        val = await _retrieve_stored(sha, prefix=prefix)
+        if val is None:
+            _stats_for(prefix)["misses"] += 1
+            # A miss used to be a debug log and nothing else, on a billed 200 — so the model
+            # answered from its own earlier paraphrase and the failure presented as a
+            # model-quality problem. Make it loud and countable.
+            _record_miss(prefix)
+            logger.warning("G28 CCR reference not found (prefix=%s): %s", prefix, ref)
+            return {"error": "Reference not found"}
+        _stats_for(prefix)["hits"] += 1
+        # Proof of capability: this caller runs a retrieve loop, so later turns may receive
+        # references instead of full content.
+        _mark_resolver_proven(prefix)
+        return {"text": val}
 
     if tool_name == "headroom_stats":
-        # Tenant-scoped. These were process-global: len(_local_store) and a single
-        # module-level _stats counted every tenant sharing the process, so polling
-        # this tool across turns leaked co-tenants' request volume, block-size
-        # distribution and activity timing. Same isolation family as the prefix bug
-        # above; the counters are keyed by prefix for the same reason the store is.
+        # Tenant-scoped: a single process-global counter leaked co-tenants' request volume,
+        # block-size distribution and activity timing to anyone polling this tool.
         tenant_stats = _stats_for(prefix)
         return {
             "local_store_size": sum(1 for k in _local_store if k.startswith(prefix)),
@@ -402,11 +513,24 @@ class G28CCR:
         # the model can't resolve a CCR reference (no agent loop). Opt in only for
         # clients that run the retrieve loop.
         compress_system: bool = cfg.get("compress_system_prompt", False)
-        redis_client = getattr(ctx, "redis_client", None)
+        prefix = getattr(ctx, "redis_prefix", "")
 
-        new_messages, tokens_before, tokens_after = _process_messages(
-            ctx.messages, redis_client, min_tokens, ctx.routed_model, ttl, compress_system,
-            prefix=getattr(ctx, "redis_prefix", ""),
+        # ── Resolve-capability handshake ────────────────────────────────────────
+        # NEVER substitute a reference the caller cannot resolve. A [CCR:ref] is only
+        # resolvable by a client that runs an agent loop and calls headroom_retrieve; in a
+        # pass-through completion nothing does, so substitution silently strips the very
+        # content the answer depends on and the model improvises — on a billed 200.
+        #
+        # A caller earns substitution by demonstrating it: the first turn stores the block
+        # and sends the content IN FULL, and only once we have actually observed that
+        # tenant resolving a reference do later turns get the savings. Storing regardless
+        # is what makes that first turn cheap for everyone afterwards, including a second
+        # artefact sending the same document.
+        may_substitute = _resolver_proven(prefix) if cfg.get("require_proven_resolver", True) else True
+
+        new_messages, tokens_before, tokens_after = await _process_messages(
+            ctx.messages, min_tokens, ctx.routed_model, ttl, compress_system,
+            prefix=prefix, may_substitute=may_substitute,
         )
 
         if tokens_after < tokens_before:
@@ -429,9 +553,16 @@ class G28CCR:
                 ctx.request_id, tokens_before, tokens_after,
             )
 
-        # Inject MCP tools when enabled so the LLM can call retrieve/compress
-        if cfg.get("expose_mcp_tools", True):
-            existing_tools = ctx.params.get("tools") or []
+        # Inject MCP tools when enabled so the LLM can call retrieve/compress.
+        #
+        # Only for callers that ALREADY send tools. Injecting three tool definitions into
+        # every request would (a) change the tool block, which is part of the cached prefix,
+        # churning the very prefix G21 stabilises; (b) add tokens to requests that can never
+        # use them; and (c) hand tools to a pass-through caller that sent none, so the model
+        # may emit tool_calls it never asked for. "Already sends tools" is the same
+        # is-this-a-stateful-agent test the resolve handshake uses.
+        existing_tools = ctx.params.get("tools") or []
+        if cfg.get("expose_mcp_tools", True) and existing_tools:
             ccr_tools = _build_mcp_tools()
             ccr_names = {t["function"]["name"] for t in ccr_tools}
             merged = [t for t in existing_tools if t.get("function", {}).get("name") not in ccr_names]
@@ -453,7 +584,6 @@ class G28CCR:
         if not _ccr_enabled(cfg, ctx):
             return response
 
-        redis_client = getattr(ctx, "redis_client", None)
         ttl: int = cfg.get("ttl_seconds", 86400)
 
         choices = response.get("choices", [])
@@ -476,8 +606,11 @@ class G28CCR:
                     arguments = json.loads(fn.get("arguments", "{}"))
                 except json.JSONDecodeError:
                     arguments = {}
-                result = dispatch_mcp_tool(tool_name, arguments, redis_client, ttl,
-                                           prefix=getattr(ctx, "redis_prefix", ""))
+                result = await dispatch_mcp_tool(
+                    tool_name, arguments, ttl,
+                    prefix=getattr(ctx, "redis_prefix", ""),
+                    max_store_chars=int(cfg.get("max_store_chars", 200_000)),
+                )
                 tc["function"]["result"] = result
                 logger.debug("[%s] G28 MCP tool %s → %r", ctx.request_id, tool_name, result)
 

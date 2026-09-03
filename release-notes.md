@@ -23,6 +23,38 @@ date changes.
 
 ## 2026-09-03
 
+### One stored copy instead of a copy per app — Enhancement (OSS + Enterprise)
+
+Context Compression & Reuse is available again. It parks a large recurring block once and
+sends a short reference in its place, so an agent that keeps returning to the same runbook,
+contract or spec pays for it once rather than on every turn.
+
+It was switched off because its store lived in a single process's memory: a reference died
+with the instance that made it, and a later turn failed silently on a request that still
+billed as a success. The store is now Redis-backed and **content-addressed** — the key is a
+hash of the content itself. That gives three things at once: references survive restarts and
+scale to any number of instances; two apps in the same tenant sending the same document
+resolve to **one** stored copy instead of each keeping their own; and concurrent writers of
+identical content are idempotent by construction, which is the hard part of any shared cache.
+
+Answer quality is protected by refusing to be clever:
+- a reference is **never** substituted for a client that has not demonstrated it can fetch
+  one back — until then the full content is sent, and stored anyway so later turns are cheap;
+- if the durable store is unreachable, nothing is substituted at all;
+- the CCR tools are offered only to callers that already send tools, so ordinary
+  request/response traffic is untouched;
+- system prompts are still left alone unless explicitly opted in.
+
+Also fixed along the way: references carried only 8 characters of the hash and were resolved
+by scanning, so a collision could return a **different** document with no error anywhere; the
+default tenant's scan matched every tenant's keys; the auto-execution path did not check
+whether the feature was available at all; an unresolvable reference was a debug log rather
+than a warning; and the in-memory store honoured neither its expiry nor any size limit.
+
+- **OSS:** the durable content-addressed store, the resolve handshake, exact-key retrieval,
+  and a new ablation dataset (DS22) that fails its quality gate if a reference does not resolve.
+- **[Enterprise]:** the portal toggle and its knobs — <https://tokenlean.cbeyond.cloud/>
+
 ### Stop re-paying to build the same prompt cache every turn — Enhancement (OSS + Enterprise)
 
 Provider prompt caches match from the first token and stop at the first byte that differs.

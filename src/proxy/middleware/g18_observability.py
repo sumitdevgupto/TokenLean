@@ -57,6 +57,11 @@ CACHE_WRITE_TOKENS = Counter(
     "Provider prompt-cache WRITE/creation tokens (billed at full rate or a premium)",
     ["model", "team", "feature", "tenant_id"],
 )
+CCR_MISSES = Counter(
+    "token_opt_ccr_reference_misses_total",
+    "CCR references the model asked for that could not be resolved (answer quality risk)",
+    ["tenant_id"],
+)
 EFFECTIVE_TOKENS = Counter(
     "token_opt_effective_tokens_total",
     "Effective token cost (ET metric)",

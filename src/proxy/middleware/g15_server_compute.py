@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 GROUP = "G15"
 
 # Headroom MCP tool names dispatched server-side by G15
-_HEADROOM_MCP_TOOLS = frozenset({"headroom_compress", "headroom_retrieve", "headroom_stats"})
+# ONE definition, imported from G28 rather than duplicated. The two copies had already
+# drifted in intent: G28's comment claimed G15 imported it while G15 kept its own.
+from middleware.g28_ccr import _CCR_MCP_TOOLS as _HEADROOM_MCP_TOOLS
 
 
 def authorize_dispatch(ctx: RequestContext, tool_name: str):
@@ -71,7 +73,7 @@ class G15ServerCompute:
                     if reason:
                         record_dispatch_block(ctx, fn_name, reason)
                         continue
-                    _dispatch_headroom_tool(tc, ctx)
+                    await _dispatch_headroom_tool(tc, ctx)
                     continue
 
                 # ── Config-driven hooks (existing logic) ─────────────────────
@@ -98,24 +100,32 @@ class G15ServerCompute:
         return response
 
 
-def _dispatch_headroom_tool(tc: Dict, ctx: RequestContext) -> None:
+async def _dispatch_headroom_tool(tc: Dict, ctx: RequestContext) -> None:
     """Dispatch a headroom_* tool call server-side and store result in tc."""
-    from middleware.g28_ccr import dispatch_mcp_tool
+    from middleware.g28_ccr import ccr_available, dispatch_mcp_tool
     fn = tc.get("function", {})
     tool_name = fn.get("name", "")
     try:
         arguments = json.loads(fn.get("arguments", "{}") or "{}")
     except (json.JSONDecodeError, TypeError):
         arguments = {}
-    redis_client = getattr(ctx, "redis_client", None)
-    ttl = resolve_group_config(ctx, "G28_ccr").get("ttl_seconds", 86400)
-    # `prefix` is NOT optional here. Omitting it defaults to "" — and the retrieve path
-    # then scans with `key.startswith("")`, which is true of every key, so an 8-char
-    # [CCR:...] reference resolved to ANY tenant's stored block. G28's own call site
-    # passes it (g28_ccr.py, WS21); this one silently did not, and G15 is the path that
-    # ships enabled by default while G28 does not.
-    result = dispatch_mcp_tool(tool_name, arguments, redis_client, ttl,
-                               prefix=getattr(ctx, "redis_prefix", ""))
+    cfg = resolve_group_config(ctx, "G28_ccr")
+    # G15 must not execute a CCR tool that G28 itself would refuse to run. This path ships
+    # ENABLED by default while G28 does not, and it previously consulted neither the
+    # group's `enabled` flag nor the store-availability guard — the only thing keeping it
+    # dormant was that ctx.ccr_tools_injected is set solely by G28. That made a single
+    # stray flag assignment enough to start dispatching into an unavailable store.
+    if not ccr_available(cfg, ctx):
+        fn["result"] = {"error": "CCR is not available"}
+        logger.debug("[%s] G15 refused %s: CCR unavailable", ctx.request_id, tool_name)
+        return
+    ttl = cfg.get("ttl_seconds", 86400)
+    # `prefix` is NOT optional here: it is what scopes the store to one tenant.
+    result = await dispatch_mcp_tool(
+        tool_name, arguments, ttl,
+        prefix=getattr(ctx, "redis_prefix", ""),
+        max_store_chars=int(cfg.get("max_store_chars", 200_000)),
+    )
     fn["result"] = result
     logger.debug("[%s] G15 headroom MCP server: %s → %r", ctx.request_id, tool_name, result)
 
