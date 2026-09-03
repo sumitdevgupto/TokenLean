@@ -36,6 +36,26 @@ date changes.
 -->
 
 
+### Claude requests no longer fail when the proxy itself enables extended thinking — Bug fix
+
+When the reasoning-budget optimisation turns on Claude's extended thinking, Anthropic rejects
+any temperature but 1 — so a caller's perfectly valid `temperature: 0` came back as a 502
+Bad Gateway naming neither the parameter nor the model. The caller's request was valid when
+they sent it; the proxy made it invalid, so the proxy now owns the fix: when it enables
+thinking it drops the incompatible sampling settings (`temperature`, `top_p`, `top_k`) —
+dropped, not rewritten, since Anthropic's own default under thinking is the only accepted
+value anyway. A request where thinking is not enabled keeps the caller's settings untouched.
+
+### A reference the model re-formats is still a valid reference — Bug fix
+
+Models copying a `[CCR:...]` handle out of a prompt often re-emit it without the brackets —
+they read the delimiters as markup. The lookup demanded the exact wrapper, so a byte-perfect
+64-character hash was refused for formatting alone; the model retried, failed again, and
+improvised an answer on a request that returned 200. References are now parsed tolerantly
+(`[CCR:<hash>]`, `CCR:<hash>`, or the bare hash), while the actual security property is
+unchanged: exactly 64 hex characters and an exact keyed lookup, so truncated or forged
+handles are refused exactly as before.
+
 ### A shortened reference is never sent to a caller that cannot expand it — Bug fix
 
 Context Compression & Reuse offers its lookup tools only to callers that already send tools.

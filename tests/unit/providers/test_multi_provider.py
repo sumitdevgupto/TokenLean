@@ -316,3 +316,49 @@ class TestAllTenProvidersRouteSmoke:
         cfg = {"name": name, "api_base": "https://x.example", "api_version": "2024-10-21"}
         m, _kw = get_adapter_by_name(name).build_call(model, cfg, "K")
         assert m == expect
+
+
+class TestThinkingSamplingReconciliation:
+    """The proxy turns thinking ON (G12/G25), which invalidates the caller's temperature.
+
+    Anthropic: "temperature may only be set to 1 when thinking is enabled". The caller's
+    `temperature: 0` was valid when they sent it and became invalid because of us, so the
+    proxy owns the reconciliation. Left alone it surfaces as a 502 Bad Gateway that names
+    neither the parameter nor the model - which is exactly how it presented when DS22 was
+    pinned to claude-haiku-4-5 on 2026-09-03 and every request failed upstream.
+    """
+
+    @staticmethod
+    def _adapter():
+        from providers.anthropic_adapter import AnthropicAdapter
+        return AnthropicAdapter()
+
+    def test_temperature_is_dropped_when_thinking_is_on(self):
+        params = {"temperature": 0, "thinking": {"type": "enabled", "budget_tokens": 2048}}
+        out = self._adapter().cap_reasoning_params(params, max_tokens=4096)
+        assert "temperature" not in out
+        assert out["thinking"]["budget_tokens"] == 2048, "the budget must survive untouched"
+
+    def test_top_p_and_top_k_go_too(self):
+        params = {"top_p": 0.1, "top_k": 5, "thinking": {"type": "enabled", "budget_tokens": 2048}}
+        out = self._adapter().cap_reasoning_params(params, max_tokens=4096)
+        assert "top_p" not in out and "top_k" not in out
+
+    def test_sampling_survives_when_thinking_is_off(self):
+        """Only the conflict is resolved. A plain Claude call keeps the caller's settings."""
+        out = self._adapter().cap_reasoning_params({"temperature": 0}, max_tokens=4096)
+        assert out["temperature"] == 0
+
+    def test_sampling_survives_when_thinking_was_stripped_for_a_small_budget(self):
+        """max_tokens <= 1024 removes thinking entirely, so there is no conflict left."""
+        params = {"temperature": 0, "thinking": {"type": "enabled", "budget_tokens": 2048},
+                  "reasoning_effort": "high"}
+        out = self._adapter().cap_reasoning_params(params, max_tokens=512)
+        assert "thinking" not in out and out["temperature"] == 0
+
+    def test_applies_when_no_max_tokens_was_given(self):
+        """The early `if not max_tokens` return skipped the whole method - and an omitted
+        max_tokens is the common case for a chat caller."""
+        params = {"temperature": 0, "thinking": {"type": "enabled", "budget_tokens": 2048}}
+        out = self._adapter().cap_reasoning_params(params, max_tokens=None)
+        assert "temperature" not in out

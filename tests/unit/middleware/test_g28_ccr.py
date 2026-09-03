@@ -609,3 +609,48 @@ class TestToolsAreOnlyOfferedToAgenticCallers:
         assert "headroom_retrieve" in names
         assert "search" in names, "the caller own tools must survive"
         assert out.ccr_tools_injected is True
+
+
+class TestReferenceParsingToleratesModelFormatting:
+    """The security property is the 64-hex exact-key lookup, not the brackets.
+
+    A model copying `[CCR:<sha>]` out of a prompt re-emits it in whatever shape it considers
+    clean - it reads the delimiters as markup. On 2026-09-03 DS22 thread 02 called
+    headroom_retrieve TWICE with `"CCR:01bbfa2c..."`, was refused both times for the missing
+    brackets alone, then improvised an answer - on a billed 200, with a sha that was perfectly
+    correct. Sibling threads that happened to keep the brackets resolved and answered right.
+    """
+
+    SHA = "a" * 64
+
+    def _parse(self, ref):
+        from middleware.g28_ccr import _sha_from_ref
+        return _sha_from_ref(ref)
+
+    def test_the_canonical_form_works(self):
+        assert self._parse(f"[CCR:{self.SHA}]") == self.SHA
+
+    def test_brackets_are_optional(self):
+        assert self._parse(f"CCR:{self.SHA}") == self.SHA
+
+    def test_a_bare_sha_works(self):
+        assert self._parse(self.SHA) == self.SHA
+
+    def test_surrounding_whitespace_is_ignored(self):
+        assert self._parse(f"  [CCR:{self.SHA}]  ") == self.SHA
+
+    def test_case_is_normalised(self):
+        assert self._parse(f"[CCR:{self.SHA.upper()}]") == self.SHA
+
+    def test_a_short_hash_is_still_refused(self):
+        """#29: 8-char refs resolved by SCANNING returned a DIFFERENT document on collision.
+        Tolerating the wrapper must not reopen that."""
+        assert self._parse(f"[CCR:{'a' * 8}]") is None
+
+    def test_non_hex_is_refused(self):
+        assert self._parse(f"[CCR:{'z' * 64}]") is None
+
+    def test_junk_is_refused(self):
+        assert self._parse("") is None
+        assert self._parse(None) is None
+        assert self._parse("the runbook") is None

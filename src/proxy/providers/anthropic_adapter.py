@@ -1,7 +1,10 @@
 import copy
+import logging
 from typing import Any, Dict, List, Optional
 
 from providers import ProviderAdapter, register_adapter
+
+logger = logging.getLogger(__name__)
 
 _THINKING_DEFAULTS = {"low": 1024, "medium": 4096, "high": 16000}
 
@@ -121,9 +124,33 @@ class AnthropicAdapter(ProviderAdapter):
         budget = tier_cfg.get("anthropic_tokens", _THINKING_DEFAULTS.get(tier, 1024))
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
 
+    # Anthropic rejects any temperature but 1 once thinking is enabled:
+    #   "temperature may only be set to 1 when thinking is enabled"
+    _THINKING_INCOMPATIBLE_PARAMS = ("temperature", "top_p", "top_k")
+
+    def _reconcile_thinking_sampling(self, params: Dict) -> Dict:
+        """Drop sampling params Anthropic forbids once thinking is on.
+
+        The proxy is what turned thinking on (G12/G25 -> map_reasoning_effort), so the caller's
+        `temperature: 0` was valid when they sent it and became invalid because of us. Left
+        alone it surfaces as a 502 Bad Gateway naming neither the parameter nor the model.
+        Dropping rather than forcing `1` avoids fabricating an intent the caller never
+        expressed: Anthropic's own default under thinking IS 1, so the outcome is identical
+        and the request stays honest about what was asked for.
+        """
+        if not isinstance(params.get("thinking"), dict):
+            return params
+        dropped = [k for k in self._THINKING_INCOMPATIBLE_PARAMS if k in params]
+        for key in dropped:
+            params.pop(key, None)
+        if dropped:
+            logger.debug("Anthropic: dropped %s — incompatible with thinking", dropped)
+        return params
+
     def cap_reasoning_params(self, params: Dict, max_tokens: Optional[int]) -> Dict:
         """Keep ``thinking.budget_tokens`` strictly below ``max_tokens`` — Anthropic 400s
-        when ``max_tokens <= thinking.budget_tokens``.
+        when ``max_tokens <= thinking.budget_tokens`` — and drop the sampling params
+        Anthropic forbids alongside thinking.
 
         If ``max_tokens`` is too small to fit Anthropic's 1024-token minimum thinking
         budget, drop reasoning entirely — including a stray ``reasoning_effort`` (which
@@ -132,17 +159,18 @@ class AnthropicAdapter(ProviderAdapter):
         the same 400 even after the explicit ``thinking`` param is removed.
         """
         if not max_tokens:
-            return params
+            return self._reconcile_thinking_sampling(params)
         # Can't fit the 1024-token minimum budget → strip both the explicit `thinking`
         # AND `reasoning_effort` so litellm neither receives an oversized budget nor
         # re-derives one from the effort string.
         if max_tokens <= 1024:
             params.pop("thinking", None)
             params.pop("reasoning_effort", None)
-            return params
+            return params          # thinking removed → the caller's sampling params stand
         thinking = params.get("thinking")
         if not isinstance(thinking, dict):
             return params
+        params = self._reconcile_thinking_sampling(params)
         budget = thinking.get("budget_tokens")
         if budget is None or budget < max_tokens:
             return params

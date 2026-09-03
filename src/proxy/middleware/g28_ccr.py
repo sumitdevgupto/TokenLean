@@ -201,6 +201,33 @@ _REF_PREFIX = "[CCR:"
 _REF_SUFFIX = "]"
 
 
+def _sha_from_ref(ref: str) -> Optional[str]:
+    """Extract the sha from a reference the MODEL typed back, tolerating its formatting.
+
+    The security property is the 64-hex exact-key lookup, not the decorative brackets. A model
+    copying `[CCR:<sha>]` out of a prompt reasonably often re-emits it as `CCR:<sha>` or as the
+    bare hash - it reads the delimiters as markup. Rejecting those cost a real answer: on
+    2026-09-03 DS22 thread 02 called headroom_retrieve twice with `"CCR:01bbfa2c..."`, was
+    refused both times for the missing brackets alone, and the model then improvised - on a
+    billed 200, with a 64-hex sha that was perfectly correct.
+
+    This does NOT loosen #29: that was 8-char prefixes resolved by SCANNING, where a collision
+    returned a different document. Exactly 64 hex characters and an exact keyed GET are still
+    required; only the wrapper is optional.
+    """
+    if not isinstance(ref, str):
+        return None
+    candidate = ref.strip()
+    if candidate.startswith(_REF_PREFIX) and candidate.endswith(_REF_SUFFIX):
+        candidate = candidate[len(_REF_PREFIX):-len(_REF_SUFFIX)]
+    elif candidate.upper().startswith("CCR:"):
+        candidate = candidate[4:]
+    candidate = candidate.strip().strip("[]").strip()
+    if len(candidate) != 64 or not all(c in "0123456789abcdef" for c in candidate.lower()):
+        return None
+    return candidate.lower()
+
+
 def _make_ref(sha: str) -> str:
     """Reference token carrying the FULL sha256.
 
@@ -470,15 +497,14 @@ async def dispatch_mcp_tool(
 
     if tool_name == "headroom_retrieve":
         ref = arguments.get("ref", "")
-        if not ref.startswith(_REF_PREFIX) or not ref.endswith(_REF_SUFFIX):
+        sha = _sha_from_ref(ref)
+        if sha is None:
             return {"error": f"Invalid CCR reference: {ref!r}"}
-        sha = ref[len(_REF_PREFIX):-len(_REF_SUFFIX)]
         # Exact keyed GET on the full sha — no prefix scan. The old scan returned the first
         # insertion-order match on 8 hex chars, so a collision silently handed the model a
         # DIFFERENT document; and because the default tenant's prefix is the empty string,
-        # `startswith(prefix)` matched every tenant's keys.
-        if len(sha) != 64 or not all(c in "0123456789abcdef" for c in sha):
-            return {"error": f"Invalid CCR reference: {ref!r}"}
+        # `startswith(prefix)` matched every tenant's keys. _sha_from_ref enforces the
+        # 64-hex requirement, so anything reaching here is exact-lookup-safe.
         val = await _retrieve_stored(sha, prefix=prefix)
         if val is None:
             _stats_for(prefix)["misses"] += 1
