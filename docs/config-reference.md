@@ -586,6 +586,11 @@ Reorders messages so shared prefixes are contiguous for provider auto-caching, *
 |---|---|---|
 | `enabled` | `true` | Enable prefix-cache alignment + cache policy |
 | `providers.openai.auto` | `true` | Reorder for OpenAI prefix caching |
+| `stabilise.enabled` | `false` | Relocate volatile spans out of the cached prefix so it stays byte-stable across turns. Needs `patterns` to do anything |
+| `stabilise.patterns` | `[]` | Operator-supplied regexes matching volatile content (timestamps, session ids). **Operator-only on purpose** — a wrong pattern silently relocates the wrong span, and it looks identical to a stabiliser that never fires |
+| `stabilise.relocate_to` | `trailing_system` | The only supported target. Never the first user turn: G05's L2 store recomputes its semantic key from post-G21 user turns, so writing there would desynchronise store from lookup |
+| `stabilise.max_relocated_chars` | `2000` | Budget for relocated content. An over-budget span is left in place rather than truncated — a partial identifier reaching the model is worse than an unstable prefix |
+| `prefix_profile` | `""` | Pin the provider cache-shard key so several artefacts sharing a system prompt land on ONE cached copy instead of each building their own. Per-request override: `X-Prefix-Profile` header |
 | `providers.openai.prompt_cache_key` | `true` | Emit a deterministic, tenant-scoped `prompt_cache_key` (pure upside; set `false` to disable) |
 | `providers.openai.prompt_cache_key_len` | `32` | Hex chars of the sha256 cache key |
 | `providers.openai.prompt_cache_retention` | *(unset)* | Optional OpenAI cache retention (`"24h"` \| `"in-memory"`); unset = provider default |

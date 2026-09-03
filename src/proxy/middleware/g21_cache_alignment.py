@@ -15,7 +15,8 @@ Technique:
 """
 import copy
 import logging
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext, resolve_group_config
 from middleware import langfuse_tracing
@@ -32,6 +33,92 @@ GROUP = "G21"
 # system-first reordering here. Revisit as a dedicated enhancement if measured.
 
 
+
+
+_RELOCATION_HEADER = "Request-specific values (excluded from the cached prefix):"
+
+
+def _compile_patterns(patterns: List[str]) -> List[Any]:
+    """Compile operator-supplied volatility patterns, skipping (and logging) bad ones.
+
+    A malformed regex must not take the request down, and it must not silently behave as
+    "matches nothing" either — that would look exactly like a working stabiliser that
+    never fires, which is the failure mode hardest to notice on a cost line.
+    """
+    compiled = []
+    for pat in patterns or []:
+        try:
+            compiled.append(re.compile(pat))
+        except re.error as exc:
+            logger.warning("G21 stabilise: ignoring invalid pattern %r (%s)", pat, exc)
+    return compiled
+
+
+def _stabilise_system_messages(
+    system_msgs: List[Dict[str, Any]],
+    patterns: List[Any],
+    max_chars: int,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Excise volatile spans from system content and return them for relocation.
+
+    Provider prompt caches match from token 0 and stop at the first byte that differs, so
+    one changing value early in a system prompt (a timestamp, a session id) invalidates the
+    entire cached prefix behind it: the turn pays a full cache WRITE instead of a discounted
+    read, at an identical token count. Removing the span from the prefix and re-emitting it
+    AFTER the cached block keeps the prefix byte-stable while the model still sees the value.
+
+    Relocation, never deletion or rewriting: the content is preserved verbatim. Deleting a
+    timestamp the prompt depends on would be a correctness bug wearing a savings costume.
+    """
+    if not patterns:
+        return system_msgs, []
+
+    relocated: List[str] = []
+    budget = max_chars
+    out: List[Dict[str, Any]] = []
+    for msg in system_msgs:
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            out.append(msg)
+            continue
+        spans: List[Tuple[int, int]] = []
+        for rx in patterns:
+            for m in rx.finditer(content):
+                if m.end() > m.start():
+                    spans.append((m.start(), m.end()))
+        if not spans:
+            out.append(msg)
+            continue
+        # Longest-span-wins over overlaps, then excise back-to-front so earlier indices
+        # stay valid while cutting.
+        spans.sort(key=lambda sp: (sp[0], -(sp[1] - sp[0])))
+        merged: List[Tuple[int, int]] = []
+        for start, end in spans:
+            if merged and start < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        new_content = content
+        taken: List[str] = []
+        for start, end in reversed(merged):
+            fragment = content[start:end]
+            if budget - len(fragment) < 0:
+                # Over budget: leave this span in place rather than relocating a partial
+                # value. A truncated identifier reaching the model would be worse than an
+                # unstable prefix.
+                continue
+            budget -= len(fragment)
+            taken.append(fragment)
+            new_content = new_content[:start] + new_content[end:]
+        if not taken:
+            out.append(msg)
+            continue
+        relocated.extend(reversed(taken))
+        cleaned = re.sub(r"[ 	]{2,}", " ", new_content).strip()
+        copied = dict(msg)
+        copied["content"] = cleaned
+        out.append(copied)
+    return out, relocated
 
 
 def _resolve_g21_cfg(ctx: RequestContext) -> Dict[str, Any]:
@@ -70,6 +157,37 @@ class G21CacheAlignment:
         # Partition messages into stable prefix vs variable suffix
         system_msgs = [m for m in messages if m.get("role") == "system"]
         variable_msgs = [m for m in messages if m.get("role") != "system"]
+
+        # ── Prefix stabilisation (#33) ───────────────────────────────────────────
+        # Must run BEFORE align_prefix AND before _apply_cache_policy: the latter hashes
+        # the concatenated system CONTENT into OpenAI's prompt_cache_key, so a volatile
+        # span breaks caching twice over — the prefix bytes stop matching AND the request
+        # is routed to a different cache shard. Stabilising first fixes both.
+        stab_cfg = cfg.get("stabilise") or {}
+        relocated: List[str] = []
+        if stab_cfg.get("enabled", False):
+            try:
+                patterns = _compile_patterns(stab_cfg.get("patterns") or [])
+                system_msgs, relocated = _stabilise_system_messages(
+                    system_msgs, patterns,
+                    int(stab_cfg.get("max_relocated_chars", 2000)),
+                )
+                if relocated:
+                    # Trailing system message ONLY. Never the first user turn: G05's L2
+                    # store recomputes its semantic key from post-G21 USER turns, so
+                    # prepending there would desynchronise store-from-lookup and poison
+                    # the semantic cache.
+                    note = _RELOCATION_HEADER + " " + " ".join(relocated)
+                    variable_msgs = variable_msgs + [{"role": "system", "content": note}]
+                    ctx.messages = system_msgs + variable_msgs
+                    logger.debug(
+                        "[%s] G21 stabilised prefix: relocated %d volatile span(s)",
+                        ctx.request_id, len(relocated),
+                    )
+            except Exception as exc:
+                # Never fail a request over a cost optimisation.
+                logger.warning("[%s] G21 stabilise failed: %s", ctx.request_id, exc)
+                relocated = []
 
         # Provider-specific prefix alignment lives on the adapter (no provider-name
         # branching here): OpenAI reorders system-first, Anthropic injects cache_control,
@@ -145,11 +263,26 @@ class G21CacheAlignment:
         adapter = ctx.provider_adapter
         if adapter is None:
             return
-        parts: List[str] = []
-        for m in system_msgs:
-            content = m.get("content", "")
-            parts.append(content if isinstance(content, str) else str(content))
-        cache_seed = "".join(parts) or "default"
+        # Shared prefix profile (#33, cross-artefact): several internal artefacts that
+        # share a system prompt should land on ONE provider cache shard instead of each
+        # paying to build their own copy. Today convergence is accidental — the seed is the
+        # concatenated system content, so prompts differing by a word get different shards.
+        # An explicit profile makes it deliberate: every caller declaring the same profile
+        # keys the same shard. It pins the KEY only; it cannot make genuinely different
+        # prefixes match, so pair it with `stabilise` when artefacts still show writes.
+        profile = (
+            ctx.params.get("x_prefix_profile")
+            or cfg.get("prefix_profile")
+            or ""
+        )
+        if profile:
+            cache_seed = f"profile:{profile}"
+        else:
+            parts: List[str] = []
+            for m in system_msgs:
+                content = m.get("content", "")
+                parts.append(content if isinstance(content, str) else str(content))
+            cache_seed = "".join(parts) or "default"
         tenant_id = getattr(ctx, "tenant_id", "default") or "default"
         try:
             policy = adapter.cache_policy_params(ctx.routed_model, tenant_id, cache_seed, cfg)

@@ -23,6 +23,31 @@ date changes.
 
 ## 2026-09-03
 
+### Stop re-paying to build the same prompt cache every turn — Enhancement (OSS + Enterprise)
+
+Provider prompt caches match from the first token and stop at the first byte that differs.
+One changing value early in a system prompt — a timestamp, a session id, a rotating build
+number — therefore invalidates the entire cached prefix behind it: the turn is billed as a
+full cache **write** instead of a discounted read, with an identical token count. Nothing in
+the product addressed this; G21 reordered a prefix that then failed to match anyway.
+
+Two configurable additions, both default-off and byte-identical until enabled:
+- **Prefix stabilisation** relocates operator-nominated volatile spans out of the cached
+  prefix and re-attaches them immediately after it. Nothing is deleted or reworded — the
+  model still sees every value; only its position changes. Patterns stay operator-owned
+  because a wrong one silently moves the wrong text.
+- **Shared prefix profile** lets several internal apps declare they share a prompt, so they
+  converge on one provider cache shard instead of each paying to build a private copy.
+  Set per tenant, or per request with an `X-Prefix-Profile` header.
+
+Verified the honest way: two turns differing only in a timestamp now produce a byte-identical
+prefix *and* an identical cache-shard key, with a control proving they genuinely diverge when
+the feature is off.
+
+- **OSS:** the stabilisation and profile engines, config, and a readiness probe.
+- **[Enterprise]:** a portal switch for stabilisation, and the cache read/write split that
+  shows it worked — <https://tokenlean.cbeyond.cloud/>
+
 ### Cache reads *and* writes are now measured, priced and reported — Bug fix
 
 Cost reporting credited the provider cache half that is **discounted** (reads) and tracked

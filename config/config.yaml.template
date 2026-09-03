@@ -1108,6 +1108,28 @@ groups:
     schedule: weekly
   G21_cache_alignment:
     enabled: true
+    # Prefix stabilisation (#33). Provider prompt caches match from token 0 and stop at
+    # the first differing byte, so ONE volatile value early in a system prompt (a
+    # timestamp, a session id) invalidates the whole cached prefix: every turn pays a full
+    # cache WRITE instead of a discounted read, at an identical token count.
+    # Matched spans are RELOCATED to a trailing system message, never deleted or rewritten
+    # - the model still sees them, the prefix stays byte-stable. Patterns are
+    # operator-supplied on purpose: the proxy must not guess which value is safe to move.
+    # Default off => byte-identical.
+    stabilise:
+      enabled: false
+      patterns: []
+      #   - '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z'   # ISO-8601 timestamps
+      #   - 'session[-_ ]?id[:=]\s*\S+'                # session identifiers
+      relocate_to: trailing_system   # the only supported target (see docs)
+      max_relocated_chars: 2000
+    # Shared prefix profile (#33, cross-artefact). Several internal apps that share a
+    # system prompt should land on ONE provider cache shard instead of each paying to
+    # build its own copy. Without this, convergence is accidental: the shard key is
+    # derived from system content, so prompts differing by a word never share a cache.
+    # Set per tenant, or per request via the X-Prefix-Profile header. Empty = today's
+    # content-derived behaviour.
+    prefix_profile: ""
     providers:
       openai:
         auto: true

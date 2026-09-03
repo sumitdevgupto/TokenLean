@@ -493,3 +493,190 @@ async def test_skips_when_cache_hit():
     result = await G21CacheAlignment().process_request(ctx)
     assert result.messages == msgs
     assert "prompt_cache_key" not in result.params
+
+
+# ── #33 prefix stabilisation ────────────────────────────────────────────────
+
+from providers.openai_adapter import OpenAIAdapter
+
+
+def _stabilise_cfg(patterns, enabled=True, max_chars=2000, **kw):
+    cfg = _make_config(**kw)
+    cfg["groups"]["G21_cache_alignment"]["stabilise"] = {
+        "enabled": enabled, "patterns": patterns,
+        "relocate_to": "trailing_system", "max_relocated_chars": max_chars,
+    }
+    return cfg
+
+
+_TS = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
+
+
+def _turn(ts, question):
+    return [
+        {"role": "system", "content": f"You are Acme support. Current time: {ts}. Be concise."},
+        {"role": "user", "content": question},
+    ]
+
+
+class TestPrefixStabilisation:
+    """A volatile value early in a system prompt invalidates the whole cached prefix, so
+    every turn pays a full cache WRITE instead of a discounted read — at an identical token
+    count. Relocating it out of the prefix fixes that without hiding anything from the model.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prefix_becomes_byte_stable_across_turns(self):
+        cfg = _stabilise_cfg([_TS])
+        outs = []
+        for ts in ("2026-09-03T10:00:00Z", "2026-09-03T11:30:00Z"):
+            ctx = _make_ctx(_turn(ts, "What are the SLA tiers?"), config=cfg,
+                            provider_adapter=OpenAIAdapter())
+            res = await G21CacheAlignment().process_request(ctx)
+            outs.append(res.messages[0]["content"])
+        assert outs[0] == outs[1], "the cached prefix still differs between turns"
+        assert "2026-09-03" not in outs[0]
+
+    @pytest.mark.asyncio
+    async def test_prompt_cache_key_is_identical_across_turns(self):
+        """The cheapest possible proof the fix works — and it needs no provider call.
+
+        Drift breaks caching TWICE: the prefix bytes stop matching, and the seed feeding
+        OpenAI's prompt_cache_key changes, sending the request to a different shard.
+        """
+        cfg = _stabilise_cfg([_TS])
+        keys = []
+        for ts in ("2026-09-03T10:00:00Z", "2026-09-03T11:30:00Z"):
+            ctx = _make_ctx(_turn(ts, "Same question"), config=cfg,
+                            provider_adapter=OpenAIAdapter())
+            res = await G21CacheAlignment().process_request(ctx)
+            keys.append(res.params["prompt_cache_key"])
+        assert keys[0] == keys[1], "volatile span still reaches the cache-shard key"
+
+    @pytest.mark.asyncio
+    async def test_unstabilised_control_really_does_drift(self):
+        """Guards against a vacuous pass: without the fix, the keys MUST differ."""
+        cfg = _stabilise_cfg([_TS], enabled=False)
+        keys = []
+        for ts in ("2026-09-03T10:00:00Z", "2026-09-03T11:30:00Z"):
+            ctx = _make_ctx(_turn(ts, "Same question"), config=cfg,
+                            provider_adapter=OpenAIAdapter())
+            res = await G21CacheAlignment().process_request(ctx)
+            keys.append(res.params["prompt_cache_key"])
+        assert keys[0] != keys[1]
+
+    @pytest.mark.asyncio
+    async def test_relocated_content_still_reaches_the_model(self):
+        """Relocation, not deletion — dropping a value the prompt depends on would be a
+        correctness bug in a savings costume."""
+        ts = "2026-09-03T10:00:00Z"
+        ctx = _make_ctx(_turn(ts, "Q"), config=_stabilise_cfg([_TS]),
+                        provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        assert any(ts in (m.get("content") or "") for m in res.messages), (
+            "the volatile value was dropped instead of relocated")
+
+    @pytest.mark.asyncio
+    async def test_relocation_target_is_a_trailing_system_message(self):
+        """Never the first user turn: G05's L2 store recomputes its semantic key from
+        post-G21 USER turns, so writing there would desynchronise store from lookup."""
+        ts = "2026-09-03T10:00:00Z"
+        ctx = _make_ctx(_turn(ts, "Q"), config=_stabilise_cfg([_TS]),
+                        provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        assert res.messages[-1]["role"] == "system"
+        assert ts in res.messages[-1]["content"]
+        user_turns = [m for m in res.messages if m.get("role") == "user"]
+        assert all(ts not in m["content"] for m in user_turns), "user turns must be untouched"
+
+    @pytest.mark.asyncio
+    async def test_disabled_is_byte_identical(self):
+        msgs = _turn("2026-09-03T10:00:00Z", "Q")
+        ctx = _make_ctx(copy.deepcopy(msgs), config=_stabilise_cfg([_TS], enabled=False),
+                        provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        assert [m["content"] for m in res.messages] == [m["content"] for m in msgs]
+
+    @pytest.mark.asyncio
+    async def test_invalid_pattern_is_skipped_not_fatal(self):
+        ctx = _make_ctx(_turn("2026-09-03T10:00:00Z", "Q"),
+                        config=_stabilise_cfg(["(unclosed", _TS]),
+                        provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        assert "2026-09-03" not in res.messages[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_oversized_span_is_left_in_place_not_truncated(self):
+        """A truncated identifier reaching the model is worse than an unstable prefix."""
+        ctx = _make_ctx(_turn("2026-09-03T10:00:00Z", "Q"),
+                        config=_stabilise_cfg([_TS], max_chars=2),
+                        provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        assert "2026-09-03T10:00:00Z" in res.messages[0]["content"]
+
+
+class TestSharedPrefixProfile:
+    """Cross-artefact convergence: artefacts declaring one profile share a cache shard
+    instead of each paying to build their own copy."""
+
+    @pytest.mark.asyncio
+    async def _key_for(self, system_text, profile=None):
+        cfg = _make_config()
+        if profile:
+            cfg["groups"]["G21_cache_alignment"]["prefix_profile"] = profile
+        ctx = _make_ctx([{"role": "system", "content": system_text},
+                         {"role": "user", "content": "Q"}],
+                        config=cfg, provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        return res.params["prompt_cache_key"]
+
+    @pytest.mark.asyncio
+    async def test_same_profile_converges_divergent_prompts(self):
+        a = await self._key_for("You are Acme support. Be concise.", profile="support-v1")
+        b = await self._key_for("You are Acme support. Be brief.", profile="support-v1")
+        assert a == b, "artefacts sharing a profile must share one cache shard"
+
+    @pytest.mark.asyncio
+    async def test_different_profiles_stay_separate(self):
+        a = await self._key_for("Same prompt.", profile="support-v1")
+        b = await self._key_for("Same prompt.", profile="billing-v1")
+        assert a != b
+
+    @pytest.mark.asyncio
+    async def test_no_profile_keeps_content_derived_key(self):
+        a = await self._key_for("Prompt A")
+        b = await self._key_for("Prompt B")
+        assert a != b
+
+
+class TestStabilisationRespectsG05CacheKeys:
+    """G21 mutates ctx.messages AFTER G05 computed its lookup key, which is safe only
+    because of two properties. Stabilisation must not break either.
+
+    1. L1 memoises its key on ctx.params["_g05_l1_cache_key"] at lookup and reuses it at
+       store, so post-G21 edits cannot split store from lookup.
+    2. L2's semantic text is built from USER turns only — which is exactly why relocation
+       targets a trailing SYSTEM message and never the first user turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_l1_memoised_key_is_untouched(self):
+        ctx = _make_ctx(_turn("2026-09-03T10:00:00Z", "Q"), config=_stabilise_cfg([_TS]),
+                        provider_adapter=OpenAIAdapter())
+        ctx.params["_g05_l1_cache_key"] = "t:acme:tok_opt:l1:precomputed"
+        res = await G21CacheAlignment().process_request(ctx)
+        assert res.params["_g05_l1_cache_key"] == "t:acme:tok_opt:l1:precomputed", (
+            "G21 must never disturb the memoised L1 key — the store path reuses it")
+
+    @pytest.mark.asyncio
+    async def test_l2_semantic_text_is_unchanged_by_stabilisation(self):
+        """L2 recomputes its query text from post-G21 messages at STORE time. If
+        stabilisation altered user turns, store and lookup would key differently and the
+        semantic cache would quietly fill with unreachable entries."""
+        from middleware.g05_cache import _semantic_query_text
+        msgs = _turn("2026-09-03T10:00:00Z", "What are the SLA tiers?")
+        before = _semantic_query_text(copy.deepcopy(msgs))
+        ctx = _make_ctx(msgs, config=_stabilise_cfg([_TS]), provider_adapter=OpenAIAdapter())
+        res = await G21CacheAlignment().process_request(ctx)
+        assert _semantic_query_text(res.messages) == before
+
