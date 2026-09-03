@@ -37,6 +37,25 @@ date changes.
 -->
 
 
+### Deployment readiness no longer reports a healthy proxy as broken — Bug fix
+
+A full readiness run against a live, healthy proxy reported 16 optimisation stages as "never
+executed" and returned NOT READY. Nothing was wrong with the proxy. The check compares a metrics
+snapshot from before and after the run, and the proxy serves metrics from two worker processes
+that each count separately — so the two snapshots came from different workers and the second
+looked *smaller* than the first. A counter cannot go backwards, so that difference was never
+evidence of anything.
+
+The check now recognises that signature and reports "metrics unusable, cannot confirm from
+metrics" instead of asserting a stage did not run, and continues to judge each stage on the
+per-request evidence in the response, which is unaffected. This mattered because the failure was
+invisible in normal use: a readiness run immediately after a deploy reads near-empty counters, so
+it always passed there and only misfired against a proxy that had already served traffic.
+
+Follow-on, tracked separately: the same worker split means Prometheus-derived dashboards and
+alerts are computed from an oscillating series. Billing is not affected — invoices are computed
+from the request ledger in Postgres, not from these counters.
+
 ### Feature-proof datasets no longer enter the blended savings headline — Bug fix
 
 Our published savings figure is blended over the datasets that pass the quality gate. Two
