@@ -36,6 +36,20 @@ date changes.
 -->
 
 
+### A document inside a tool result is no longer destroyed by structured pruning — Bug fix
+
+Structured pruning treats a JSON payload as data to compact. But a tool result carrying a
+document — `{"text": "<the whole runbook>"}`, one of the most common tool-output shapes — is
+prose in an envelope, and the JSON compactor reduced an 11,492-character document to **45
+characters** in the live deployment. The failure chain was invisible end to end: the model
+asked for the document, the proxy fetched it, pruning destroyed it in transit, and the model
+answered from memory on a request that returned 200. Payloads dominated by a single long
+string are now compressed as the prose they are (11,492 → 1,534 characters with every checked
+fact intact, verified against the same live compactor), genuinely structured JSON keeps the
+strong compaction path, and a payload that resists safe compression is kept whole — content
+beats tokens. Found by a quality-gated ablation whose planted facts vanished only when this
+group was in the chain.
+
 ### Claude requests no longer fail when the proxy itself enables extended thinking — Bug fix
 
 When the reasoning-budget optimisation turns on Claude's extended thinking, Anthropic rejects

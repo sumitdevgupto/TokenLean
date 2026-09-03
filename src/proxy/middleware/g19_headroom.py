@@ -337,6 +337,22 @@ def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optiona
     against the shipped template, and the test fixture omitted `text` so nothing caught
     it.)
     """
+    # A JSON payload dominated by ONE long string leaf is prose in an envelope, not
+    # structured data — the exact shape of a tool result carrying a document
+    # ({"text": "<11k-char runbook>"}). SmartCrusher's compact_document_json is built for
+    # arrays of records and reduced that shape 11,492 → 45 chars in the live container
+    # (2026-09-03, DS22 all-on turn 2): the model retrieved the document, G15 attached it,
+    # and G19 destroyed it before the model could read it — every thread then fabricated
+    # the facts, while the only-G28 arm answered correctly. Treat the leaf as the prose it
+    # is: same text strategy the identical content gets when it arrives unwrapped.
+    # (The unit-test environment has no `headroom` package, so the destructive path was
+    # invisible to the suite — the fallback compactor is benign. Tests now fake the
+    # crusher; do not assume local behaviour matches the container's.)
+    if content_type == "json":
+        enveloped = _compress_prose_envelope(text, strategy)
+        if enveloped is not None:
+            return enveloped
+
     # Headroom: JSON compaction (its strongest path); guard so we only keep a real reduction.
     if _headroom_available and _smart_crusher is not None and content_type == "json":
         try:
@@ -356,6 +372,52 @@ def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optiona
     elif content_type == "text":
         return _compress_text(text, strategy)
     return None
+
+
+_ENVELOPE_DOMINANCE = 0.7  # a single string leaf carrying >70% of the payload IS the payload
+
+
+def _largest_string_leaf(obj: Any) -> str:
+    """The longest string value anywhere in a parsed JSON structure."""
+    if isinstance(obj, str):
+        return obj
+    best = ""
+    values = obj.values() if isinstance(obj, dict) else obj if isinstance(obj, list) else ()
+    for v in values:
+        leaf = _largest_string_leaf(v)
+        if len(leaf) > len(best):
+            best = leaf
+    return best
+
+
+def _compress_prose_envelope(text: str, strategy: Dict[str, Any]) -> Optional[str]:
+    """Compress a prose-dominated JSON payload by its leaf, never by its structure.
+
+    Returns the re-serialised payload with the dominant leaf text-compressed, the ORIGINAL
+    text when the leaf resists compression (keeping content beats saving tokens), or None
+    when the payload is genuinely structured and should take the normal JSON path.
+    """
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    leaf = _largest_string_leaf(data)
+    if not leaf or len(leaf) < _ENVELOPE_DOMINANCE * len(text):
+        return None
+    compressed_leaf = _compress_text(leaf, strategy)
+    if not compressed_leaf or len(compressed_leaf) >= len(leaf):
+        return text  # envelope confirmed but nothing safe to remove — keep it whole
+
+    def _swap(obj):
+        if isinstance(obj, str):
+            return compressed_leaf if obj == leaf else obj
+        if isinstance(obj, dict):
+            return {k: _swap(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_swap(v) for v in obj]
+        return obj
+
+    return json.dumps(_swap(data), separators=(",", ":"))
 
 
 def _compress_json(text: str, strategy: Dict[str, Any]) -> Optional[str]:

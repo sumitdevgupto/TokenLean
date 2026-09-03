@@ -787,3 +787,69 @@ class TestAnswerFidelity:
             "Redeploy afterwards to pick up the change.\n"
         )
         assert _detect_content_type(answer) == "text"
+
+
+class TestProseEnvelopeIsNeverCrushedAsStructure:
+    """A JSON payload dominated by one long string leaf is prose in an envelope.
+
+    The exact shape of a tool result carrying a document: {"text": "<11k-char runbook>"}.
+    In the live container SmartCrusher's compact_document_json reduced that to 45 CHARS
+    (2026-09-03, DS22 all-on turn 2) - the model retrieved the document, G15 attached it,
+    and G19 destroyed it before the model could read it; every thread then fabricated the
+    facts while the only-G28 arm answered correctly. The unit env has no `headroom`
+    package, so the destructive path was invisible to this suite until faked here.
+    """
+
+    DOC = ("# RUNBOOK-4471 Payments Ledger Recovery\n"
+           "Primary region: eu-west-2\n"
+           "Approved maintenance window: Saturday 02:00-04:00 UTC\n"
+           + "\n".join(f"Step {i}: drain, verify parity, then promote the standby replica "
+                       f"for shard group {i} before unfreezing writes." for i in range(120)))
+
+    class _DestructiveCrusher:
+        """What SmartCrusher actually did in the container: near-total loss."""
+        @staticmethod
+        def compact_document_json(text):
+            return '{"text":"<compacted document: 1 field>"}'
+
+    def _with_fake_crusher(self, monkeypatch):
+        import middleware.g19_headroom as g19
+        monkeypatch.setattr(g19, "_headroom_available", True)
+        monkeypatch.setattr(g19, "_smart_crusher", self._DestructiveCrusher())
+        return g19
+
+    def test_tool_result_document_survives_the_crusher(self, monkeypatch):
+        g19 = self._with_fake_crusher(monkeypatch)
+        payload = json.dumps({"text": self.DOC})
+        out = g19._compress(payload, "json", {"remove_empty": True, "dedupe_keys": True})
+        kept = out if out else payload
+        assert "eu-west-2" in kept and "Saturday 02:00-04:00 UTC" in kept, (
+            "the retrieved document's facts must survive request-side pruning")
+        assert "<compacted document" not in kept, "SmartCrusher must not see prose envelopes"
+
+    def test_structured_json_still_reaches_the_crusher(self, monkeypatch):
+        """The reroute is for envelopes ONLY - real record arrays keep the strong path."""
+        g19 = self._with_fake_crusher(monkeypatch)
+        records = json.dumps([{"id": i, "status": "ok", "region": "eu"} for i in range(200)])
+        out = g19._compress(records, "json", {})
+        assert out == '{"text":"<compacted document: 1 field>"}', (
+            "genuinely structured JSON should still take the SmartCrusher path")
+
+    def test_incompressible_envelope_is_kept_whole(self, monkeypatch):
+        """When the leaf resists text compression, keep the ORIGINAL - content beats tokens."""
+        g19 = self._with_fake_crusher(monkeypatch)
+        unique_prose = " ".join(f"Fact number {i} is distinct." for i in range(400))
+        payload = json.dumps({"text": unique_prose})
+        out = g19._compress(payload, "json", {})
+        assert out == payload
+
+    def test_nested_leaf_is_found(self):
+        from middleware.g19_headroom import _largest_string_leaf
+        obj = {"meta": {"id": "x"}, "result": {"pages": [{"body": "A" * 500}, {"body": "B" * 20}]}}
+        assert _largest_string_leaf(obj) == "A" * 500
+
+    def test_dominance_threshold_respected(self):
+        """Many small strings != an envelope; the normal JSON path must handle those."""
+        from middleware.g19_headroom import _compress_prose_envelope
+        payload = json.dumps({f"k{i}": f"value {i} padding padding" for i in range(80)})
+        assert _compress_prose_envelope(payload, {}) is None
