@@ -30,11 +30,30 @@ date changes.
      turn. TokenLean can move it out of the way, without hiding it from the model."
   * "Several apps sharing a prompt can share one cached copy instead of each paying to
      build their own." (configurable)
-  * "Park a big document once and refer to it, instead of re-sending it every turn."
-     (configurable; agent clients only)
+  * "Park a big document once and refer to it, instead of re-sending it every turn -
+     measured at 63% fewer input tokens when it is rarely read back, and a 30% penalty when
+     it always is. We publish both numbers." (configurable; agent clients only)
   * "Index the same document twice and pay for it once."
 -->
 
+
+### Context Compression & Reuse now has a measured, two-sided savings figure — Enhancement (OSS)
+
+G28 (Context Compression & Reuse) shipped with its savings honestly marked "not measured". It now
+has a number, and the number has two sides, because CCR's value is entirely a function of how
+often a parked document is actually read back (the expansion rate):
+
+- **17% expansion** (a document parked once, referenced across many requests that rarely open it):
+  **−63% input tokens, −20% cost**, quality gate passing with the retrieval request graded.
+- **100% expansion** (every request needs the document): **+30% tokens** — the round trip re-sends
+  the document, so CCR can only lose. Break-even sits near 75-80% expansion.
+
+Measured on a new ablation dataset that also settles what CCR is *for*: budget-aware compaction
+(G26) saved more on the same traffic but silently lost a detail that existed only in the parked
+document, while CCR fetched it back intact. CCR is lossless recall of rarely-needed context, not
+compression. Both remain default-off and require a tool-capable client.
+
+- **OSS:** the measurement, the dataset, and the two-sided figure — no behaviour change.
 
 ### A document inside a tool result is no longer destroyed by structured pruning — Bug fix
 
