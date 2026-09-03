@@ -37,6 +37,23 @@ date changes.
 -->
 
 
+### Feature-proof datasets no longer enter the blended savings headline — Bug fix
+
+Our published savings figure is blended over the datasets that pass the quality gate. Two
+datasets exist to prove one optional feature works, measuring deliberately opposite conditions —
+its best case and its worst case. Because the blend counts only passing datasets, the best case
+would have been folded into the headline (worth about +1.25 points) while the worst case, which
+fails by construction, was silently dropped. A benchmark that keeps a feature's wins and discards
+its losses is not measuring anything.
+
+Both are now excluded together, by name and with the reason recorded, and the two "run everything"
+code paths that had drifted apart now share one definition. That feature's figure is reported as a
+range across both regimes rather than an average, because the mean of a best and a worst case
+describes no workload that exists.
+
+No effect on any published number today — the headline datasets are unchanged. This closes the
+route by which a future re-baseline could have quietly risen.
+
 ### Context-budget compaction is lossy from rung 3, not just rung 4 — Bug fix
 
 The G26 documentation marked only `rungs.drop` (rung 4, opt-in, default off) as lossy, which
