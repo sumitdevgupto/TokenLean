@@ -421,9 +421,45 @@ def call_direct(litellm_model: str, messages: list, max_tokens: int, tools: list
     # opposite things (a real regression vs a too-tight output budget).
     fr = (choice.get("finish_reason") if isinstance(choice, dict)
           else getattr(choice, "finish_reason", None)) or ""
+    cache_read, cache_write = _cache_tokens(usage)
     return {"content": content, "prompt_tokens": pt, "completion_tokens": ct,
             "tool_calls": tcs, "finish_reason": fr,
+            "cache_read_tokens": cache_read, "cache_write_tokens": cache_write,
             "assistant_msg": _assistant_msg(content, tcs)}
+
+
+def _cache_tokens(usage) -> tuple:
+    """(cache_read, cache_write) from a provider usage object, or (None, None).
+
+    Cache billing is the half of the bill that token counts do not show: a prefix that
+    changes every turn is re-BUILT every turn, which costs money at an identical token
+    count. Reported additively here - it does not enter the savings calculation, so the
+    calibrated per-workload numbers are unaffected.
+
+    None means the provider reported nothing, which is not the same as zero.
+    """
+    if usage is None:
+        return None, None
+    if not isinstance(usage, dict):
+        usage = getattr(usage, "model_dump", lambda: {})() or {}
+    details = usage.get("prompt_tokens_details") or {}
+    if not isinstance(details, dict):
+        details = getattr(details, "model_dump", lambda: {})() or {}
+
+    def _first(src, keys):
+        for k in keys:
+            v = src.get(k) if isinstance(src, dict) else None
+            if v is not None:
+                return int(v)
+        return None
+
+    read = _first(details, ("cached_tokens",))
+    if read is None:
+        read = _first(usage, ("cache_read_input_tokens", "cached_content_token_count"))
+    write = _first(details, ("cache_write_tokens", "cache_creation_tokens"))
+    if write is None:
+        write = _first(usage, ("cache_creation_input_tokens",))
+    return read, write
 
 
 def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_tokens: int,
@@ -461,6 +497,9 @@ def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_toke
             "completion_tokens": completion_tokens, "routed_model": routed,
             "cache_hit": cache_hit, "tool_calls": tcs,
             "finish_reason": choice.get("finish_reason") or "",
+            # The proxy discloses both halves of provider cache billing in _token_opt.
+            "cache_read_tokens": opt.get("cache_read_tokens"),
+            "cache_write_tokens": opt.get("cache_write_tokens"),
             "assistant_msg": _assistant_msg(content, tcs)}
 
 
@@ -509,7 +548,12 @@ def run_episode(arm_fn, messages: list, tools: list, tool_results: dict,
 def _blank():
     return {"a_prompt": 0, "a_completion": 0, "a_cost": 0.0, "a_calls": 0,
             "b_prompt": 0, "b_completion": 0, "b_cost": 0.0, "b_calls": 0,
-            "cache_hits": 0, "facts_checked": 0, "facts_regressed": 0}
+            "cache_hits": 0, "facts_checked": 0, "facts_regressed": 0,
+            # Provider prompt-cache halves, reported alongside the savings numbers but
+            # deliberately NOT part of them: cache cost moves without token counts moving,
+            # so folding it in would silently redefine the calibrated per-workload figures.
+            "a_cache_read": 0, "a_cache_write": 0,
+            "b_cache_read": 0, "b_cache_write": 0}
 
 
 def _accumulate(bucket, rec):
@@ -521,6 +565,12 @@ def _accumulate(bucket, rec):
     bucket["b_completion"] += rec["b"]["completion_tokens"]
     bucket["b_cost"] += rec["b"]["cost"]
     bucket["b_calls"] += 1
+    for arm in ("a", "b"):
+        for half in ("cache_read", "cache_write"):
+            # None (provider reported nothing) contributes nothing rather than a zero.
+            val = rec[arm].get(half + "_tokens")
+            if val:
+                bucket[f"{arm}_{half}"] += int(val)
     if rec["b"]["cache_hit"]:
         bucket["cache_hits"] += 1
     if rec["facts"]["graded"]:

@@ -880,3 +880,60 @@ def test_builder_meta_emits_max_tokens_by_profile():
     # keeps the field but main() stops writing it — the original defect).
     src = (BENCH / "build_public_dataset.py").read_text(encoding="utf-8")
     assert '"max_tokens_by_profile"' in src
+
+
+class TestCacheTokenReporting:
+    """The A/B benchmark reports both halves of provider cache billing - additively.
+
+    Cache cost moves without token counts moving, so a prefix rebuilt every turn is
+    invisible in a savings percentage. These numbers are reported ALONGSIDE the savings
+    figures and deliberately excluded from them: folding them in would silently redefine
+    the calibrated per-workload numbers.
+    """
+
+    def test_reads_litellm_normalised_shape(self):
+        usage = {"prompt_tokens_details": {"cached_tokens": 800, "cache_write_tokens": 200}}
+        assert run_ab._cache_tokens(usage) == (800, 200)
+
+    def test_reads_anthropic_native_shape(self):
+        usage = {"cache_read_input_tokens": 40, "cache_creation_input_tokens": 90}
+        assert run_ab._cache_tokens(usage) == (40, 90)
+
+    def test_unreported_is_none_not_zero(self):
+        """A provider that says nothing must not be recorded as 'did no cache work'."""
+        assert run_ab._cache_tokens({"prompt_tokens": 10}) == (None, None)
+        assert run_ab._cache_tokens(None) == (None, None)
+
+    def test_explicit_zero_survives(self):
+        usage = {"prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        assert run_ab._cache_tokens(usage) == (0, 0)
+
+    def test_buckets_track_both_arms_and_both_halves(self):
+        bucket = run_ab._blank()
+        rec = {
+            "a": {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.1,
+                  "cache_read_tokens": 60, "cache_write_tokens": 40},
+            "b": {"prompt_tokens": 50, "completion_tokens": 10, "cost": 0.05,
+                  "cache_hit": False,
+                  "cache_read_tokens": 45, "cache_write_tokens": None},
+            "facts": {"graded": False, "passed": True},
+        }
+        run_ab._accumulate(bucket, rec)
+        assert bucket["a_cache_read"] == 60 and bucket["a_cache_write"] == 40
+        # None contributes nothing rather than being counted as a zero.
+        assert bucket["b_cache_read"] == 45 and bucket["b_cache_write"] == 0
+
+    def test_cache_tokens_do_not_enter_the_savings_maths(self):
+        """Guard the calibration: savings must be computed from prompt/completion only."""
+        bucket = run_ab._blank()
+        rec = {
+            "a": {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.1,
+                  "cache_read_tokens": 9999, "cache_write_tokens": 9999},
+            "b": {"prompt_tokens": 50, "completion_tokens": 10, "cost": 0.05,
+                  "cache_hit": False,
+                  "cache_read_tokens": 0, "cache_write_tokens": 0},
+            "facts": {"graded": False, "passed": True},
+        }
+        run_ab._accumulate(bucket, rec)
+        assert bucket["a_prompt"] == 100 and bucket["b_prompt"] == 50
+        assert bucket["a_cost"] == 0.1 and bucket["b_cost"] == 0.05

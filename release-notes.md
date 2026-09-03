@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-09-03
 
+<!-- Marketing one-liners (benefit-led, no G-codes, honest about opt-in):
+  * "See exactly how much of your LLM bill is cache - reads and writes, per call, per team,
+     per day - so your cost line reconciles against the provider invoice."
+  * "One changing value in your prompt can make you re-buy your whole cached prefix every
+     turn. TokenLean can move it out of the way, without hiding it from the model."
+  * "Several apps sharing a prompt can share one cached copy instead of each paying to
+     build their own." (configurable)
+  * "Park a big document once and refer to it, instead of re-sending it every turn."
+     (configurable; agent clients only)
+  * "Index the same document twice and pay for it once."
+-->
+
+
 ### Embed a document once, not once per app — Enhancement (OSS)
 
 Apps inside one tenant already shared a vector collection, but the sharing stopped at
