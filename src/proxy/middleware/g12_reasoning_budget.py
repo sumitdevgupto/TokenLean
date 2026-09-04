@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from middleware import RequestContext
 from middleware import langfuse_tracing
+from providers import REASONING_OFF
 
 logger = logging.getLogger(__name__)
 GROUP = "G12"
@@ -35,7 +36,7 @@ class G12ReasoningBudget:
             from providers.openai_adapter import OpenAIAdapter
             adapter = OpenAIAdapter()
 
-        if adapter.supports_reasoning(ctx.routed_model.lower()):
+        if adapter.supports_reasoning(ctx.routed_model.lower(), ctx.config):
             reasoning_params = adapter.map_reasoning_effort(effort, ctx.config)
             for key, value in reasoning_params.items():
                 if key not in ctx.params:
@@ -50,6 +51,27 @@ class G12ReasoningBudget:
             if applied and "reasoning_effort" not in reasoning_params:
                 ctx.params.pop("reasoning_effort", None)
 
+            if effort == REASONING_OFF:
+                # `off` emits nothing, so `applied` is False and the pop above never
+                # runs. A `reasoning_effort` already sitting in ctx.params would then
+                # survive and litellm would expand it straight back into a thinking
+                # budget — re-enabling precisely what was just turned off. Clear every
+                # reasoning key the provider layer recognises, except any the adapter
+                # deliberately emitted for `off` (Gemini's explicit thinking_budget: 0).
+                for _rk in adapter.reasoning_param_keys():
+                    if _rk not in reasoning_params:
+                        ctx.params.pop(_rk, None)
+                # Record what the provider can actually DELIVER, not what was asked.
+                # Omitting `reasoning_effort` on an o-series model selects the model's
+                # default; it does not stop it reasoning. Collapsing these two into one
+                # "reasoning disabled" would credit a saving that never happened.
+                ctx.reasoning_mode = (
+                    "off_honoured" if adapter.can_disable_reasoning(ctx.routed_model)
+                    else "off_unsupported"
+                )
+            else:
+                ctx.reasoning_mode = effort
+
         # Inject reasoning-suppression prompt for low/medium effort
         suppression_prompts = cfg.get("reasoning_suppression_prompts", {})
         suppression = suppression_prompts.get(effort) if suppression_prompts else None
@@ -61,7 +83,7 @@ class G12ReasoningBudget:
                 effort,
             )
 
-        if applied or suppression:
+        if applied or suppression or effort == REASONING_OFF:
             tokens_after = ctx.current_token_count
             if suppression:
                 # Suppression appends prompt text; recount only to record G12's
@@ -73,7 +95,8 @@ class G12ReasoningBudget:
 
             ctx.savings.add_step(
                 GROUP,
-                f"Reasoning budget: effort={effort} provider={adapter.name} (investment: +{tokens_after - tokens_before_note}t)",
+                f"Reasoning budget: effort={effort} mode={ctx.reasoning_mode} "
+                f"provider={adapter.name} (investment: +{tokens_after - tokens_before_note}t)",
                 tokens_before_note,
                 tokens_after,
             )
@@ -86,7 +109,8 @@ class G12ReasoningBudget:
                     "suppression_injected": bool(suppression),
                     "params_changed": list(ctx.params.keys()),
                 },
-                metadata={"effort": effort, "provider": adapter.name},
+                metadata={"effort": effort, "provider": adapter.name,
+                          "reasoning_mode": ctx.reasoning_mode},
             )
             logger.debug(
                 "[%s] G12 reasoning budget injected: effort=%s provider=%s model=%s",

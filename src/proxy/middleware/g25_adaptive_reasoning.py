@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext
 from middleware import langfuse_tracing
+from providers import REASONING_OFF, REASONING_TIERS
 
 logger = logging.getLogger(__name__)
 GROUP = "G25"
@@ -110,7 +111,7 @@ def _classify_complexity(
         if m:
             return "low", f"low-complexity keyword: {m.group(0)!r}"
 
-    effort = default_effort if default_effort in ("low", "medium", "high") else "medium"
+    effort = default_effort if default_effort in REASONING_TIERS else "medium"
     return effort, f"no keyword match — defaulting to {effort}"
 
 
@@ -182,20 +183,53 @@ class G25AdaptiveReasoning:
         raw_roles = cfg.get("scan_roles", ["user"])
         roles = tuple(r for r in raw_roles if isinstance(r, str)) or ("user",)
         user_text = _extract_user_text(ctx.messages, roles)
-        effort, reason = _classify_complexity(
-            user_text, high_patterns, medium_patterns, low_patterns,
-            default_effort=str(cfg.get("default_effort", "medium")).lower(),
-        )
 
-        # Apply per-complexity floor/ceiling from config
-        effort_floor: str = cfg.get("effort_floor", "low")
-        effort_ceiling: str = cfg.get("effort_ceiling", "high")
-        _order = {"low": 0, "medium": 1, "high": 2}
+        # Prefer G06's decision when it actually classified this request. G06 already
+        # judged complexity (word count AND keywords, over non-system turns) to pick a
+        # model tier; re-deciding it here with a different, keyword-only classifier gave
+        # two answers to one question — `explain`/`compare`/`analyse` are COMPLEX to G06
+        # and MEDIUM to G25. On `simple` we select `off`: no reasoning was asked for and
+        # neither classifier thinks the request needs any. Measured on DS8 (backlog #42),
+        # reasoning was 61% of the output bill on exactly this kind of FAQ lookup, for
+        # answers no longer than the non-reasoning arm's — and on one request, less
+        # complete. Everything else falls through to the keyword classifier unchanged.
+        effort = reason = None
+        if cfg.get("use_routing_complexity", True):
+            # `or` would treat an EMPTY map as absent and silently restore the default,
+            # so an operator who set `routing_complexity_map: {}` to switch the mapping
+            # off would get it back. Distinguish absent from deliberately empty.
+            tier_map = cfg.get("routing_complexity_map")
+            if not isinstance(tier_map, dict):
+                tier_map = {"simple": REASONING_OFF}
+            mapped = tier_map.get(ctx.complexity_tier) if ctx.complexity_tier else None
+            if isinstance(mapped, str) and mapped.lower() in REASONING_TIERS:
+                effort = mapped.lower()
+                reason = f"G06 classified this request {ctx.complexity_tier!r}"
+
+        if effort is None:
+            effort, reason = _classify_complexity(
+                user_text, high_patterns, medium_patterns, low_patterns,
+                default_effort=str(cfg.get("default_effort", "medium")).lower(),
+            )
+
+        # Apply the per-complexity floor/ceiling from config, LITERALLY — no special case.
+        # `off` is a real rung below `low` (backlog #42), so a floor of `low` genuinely
+        # blocks it, and the shipped template now defaults the floor to `off` so the
+        # G06 bridge is not clamped away. An earlier attempt here bypassed the floor when
+        # the key was absent from config; that passed in tests and was INERT in production,
+        # because the shipped config.yaml sets `effort_floor: low` explicitly. Keeping this
+        # literal means the config file says exactly what happens.
+        # Migration note: a deployment whose config predates the `off` rung and says
+        # `effort_floor: low` keeps reasoning at low or above until that value is changed.
+        effort_floor: str = str(cfg.get("effort_floor", REASONING_OFF)).lower()
+        effort_ceiling: str = str(cfg.get("effort_ceiling", "high")).lower()
+        _order = {tier: i for i, tier in enumerate(REASONING_TIERS)}
+        _last = len(REASONING_TIERS) - 1
         effort_idx = max(
             _order.get(effort_floor, 0),
-            min(_order.get(effort_ceiling, 2), _order.get(effort, 1)),
+            min(_order.get(effort_ceiling, _last), _order.get(effort, _order["medium"])),
         )
-        effort = ["low", "medium", "high"][effort_idx]
+        effort = REASONING_TIERS[effort_idx]
 
         ctx.params["reasoning_effort"] = effort
         logger.debug(

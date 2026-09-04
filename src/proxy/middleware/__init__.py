@@ -156,6 +156,22 @@ class RequestContext:
     # ASSIGNED (not appended), so writing them from a dispatch site would erase G32's own
     # list from the audit row. Distinct field -> distinct metric + distinct audit action.
     tool_dispatch_blocked: List[str] = field(default_factory=list)
+    # The complexity tier G06's classifier actually chose for THIS request
+    # ("simple" | "medium" | "complex"), or None when no classifier ran — a caller
+    # x_complexity override, a routing rule, a cascade plan, or G06 disabled entirely.
+    # Published so G25 can reuse the decision instead of running a second, differently
+    # tuned keyword classifier over the same text (backlog #42): the two disagree
+    # materially — `explain`/`compare`/`analyse` are COMPLEX to G06 and MEDIUM to G25.
+    # NOTE this is NOT usage_events.complexity_tier, which carries the caller's
+    # X-Complexity-Tier header rather than anything the proxy decided.
+    complexity_tier: Optional[str] = None
+    # What actually happened to reasoning on this request, set by G12:
+    #   "off_honoured"    — reasoning was requested off AND the provider can honour it
+    #   "off_unsupported" — requested off, but the model reasons intrinsically (o-series)
+    #   "low"/"medium"/"high" — that effort tier was applied
+    # The two `off_*` values must stay distinct: collapsing them would let the proxy
+    # report a reasoning saving on a provider that could not deliver one (backlog #42).
+    reasoning_mode: Optional[str] = None
     # Ingress protocol the client used (default = the OpenAI identity protocol;
     # "anthropic" for /v1/messages, "gemini" for …:generateContent). The pipeline is
     # protocol-agnostic (OpenAI-shaped internally) — this only flows into

@@ -1138,6 +1138,15 @@ class G06Routing:
                     selected_model = _select_from_tier(candidates, eff_cfg, ctx, complexity)
                 ctx.savings.routing_mode = classifier
 
+        # 2a-bis. Publish the tier the classifier chose, for stages that run later.
+        # G25 reuses it rather than running a second, differently tuned keyword classifier
+        # over the same text (backlog #42). Deliberately left None unless a classifier
+        # actually ran: a caller `x_complexity` override, a routing rule and a cascade plan
+        # all express ROUTING intent, and treating them as a reasoning decision would mean
+        # `x_complexity: simple` silently disabled extended thinking — a coupling no caller
+        # asked for. `complexity` is "" until a classifier populates it.
+        ctx.complexity_tier = complexity or None
+
         # 2b. Reachability guard (P8 hardening): never hand main.py a routed tier model whose
         # provider has no usable credential — that becomes a downstream 503. Per
         # G6_routing.on_unreachable_tier: 'fallback' (default) serves the caller's OWN model

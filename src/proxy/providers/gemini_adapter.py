@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from providers import ProviderAdapter, register_adapter
+from providers import ProviderAdapter, REASONING_OFF, REASONING_TIERS, register_adapter
 
 _THINKING_DEFAULTS = {"low": 1024, "medium": 4096, "high": 16000}
 
@@ -97,14 +97,29 @@ class GeminiAdapter(ProviderAdapter):
         return {}
 
     def map_reasoning_effort(self, tier: str, config: Dict) -> Dict:
+        """Map an effort tier onto Gemini's ``thinking_config``.
+
+        ``off`` sends an EXPLICIT ``thinking_budget: 0``, which is how Gemini disables
+        thinking — unlike Anthropic, where omission is the off switch. An unrecognised
+        tier emits nothing rather than falling through to the 1024-token default, which
+        before backlog #42 meant a config typo silently enabled thinking.
+        """
+        if tier == REASONING_OFF:
+            return {"thinking_config": {"thinking_budget": 0}}
+        if tier not in REASONING_TIERS:
+            return {}
         tier_cfg = (
             config.get("groups", {})
             .get("G12_reasoning", {})
             .get("effort_map", {})
             .get(tier, {})
         )
-        # Config key is `gemini_mode`; fall back to module defaults if absent.
+        # Config key is `gemini_thinking_budget`; fall back to module defaults if absent.
         budget = tier_cfg.get("gemini_thinking_budget", _THINKING_DEFAULTS.get(tier, 1024))
+        try:
+            budget = max(0, int(budget))
+        except (TypeError, ValueError):
+            return {}
         return {"thinking_config": {"thinking_budget": budget}}
 
     def cap_reasoning_params(self, params: Dict, max_tokens: Optional[int]) -> Dict:

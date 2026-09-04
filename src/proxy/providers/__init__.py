@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 # Request-param keys never forwarded into a batch item body.
 _NON_FORWARDED_BATCH_PARAMS = {"model", "batch_topic"}
 
+# The effort tier meaning "do not opt this request into optional reasoning" (backlog #42).
+# Deliberately NOT "guarantee zero reasoning tokens" — that promise cannot be kept on the
+# OpenAI o-series, whose models reason intrinsically. `can_disable_reasoning()` says which
+# providers can honour it; every caller records the real outcome rather than the request.
+REASONING_OFF = "off"
+# Ordered lowest-effort-first. `off` is a real rung below `low`, not a sentinel.
+REASONING_TIERS = (REASONING_OFF, "low", "medium", "high")
+
 
 def build_batch_jsonl(items: List[Dict]) -> str:
     """Build OpenAI-style batch JSONL: one line per item with custom_id=request_id.
@@ -141,18 +149,81 @@ class ProviderAdapter(ABC):
         """
         Return provider-specific reasoning-effort params.
 
-        tier: "low" | "medium" | "high"
-        config: full ctx.config dict (reads groups.g12_reasoning_budget.effort_tiers)
+        tier: "off" | "low" | "medium" | "high"
+        config: full ctx.config dict (reads groups.G12_reasoning.effort_map)
         Returns dict to be merged into the LLM request params.
+
+        ``off`` means "do not opt this request into optional reasoning" and is realised
+        per provider: Anthropic omits ``thinking`` (its own default), Gemini sends
+        ``thinking_budget: 0``, OpenAI omits ``reasoning_effort`` (the o-series still
+        reasons — see ``can_disable_reasoning``). An UNKNOWN tier must never fall through
+        to an enabling default: before backlog #42 an unrecognised tier produced a
+        1024-token Anthropic thinking budget, so a config typo silently turned reasoning
+        ON. Implementations return {} for anything they do not recognise.
         """
 
-    def supports_reasoning(self, model: str) -> bool:
+    def supports_reasoning(self, model: str, config: Optional[Dict] = None) -> bool:
         """
         Return True if model supports reasoning-budget injection for this provider.
         Default True (Anthropic and Gemini: all models support it).
         OpenAI overrides to restrict to o-series models only.
+
+        ``config`` is optional so the four existing call sites keep working unchanged.
+        When supplied, a provider entry may name the models that actually reason::
+
+            providers:
+              - name: anthropic
+                reasoning_models: ["claude-sonnet-4-5", "claude-opus-4-1"]
+
+        An empty/absent list leaves the default behaviour exactly as before. This is the
+        only way to express "my simple tier must not think" on a provider where reasoning
+        is a request parameter rather than a separate model (backlog #42): routing to a
+        cheaper Claude model does not disable thinking, because every Claude model reports
+        as reasoning-capable here.
+        """
+        models = self._provider_entry(config).get("reasoning_models")
+        if isinstance(models, list) and models:
+            low = (model or "").lower()
+            return any(isinstance(m, str) and m.lower() in low for m in models)
+        return True
+
+    def can_disable_reasoning(self, model: str) -> bool:
+        """True when omitting the reasoning param actually yields NO reasoning.
+
+        Not the same question as ``supports_reasoning``, and the difference is the whole
+        cross-provider problem (backlog #42):
+
+        * **Anthropic** — extended thinking is opt-in; omitting ``thinking`` is the
+          provider's own default, so ``off`` is genuinely off. True.
+        * **Gemini** — ``thinking_budget: 0`` disables it explicitly. True.
+        * **OpenAI o-series** — these models reason inherently; omitting
+          ``reasoning_effort`` just selects the model's default. False.
+
+        Callers use this to record what actually happened rather than what was requested,
+        so a saving is never claimed on a provider that could not honour the request.
+        Default True; adapters whose reasoning is intrinsic to the model override.
         """
         return True
+
+    def _provider_entry(self, config: Optional[Dict]) -> Dict:
+        """This adapter's entry from the ``providers`` config block, or {}.
+
+        ``providers`` may be a dict keyed by name or a list of ``{name: ...}`` dicts;
+        both shapes ship in this repo. Never raises — a malformed block reads as absent.
+        """
+        if not isinstance(config, dict):
+            return {}
+        entry = config.get("providers") or {}
+        try:
+            if isinstance(entry, dict):
+                entry = entry.get(self.name) or {}
+            else:
+                entry = next(
+                    (p for p in entry
+                     if isinstance(p, dict) and p.get("name") == self.name), {})
+        except Exception:
+            return {}
+        return entry if isinstance(entry, dict) else {}
 
     def reasoning_param_keys(self) -> set:
         """
@@ -163,7 +234,7 @@ class ProviderAdapter(ABC):
         the strip only fires when supports_reasoning() is False, so listing a
         sibling provider's key here is harmless.
         """
-        return {"reasoning_effort", "thinking"}
+        return {"reasoning_effort", "thinking", "thinking_config"}
 
     def min_cacheable_prompt_tokens(self, config: Dict, model: str) -> int:
         """Smallest prompt this provider will cache a prefix for, or 0 if it has none.
@@ -177,11 +248,7 @@ class ProviderAdapter(ABC):
         without a redeploy; 0 (the default here) leaves every dependent guard inert, so
         an adapter that does not override this changes nothing.
         """
-        entry = (config.get("providers") or {})
-        if isinstance(entry, dict):
-            entry = entry.get(self.name) or {}
-        else:  # providers may be a LIST of {name: ...} dicts
-            entry = next((p for p in entry if isinstance(p, dict) and p.get("name") == self.name), {})
+        entry = self._provider_entry(config)
         try:
             return max(0, int(entry.get("min_cacheable_tokens", 0) or 0))
         except (TypeError, ValueError):

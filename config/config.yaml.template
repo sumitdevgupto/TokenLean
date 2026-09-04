@@ -978,22 +978,25 @@ groups:
   G12_reasoning:
     enabled: true
     default_effort: medium
-    provider_params:
-    - model_fragment: o1
-      param_key: reasoning_effort
-      is_effort_key: true
-    - model_fragment: o3
-      param_key: reasoning_effort
-      is_effort_key: true
-    - model_fragment: claude
-      param_key: thinking
-      budget_key: budget_tokens
-      is_effort_key: false
+    # NOTE: a `provider_params` block (model_fragment / param_key / budget_key /
+    # is_effort_key) used to live here. NO code ever read it -- the adapters read
+    # `effort_map` below and nothing else. Removed 2026-09-04 so an operator cannot
+    # spend time tuning a key that has never had any effect.
     reasoning_suppression_prompts:
       low: '[BUDGET] Provide the final answer only - no reasoning steps, no chain-of-thought, no explanation.'
       medium: '[BUDGET] Keep reasoning minimal. One brief step max, then final answer.'
       high: null
     effort_map:
+      # `off` = do not opt this request into optional reasoning. Realised per provider:
+      # Anthropic OMITS `thinking` (its own default -- genuinely off), Gemini sends an
+      # explicit thinking_budget: 0, OpenAI omits `reasoning_effort`. NOTE the o-series
+      # still reasons -- omitting the param selects the model's default, it does not
+      # disable anything, so `off` there is recorded as `off_unsupported` and no
+      # reasoning saving is claimed. There are no per-provider values to set: `off` is
+      # the ABSENCE of a budget, and this row exists so the tier is visible to operators.
+      # QUOTED deliberately: YAML 1.1 parses a bare `off` as the BOOLEAN False,
+      # so `off:` here would become the key False and never match the string tier.
+      'off': {}
       low:
         openai: low
         anthropic_tokens: 1000
@@ -1236,7 +1239,10 @@ groups:
     rules_file: config/adaptive_bypass_rules.yaml
   G25_adaptive_reasoning:
     enabled: true
-    effort_floor: low
+    # Lowest effort G25 may select. Defaults to 'off' so the G06 bridge below is
+    # not clamped away -- `off` is a rung BELOW `low`. Quoted: bare off is YAML false.
+    # Set to 'low' to guarantee every request gets at least minimal reasoning.
+    effort_floor: 'off'
     effort_ceiling: high
     extra_reasoning_prefixes: []
     # Which message roles are scored for complexity. USER only by default: a system
@@ -1252,6 +1258,18 @@ groups:
     # `low` cuts reasoning cost across the board but is a QUALITY trade, so the shipped
     # default stays `medium`; change it with your own measurement.
     default_effort: medium
+    # Reuse the complexity tier G06 ALREADY decided for routing, instead of running a
+    # second keyword classifier over the same text. The two disagree materially --
+    # 'explain'/'compare'/'analyse' are COMPLEX to G06 and MEDIUM here -- so one request
+    # got two answers to one question. When G06 classified `simple` we select `off`:
+    # nothing asked for reasoning and neither classifier thinks it is needed. Measured on
+    # DS8 (2026-09-04), reasoning was 61% of the output bill on FAQ lookup, for answers no
+    # longer than the non-reasoning arm's. Set false to restore keyword-only behaviour.
+    use_routing_complexity: true
+    # Which G06 routing tier maps to which reasoning effort. Only `simple` is mapped by
+    # default; `medium`/`complex` fall through to the keyword classifier untouched.
+    routing_complexity_map:
+      simple: 'off'
   # ── G26 · Budget-aware context management (BACM-style) ───────────────────────
   # Treats the model's context window as a budget assessed BEFORE the call: when the
   # assembled prompt crosses compact_at_pct of the USABLE window (context window minus

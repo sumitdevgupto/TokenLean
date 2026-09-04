@@ -23,6 +23,36 @@ date changes.
 
 ## 2026-09-04
 
+### Reasoning can now be turned OFF per request, across providers — Enhancement (OSS)
+
+Every effort tier previously emitted an *enabling* parameter, including `low` — so once a
+reasoning-capable model was routed, extended thinking was on for every request and the tier
+only set a ceiling the model never approached. Measured on a support workload: reasoning was
+**61% of the output bill** for answers no longer than the non-reasoning arm's. There is now
+an `off` tier, realised per provider: Claude omits `thinking` (its own default), Gemini sends
+budget `0`, OpenAI omits `reasoning_effort`. **The o-series still reasons intrinsically**, so
+`off` there is recorded as `off_unsupported` and never counted as a saving. G25 now reuses the
+complexity tier G06 already decided for routing — when that says `simple`, effort is `off`.
+Also fixed: an unrecognised tier used to fall through to a 1024-token Claude thinking budget,
+so a config typo turned reasoning **on**. Savings are **not yet measured**; the published
+G12/G25 "10-30%" figures, which never were, are corrected to "not measured".
+**Upgrade note:** `off` is a new rung *below* `low`, so an existing `G25_adaptive_reasoning.
+effort_floor: low` keeps reasoning at `low` or above. Set it to `'off'` (quoted — bare `off`
+is YAML `false`) to adopt the new default.
+- **OSS:** `off` tier, `use_routing_complexity`, config-driven `reasoning_models`, and a new
+  `token_opt_reasoning_mode_total{mode}` metric pairing the request with what was billed.
+- **[Enterprise]:** the effort selectors are portal knobs — <https://tokenlean.cbeyond.cloud/>
+
+### Portal offered a reasoning effort level that did nothing — Bug fix
+
+The tenant portal listed `minimal` as a selectable reasoning effort for three settings, and
+no part of the system implemented it. Choosing it sent an invalid parameter to OpenAI
+o-series models, gave Claude a 1024-token thinking budget (i.e. it *enabled* thinking), and
+silently widened the adaptive-reasoning band instead of narrowing it. Replaced with `off`,
+which every layer now implements. The setting that governs most traffic — the effort used
+when a request matches no complexity keyword — was also not exposed at all, while two
+rarely-binding knobs were; it is now selectable.
+
 ### Tool policy is now enforced on streaming responses — Bug fix
 
 Tool-call policy was applied only to non-streaming responses. On a streamed response the

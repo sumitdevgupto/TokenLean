@@ -47,6 +47,14 @@ REASONING_TOKENS = Counter(
     "Total reasoning tokens processed (for models with reasoning_effort/thinking)",
     ["model", "team", "feature", "tenant_id"],
 )
+REASONING_MODE = Counter(
+    "token_opt_reasoning_mode_total",
+    "Requests by what actually happened to reasoning. `off_honoured` means the provider "
+    "can genuinely disable it (Anthropic omits `thinking`, Gemini sends budget 0); "
+    "`off_unsupported` means `off` was selected but the model reasons intrinsically "
+    "(OpenAI o-series), so no reasoning saving may be claimed for it.",
+    ["mode", "model", "tenant_id"],
+)
 CACHE_READ_TOKENS = Counter(
     "token_opt_cache_read_tokens_total",
     "Provider prompt-cache READ tokens (billed at a discount)",
@@ -434,6 +442,12 @@ class G18Observability:
             COMPLETION_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(completion_tokens)
             if reasoning_tokens > 0:
                 REASONING_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(reasoning_tokens)
+            # Pair the requested outcome with the billed reasoning tokens above, so
+            # "we turned reasoning off" is always checkable against what was actually
+            # billed rather than taken on trust (backlog #42).
+            _rmode = getattr(ctx, "reasoning_mode", None)
+            if _rmode:
+                REASONING_MODE.labels(mode=_rmode, model=model, tenant_id=tenant_id).inc()
             if cache_read_tokens > 0:
                 CACHE_READ_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_read_tokens)
             if cache_write_tokens > 0:

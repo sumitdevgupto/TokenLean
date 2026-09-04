@@ -101,6 +101,8 @@ configured; add more here. See [extensibility.md](extensibility.md) for the full
 | `api_version` | Azure only — API version |
 | `aws_region` | Bedrock only — AWS region (auth via SigV4 env creds, no API key) |
 | `supports_reasoning` | Generic: opt in to reasoning-param injection (default off) |
+| `reasoning_models` | Optional list narrowing which of this provider's models actually reason. Every Claude model reports reasoning-capable by default, so this is the only way to say "my simple tier must not think" on a provider where reasoning is a request parameter rather than a separate model. Never widens: a model the adapter rejects stays rejected. |
+| `can_disable_reasoning` | Generic only: assert that omitting the reasoning param genuinely stops this endpoint reasoning. Default `false` so the proxy under-claims rather than reporting a saving it cannot demonstrate. |
 
 `pricing:` is a flat map of `model-fragment → {input, output}` (USD per 1k tokens, reporting only —
 billing is per-request); add a row per new provider model.
@@ -470,10 +472,33 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | `validate_block_message` | *(default text)* | Message returned when a malformed answer is withheld in `block` mode. |
 
 ### G12_reasoning
+Injects the provider's reasoning parameter for the effort tier G25 selected (or
+`default_effort` when G25 did not run).
+
+**The `off` tier** means *"do not opt this request into optional reasoning"* — deliberately
+not *"guarantee zero reasoning tokens"*, because that promise cannot be kept on every
+provider. It is realised differently by each:
+
+| Provider | How `off` is sent | Genuinely off? |
+|---|---|---|
+| **Anthropic** | `thinking` omitted — which is Anthropic's own default | **Yes** |
+| **Gemini** | explicit `thinking_config.thinking_budget: 0` | **Yes** |
+| **OpenAI o-series** | `reasoning_effort` omitted → the model's default applies | **No** — these models reason intrinsically |
+
+Because of that last row, G12 records the real outcome on the request rather than the
+request itself, and exports it as `token_opt_reasoning_mode_total{mode}`: `off_honoured`,
+`off_unsupported`, or the applied tier. A reasoning saving must never be claimed for
+`off_unsupported`.
+
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable reasoning budget injection |
-| `default_effort` | `medium` | `low` \| `medium` \| `high` — validate per workload |
+| `default_effort` | `medium` | `off` \| `low` \| `medium` \| `high` — validate per workload. Only consulted when G25 did not set an effort. |
+| `effort_map.<tier>` | see template | Per-provider budgets. The `off` row is intentionally empty — `off` is the *absence* of a budget. **Quote the key** (`'off'`): bare `off` is the boolean `false` in YAML. |
+| `reasoning_suppression_prompts.<tier>` | low/medium set | Prompt text appended for that tier. No `off` entry: with reasoning already off there is nothing to suppress, so paying input tokens for it would be waste. |
+
+An **unrecognised** tier now emits no reasoning parameter at all. Previously it fell through
+to a 1024-token Anthropic thinking budget, so a config typo silently turned reasoning **on**.
 
 ### G13_batch
 Batch accumulation (Redis Streams) plus TOON compact notation — converts JSON arrays of uniform objects into pipe-delimited rows. The `toon_*` knobs gate when TOON fires so it never inflates tokens. All `toon_*` knobs honour per-tenant overrides (`tenants.<id>.groups.G13_batch`).
@@ -650,12 +675,30 @@ Runs first in the pipeline. Loads learned rules and populates `ctx.skip_groups` 
 G24 picks up the rules file on the normal config-reload cycle (local) or after the deploy uploads it to the config bucket (GCP). With an empty or missing `rules_file`, G24 is a no-op.
 
 ### G25_adaptive_reasoning
-Classifies request complexity (HIGH/MEDIUM/LOW) and injects `reasoning_effort` before G12 applies the budget. Only fires on reasoning-capable models (o1/o3/o4, Claude). Setting `reasoning_effort` explicitly in the request bypasses classification.
+Selects the reasoning effort before G12 applies it. Only fires on reasoning-capable models
+(o1/o3/o4, Claude, Gemini). Setting `reasoning_effort` explicitly in the request bypasses
+classification entirely.
+
+**It prefers G06's decision.** G06 has already classified this request's complexity in
+order to pick a model tier, so when that classifier ran, G25 reuses its answer instead of
+running a second, differently tuned keyword classifier over the same text. The two
+disagreed materially — `explain` / `compare` / `analyse` are *complex* to G06 and *medium*
+to G25, and G06 also weighs word count while G25 has no size signal. When G06 said
+`simple`, G25 selects `off`. Anything else falls through to the keyword classifier.
+
+G06's tier is deliberately **not** used when the caller sent `x_complexity`, a routing rule
+pinned the model, a cascade planned it, or G06 is disabled: those express *routing* intent,
+and treating them as a reasoning decision would mean `x_complexity: simple` silently
+disabled extended thinking — a coupling no caller asked for.
 
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable adaptive reasoning classification |
-| `effort_floor` | `low` | Never classify below this effort level |
+| `use_routing_complexity` | `true` | Reuse G06's complexity tier. `false` = keyword classifier only (the pre-2026-09-04 behaviour). |
+| `routing_complexity_map` | `{simple: 'off'}` | G06 tier → effort. `{}` disables the mapping without disabling the feature. Quote `'off'` — bare `off` is YAML boolean `false`. |
+| `default_effort` | `medium` | Effort when no keyword matches. This is a keyword classifier, so "no match" is the **common** case — this value is the behaviour for most traffic, not an edge case. |
+| `scan_roles` | `["user"]` | Which roles are scored. A system prompt is static across a workload, so scoring it pins every request under that prompt to one tier. |
+| `effort_floor` | `'off'` | Lowest effort G25 may select, applied literally. `off` is a rung **below** `low`, so a floor of `low` genuinely blocks it — set `low` to guarantee every request gets at least minimal reasoning. **Upgrade note:** a config predating the `off` rung that says `effort_floor: low` keeps its current behaviour until changed. Quote the value: bare `off` is YAML `false`. |
 | `effort_ceiling` | `high` | Never classify above this effort level |
 | `extra_reasoning_prefixes` | `[]` | Additional reasoning-model name prefixes |
 

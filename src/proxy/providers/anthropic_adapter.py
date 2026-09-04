@@ -2,7 +2,7 @@ import copy
 import logging
 from typing import Any, Dict, List, Optional
 
-from providers import ProviderAdapter, register_adapter
+from providers import ProviderAdapter, REASONING_OFF, REASONING_TIERS, register_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,19 @@ class AnthropicAdapter(ProviderAdapter):
         return {}
 
     def map_reasoning_effort(self, tier: str, config: Dict) -> Dict:
+        """Map an effort tier onto Anthropic's ``thinking`` param.
+
+        ``off`` — and any tier this adapter does not recognise — emits NOTHING, which is
+        Anthropic's own default: extended thinking is opt-in, so omitting the param is
+        genuinely off. Before backlog #42 an unrecognised tier fell through to
+        ``_THINKING_DEFAULTS.get(tier, 1024)`` and silently ENABLED thinking with a
+        1024-token budget, so a config typo turned reasoning on rather than off.
+
+        A budget of 0 or less is also treated as off; Anthropic's minimum is 1024, so a
+        smaller positive budget could never have been honoured anyway.
+        """
+        if tier not in REASONING_TIERS or tier == REASONING_OFF:
+            return {}
         tier_cfg = (
             config.get("groups", {})
             .get("G12_reasoning", {})
@@ -122,6 +135,12 @@ class AnthropicAdapter(ProviderAdapter):
         )
         # Config key is `anthropic_tokens`; fall back to module defaults if absent.
         budget = tier_cfg.get("anthropic_tokens", _THINKING_DEFAULTS.get(tier, 1024))
+        try:
+            budget = int(budget)
+        except (TypeError, ValueError):
+            return {}
+        if budget <= 0:
+            return {}
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
 
     # Anthropic rejects any temperature but 1 once thinking is enabled:

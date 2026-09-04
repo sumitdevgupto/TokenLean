@@ -168,11 +168,25 @@ class TestExtractUserText:
         msgs = [{"role": "user", "content": "hello world"}]
         assert "hello world" in self._extract(msgs)
 
-    def test_extracts_system_content(self):
+    def test_does_not_extract_system_content(self):
+        """Updated 2026-09-04 (backlog #42) — this file previously asserted the OPPOSITE.
+
+        Scoring the system prompt defeated the group: a system prompt is static across a
+        workload, so any medium/high keyword in it pinned every request under that prompt
+        to one tier. Measured on DS8: a one-line billing question inherited `medium` from
+        the word 'explain' in an 8,150-character policy document. The default is now user
+        turns only; `scan_roles` restores the old behaviour deliberately.
+        """
         msgs = [{"role": "system", "content": "You are helpful."}, {"role": "user", "content": "hi"}]
         text = self._extract(msgs)
-        assert "You are helpful." in text
+        assert "You are helpful." not in text
         assert "hi" in text
+
+    def test_scan_roles_can_restore_system_scoring(self):
+        from middleware.g25_adaptive_reasoning import _extract_user_text
+        msgs = [{"role": "system", "content": "You are helpful."}, {"role": "user", "content": "hi"}]
+        text = _extract_user_text(msgs, ("user", "system"))
+        assert "You are helpful." in text and "hi" in text
 
     def test_skips_assistant_content(self):
         msgs = [

@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from providers import (
     ProviderAdapter,
+    REASONING_OFF,
+    REASONING_TIERS,
     register_adapter,
     build_batch_jsonl,
     parse_batch_jsonl_results,
@@ -153,10 +155,27 @@ class OpenAIAdapter(ProviderAdapter):
             return {"response_format": {"type": "json_schema", "json_schema": schema}}
         return {}
 
-    def supports_reasoning(self, model: str) -> bool:
-        return any(f in model for f in ("o1", "o3", "o4"))
+    def supports_reasoning(self, model: str, config: Optional[Dict] = None) -> bool:
+        """o-series only. An explicit ``reasoning_models`` list on the provider entry
+        NARROWS this further (e.g. to pin a specific o-series model); it never widens it,
+        because a non-o-series OpenAI model rejects ``reasoning_effort`` outright."""
+        if not any(f in model for f in ("o1", "o3", "o4")):
+            return False
+        models = self._provider_entry(config).get("reasoning_models")
+        if isinstance(models, list) and models:
+            low = (model or "").lower()
+            return any(isinstance(m, str) and m.lower() in low for m in models)
+        return True
 
     def map_reasoning_effort(self, tier: str, config: Dict) -> Dict:
+        """Map an effort tier onto ``reasoning_effort``.
+
+        ``off`` and any unrecognised tier emit NOTHING. Emitting the tier string verbatim
+        (the pre-#42 behaviour) sent ``reasoning_effort: "off"`` — an invalid enum the
+        o-series 400s on — and would have done the same for the portal's `minimal`.
+        """
+        if tier not in REASONING_TIERS or tier == REASONING_OFF:
+            return {}
         tier_cfg = (
             config.get("groups", {})
             .get("G12_reasoning", {})
@@ -165,3 +184,13 @@ class OpenAIAdapter(ProviderAdapter):
         )
         effort_value = tier_cfg.get("openai", tier)
         return {"reasoning_effort": effort_value}
+
+    def can_disable_reasoning(self, model: str) -> bool:
+        """False for the o-series: those models reason intrinsically.
+
+        Omitting ``reasoning_effort`` selects the model's own default, it does not turn
+        reasoning off. Saying True here would let the proxy report a reasoning saving it
+        never made. On a non-reasoning OpenAI model the question is moot, and True is the
+        honest answer — there is nothing to disable.
+        """
+        return not self.supports_reasoning(model)

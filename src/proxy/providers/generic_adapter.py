@@ -13,7 +13,7 @@ structured-output and reasoning use OpenAI-shaped defaults that LiteLLM normalis
 """
 from typing import Dict, Optional
 
-from providers import ProviderAdapter
+from providers import ProviderAdapter, REASONING_OFF
 
 
 class GenericLiteLLMAdapter(ProviderAdapter):
@@ -57,6 +57,8 @@ class GenericLiteLLMAdapter(ProviderAdapter):
         Avoids sending a reasoning param to providers that reject it — opt in by adding
         ``effort_map[<tier>].<name>`` and ``supports_reasoning: true`` on the provider entry.
         """
+        if tier == REASONING_OFF:
+            return {}
         tier_cfg = (
             config.get("groups", {})
             .get("G12_reasoning", {})
@@ -68,9 +70,30 @@ class GenericLiteLLMAdapter(ProviderAdapter):
             return {}
         return {"reasoning_effort": value}
 
-    def supports_reasoning(self, model: str) -> bool:
-        """Conservative default off — opt in per provider via ``supports_reasoning: true``."""
-        return bool(self._cfg.get("supports_reasoning", False))
+    def can_disable_reasoning(self, model: str) -> bool:
+        """Conservative default OFF for an unknown OpenAI-compatible endpoint.
+
+        Whether omitting ``reasoning_effort`` actually stops the model reasoning is not
+        knowable for an arbitrary provider, and this flag only governs what we REPORT.
+        Defaulting False makes the proxy under-claim rather than credit itself with a
+        reasoning saving it cannot demonstrate; a provider that genuinely honours it
+        opts in with ``can_disable_reasoning: true`` on its config entry.
+        """
+        return bool(self._cfg.get("can_disable_reasoning", False))
+
+    def supports_reasoning(self, model: str, config: Optional[Dict] = None) -> bool:
+        """Conservative default off — opt in per provider via ``supports_reasoning: true``.
+
+        Reads this adapter's OWN construction config, so the optional ``config`` argument
+        (present for interface parity with the base signature) is not needed here.
+        """
+        if not bool(self._cfg.get("supports_reasoning", False)):
+            return False
+        models = self._cfg.get("reasoning_models")
+        if isinstance(models, list) and models:
+            low = (model or "").lower()
+            return any(isinstance(m, str) and m.lower() in low for m in models)
+        return True
 
     def cache_read_cost_multiplier(self, config: Dict) -> float:
         pcfg = (
