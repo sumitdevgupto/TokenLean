@@ -12,12 +12,34 @@ import json
 import sys
 import os
 import pytest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "proxy"))
 
 from middleware.g19_headroom import G19Headroom
 from middleware import RequestContext
 from tests.conftest import _make_savings
+
+
+@pytest.fixture(autouse=True)
+def _pin_the_builtin_compactor():
+    """Pin these tests to the BUILT-IN compactor, which is the contract they assert.
+
+    Without this they silently depend on whether the optional `headroom` package happens
+    to be installed. It is a pinned production dependency (`headroom-ai==0.34.0`) and IS
+    present in the container and in CI, but is absent from a typical dev machine — so
+    these four tests passed locally and for the OSS gate while failing in CI the moment
+    the gate was widened to run them (2026-09-04). `headroom.SmartCrusher` takes a
+    different path for arrays of records: it emits TOON-style compaction, so `results`
+    becomes a string rather than a list and empty keys are not pruned. Neither behaviour
+    is wrong; asserting one while running the other is.
+
+    `test_g19_structured.py` already patches this flag both ways; this applies the same
+    discipline here. The headroom path is covered explicitly at the bottom of this file.
+    """
+    from middleware import g19_headroom as mod
+    with patch.object(mod, "_headroom_available", False):
+        yield
 
 
 def _make_ctx(messages, config=None):
@@ -188,3 +210,59 @@ class Worker:
     assert "# Helper function" not in compressed
     assert "def helper():" in compressed
     assert "class Worker:" in compressed
+
+
+# ─── The path that actually ships ────────────────────────────────────────────
+# `headroom-ai==0.34.0` is a pinned production dependency, so the container and CI take
+# the SmartCrusher branch while a bare dev machine takes the built-in one. Until the test
+# gate was widened on 2026-09-04, nothing ever executed these files with headroom present,
+# and the difference went unnoticed for as long as both paths existed.
+#
+# The fake below mirrors what real headroom produced in CI (run 33898297256): the outer
+# JSON envelope survives and is still parseable; an inner array of records becomes a
+# TOON-style string; and empty keys are NOT pruned, unlike the built-in compactor.
+
+def _headroom_like(text):
+    """Stand-in for SmartCrusher.compact_document_json, shaped from observed output."""
+    doc = json.loads(text)
+    if isinstance(doc.get("results"), list):
+        doc["results"] = ("[%d]{action:string,id:int}\n" % len(doc["results"])) + "".join(
+            "%s,%s\n" % (r.get("action", ""), r.get("id", "")) for r in doc["results"])
+    return json.dumps(doc, separators=(",", ":"))
+
+
+async def _run_with_headroom(tool_json):
+    from middleware import g19_headroom as mod
+    sc = MagicMock()
+    sc.compact_document_json.side_effect = _headroom_like
+    ctx = _make_ctx([{"role": "user", "content": "test"}])
+    response = {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "search", "result": tool_json}}]}}]}
+    with patch.object(mod, "_headroom_available", True), \
+         patch.object(mod, "_smart_crusher", sc):
+        out = await mod.G19Headroom().process_response(ctx, response)
+    return out["choices"][0]["message"]["tool_calls"][0]["function"]["result"], sc
+
+
+@pytest.mark.asyncio
+async def test_headroom_path_keeps_the_tool_result_parseable():
+    """The client-facing contract: a tool result stays valid JSON.
+
+    This is what makes the TOON compaction safe to ship — an agent that does
+    `json.loads(result)` still works. If a future headroom version returns something
+    non-JSON, G19's only guard is a LENGTH check (`0 < len(crushed) < len(text)`), so this
+    assertion is the thing standing between that and a broken client.
+    """
+    result, sc = await _run_with_headroom(_agent_tool_output())
+    assert sc.compact_document_json.called, "the shipped path must actually be exercised"
+    json.loads(result)          # must not raise
+
+
+@pytest.mark.asyncio
+async def test_headroom_path_differs_from_the_builtin_and_that_is_expected():
+    """Documents the divergence rather than pretending it does not exist: the built-in
+    compactor prunes empty keys and keeps `results` a list; headroom does neither."""
+    result, _ = await _run_with_headroom(_agent_tool_output())
+    parsed = json.loads(result)
+    assert isinstance(parsed["results"], str), "headroom TOON-encodes arrays of records"
+    assert parsed["status"] == "success", "scalar fields still survive intact"

@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-09-04
 
+### Four G19 tests depended on whether an optional package happened to be installed — Bug fix
+
+Immediately after the test gate was widened, CI went red on four G19 compression tests that
+pass on a typical developer machine. `headroom-ai` is a pinned production dependency, so the
+container and CI take its compaction path while a bare dev checkout falls back to the
+built-in one — and the two produce different output for arrays of records. The tests asserted
+the fallback's shape without pinning which path they were on, so they had been passing
+locally and failing under the real dependency for as long as both paths existed; nothing
+noticed, because no gate ever ran them. They now pin the built-in path explicitly, matching
+the discipline the other G19 test file already used, and the shipped path gained its own
+coverage — including that a compressed tool result must remain valid JSON, which is the
+contract an agent parsing that result depends on.
+
 ### CI and the OSS gate now run the whole test suite — Bug fix
 
 Both the public CI job and the open-core release gate ran `pytest tests/unit`, so roughly
