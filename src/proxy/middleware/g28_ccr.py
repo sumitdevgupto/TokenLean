@@ -76,29 +76,54 @@ _STORE_IS_DURABLE = True
 _local_store: Dict[str, Tuple[float, str]] = {}
 # hits/misses per tenant prefix. A single global pair was readable by any tenant via
 # headroom_stats (see that branch below).
+# Reporting-only, and deliberately per-instance: hits/misses are additive counters, so a
+# per-instance view is incomplete but never unsafe (unlike the resolver proof below,
+# which is a trust decision and therefore lives in Redis).
 _stats: Dict[str, Dict[str, int]] = {}
 
 
 # Tenants observed actually resolving a CCR reference. A client only earns reference
 # substitution by demonstrating it can resolve one — see the handshake note in
-# process_request. Process-local and intentionally so: it is a conservative gate, and the
-# worst case of "forgot after a restart" is one honest full-content turn, whereas the worst
-# case of wrongly assuming capability is a silently degraded answer.
-_resolvers_proven: Dict[str, float] = {}
-_RESOLVER_PROOF_TTL = 3600.0
+# process_request.
+#
+# Redis-backed since backlog #40 (2026-09-04). It was a module-level dict, which is
+# per-worker AND per-instance: under `uvicorn --workers 2` or `max_instances > 1` the
+# proof simply did not travel. Missing PROOF is fail-safe (unproven → full content), but
+# missing REVOCATION is not: a client that demonstrably stopped resolving kept receiving
+# references from every other worker/instance and answered from the summary on a billed
+# 200. A trust guard that decays must decay everywhere, so the record lives in the same
+# tenant-scoped Redis the CCR store already uses. There is deliberately NO local cache in
+# front of it — being fast to revoke is the entire point, and one exact-key GET per
+# CCR-enabled request is negligible beside the request's existing Redis traffic.
+_RESOLVER_PROOF_TTL = 3600.0  # default; operators override via resolver_proof_ttl_seconds
 
 
-def _resolver_proven(prefix: str) -> bool:
-    seen = _resolvers_proven.get(prefix)
-    return seen is not None and (time.time() - seen) < _RESOLVER_PROOF_TTL
+def _proof_key(prefix: str) -> str:
+    """Tenant-scoped proof key. The default tenant's prefix is "", giving a bare
+    `ccr:resolver_proven`; every lookup is an exact-key GET (never a scan), so the
+    historical `startswith("")` cross-tenant hole cannot apply here."""
+    return f"{prefix}ccr:resolver_proven"
 
 
-def _mark_resolver_proven(prefix: str) -> None:
+async def _resolver_proven(prefix: str) -> bool:
+    try:
+        from cache.redis_pool import get_redis
+        return await get_redis().get(_proof_key(prefix)) is not None
+    except Exception as exc:  # fail-SAFE: unproven → send full content
+        logger.debug("G28 CCR: resolver-proof lookup failed (prefix=%s): %s", prefix, exc)
+        return False
+
+
+async def _mark_resolver_proven(prefix: str, ttl: float = _RESOLVER_PROOF_TTL) -> None:
     """Called when a client successfully resolves a reference — it has an agent loop."""
-    _resolvers_proven[prefix] = time.time()
+    try:
+        from cache.redis_pool import get_redis
+        await get_redis().set(_proof_key(prefix), str(time.time()), ex=max(1, int(ttl)))
+    except Exception as exc:  # worst case: one more honest full-content turn
+        logger.debug("G28 CCR: could not record resolver proof (prefix=%s): %s", prefix, exc)
 
 
-def _revoke_resolver_proof(prefix: str) -> None:
+async def _revoke_resolver_proof(prefix: str) -> None:
     """Called when a client answered a turn WITHOUT resolving a reference we substituted.
 
     The proof used to be write-once: resolve successfully a single time and the tenant was
@@ -111,9 +136,18 @@ def _revoke_resolver_proof(prefix: str) -> None:
 
     Revoking costs at most one honest full-content turn; NOT revoking costs a wrong answer
     that reports as a saving. The trade is deliberately asymmetric, in the same direction as
-    every other guard in this module.
+    every other guard in this module — which is why a FAILED revoke is the one direction
+    that logs at WARNING: the stale proof then survives until its TTL, on every worker and
+    instance at once.
     """
-    _resolvers_proven.pop(prefix, None)
+    try:
+        from cache.redis_pool import get_redis
+        await get_redis().delete(_proof_key(prefix))
+    except Exception as exc:
+        logger.warning(
+            "G28 CCR: could not revoke resolver proof (prefix=%s): %s — this tenant keeps "
+            "receiving references it may not resolve until the proof TTL expires", prefix, exc,
+        )
 
 
 def _record_ignored_reference(prefix: str) -> None:
@@ -479,6 +513,7 @@ async def dispatch_mcp_tool(
     ttl: int = 86400,
     prefix: str = "",
     max_store_chars: int = 200_000,
+    proof_ttl: float = _RESOLVER_PROOF_TTL,
 ) -> Any:
     """Dispatch a CCR MCP tool call; return the tool result as a JSON-serialisable value."""
     if tool_name == "headroom_compress":
@@ -517,7 +552,7 @@ async def dispatch_mcp_tool(
         _stats_for(prefix)["hits"] += 1
         # Proof of capability: this caller runs a retrieve loop, so later turns may receive
         # references instead of full content.
-        _mark_resolver_proven(prefix)
+        await _mark_resolver_proven(prefix, proof_ttl)
         return {"text": val}
 
     if tool_name == "headroom_stats":
@@ -597,7 +632,7 @@ class G28CCR:
         will_advertise_tools = bool(cfg.get("expose_mcp_tools", True)) and bool(ctx.params.get("tools"))
         may_substitute = (
             will_advertise_tools
-            and (_resolver_proven(prefix) if cfg.get("require_proven_resolver", True) else True)
+            and ((await _resolver_proven(prefix)) if cfg.get("require_proven_resolver", True) else True)
         )
         if not will_advertise_tools:
             logger.debug(
@@ -696,6 +731,7 @@ class G28CCR:
                     tool_name, arguments, ttl,
                     prefix=getattr(ctx, "redis_prefix", ""),
                     max_store_chars=int(cfg.get("max_store_chars", 200_000)),
+                    proof_ttl=float(cfg.get("resolver_proof_ttl_seconds", _RESOLVER_PROOF_TTL)),
                 )
                 tc["function"]["result"] = result
                 if tool_name == "headroom_retrieve" and "text" in (result or {}):
@@ -710,7 +746,7 @@ class G28CCR:
         # completed answer.
         if getattr(ctx, "ccr_refs_substituted", False) and answered_without_tools and not resolved_this_turn:
             prefix = getattr(ctx, "redis_prefix", "")
-            _revoke_resolver_proof(prefix)
+            await _revoke_resolver_proof(prefix)
             _record_ignored_reference(prefix)
             logger.warning(
                 "[%s] G28 CCR: reference substituted but the model answered without resolving it "

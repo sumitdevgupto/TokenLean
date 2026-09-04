@@ -125,6 +125,9 @@ async def _dispatch_headroom_tool(tc: Dict, ctx: RequestContext) -> None:
         tool_name, arguments, ttl,
         prefix=getattr(ctx, "redis_prefix", ""),
         max_store_chars=int(cfg.get("max_store_chars", 200_000)),
+        # How long a resolve-capability proof stays valid, shared across workers and
+        # instances via Redis (backlog #40). Operator-only knob; default 3600s.
+        proof_ttl=float(cfg.get("resolver_proof_ttl_seconds", 3600.0)),
     )
     fn["result"] = result
     logger.debug("[%s] G15 headroom MCP server: %s → %r", ctx.request_id, tool_name, result)

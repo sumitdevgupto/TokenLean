@@ -11,6 +11,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# ─── Prometheus: force single-process mode for the whole suite ───────────────
+# prometheus_client picks its value class when the FIRST metric object is
+# constructed — which happens at module import, below. A developer whose shell
+# exports PROMETHEUS_MULTIPROC_DIR (set in the container images since backlog #39)
+# would otherwise flip every metric in the suite to mmap-backed values, breaking
+# the `._value.get()` accessors in test_g18_observability.py and friends. Cleared
+# here, before any proxy import. Tests that need the multiprocess path set the var
+# explicitly (monkeypatch / subprocess env) — see test_metrics_multiprocess.py.
+os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+
 # ─── Path setup ──────────────────────────────────────────────────────────────
 _PROXY_DIR = os.path.join(os.path.dirname(__file__), "..", "src", "proxy")
 if _PROXY_DIR not in sys.path:

@@ -21,12 +21,22 @@ class _FakeRedis:
 
     def __init__(self):
         self.data = {}
+        self.ttls = {}
 
     async def set(self, key, value, ex=None):
         self.data[key] = value
+        self.ttls[key] = ex
 
     async def get(self, key):
         return self.data.get(key)
+
+    async def delete(self, *keys):
+        n = 0
+        for k in keys:
+            if self.data.pop(k, None) is not None:
+                self.ttls.pop(k, None)
+                n += 1
+        return n
 
 
 @pytest.fixture
@@ -36,7 +46,8 @@ def fake_redis(monkeypatch):
     monkeypatch.setattr("cache.redis_pool.get_redis", lambda: r)
     g28._local_store.clear()
     g28._stats.clear()
-    g28._resolvers_proven.clear()
+    # No _resolvers_proven to clear: the proof is Redis-backed (backlog #40) and a
+    # fresh _FakeRedis per test isolates it.
     return r
 
 
@@ -48,7 +59,6 @@ def no_redis(monkeypatch):
         raise ConnectionError("no redis")
     monkeypatch.setattr("cache.redis_pool.get_redis", _boom)
     g28._local_store.clear()
-    g28._resolvers_proven.clear()
 
 
 @pytest.fixture
@@ -58,7 +68,9 @@ def proven_resolver(fake_redis, monkeypatch):
     Substitution is earned, never assumed: see the handshake in process_request.
     """
     import middleware.g28_ccr as g28
-    monkeypatch.setattr(g28, "_resolver_proven", lambda prefix: True)
+    async def _always_proven(prefix):
+        return True
+    monkeypatch.setattr(g28, "_resolver_proven", _always_proven)
     return fake_redis
 
 
@@ -379,15 +391,15 @@ class TestResolveCapabilityHandshake:
     async def test_resolving_a_reference_proves_capability(self, fake_redis):
         from middleware.g28_ccr import dispatch_mcp_tool, _resolver_proven
         stored = await dispatch_mcp_tool("headroom_compress", {"text": "doc"}, 60, prefix="t:a:")
-        assert not _resolver_proven("t:a:")
+        assert not await _resolver_proven("t:a:")
         await dispatch_mcp_tool("headroom_retrieve", {"ref": stored["ref"]}, 60, prefix="t:a:")
-        assert _resolver_proven("t:a:"), "a successful retrieve is the proof"
+        assert await _resolver_proven("t:a:"), "a successful retrieve is the proof"
 
     async def test_proof_does_not_leak_between_tenants(self, fake_redis):
         from middleware.g28_ccr import dispatch_mcp_tool, _resolver_proven
         stored = await dispatch_mcp_tool("headroom_compress", {"text": "doc"}, 60, prefix="t:a:")
         await dispatch_mcp_tool("headroom_retrieve", {"ref": stored["ref"]}, 60, prefix="t:a:")
-        assert not _resolver_proven("t:b:")
+        assert not await _resolver_proven("t:b:")
 
     async def test_opt_out_restores_unconditional_substitution(self, fake_redis, make_ctx):
         from middleware.g28_ccr import G28CCR
@@ -487,17 +499,17 @@ class TestProofIsRevokedWhenTheModelIgnoresAReference:
     async def test_answering_without_resolving_revokes_the_proof(self, make_ctx, ccr_available):
         from middleware.g28_ccr import G28CCR, _mark_resolver_proven, _resolver_proven
         ctx = await self._ctx(make_ctx, substituted=True)
-        _mark_resolver_proven(ctx.redis_prefix)
-        assert _resolver_proven(ctx.redis_prefix)
+        await _mark_resolver_proven(ctx.redis_prefix)
+        assert await _resolver_proven(ctx.redis_prefix)
         await G28CCR().process_response(ctx, self._final_answer())
-        assert not _resolver_proven(ctx.redis_prefix), (
+        assert not await _resolver_proven(ctx.redis_prefix), (
             "the model answered from the summary — it must not keep receiving references")
 
     async def test_next_turn_gets_full_content_again(self, make_ctx, ccr_available):
         """The revocation has to CHANGE something, not just clear a flag."""
         from middleware.g28_ccr import G28CCR, _mark_resolver_proven
         ctx = await self._ctx(make_ctx, substituted=True)
-        _mark_resolver_proven(ctx.redis_prefix)
+        await _mark_resolver_proven(ctx.redis_prefix)
         await G28CCR().process_response(ctx, self._final_answer())
 
         nxt = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
@@ -511,30 +523,30 @@ class TestProofIsRevokedWhenTheModelIgnoresAReference:
         ctx = await self._ctx(make_ctx, substituted=True)
         stored = await dispatch_mcp_tool("headroom_compress", {"text": "doc" * 50}, 60,
                                          prefix=ctx.redis_prefix)
-        _mark_resolver_proven(ctx.redis_prefix)
+        await _mark_resolver_proven(ctx.redis_prefix)
         await G28CCR().process_response(ctx, self._retrieve_call(stored["ref"]))
-        assert _resolver_proven(ctx.redis_prefix), "it DID resolve — do not punish it"
+        assert await _resolver_proven(ctx.redis_prefix), "it DID resolve — do not punish it"
 
     async def test_mid_loop_turn_is_not_judged(self, make_ctx, ccr_available):
         """tool_calls present = the conversation is still running; it may retrieve next turn.
         Revoking here would thrash a working agent on every non-CCR tool call it makes."""
         from middleware.g28_ccr import G28CCR, _mark_resolver_proven, _resolver_proven
         ctx = await self._ctx(make_ctx, substituted=True)
-        _mark_resolver_proven(ctx.redis_prefix)
+        await _mark_resolver_proven(ctx.redis_prefix)
         other_tool = {"choices": [{"finish_reason": "tool_calls", "message": {
             "role": "assistant", "content": None, "tool_calls": [
                 {"id": "c1", "type": "function",
                  "function": {"name": "search_logs", "arguments": "{}"}}]}}]}
         await G28CCR().process_response(ctx, other_tool)
-        assert _resolver_proven(ctx.redis_prefix)
+        assert await _resolver_proven(ctx.redis_prefix)
 
     async def test_no_substitution_means_nothing_to_ignore(self, make_ctx, ccr_available):
         """A plain answer on a turn that sent no reference is not evidence of anything."""
         from middleware.g28_ccr import G28CCR, _mark_resolver_proven, _resolver_proven
         ctx = await self._ctx(make_ctx, substituted=False)
-        _mark_resolver_proven(ctx.redis_prefix)
+        await _mark_resolver_proven(ctx.redis_prefix)
         await G28CCR().process_response(ctx, self._final_answer())
-        assert _resolver_proven(ctx.redis_prefix)
+        assert await _resolver_proven(ctx.redis_prefix)
 
     async def test_the_failure_is_counted(self, make_ctx, ccr_available, monkeypatch):
         """Silent degradation is the whole problem: the request succeeds and only the answer
@@ -543,7 +555,7 @@ class TestProofIsRevokedWhenTheModelIgnoresAReference:
         seen = []
         monkeypatch.setattr(g28, "_record_ignored_reference", lambda p: seen.append(p))
         ctx = await self._ctx(make_ctx, substituted=True)
-        g28._mark_resolver_proven(ctx.redis_prefix)
+        await g28._mark_resolver_proven(ctx.redis_prefix)
         await g28.G28CCR().process_response(ctx, self._final_answer())
         assert seen == [ctx.redis_prefix]
 
@@ -559,7 +571,9 @@ class TestStoreUnavailableRefusesToSubstitute:
 
     async def test_no_redis_means_full_content(self, no_redis, make_ctx, monkeypatch):
         import middleware.g28_ccr as g28
-        monkeypatch.setattr(g28, "_resolver_proven", lambda prefix: True)
+        async def _always(prefix):
+            return True
+        monkeypatch.setattr(g28, "_resolver_proven", _always)
         ctx = make_ctx([{"role": "user", "content": _BIG}], model="gpt-4o-mini")
         ctx.config["groups"]["G28_ccr"] = {"enabled": True}
         out = await g28.G28CCR().process_request(ctx)
@@ -654,3 +668,104 @@ class TestReferenceParsingToleratesModelFormatting:
         assert self._parse("") is None
         assert self._parse(None) is None
         assert self._parse("the runbook") is None
+
+
+@pytest.mark.asyncio
+class TestResolverProofSurvivesScaleOut:
+    """Backlog #40 — the proof and its revocation must reach every worker/instance.
+
+    The record used to be a module-level dict, which is private to one uvicorn worker in
+    one container. Missing PROOF is fail-safe (unproven → full content). Missing
+    REVOCATION is not: a client that demonstrably stopped resolving kept receiving
+    references from every OTHER worker and instance, answering from the summary on a
+    billed 200. The whole value of the 2026-09-03 revocation guard was that it is fast,
+    and a per-process guard is not fast anywhere but its own process.
+    """
+
+    async def test_proof_is_written_to_redis_under_the_tenant_key(self, fake_redis):
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("t:acme:")
+        assert "t:acme:ccr:resolver_proven" in fake_redis.data
+
+    async def test_default_tenant_key_is_bare_but_still_exact(self, fake_redis):
+        """The default tenant's prefix is "" — the key must still be an exact lookup,
+        never a prefix scan (the historical startswith("") cross-tenant hole)."""
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("")
+        assert set(fake_redis.data) == {"ccr:resolver_proven"}
+        assert not await g28._resolver_proven("t:other:")
+
+    async def test_proof_carries_the_configured_ttl(self, fake_redis):
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("t:a:", ttl=120)
+        assert fake_redis.ttls["t:a:ccr:resolver_proven"] == 120
+
+    async def test_ttl_defaults_to_one_hour(self, fake_redis):
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("t:a:")
+        assert fake_redis.ttls["t:a:ccr:resolver_proven"] == 3600
+
+    async def test_dispatch_threads_the_operator_ttl(self, fake_redis):
+        """The knob has to reach the sink, not just exist in config."""
+        from middleware.g28_ccr import dispatch_mcp_tool
+        stored = await dispatch_mcp_tool("headroom_compress", {"text": "doc"}, 60, prefix="t:a:")
+        await dispatch_mcp_tool("headroom_retrieve", {"ref": stored["ref"]}, 60,
+                                prefix="t:a:", proof_ttl=900)
+        assert fake_redis.ttls["t:a:ccr:resolver_proven"] == 900
+
+    async def test_a_second_instance_sees_the_proof(self, fake_redis):
+        """Instance B shares only Redis with instance A — no module state at all."""
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("t:a:")
+        # Nothing but the shared store carries the fact across.
+        assert not hasattr(g28, "_resolvers_proven")
+        assert await g28._resolver_proven("t:a:")
+
+    async def test_a_second_instance_sees_the_REVOCATION(self, fake_redis):
+        """The direction that was actually broken: A revokes, B must stop substituting."""
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("t:a:")
+        await g28._revoke_resolver_proof("t:a:")
+        assert "t:a:ccr:resolver_proven" not in fake_redis.data
+        assert not await g28._resolver_proven("t:a:")
+
+    async def test_the_per_instance_dict_must_not_come_back(self):
+        """Regression guard: reintroducing the dict silently re-breaks revocation."""
+        import middleware.g28_ccr as g28
+        assert not hasattr(g28, "_resolvers_proven"), (
+            "resolver proof must live in Redis — a module dict does not propagate across "
+            "uvicorn workers or Cloud Run instances (backlog #40)"
+        )
+
+    async def test_redis_failure_on_lookup_reads_as_unproven(self, no_redis):
+        """Fail-SAFE: an unreachable store must degrade to full content, never raise."""
+        import middleware.g28_ccr as g28
+        assert await g28._resolver_proven("t:a:") is False
+
+    async def test_redis_failure_on_mark_is_quiet(self, no_redis):
+        """Worst case is one more honest full-content turn — not worth a WARNING."""
+        import middleware.g28_ccr as g28
+        await g28._mark_resolver_proven("t:a:")  # must not raise
+
+    async def test_failed_revoke_is_LOUD(self, no_redis, caplog):
+        """The asymmetric one: a failed revoke leaves a stale proof live on every
+        instance until its TTL, so it must not pass silently."""
+        import logging
+        import middleware.g28_ccr as g28
+        with caplog.at_level(logging.WARNING):
+            await g28._revoke_resolver_proof("t:a:")
+        assert any("revoke resolver proof" in r.message for r in caplog.records)
+
+    async def test_revocation_through_the_real_response_path(self, fake_redis, make_ctx):
+        """End-to-end: the pipeline's revoke reaches Redis, not a local dict."""
+        import middleware.g28_ccr as g28
+        ctx = make_ctx([{"role": "user", "content": "hi"}], model="gpt-4o-mini")
+        ctx.config["groups"]["G28_ccr"] = {"enabled": True}
+        ctx.ccr_refs_substituted = True
+        await g28._mark_resolver_proven(ctx.redis_prefix)
+        assert g28._proof_key(ctx.redis_prefix) in fake_redis.data
+        await g28.G28CCR().process_response(ctx, {
+            "choices": [{"message": {"role": "assistant", "content": "answered from memory"},
+                         "finish_reason": "stop"}]
+        })
+        assert g28._proof_key(ctx.redis_prefix) not in fake_redis.data

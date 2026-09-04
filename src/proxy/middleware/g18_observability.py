@@ -93,6 +93,11 @@ WORKFLOW_TURNS = Gauge(
     "token_opt_workflow_turns",
     "Current turn count per workflow",
     ["workflow_id", "tenant_id"],
+    # Turn counts only ever grow, so the highest value any worker saw IS the count.
+    # "max" also keeps the series label-identical to single-process mode (only the
+    # "all"/"liveall" modes add a `pid` label, which would break dashboards + the
+    # readiness text parser).
+    multiprocess_mode="max",
 )
 TURN_EFFICIENCY_ALERTS = Counter(
     "token_opt_turn_efficiency_alerts_total",
@@ -187,6 +192,9 @@ CIRCUIT_BREAKER_STATE = Gauge(
     "prefers failing over past that provider until its cooldown elapses "
     "(SLA dashboard resilience panel)",
     ["provider"],
+    # 0/1/2 is a severity ladder — under multiprocess, report the most severe state
+    # any worker observed rather than whichever worker answered the scrape.
+    multiprocess_mode="max",
 )
 FAILOVER_TOTAL = Counter(
     "token_opt_failover_total",
@@ -203,6 +211,9 @@ MODEL_LOCKOUT_STATE = Gauge(
     "`model_failure_threshold` model-scoped failures for `model_lockout_seconds`, then a "
     "single probe re-tests. Labelled by provider+model (SLA resilience panel)",
     ["provider", "model"],
+    # Locked (1) wins over available (0): if any worker has quarantined the model,
+    # the container's scrape should say so.
+    multiprocess_mode="max",
 )
 # ── Trust & Safety (#2 PII redaction G29 / #3 injection guardrails G30) ────────
 # Emitted directly by the G29/G30 middleware (not here) so the count is recorded even

@@ -21,6 +21,49 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-04
+
+### Proxy metrics are now aggregated across worker processes — Bug fix
+
+Each proxy container runs two uvicorn workers, and Prometheus keeps its counters in
+per-process memory. Without a shared directory each worker held a private registry, so a
+`/metrics` scrape answered from whichever worker the OS happened to route to: six
+consecutive scrapes returned 69, 69, 23, 69, 23, 69. Every metrics-derived dashboard and
+alert was computed from that oscillating series, and `rate()` reads each flip as a counter
+reset. The images now set `PROMETHEUS_MULTIPROC_DIR` (it has to be in the environment —
+metric objects choose their storage at import time) and `/metrics` aggregates across all
+workers, purging stale files at container start. Gauges report the highest value any worker
+saw, which keeps series names and labels identical, so no dashboard changes are needed.
+**Billing is unaffected** — invoices are computed from the Postgres ledger, never metrics.
+Under `max_instances > 1` each container is still scraped separately, as Prometheus expects.
+
+### Deployment readiness no longer blames routing for a cached probe — Bug fix
+
+The readiness check that proves per-tenant routing rules take effect sends a fixed prompt,
+so its own earlier run left that answer in the cache. On any re-run against the same live
+deployment the probe was served from cache, the routing stage never ran, and the check
+reported "config propagation lag, or G6 routing disabled" — neither of which was true.
+The result was a deployment that passed the first time and reported NOT READY on every
+subsequent check, with a message pointing at the wrong subsystem. The probe now opts out
+of the cache explicitly, and if a probe is still cache-served the check says so and reports
+itself inconclusive rather than failing routing. Verified by polling for 145 seconds: the
+rule never appeared, which is what ruled out a propagation delay and identified the cache.
+
+### Reference-substitution trust now propagates across workers and instances — Bug fix
+
+Context Compression & Reuse only replaces content with a reference for a client that has
+proven it can fetch the content back, and revokes that trust the moment a client answers
+without fetching. Both records lived in per-process memory, so neither travelled between
+uvicorn workers or Cloud Run instances. Missing trust was harmless (the proxy simply sent
+full content), but a missing **revocation** was not: a client that had demonstrably stopped
+resolving kept receiving references from every other worker, answering from a summary on a
+request that still billed 200. The record now lives in Redis under a per-tenant key, so
+trust and its withdrawal are shared instantly. A lookup failure reads as "not proven" (the
+safe direction); a failed revocation logs a warning. New operator setting
+`groups.G28_ccr.resolver_proof_ttl_seconds` (default 3600) replaces the hardcoded lifetime.
+Also corrects the configuration reference, which still described this feature as unavailable
+and its store as in-process — both untrue since 2026-09-03.
+
 ## 2026-09-03
 
 <!-- Marketing one-liners (benefit-led, no G-codes, honest about opt-in):

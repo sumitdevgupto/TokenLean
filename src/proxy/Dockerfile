@@ -39,7 +39,16 @@ COPY . .
 
 ENV PORT=8080
 ENV LOG_LEVEL=INFO
+# Prometheus metric objects are constructed at module IMPORT time, which is when
+# prometheus_client picks its value class — so this must come from the container
+# environment; Python code cannot set it in time. Without it, each of the two
+# uvicorn workers keeps a private registry and /metrics answers from whichever one
+# the OS routed to (observed live: 69/69/23/69/23/69 on six consecutive scrapes).
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-multiproc
 
 EXPOSE 8080
 
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 2
+# Purge before start: `docker restart` keeps the container layer, so stale per-PID
+# mmap files from the previous run would otherwise be summed into the aggregate.
+# `exec` keeps uvicorn as PID 1 so it still receives SIGTERM.
+CMD sh -c 'rm -rf "$PROMETHEUS_MULTIPROC_DIR" && mkdir -p "$PROMETHEUS_MULTIPROC_DIR" && exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 2'

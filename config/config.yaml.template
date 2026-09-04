@@ -1199,6 +1199,12 @@ groups:
     # also refuses to substitute at all when the durable store is unreachable, because
     # an unresolvable reference degrades the answer on a request that still bills 200.
     require_proven_resolver: true
+    # How long a proof stays valid, in seconds. The record is kept in Redis, so it is
+    # shared by every uvicorn worker and every instance — a client that stops resolving
+    # is demoted to full content everywhere at once, not just on the worker that noticed.
+    # Operator-only (not a portal knob): it tunes how long trust persists, which a tenant
+    # can only misread. Lower it if clients change agent behaviour often.
+    resolver_proof_ttl_seconds: 3600
     # Cap on model-supplied text accepted into the shared store.
     max_store_chars: 200000
     compress_system_prompt: false  # keep false — the system instruction must stay verbatim

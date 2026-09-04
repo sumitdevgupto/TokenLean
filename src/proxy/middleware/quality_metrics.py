@@ -43,6 +43,9 @@ CONTEXT_MAX_AGE_SECONDS = Gauge(
     "Age (seconds) of the OLDEST chunk injected on the last RAG request per tenant "
     "(freshness). Only set when at least one injected chunk carried a timestamp.",
     ["tenant_id"],
+    # Worst (oldest) freshness any worker saw — a staleness signal must not be
+    # diluted by whichever worker happens to answer the scrape.
+    multiprocess_mode="max",
 )
 GROUNDING_COVERAGE = Histogram(
     "token_opt_grounding_coverage",

@@ -251,6 +251,19 @@ async def metrics(request: Request):
     metrics carry per-tenant token/cost labels, so on a public Cloud Run service
     they must not be world-readable. When the token is unset the endpoint stays
     open for local dev (a one-time startup warning is logged in startup_event).
+
+    The image runs ``uvicorn --workers 2``, so each worker process holds its own
+    in-process registry and a scrape would otherwise answer from whichever worker
+    the OS routed to — the series oscillates and ``rate()`` reads every flip as a
+    counter reset. When ``PROMETHEUS_MULTIPROC_DIR`` is set (baked into the
+    Dockerfiles) the workers write mmap files into that directory and this endpoint
+    aggregates ACROSS all of them. The env var is read per request, not at import,
+    so the single-process path stays exercised by the unit suite.
+
+    Note this fixes the workers axis only. Under ``max_instances > 1`` each
+    container is still a separate registry — that is a Prometheus-side scrape and
+    aggregation concern (scrape every instance), not something this endpoint can
+    solve.
     """
     if _METRICS_SCRAPE_TOKEN:
         auth = request.headers.get("Authorization", "")
@@ -258,6 +271,14 @@ async def metrics(request: Request):
         if not hmac.compare_digest(provided, _METRICS_SCRAPE_TOKEN):
             raise HTTPException(status_code=401, detail="Invalid or missing metrics scrape token")
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        from prometheus_client import CollectorRegistry, multiprocess
+        registry = CollectorRegistry()
+        # Reads the per-PID mmap files of EVERY worker in this container. uvicorn
+        # does not recycle workers, so `mark_process_dead` reaping is unnecessary;
+        # staleness is bounded by the container-start purge in the Dockerfile CMD.
+        multiprocess.MultiProcessCollector(registry)
+        return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

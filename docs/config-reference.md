@@ -713,7 +713,7 @@ Compresses inline base64 image blocks before the LLM call via `headroom.compress
 | `provider` | `null` | Optional Headroom provider hint; `null` = auto-detect from the active adapter |
 
 ### G28_ccr
-> **Unavailable in this release.** The proxy refuses to run G28 regardless of `enabled`, and logs at ERROR if you set it. Its content store is in-process only, so a `[CCR:ref]` is resolvable only on the instance that created it and only until that instance recycles — `--min-instances=0` alone is enough to lose it across an idle gap. Enabling it would replace content the model needs with a reference that can fail to resolve mid-conversation, on a billed HTTP 200 with no metric. `ttl_seconds` is likewise not honoured. For long conversations use **G26 Budget-Aware Context Management**, which does the same job and is measured. Tracked as `demand-driven-features.md` #28.
+> **Available since 2026-09-03, still off by default.** The earlier availability guard is lifted: the content store is now Redis-backed and content-addressed (key = sha256 of the block), so a `[CCR:ref]` survives a restart and resolves across instances, and `ttl_seconds` is honoured. Measured savings are **regime-dependent and published two-sided**: **−63% tokens at a 17% expansion rate, +30% at 100%** (break-even around 75–80%) — CCR pays only when parked content is rarely read back. It substitutes only for a client that has **proven** it can resolve a reference (`require_proven_resolver`), refuses to substitute at all when the store is unreachable, and revokes that proof the moment a client answers without resolving one. For plain long conversations prefer **G26 Budget-Aware Context Management**.
 
 Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token before the call, then exposes MCP tools (`headroom_compress`/`retrieve`/`stats`) so the model can fetch the full text on demand. Runs on both request and response paths. Falls back gracefully without `headroom.ccr` or Redis.
 
@@ -724,7 +724,10 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 | `enabled` | `false` | Enable context compression & reuse (agent clients only) |
 | `min_tokens` | `300` | Minimum block size eligible for CCR |
 | `ttl_seconds` | `86400` | Redis TTL for stored content (24h) |
-| `expose_mcp_tools` | `true` | Inject `headroom_*` tools into the request |
+| `expose_mcp_tools` | `true` | Inject `headroom_*` tools into the request (only for callers that already send tools) |
+| `require_proven_resolver` | `true` | Send full content until this client has demonstrated it can fetch a block back |
+| `resolver_proof_ttl_seconds` | `3600` | How long that proof stays valid. Kept in Redis, so proof **and revocation** are shared by every worker and instance — a client that stops resolving is demoted everywhere at once. Operator-only (not a portal knob) |
+| `max_store_chars` | `200000` | Cap on model-supplied text accepted into the shared store |
 | `compress_system_prompt` | `false` | Allow CCR to replace the system instruction (keep false for pass-through) |
 
 ### G30_guardrails

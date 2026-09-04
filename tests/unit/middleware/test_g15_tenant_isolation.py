@@ -75,6 +75,9 @@ class _FakeRedis:
     async def get(self, key):
         return self.data.get(key)
 
+    async def delete(self, *keys):
+        return sum(1 for k in keys if self.data.pop(k, None) is not None)
+
 
 @pytest.fixture(autouse=True)
 def _durable_store(monkeypatch):
@@ -83,7 +86,7 @@ def _durable_store(monkeypatch):
     monkeypatch.setattr("cache.redis_pool.get_redis", lambda: r)
     g28._local_store.clear()
     g28._stats.clear()
-    g28._resolvers_proven.clear()
+    # The resolver proof is Redis-backed (backlog #40); a fresh fake isolates it.
     return r
 
 
