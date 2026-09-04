@@ -66,6 +66,155 @@ REASON_POLICY_DENIED = "policy_denied"
 REASON_EVALUATION_ERROR = "evaluation_error"
 
 
+class StreamToolGate:
+    """Applies the tenant's tool policy to a STREAMED response, chunk by chunk.
+
+    Backlog #25. ``main._stream_response`` relays provider chunks and never calls the
+    response pipeline, so before this a tenant's DENY rule simply did not apply to
+    streaming: the call was relayed and the caller's own agent loop executed it — a
+    security control that silently did nothing on the most common agentic path.
+
+    Note what this is NOT. Streaming also skips G15/G28, so the proxy never
+    server-side-executes a streamed tool call. The exposure was policy NON-ENFORCEMENT,
+    not proxy execution.
+
+    Gating keys off the tool NAME, which arrives in the FIRST delta for a given tool-call
+    index (arguments stream afterwards), so no full-argument buffering is needed and the
+    added latency is nil in the normal case. Only deltas for an index whose name has not
+    yet appeared are withheld — a shape providers do not currently emit, handled so a
+    future one cannot slip past unevaluated.
+
+    Modes match the non-streaming path exactly: ``off`` never evaluates, ``flag`` records
+    but relays untouched (flag governs the record, not the response), ``block`` drops the
+    denied call's deltas.
+    """
+
+    __slots__ = ("_ctx", "_cfg", "_mode", "_policy", "_verdicts", "_held",
+                 "denied", "stripped")
+
+    def __init__(self, ctx: RequestContext, cfg: Dict[str, Any], mode: str,
+                 policy: ToolPolicy) -> None:
+        self._ctx = ctx
+        self._cfg = cfg
+        self._mode = mode
+        self._policy = policy
+        self._verdicts: Dict[Any, bool] = {}
+        self._held: Dict[Any, List[Any]] = {}
+        self.denied: List[str] = []
+        self.stripped = False
+
+    def _allowed(self, name: str) -> bool:
+        try:
+            verdict = evaluate_tool(self._policy, name)
+        except Exception as exc:
+            # Fail-CLOSED, bounded to this one call — the same posture as the
+            # non-streaming path, for the same reason.
+            logger.error(
+                "[%s] G32 stream policy evaluation failed for tool %r (%s) — denying",
+                self._ctx.request_id, name, exc,
+            )
+            return False
+        if verdict.allowed:
+            return True
+        self.denied.append(name or "<unnamed>")
+        return False
+
+    def _keep(self, entry: Any) -> bool:
+        """Whether one ``tool_calls`` delta entry may be relayed."""
+        if not isinstance(entry, dict):
+            return True                       # not ours to interpret
+        idx = entry.get("index", 0)
+        if idx in self._verdicts:
+            return self._verdicts[idx]
+        fn = entry.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            allowed = self._allowed(name)
+            self._verdicts[idx] = allowed
+            return allowed
+        # No name yet for this index: it cannot be evaluated, so it must not be relayed.
+        self._held.setdefault(idx, []).append(entry)
+        return False
+
+    def filter(self, chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return the chunk to emit, or None to drop it entirely."""
+        if self._mode == "off" or not isinstance(chunk, dict):
+            return chunk
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return chunk
+
+        touched = False
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            calls = delta.get("tool_calls")
+            if not isinstance(calls, list) or not calls:
+                continue
+            kept = [c for c in calls if self._keep(c)]
+            if len(kept) == len(calls):
+                continue
+            touched = True
+            if self._mode != "block":
+                continue                      # flag: recorded above, relayed untouched
+            self.stripped = True
+            if kept:
+                delta["tool_calls"] = kept
+            else:
+                delta.pop("tool_calls", None)
+                # Only correct a finish_reason that actually said "tool_calls" — same
+                # care as the non-streaming path.
+                if choice.get("finish_reason") == "tool_calls":
+                    choice["finish_reason"] = "stop"
+
+        if not touched or self._mode != "block":
+            return chunk
+        # Drop a chunk that now carries nothing: relaying an empty delta with no
+        # finish_reason is noise a client has no reason to expect.
+        for c in choices:
+            if not isinstance(c, dict):
+                continue
+            d = c.get("delta") or {}
+            if d.get("content") is not None or d.get("tool_calls") or c.get("finish_reason"):
+                return chunk
+        return None
+
+    def finish(self) -> None:
+        """Record the verdict once the stream is complete.
+
+        Deltas still held (an index whose name never arrived) are never relayed: an
+        unevaluable tool call is malformed provider output, and fail-closed is exactly
+        what ``evaluate_tool`` does for a missing name.
+        """
+        for idx in self._held:
+            if idx not in self._verdicts:
+                self.denied.append("<unnamed>")
+                if self._mode == "block":
+                    self.stripped = True
+        if not self.denied:
+            return
+        ctx = self._ctx
+        ctx.tool_eligibility_action = self._mode
+        ctx.tool_eligibility_denied = list(dict.fromkeys(self.denied))
+        ctx.tool_eligibility_count = len(self.denied)
+        if self.stripped:
+            ctx.no_cache = True
+        try:
+            if self._cfg.get("metrics_enabled", True):
+                from middleware.quality_metrics import record_tool_denied
+                record_tool_denied(getattr(ctx, "tenant_id", "default"),
+                                   mode=self._mode, n=len(self.denied))
+        except Exception as exc:              # never let metrics break a stream
+            logger.debug("[%s] G32 stream metric emit failed: %s", ctx.request_id, exc)
+        logger.warning(
+            "[%s] G32 %s tool-eligibility (streaming): %d call(s) denied %s",
+            ctx.request_id, self._mode, len(self.denied), ctx.tool_eligibility_denied,
+        )
+
+
 def authorize_dispatch(ctx: RequestContext, tool_name: str) -> Optional[str]:
     """Second, INDEPENDENT authorization check at an auto-EXECUTION site.
 
@@ -214,6 +363,24 @@ class G32ToolEligibility:
         else:
             self._policy_cache[tenant_id] = (sig, policy)
         return policy
+
+    def stream_gate(self, ctx: RequestContext) -> Optional[StreamToolGate]:
+        """Build a gate for a streamed response, or None when there is nothing to do.
+
+        Returning None on the default install (no policy configured) is what keeps
+        streaming byte-identical — no per-chunk work happens at all. main.py never
+        compiles a policy itself, so there is exactly one policy engine and one cache.
+        """
+        cfg = self._config(ctx)
+        if not cfg.get("enabled", True):
+            return None
+        mode = coerce_mode(cfg.get("mode"), _VALID_MODES, "flag")
+        if mode == "off":
+            return None
+        policy = self._get_policy(cfg, ctx)
+        if policy.is_noop:
+            return None
+        return StreamToolGate(ctx, cfg, mode, policy)
 
     # ── main entry point ─────────────────────────────────────────────────────
     async def process_response(

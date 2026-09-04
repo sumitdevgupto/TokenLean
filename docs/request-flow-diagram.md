@@ -196,7 +196,7 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Confidence scoring: keyword (40%) + pattern (60%); dispatch `static_response` or `backend_url`
 - If match: set `ctx.bypassed=True`, skip LLM call entirely
 
-**G05: Cache** (`g05_cache.py` + `g05_cache_gptcache.py` + `g05_temporal_activity.py`)
+**G05: Cache** (`g05_cache.py` + `g05_cache_gptcache.py`)
 - L1: exact-match Redis (SHA256 of normalised prompt)
 - L2: semantic pgvector cosine similarity (threshold from config)
 - L3: headroom `SemanticCache` (hybrid scorer; falls back gracefully when headroom is absent)
@@ -712,7 +712,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G02** | `g02_template_registry.py` | Template management, deprecation, budget |
 | **G03** | `g03_doc_pipeline.py` (+ `src/doc-pipeline/`, `src/finetune-pipeline/`, `src/tika-sidecar/`) | Document ingestion, RAG fallback, fine-tuning |
 | **G04** | `g04_bypass.py`, `g04_db_resolution.py` | Rules-based bypass with DB-first resolution |
-| **G05** | `g05_cache.py`, `g05_cache_gptcache.py`, `g05_temporal_activity.py` | L1/L2/L3 caching, Auto-TTL, activity replay |
+| **G05** | `g05_cache.py`, `g05_cache_gptcache.py` | L1/L2/L3 caching, Auto-TTL, activity replay (`G05Cache.temporal_activity_replay`) |
 | **G06** | `g06_routing.py` | Model routing/cascade with confidence scoring |
 | **G07** | `g07_retrieval.py`, `g07_pgvector_fallback.py` | Hybrid RAG retrieval, pgvector fallback |
 | **G08** | `g08_tool_loading.py`, `g08_mcp_loader.py` | Intent-based tool loading, MCP lazy manifest |

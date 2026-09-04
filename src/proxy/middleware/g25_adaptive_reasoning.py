@@ -55,12 +55,24 @@ def _build_patterns(keywords: List[str]) -> List[re.Pattern]:
     return [re.compile(kw, re.IGNORECASE) for kw in keywords]
 
 
-def _extract_user_text(messages: List[Dict]) -> str:
-    """Concatenate user and system message content for complexity scoring."""
+def _extract_user_text(messages: List[Dict], roles: Tuple[str, ...] = ("user",)) -> str:
+    """Concatenate the scored message content for complexity classification.
+
+    Scores the USER turn(s) by default. It used to include ``system`` as well, which
+    quietly defeated the whole point of the group: a system prompt is STATIC across a
+    workload, so if it contains any medium/high keyword — and an 8,150-character policy
+    document almost always does — every request under that prompt is classified the same
+    regardless of what was actually asked. Measured on DS8 2026-09-04 (backlog #42): the
+    question "What are the API call limits for the Scale tier?" matched nothing on its
+    own, and the tier came from the word 'explain' buried in the system prompt. The
+    result was 4,869 reasoning tokens across the arm — 61% of the output bill — for
+    answers no longer than the non-reasoning arm's.
+
+    ``scan_roles`` restores the old behaviour for an operator who wants it.
+    """
     parts = []
     for m in messages:
-        role = m.get("role", "")
-        if role in ("user", "system"):
+        if m.get("role", "") in roles:
             content = m.get("content", "")
             if isinstance(content, str):
                 parts.append(content)
@@ -72,10 +84,16 @@ def _classify_complexity(
     high_patterns: List[re.Pattern],
     medium_patterns: List[re.Pattern],
     low_patterns: List[re.Pattern],
+    default_effort: str = "medium",
 ) -> Tuple[str, str]:
     """Return (effort_level, reason) for the given request text.
 
-    Priority: HIGH > MEDIUM > LOW > MEDIUM (default when nothing matches).
+    Priority: HIGH > MEDIUM > LOW > ``default_effort`` when nothing matches.
+
+    The default stays **medium** deliberately. For a keyword classifier "no match" is the
+    COMMON case, so this value is the behaviour for most traffic — dropping it to `low`
+    would cut reasoning cost across the board but is a quality decision, not a bug fix,
+    and it is exposed as `default_effort` rather than changed here (backlog #42).
     """
     for pat in high_patterns:
         m = pat.search(text)
@@ -92,7 +110,8 @@ def _classify_complexity(
         if m:
             return "low", f"low-complexity keyword: {m.group(0)!r}"
 
-    return "medium", "no keyword match — defaulting to medium"
+    effort = default_effort if default_effort in ("low", "medium", "high") else "medium"
+    return effort, f"no keyword match — defaulting to {effort}"
 
 
 def _is_reasoning_model(model: str, extra_prefixes: List[str], adapter=None) -> bool:
@@ -159,8 +178,14 @@ class G25AdaptiveReasoning:
             return ctx
 
         high_patterns, medium_patterns, low_patterns = self._get_patterns(cfg)
-        user_text = _extract_user_text(ctx.messages)
-        effort, reason = _classify_complexity(user_text, high_patterns, medium_patterns, low_patterns)
+        # Score the caller's REQUEST, not the developer's static instructions (#42).
+        raw_roles = cfg.get("scan_roles", ["user"])
+        roles = tuple(r for r in raw_roles if isinstance(r, str)) or ("user",)
+        user_text = _extract_user_text(ctx.messages, roles)
+        effort, reason = _classify_complexity(
+            user_text, high_patterns, medium_patterns, low_patterns,
+            default_effort=str(cfg.get("default_effort", "medium")).lower(),
+        )
 
         # Apply per-complexity floor/ceiling from config
         effort_floor: str = cfg.get("effort_floor", "low")

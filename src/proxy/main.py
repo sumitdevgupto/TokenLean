@@ -1114,6 +1114,21 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
             on_success=_make_pin_winner(ctx, request_id, "stream failover"),
         )
 
+    # G32 on the streaming path (#25). Before this, a tenant's tool policy silently did
+    # not apply to streamed responses: the call was relayed and the caller's own agent
+    # loop executed it. Built ONCE per stream and None on a default install (no policy),
+    # so the common path does no per-chunk work and stays byte-identical.
+    _tool_gate = None
+    try:
+        _g32 = getattr(_pipeline, "g32", None)
+        if _g32 is not None:
+            _tool_gate = _g32.stream_gate(ctx)
+    except Exception as exc:
+        # A gate that cannot be built must not take the request down; it is logged at
+        # ERROR because the stream then goes out UNGATED, which is the thing #25 fixed.
+        logger.error("[%s] G32 stream gate unavailable — stream is UNGATED: %s",
+                     request_id, exc)
+
     async def event_gen():
         last_usage = {}
         parts = []  # accumulated assistant text for chunk-aware G23 (measurement only)
@@ -1133,6 +1148,17 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                         parts.append(delta["content"])
                 except Exception:
                     pass
+                if _tool_gate is not None:
+                    try:
+                        cd = _tool_gate.filter(cd)
+                    except Exception as exc:
+                        # Bounded to this chunk: relaying it ungated is wrong, but tearing
+                        # down a stream mid-flight is worse, and the caller would have no
+                        # way to tell the difference from a provider error.
+                        logger.error("[%s] G32 stream gate failed on a chunk: %s",
+                                     request_id, exc)
+                    if cd is None:
+                        continue              # whole chunk was policy-stripped
                 yield f"data: {_json.dumps(cd, separators=(',', ':'))}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:
@@ -1150,6 +1176,14 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
             )
             yield f"data: {_json.dumps({'error': _client_msg})}\n\n"
         finally:
+            # Record the tool-policy verdict (#25). Kept in its OWN try and placed ahead
+            # of the accounting below, deliberately: the streaming path is where
+            # billing/SLA truth is computed, and gating must never be able to disturb it.
+            if _tool_gate is not None:
+                try:
+                    _tool_gate.finish()
+                except Exception as exc:
+                    logger.debug("[%s] G32 stream gate finish failed: %s", request_id, exc)
             # Chunk-aware G23: run output compression on the reassembled stream to record the
             # output-side savings the (skipped) response pipeline would have. The live chunks
             # are emitted unchanged — rewriting them mid-stream would corrupt the SSE output.

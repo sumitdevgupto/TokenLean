@@ -86,3 +86,39 @@ class TestOpenCoreBarricade:
         assert "customer portal" not in content, (
             "Open-core README must not market the (commercial) customer portal"
         )
+
+
+class TestSavingsClaimsAreMeasured:
+    """A published savings figure must correspond to something the ablation measures.
+
+    Backlog #32: G13's row advertised **25-60%** while covering three mechanisms — TOON,
+    Kafka batching, and the provider-native 50% batch lane — of which the ablation
+    exercises only TOON (DS4, 36.12% on the last full mint). Kafka has no topics
+    configured and `provider_native` appears nowhere in the harness config, so two thirds
+    of the claim rested on nothing. Same defect class as the "~84% on cached prefix"
+    figure withdrawn the same day: a number whose scope is wider than its evidence.
+    """
+
+    def _g13_row(self):
+        from pathlib import Path
+        readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
+        # README carries a second G13 row in the tuning table; the group table's row is
+        # the one that publishes a savings figure.
+        rows = [l for l in readme.splitlines()
+                if l.startswith("| **G13**") and "Batch/Compact" in l]
+        assert len(rows) == 1, "expected exactly one G13 row in the G-group table"
+        return rows[0]
+
+    def test_g13_does_not_advertise_the_unmeasured_range(self):
+        row = self._g13_row()
+        assert "25-60" not in row and "25–60" not in row, (
+            "the G13 range spanned two mechanisms the ablation never exercises"
+        )
+
+    def test_g13_states_what_is_measured_and_what_is_not(self):
+        row = self._g13_row()
+        assert "measured" in row.lower()
+        assert "not measured" in row.lower(), (
+            "the unmeasured mechanisms must be named as unmeasured, not omitted — "
+            "dropping them would hide the gap instead of disclosing it"
+        )

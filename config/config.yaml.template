@@ -1239,6 +1239,19 @@ groups:
     effort_floor: low
     effort_ceiling: high
     extra_reasoning_prefixes: []
+    # Which message roles are scored for complexity. USER only by default: a system
+    # prompt is static across a workload, so scoring it pins every request under that
+    # prompt to the same tier -- the opposite of adaptive. Measured 2026-09-04: a
+    # one-line billing question inherited "medium" from the word 'explain' buried in an
+    # 8,150-character policy prompt, and reasoning tokens became 61% of the output bill
+    # while the answers got no longer. Add "system" back only if your system prompts
+    # genuinely vary per request.
+    scan_roles: ["user"]
+    # Effort used when NO keyword matches. This is a keyword classifier, so "no match" is
+    # the common case -- this value is the behaviour for most traffic, not an edge case.
+    # `low` cuts reasoning cost across the board but is a QUALITY trade, so the shipped
+    # default stays `medium`; change it with your own measurement.
+    default_effort: medium
   # ── G26 · Budget-aware context management (BACM-style) ───────────────────────
   # Treats the model's context window as a budget assessed BEFORE the call: when the
   # assembled prompt crosses compact_at_pct of the USABLE window (context window minus

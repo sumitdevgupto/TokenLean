@@ -536,3 +536,31 @@ class TestTenantIsolationCallSiteLint:
             f"zep.get_memory has {len(hits)} external call sites (expected 1). "
             f"New call sites must use scoped_session_id: {hits}"
         )
+
+
+class TestNoUnprefixedTemporalCache:
+    """Backlog #8. `g05_temporal_activity.py` held a parallel activity cache whose keys
+    were built as `tok_opt:activity:<sha>` with no tenant prefix — two tenants running
+    the same workflow+activity+input would have collided. Nothing imported it, so it was
+    never reachable; it was DELETED 2026-09-04 rather than patched, because fixing keys
+    in code that never runs is the appearance of a fix. The shipped replay path is
+    `G05Cache.temporal_activity_replay`, which is tenant-scoped (tested above).
+    """
+
+    def test_the_dormant_module_is_gone(self):
+        import importlib
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("middleware.g05_temporal_activity")
+
+    def test_no_cache_key_in_g05_is_built_without_a_prefix(self):
+        """Every Redis key builder in G05 must take a prefix argument — the property the
+        deleted module violated."""
+        import inspect
+        from middleware import g05_cache
+        for name, fn in vars(g05_cache).items():
+            if not (callable(fn) and name.endswith("_cache_key")):
+                continue
+            assert "prefix" in inspect.signature(fn).parameters, (
+                f"{name} builds a cache key with no tenant prefix — that is the exact "
+                f"shape backlog #8 removed"
+            )

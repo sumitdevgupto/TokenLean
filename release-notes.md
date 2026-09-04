@@ -23,6 +23,55 @@ date changes.
 
 ## 2026-09-04
 
+### Tool policy is now enforced on streaming responses — Bug fix
+
+Tool-call policy was applied only to non-streaming responses. On a streamed response the
+policy silently did nothing: a DENY rule did not apply, the call was relayed, and the
+caller's own agent loop ran it — on the path agentic clients actually use. The gate now
+runs per chunk, keyed off the tool name (which arrives in the first fragment of each call),
+so a denied call and its trailing argument fragments never reach the client. `flag` still
+records without altering the response, matching non-streaming exactly, and an installation
+with no policy configured does no per-chunk work at all. Note the proxy never
+server-side-executed a streamed tool call — server-side execution is not on the streaming
+path — so this closes a policy-enforcement gap, not an execution one.
+
+### Removed a dormant cache module with un-namespaced keys — Bug fix
+
+`g05_temporal_activity.py` built activity-replay cache keys without a tenant prefix, so two
+tenants running the same workflow step could in principle have collided. Nothing imported
+it, so it was never reachable, and the activity replay that actually ships
+(`G05Cache.temporal_activity_replay`) has always been tenant-scoped and test-covered. The
+module was deleted rather than patched — fixing keys in code that never runs is the
+appearance of a fix — and the documentation that listed it has been corrected. A new test
+asserts every G05 cache-key builder takes a tenant prefix.
+
+### Batching savings figure corrected to what is measured — Bug fix
+
+The G13 row advertised **25-60%**, a range covering three mechanisms: TOON compaction,
+Kafka batching, and the opt-in provider-native batch lane. Only TOON is exercised by the
+ablation, at **36%**; the other two are not measured at all. The row now states the
+measured figure and names the unmeasured mechanisms as unmeasured. This **narrows the
+published claim** — the 60% upper bound had nothing behind it. Same correction as the
+"~84% on cached prefix" figure withdrawn earlier today.
+
+### Adaptive reasoning now classifies the request, not the system prompt — Bug fix
+
+Reasoning effort was chosen by scanning the user turn **and** the system prompt together. A
+system prompt is fixed across a workload, so a single keyword in it pinned every request to
+the same effort level — the opposite of adaptive. A one-line billing question inherited
+"medium" from the word "explain" inside an 8,150-character policy prompt. Complexity is now
+scored on the request itself; `scan_roles` restores the old behaviour if your system prompts
+genuinely vary per request, and the effort used when nothing matches is now configurable as
+`default_effort`.
+
+**What this does not do:** it does not reduce reasoning cost on workloads like the one that
+exposed it. Measured before and after on the same dataset, reasoning tokens were unchanged
+(4,615 → 4,703). The cost there does not come from the effort tier at all — the model used
+~157 reasoning tokens per request against a 5,000-token budget, so the tier is a ceiling it
+never approaches. It comes from extended thinking being enabled at all, which currently
+happens for any effort level on a reasoning-capable model. That is recorded as open work,
+not fixed here.
+
 ### Optional guard: stop compressing a prompt out of the provider's cache — Enhancement (OSS)
 
 Providers only cache a prompt prefix above a minimum size (~1024 tokens), and below it they

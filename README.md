@@ -421,7 +421,7 @@ tests/                      # Unit and integration tests (pytest)
 | **G10** | Memory Management | 20-40% | Mem0 OSS integration for long-horizon conversation memory |
 | **G11** | Output Format | 10-25% | Auto max_tokens with Redis feedback loop (p95 tuning). Opt-in **output JSON-schema validation** (`validate_output`) — flag / one-shot repair / block a structured answer that isn't valid JSON or misses a schema field. Opt-in **terse-output steering** (`verbosity_steering.level`: lite/full/ultra) — a built-in "answer tersely" dial (safety carve-outs; cache-key-scoped) that subsumes the Caveman-style terseness prompt |
 | **G12** | Reasoning Budget | 10-30% | Low/medium/high effort suppression prompts |
-| **G13** | Batch/Compact | 25-60% | TOON (Token-Optimized Object Notation) + Kafka batching. Opt-in **provider-native async batch lane** (`provider_native`) claims the **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs |
+| **G13** | Batch/Compact | **36% measured** (TOON only) | TOON (Token-Optimized Object Notation) compaction — the measured figure, from the DS4 ablation. The other two mechanisms in this group are **not measured**: Kafka batching, and the opt-in **provider-native async batch lane** (`provider_native`), which claims the provider's **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs. Neither is exercised by the ablation, so neither contributes to this number |
 | **G14** | Tool Output | 15-30% | Dependency-aware parallel tool combining |
 | **G15** | Server Compute | Variable | MCP SDK server dispatch for external handlers |
 | **G16** | Agent Architecture | 5-20% enforced (truncation + tool pruning); 20-45% with manual role decomposition | LangGraph + Temporal runtimes with cost modeling |

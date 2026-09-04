@@ -142,15 +142,29 @@ def test_hoist_failure_still_serves_the_cache_hit(monkeypatch):
 
 # ── 3. streaming is knowingly NOT gated (pins the documented limitation) ──────
 def test_streaming_path_does_not_run_the_response_pipeline():
-    """`_stream_response` relays provider chunks unchanged, so G32 never sees a
-    streamed tool call. This is a DOCUMENTED limitation (README + config-reference +
-    the marketing one-liner all say 'non-streaming'). If this assertion ever fails,
-    streaming gating has been added and those docs must be updated to match."""
+    """The response PIPELINE is still skipped on streams — but G32 is no longer.
+
+    Updated 2026-09-04 (backlog #25). The gate now runs per chunk via
+    ``G32ToolEligibility.stream_gate``, NOT by running the response pipeline: G14/G18/G23
+    and G15/G28 auto-execution all remain out of the streaming path, which is why a
+    streamed tool call is still never server-side-executed by the proxy. What changed is
+    that a tenant's DENY rule is now enforced instead of silently ignored.
+    """
     import inspect
     src = inspect.getsource(main._stream_response)
     assert "process_response" not in src, (
-        "_stream_response now calls the response pipeline — G32's documented "
-        "'non-streaming only' limitation is stale and the docs must be updated"
+        "the streaming path must NOT run the full response pipeline — gating is done "
+        "with the targeted stream_gate, exactly as the cache/bypass short-circuit uses "
+        "one targeted G32 call rather than the whole chain"
     )
-    # And the contract is stated where a reader will find it.
-    assert "response-side pipeline" in inspect.getdoc(main._stream_response)
+    assert "stream_gate" in src, (
+        "streamed tool calls must be gated (#25) — without this a tenant's tool policy "
+        "silently fails open on the most common agentic path"
+    )
+    # The gate must not be entangled with billing/SLA truth: its verdict is recorded in
+    # its own guarded block, never inside the accounting that decides whether a stream
+    # counts as served.
+    assert src.index("_tool_gate.finish()") < src.index("_record_outcome"), (
+        "the gate's verdict must be recorded before, and independently of, the "
+        "billing/SLA accounting"
+    )
