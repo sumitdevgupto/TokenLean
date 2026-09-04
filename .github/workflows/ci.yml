@@ -53,8 +53,13 @@ jobs:
       - name: Tenant isolation gate (cross-tenant invariants must hold)
         run: pytest tests/unit/test_isolation_invariants.py tests/unit/tenancy tests/unit/middleware/test_multi_tenancy.py -q
 
-      - name: Unit tests
-        run: pytest tests/unit -q
+      # The WHOLE tree, not just tests/unit. ~590 tests live at tests/ root and in
+      # tests/integration, and until 2026-09-04 no gate and no CI job ever executed them
+      # — the collection gate above imported them and stopped there. Two tests sat broken
+      # on main as a result. Commercial-only tests self-skip on the OSS tree (28 skipped),
+      # which is what makes running the full tree safe here.
+      - name: Tests (full tree)
+        run: pytest tests/ -q
 
   tier-build:
     name: Tier build matrix

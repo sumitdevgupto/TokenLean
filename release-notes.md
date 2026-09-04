@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-09-04
 
+### CI and the OSS gate now run the whole test suite — Bug fix
+
+Both the public CI job and the open-core release gate ran `pytest tests/unit`, so roughly
+590 tests at `tests/` root and under `tests/integration` were **never executed by anything**
+— CI imported them in its collection step and stopped there. Two tests were sitting broken
+on `main` as a direct result, one of them introduced by the previous day's commit. Both
+gates now run `pytest tests/`; commercial-only tests already self-skip on the open-source
+tree, which is what makes the full run safe. Also fixed the second of those two tests: it
+asserted that an embedding model gets loaded, but the embedding cache had since been added
+in front of it, so on any machine with Redis running the first run populated the cache and
+**every run afterwards returned the cached vector and never loaded the model** — it passed
+exactly once and failed forever after, while also writing into a live Redis.
+
 ### Reasoning can now be turned OFF per request, across providers — Enhancement (OSS)
 
 Every effort tier previously emitted an *enabling* parameter, including `low` — so once a

@@ -32,6 +32,35 @@ def test_default_embedding_model():
 
 # ─── _embed uses configured model ───────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _isolate_embedding_cache(monkeypatch):
+    """Run the embed tests against an EMPTY cache, in-process only.
+
+    These tests assert that `get_sentence_transformer` is called. `_embed` now routes
+    through `embedding_cache.embed_cached`, which checks a process-local dict and then a
+    real Redis before encoding — so on a developer machine with the stack up, the first
+    run wrote `emb:custom-model-v2:<sha256("hello world")>` into Redis and **every run
+    after that returned the cached vector and never encoded**. The test therefore passed
+    exactly once, against a clean Redis, and failed forever after (backlog #44). It also
+    meant unit tests were writing into a live Redis.
+
+    Clearing the local dict and forcing the Redis layer unreachable makes the encode path
+    genuinely execute, which is what these tests claim to be about. `embed_cached`
+    documents that an unreachable cache must compute rather than fail, so this exercises a
+    supported path, not a contrived one.
+    """
+    import embedding_cache
+
+    embedding_cache._local.clear()
+
+    def _no_redis():
+        raise RuntimeError("redis intentionally unavailable in this test")
+
+    monkeypatch.setattr("cache.redis_pool.get_redis", _no_redis)
+    yield
+    embedding_cache._local.clear()
+
+
 @pytest.mark.asyncio
 async def test_embed_uses_provided_model():
     """_embed passes model_name to get_sentence_transformer."""
