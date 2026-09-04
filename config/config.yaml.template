@@ -114,6 +114,11 @@ ip_allowlist:
 providers:
 - name: openai
   api_base: https://api.openai.com/v1
+  # Smallest prompt this provider will cache a prefix for. Below it the provider
+  # silently declines to cache -- no read, no write, no error. Only consulted when a
+  # feature opts in (groups.G1_compression.preserve_cacheable_prefix); 0 disables it.
+  # Verify against the provider's current docs before changing.
+  min_cacheable_tokens: 1024
   # Optional per-provider resilience override (merges over the top-level `resilience:`
   # block). E.g. a flakier provider can trip its breaker sooner:
   #   resilience:
@@ -155,6 +160,9 @@ providers:
   - ada
 - name: anthropic
   api_base: https://api.anthropic.com/v1
+  # See the openai entry: 1024 for Sonnet/Opus-class models, higher for the
+  # smallest ones -- check the provider's docs for the models you route to.
+  min_cacheable_tokens: 1024
   models:                        # verified 2026-08-06
   - claude-opus-5                # current Opus
   - claude-sonnet-5
@@ -516,6 +524,15 @@ groups:
   G1_compression:
     enabled: true
     min_tokens_to_compress: 200
+    # Default OFF. When true, G01 abandons a compression that would take the prompt
+    # BELOW the routed provider's minimum cacheable size (providers.<name>.
+    # min_cacheable_tokens). Below that floor a provider silently stops caching the
+    # prefix -- no read, no write, no error -- so a prompt that compresses under it
+    # can cost MORE than the uncompressed one on a workload whose prefix repeats
+    # (measured: 63% fewer tokens sent, 2.5x the input cost). Whether that trade is
+    # bad depends entirely on whether YOUR prefix repeats, which is why this is
+    # opt-in rather than a default.
+    preserve_cacheable_prefix: false
     compression_ratio_target: 0.5
     force_reserve_digit: true        # preserve digit tokens (dates/IDs/amounts) so compression can't corrupt a tool argument
     sidecar_url: http://llmlingua-svc:8080/compress

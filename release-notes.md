@@ -23,6 +23,24 @@ date changes.
 
 ## 2026-09-04
 
+### Optional guard: stop compressing a prompt out of the provider's cache — Enhancement (OSS)
+
+Providers only cache a prompt prefix above a minimum size (~1024 tokens), and below it they
+decline silently — no cache read, no cache write, no error. Measured on a shared-prefix workload:
+the full optimisation stack compressed a 2,044-token prefix to ~736, so caching stopped entirely
+and the input bill came to **2.5x the cost of prefix caching alone, while sending 63% fewer
+tokens**. A new `preserve_cacheable_prefix` setting makes compression stand down when it would
+push a prompt under the routed provider's minimum, with that minimum read from provider config so
+it can be corrected without a redeploy.
+
+**Ships off.** Which lever wins is workload-shaped: the conflict only bites when a prefix actually
+repeats, and on a workload without repetition compression is strictly better. Turn it on with your
+own measurement, not on ours. With it off, behaviour is byte-identical.
+
+- **OSS:** the `groups.G1_compression.preserve_cacheable_prefix` toggle, per-provider
+  `min_cacheable_tokens`, and per-arm cache reporting in the ablation harness so the trade is
+  visible per configuration rather than as one blended number.
+
 ### Cache reads and writes are now reconciled against the provider bill — Enhancement (OSS)
 
 The proxy already reported provider cache reads, writes and their costs per call. There was no

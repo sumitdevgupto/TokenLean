@@ -165,6 +165,28 @@ class ProviderAdapter(ABC):
         """
         return {"reasoning_effort", "thinking"}
 
+    def min_cacheable_prompt_tokens(self, config: Dict, model: str) -> int:
+        """Smallest prompt this provider will cache a prefix for, or 0 if it has none.
+
+        Providers do not cache short prefixes and say nothing when they decline: no
+        cache read, no cache write, no error. Measured on DS8 2026-09-04 — an all-on
+        prompt compressed to ~736 tokens produced ZERO cache activity on both OpenAI and
+        Anthropic while G21 was still injecting markers that could never pay out.
+
+        Returned from config so an operator can track a provider's published minimum
+        without a redeploy; 0 (the default here) leaves every dependent guard inert, so
+        an adapter that does not override this changes nothing.
+        """
+        entry = (config.get("providers") or {})
+        if isinstance(entry, dict):
+            entry = entry.get(self.name) or {}
+        else:  # providers may be a LIST of {name: ...} dicts
+            entry = next((p for p in entry if isinstance(p, dict) and p.get("name") == self.name), {})
+        try:
+            return max(0, int(entry.get("min_cacheable_tokens", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def render_tools_for_counting(self, tools: List[Dict]) -> Optional[Tuple[str, int]]:
         """(body_text, constant_overhead) approximating how THIS provider bills tool
         definitions, or None to use the calculator's default (OpenAI packed-TS form).

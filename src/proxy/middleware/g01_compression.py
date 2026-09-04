@@ -339,6 +339,38 @@ class G01Compression:
                         continue
             compressed_messages.append(msg)
 
+        # ── Cacheable-prefix guard (backlog #41) — DEFAULT OFF ────────────────────
+        # Compressing a prompt below the provider's minimum cacheable size destroys
+        # provider prefix caching outright: the provider stops caching and says nothing
+        # (no read, no write, no error), while G21 keeps injecting markers that can never
+        # pay out. Measured on DS8 2026-09-04: the all-on stack sent 63% FEWER tokens and
+        # paid 2.5x MORE for input than G21 alone, because a ~90% discount on ~51.7k
+        # tokens was forfeited.
+        #
+        # Whether that trade is bad is WORKLOAD-SHAPED — it only bites when a prefix
+        # actually repeats, and on a workload with no repetition compression wins
+        # outright. So this ships OFF: enabling it is an operator decision made with
+        # evidence, and with it off the behaviour is byte-identical.
+        #
+        # The check runs AFTER compression rather than predicting it: the real post-
+        # compression size is known here, so no estimate can be wrong.
+        if changed and cfg.get("preserve_cacheable_prefix", False):
+            try:
+                floor = ctx.provider_adapter.min_cacheable_prompt_tokens(ctx.config, ctx.model)
+            except Exception:  # an adapter without the method must never break a request
+                floor = 0
+            if floor:
+                projected = count_messages_tokens(compressed_messages, ctx.model)
+                if tokens_before >= floor > projected:
+                    logger.info(
+                        "[%s] G01: skipping compression — it would take the prompt from %d to "
+                        "%d tokens, below this provider's %d-token minimum cacheable size, "
+                        "forfeiting the prefix-cache discount (preserve_cacheable_prefix)",
+                        ctx.request_id, tokens_before, projected, floor,
+                    )
+                    ctx.g01_cache_floor_skips = getattr(ctx, "g01_cache_floor_skips", 0) + 1
+                    changed = False
+
         if changed:
             original_messages = ctx.messages
             compressed_count = sum(1 for a, b in zip(original_messages, compressed_messages) if a != b)
