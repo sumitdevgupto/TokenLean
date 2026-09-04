@@ -115,8 +115,12 @@ You could assemble these yourself — LLMLingua for compression, GPTCache for ca
 > space moves fast, so **verify against each project's current docs** — and please
 > [open an issue or PR](https://github.com/sumitdevgupto/TokenLean/issues) if any cell is out of date.
 >
-> TokenLean's own figures (**54.1%**, up to **~84%** on cached prefix, **28 techniques**) are **self-measured**
-> on our live-ablation harness — directional estimates, not an independent third-party benchmark.
+> TokenLean's own figures (**54.1%**, **28 techniques**) are **self-measured** on our live-ablation
+> harness — directional estimates, not an independent third-party benchmark. (The "up to ~84% on
+> cached prefix" figure previously quoted here was **modelled, never measured**, and has been
+> withdrawn. Provider prefix caching is a discount the *provider* gives; TokenLean measures and
+> reconciles it rather than creating it, so it is reported as cache reads/writes per call — not as
+> a savings percentage.)
 >
 > **Sources:** [LiteLLM](https://docs.litellm.ai/) · [Portkey](https://portkey.ai/) ·
 > [Helicone](https://docs.helicone.ai/) · [Bifrost](https://docs.getbifrost.ai/) ·

@@ -23,6 +23,27 @@ date changes.
 
 ## 2026-09-04
 
+### Cache reads and writes are now reconciled against the provider bill — Enhancement (OSS)
+
+The proxy already reported provider cache reads, writes and their costs per call. There was no
+evidence that those figures were *right*. Each request now records the provider's own numbers
+alongside the proxy's and marks whether they agree, so every call is its own reconciliation test —
+first measured result: **54/54 calls reconciled, zero mismatches**, with costs independently
+recomputed from list prices and matching to the cent. A provider that reports nothing (OpenAI has
+no cache-write charge and no write field) is recorded as such, never as a disagreement. This is an
+accuracy proof, not a savings claim: the read discount is the provider's, and TokenLean measures
+and reconciles it rather than creating it.
+
+Measuring it surfaced two things worth stating plainly. Prompt compression can push a prompt below
+the ~1024-token minimum both providers require to cache a prefix at all, at which point caching
+silently stops happening — no read, no write, no error; the two features do not always compose, and
+which one wins is workload-shaped. And the README's "up to ~84% on cached prefix" has been
+**withdrawn**: it was modelled, never measured.
+
+- **OSS:** per-call cache reconciliation in the ablation harness, reported per arm; a
+  `required_request_ids` guarantee so a dataset's signal cannot be sampled away; and an explicit
+  warning when an arm's percentage was graded against no curated facts.
+
 ### Proxy metrics are now aggregated across worker processes — Bug fix
 
 Each proxy container runs two uvicorn workers, and Prometheus keeps its counters in
