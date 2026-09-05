@@ -675,6 +675,17 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
                     "[%s] Stripped reasoning param '%s' — model %s does not support reasoning",
                     request_id, rk, model,
                 )
+    # `off` is OUR tier vocabulary, never a value any provider accepts. G12 normally
+    # consumes it and clears the key, but G12 can be disabled independently of G25 (the
+    # ablation harness does exactly that), and then the raw sentinel would be forwarded —
+    # litellm would either reject it or expand it back into a thinking budget, i.e. turn
+    # reasoning ON for a request that asked for none. Strip it here so no configuration
+    # of the two groups can leak an internal tier name to a provider.
+    if outgoing.get("reasoning_effort") == REASONING_OFF:
+        outgoing.pop("reasoning_effort", None)
+        if request_id:
+            logger.debug("[%s] Stripped reasoning_effort=%r — internal tier, not a "
+                         "provider value", request_id, REASONING_OFF)
     if "service_tier" in outgoing and not adapter.supports_service_tier():
         outgoing.pop("service_tier", None)
         if request_id:

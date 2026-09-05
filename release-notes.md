@@ -23,6 +23,18 @@ date changes.
 
 ## 2026-09-05
 
+### An internal reasoning tier name could reach the provider — Bug fix
+
+Adaptive reasoning writes the chosen effort level for the reasoning-budget group to
+consume, and the two groups can be switched on and off independently. With adaptive
+reasoning enabled and the budget group disabled, nothing cleared the internal `off` value
+and it was forwarded to the provider — which either rejects it or expands it back into a
+thinking budget, i.e. turns reasoning ON for a request that had asked for none. The
+outgoing-parameter build now strips it, so no combination of the two groups can leak an
+internal tier name. Found by reasoning about an untested configuration before running it,
+rather than from a failure.
+
+
 ### The ROI harness reported zero reasoning tokens on every run — Bug fix
 
 The per-run aggregate summed a `reasoning_tokens` field that no request record ever
