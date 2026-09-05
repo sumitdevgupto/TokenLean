@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-09-05
 
+### The ROI harness reported zero reasoning tokens on every run — Bug fix
+
+The per-run aggregate summed a `reasoning_tokens` field that no request record ever
+carried, so every arm of every measurement reported zero — including a run whose full-stack
+Anthropic block had actually billed 4,869 of them, 60% of its output. The reasoning-budget
+group's measured-savings percentage is defined as the before/after difference over that
+figure, so it was being computed from zeros and could never have shown a change in either
+direction. The harness now reads the number from the provider's own usage block, using the
+same fields the proxy does so the two cannot drift, and sums it across the turns of a
+multi-turn conversation because every turn bills its own. Validated by re-deriving the
+4,869 from the stored responses of the run that first exposed it.
+
+
 ### Cascade routing computed a complexity tier and discarded it — Bug fix
 
 Adaptive reasoning reuses the complexity tier the router already decided, rather than
