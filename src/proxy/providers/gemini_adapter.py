@@ -12,8 +12,14 @@ class GeminiAdapter(ProviderAdapter):
         return "gemini"
 
     def unsupported_params(self) -> set:
-        """Gemini rejects OpenAI-only params and Anthropic's ``thinking``."""
-        return {"parallel_tool_calls", "logprobs", "top_logprobs", "thinking"}
+        """Gemini rejects OpenAI-only params and Anthropic's ``thinking``.
+
+        ``reasoning_effort`` for the same reason as the Anthropic adapter: Gemini expresses
+        reasoning as ``thinking_config``, so a raw effort string is either ignored or
+        translated behind our back — never what the group that set it intended.
+        """
+        return {"parallel_tool_calls", "logprobs", "top_logprobs", "thinking",
+                "reasoning_effort"}
 
     def build_call(self, model: str, provider_cfg: Dict, api_key: Optional[str]) -> tuple:
         """Route via the ``gemini/`` namespace so litellm uses the API-key Google AI Studio

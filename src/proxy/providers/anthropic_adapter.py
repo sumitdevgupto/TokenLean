@@ -35,8 +35,19 @@ class AnthropicAdapter(ProviderAdapter):
         return "anthropic"
 
     def unsupported_params(self) -> set:
-        """Anthropic rejects OpenAI-only sampling/tool params."""
-        return {"parallel_tool_calls", "logprobs", "top_logprobs"}
+        """Anthropic rejects OpenAI-only sampling/tool params.
+
+        ``reasoning_effort`` is here because Anthropic expresses reasoning as ``thinking``,
+        and litellm silently EXPANDS a raw ``reasoning_effort`` into a thinking budget on
+        the way out. G12 already pops it for that reason, but G12 and G25 are independently
+        switchable (both are portal toggles), and with G25 on and G12 off nothing cleared
+        it: litellm turned thinking on, Anthropic then rejected the caller's
+        ``temperature: 0`` with "temperature may only be set to 1 when thinking is
+        enabled", and every Anthropic request 502'd. Observed on a live DS8 run 2026-09-05.
+        Stripping it here makes the guarantee structural rather than dependent on which
+        groups happen to be enabled.
+        """
+        return {"parallel_tool_calls", "logprobs", "top_logprobs", "reasoning_effort"}
 
     def extract_usage(self, response: Dict) -> Dict:
         """Prefer litellm's normalised OpenAI shape; fall back to Anthropic-native fields.

@@ -63,3 +63,50 @@ class TestRealTiersAreUntouched:
         out = _out({"reasoning_effort": REASONING_OFF, "max_tokens": 4096, "top_p": 0.9},
                    OpenAIAdapter(), "o4-mini")
         assert out["max_tokens"] == 4096 and out["top_p"] == 0.9
+
+
+class TestG25WithoutG12CannotBreakAnthropic:
+    """The live outage this file grew to cover.
+
+    G12 and G25 are independently switchable — both are portal toggles. With G25 ON and
+    G12 OFF, G25 sets `reasoning_effort` and nothing converts or clears it, because G12 is
+    the only consumer. litellm then EXPANDS that raw effort string into an Anthropic
+    thinking budget, Anthropic rejects the caller's `temperature: 0` with "temperature may
+    only be set to 1 when thinking is enabled", and every Anthropic request returns 502.
+
+    Observed on a live DS8 run 2026-09-05, in the ablation arm that disables G12 while an
+    override left G25 on. Not hypothetical, and not confined to the harness: any tenant who
+    turns the reasoning-budget group off while adaptive reasoning stays on hits it.
+    """
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    def test_anthropic_never_receives_a_raw_effort_string(self, effort):
+        out = _out({"reasoning_effort": effort, "temperature": 0, "max_tokens": 4096},
+                   AnthropicAdapter(), "claude-sonnet-4-5")
+        assert "reasoning_effort" not in out, (
+            "litellm expands this into a thinking budget, which makes Anthropic reject "
+            "temperature=0 and 502 the request"
+        )
+
+    def test_the_callers_temperature_survives(self):
+        """The point of stripping rather than forcing temperature to 1: the caller asked
+        for 0 and no group here has any business overriding that."""
+        out = _out({"reasoning_effort": "medium", "temperature": 0, "max_tokens": 4096},
+                   AnthropicAdapter(), "claude-sonnet-4-5")
+        assert out["temperature"] == 0
+
+    def test_gemini_is_covered_too(self):
+        from providers.gemini_adapter import GeminiAdapter
+        out = _out({"reasoning_effort": "high"}, GeminiAdapter(), "gemini-2.5-pro")
+        assert "reasoning_effort" not in out
+
+    def test_an_explicit_thinking_budget_still_reaches_anthropic(self):
+        """Stripping the OpenAI-shaped key must not disable reasoning for callers who
+        legitimately asked for it in Anthropic's own vocabulary."""
+        out = _out({"thinking": {"type": "enabled", "budget_tokens": 2000},
+                    "max_tokens": 8192}, AnthropicAdapter(), "claude-sonnet-4-5")
+        assert out["thinking"]["budget_tokens"] == 2000
+
+    def test_openai_still_gets_its_native_key(self):
+        out = _out({"reasoning_effort": "medium"}, OpenAIAdapter(), "o4-mini")
+        assert out["reasoning_effort"] == "medium"

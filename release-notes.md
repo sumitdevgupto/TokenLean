@@ -23,6 +23,20 @@ date changes.
 
 ## 2026-09-05
 
+### Turning the reasoning-budget group off broke every Claude request — Bug fix
+
+Adaptive reasoning and the reasoning-budget group are separate toggles, and the budget group
+is the only thing that translates the chosen effort level into what a provider actually
+understands. With adaptive reasoning on and the budget group off, the raw effort string was
+forwarded to Claude, where the client library silently expanded it into a thinking budget —
+so Claude then rejected the caller's own `temperature: 0` with "temperature may only be set
+to 1 when thinking is enabled", and **every Claude request failed with a 502**. Observed on a
+live run, not in theory. Claude and Gemini now reject that parameter outright, because both
+express reasoning in their own vocabulary, so no combination of group toggles can leak it.
+The caller's temperature is left untouched, and an explicitly requested thinking budget still
+works.
+
+
 ### An internal reasoning tier name could reach the provider — Bug fix
 
 Adaptive reasoning writes the chosen effort level for the reasoning-budget group to
