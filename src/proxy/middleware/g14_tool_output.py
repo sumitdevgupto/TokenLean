@@ -140,19 +140,34 @@ def _maybe_compress_spreadsheet(result: Any, model: str) -> Any:
         return _builtin_compress_spreadsheet(result, model)
 
     try:
+        # CSV strings: measured 2026-09-05 on headroom 0.34.0, `crush` returns output that
+        # is never SHORTER for CSV (10, 200 and 2,000 rows all came back longer), so the
+        # `len(compressed) < len(result)` guard below discarded it every time. The call was
+        # pure cost — a Rust round-trip per CSV tool result whose result was always thrown
+        # away. The built-in handles what it can; a CSV string passes through either way.
         if isinstance(result, str) and _CSV_PATTERN.search(result):
-            crushed = _smart_crusher.crush(result)
-            compressed = getattr(crushed, "compressed", None)
-            return compressed if compressed and len(compressed) < len(result) else result
+            return _builtin_compress_spreadsheet(result, model)
 
         if isinstance(result, list) and len(result) >= 2:
             raw = json.dumps(result, separators=(",", ":"))
+            # `compact_document_json`, not `crush`. On JSON input the two returned
+            # BYTE-IDENTICAL output when measured, and `crush` additionally owns a lossy
+            # row-dropping path that emits a `<<ccr:HASH>>` retrieval marker. Nothing in
+            # this repo resolves that marker — headroom keeps the dropped rows in an
+            # in-process Rust store no route of ours exposes — so a client would receive a
+            # pointer to nothing. That path does not fire on 0.34.0 (verified across
+            # queries and sizes), but calling the lossless entry point means a library
+            # change cannot switch it on underneath us. See backlog #45.
             compressed = _smart_crusher.compact_document_json(raw)
             if isinstance(compressed, str) and compressed and len(compressed) < len(raw):
                 try:
                     return json.loads(compressed)
                 except (json.JSONDecodeError, TypeError):
-                    return compressed
+                    # Input was valid JSON (we serialised it); output is not. Returning it
+                    # would hand a caller doing json.loads() an unparseable tool result.
+                    logger.warning(
+                        "G14: headroom compaction produced unparseable JSON — discarded")
+                    return _builtin_compress_spreadsheet(result, model)
     except Exception as exc:
         logger.debug("G14 headroom SmartCrusher failed: %s — using built-in", exc)
         return _builtin_compress_spreadsheet(result, model)

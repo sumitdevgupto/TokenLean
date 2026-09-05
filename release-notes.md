@@ -21,6 +21,34 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-05
+
+### Compressed tool output is now checked for validity, not just size — Bug fix
+
+When the optional compaction library shortened a tool result, the only check applied was
+that the output was smaller than the input. Nothing verified it was still valid JSON — and
+an agent consuming a tool result normally parses it, so a shorter-but-unparseable payload
+would have broken the caller silently on a successful, billed request. Compaction is now
+rejected if it turns parseable JSON into something that is not, falling back to the
+built-in compactor. Measured against the shipped library this changes no output today; it
+exists so a future upgrade cannot reintroduce the failure quietly, which this component has
+done twice before.
+
+Two related cleanups found by measuring rather than reading. The CSV branch of tool-output
+compression was calling the library on every CSV result and then discarding the answer,
+because it came back larger every time at 10, 200 and 2,000 rows — that call is gone. And
+tool-output compaction now uses the library's lossless entry point rather than one that can
+drop rows and leave behind a retrieval marker this proxy has no way to resolve; that path
+does not trigger on the pinned version, but calling the safe entry point means an upgrade
+cannot switch it on underneath us.
+
+### A content-type detection call had never once succeeded — Bug fix
+
+Response compression called `detect_type()` on the optional compaction library to classify
+content, wrapped in a catch-all. That function does not exist in the pinned version, so the
+call raised on every request and fell through to the built-in classifier — which has
+therefore always been the only one running. Removed, so the code says what it does.
+
 ## 2026-09-04
 
 ### Four G19 tests depended on whether an optional package happened to be installed — Bug fix

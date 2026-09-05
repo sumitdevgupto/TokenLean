@@ -36,7 +36,7 @@ Imported via `try/except` in middleware. Install only when the corresponding fea
 
 | Package | Version | SPDX License | Used By | Feature |
 |---|---|---|---|---|
-| headroom-ai | >=0.26.0 | Apache-2.0 | G19, G25 (planned) | Prompt compression, effort routing |
+| headroom-ai | ==0.34.0 | Apache-2.0 | G14, G19 (G05 L3 imports it, but L3 is disabled) | JSON/document compaction via `SmartCrusher.compact_document_json`. Ships a ~20 MB compiled Rust extension (`headroom._core`); `ast-grep-cli` and `tomlkit` come in solely with it |
 | mem0ai | >=2.0.7 | Apache-2.0 | G10 | Long-term conversation memory |
 | zep-python | >=2.0.2 | Apache-2.0 | G10 | Zep memory backend |
 

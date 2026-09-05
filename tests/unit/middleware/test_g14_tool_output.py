@@ -123,20 +123,50 @@ class TestT32SpreadsheetCompression:
             result = _maybe_compress_spreadsheet(rows, "gpt-4o")
         assert "_schema_" in result
 
-    def test_maybe_compress_calls_smartcrusher_for_csv(self):
+    def test_csv_no_longer_round_trips_through_the_rust_crusher(self):
+        """UPDATED 2026-09-05 - this test previously asserted `crush` IS called for CSV.
+
+        The mock made that look productive: it returned a short string, so the
+        `len(compressed) < len(result)` guard kept it. Real headroom 0.34.0 does not
+        behave that way. Measured on 10, 200 and 2,000-row CSV, `crush` returned output
+        that was **never shorter**, so the guard discarded it every time and the original
+        was returned. The call was a Rust round-trip per CSV tool result whose result was
+        always thrown away - and `crush` additionally owns a lossy row-dropping path
+        emitting a `<<ccr:HASH>>` marker that nothing in this repo can resolve.
+
+        The assertion is inverted deliberately: the mock pinned behaviour the library
+        never exhibited. A CSV string passes through unchanged, which is exactly what the
+        old code produced in production.
+        """
         from unittest.mock import MagicMock, patch
         import middleware.g14_tool_output as mod
 
-        csv_text = "id,name,value\n1,foo,100\n2,bar,200\n3,baz,300\n"
+        # chr(10) rather than an escape: this file has already been mangled once by a
+        # scripted edit that ate the backslash and split the literal across lines.
+        csv_text = chr(10).join(
+            ["id,name,value", "1,foo,100", "2,bar,200", "3,baz,300"]) + chr(10)
         mock_crusher = MagicMock()
-        mock_crusher.crush.return_value = MagicMock(compressed="id|name|value\n1|foo|100")
 
         with patch.object(mod, "_smart_crusher", mock_crusher):
             from middleware.g14_tool_output import _maybe_compress_spreadsheet
             result = _maybe_compress_spreadsheet(csv_text, "gpt-4o")
 
-        mock_crusher.crush.assert_called_once_with(csv_text)
-        assert result == "id|name|value\n1|foo|100"
+        mock_crusher.crush.assert_not_called()
+        assert result == csv_text, "a CSV string passes through, as it did before"
+
+    def test_the_lossy_entry_point_is_never_called_anywhere(self):
+        """`crush` can drop rows and emit a retrieval marker we cannot resolve.
+
+        The dropped rows live in headroom's in-process Rust store, which no route of ours
+        exposes and which does not survive a restart or span instances. It does not fire
+        on 0.34.0 (verified across queries and payload sizes), but the defence is to not
+        call the entry point at all rather than to trust the library's current defaults.
+        """
+        import inspect
+        import middleware.g14_tool_output as mod
+        assert "_smart_crusher.crush(" not in inspect.getsource(mod), (
+            "G14 must use the lossless compact_document_json, never crush()"
+        )
 
     def test_maybe_compress_calls_smartcrusher_for_json_array(self):
         from unittest.mock import MagicMock, patch

@@ -287,15 +287,13 @@ def _detect_content_type(text: str, dominance_ratio: float = None) -> Optional[s
     """
     if dominance_ratio is None:
         dominance_ratio = _DOMINANCE_RATIO
-    if _headroom_available:
-        try:
-            detected = _headroom_mod.detect_type(text)
-            if detected:
-                return detected
-        except Exception:
-            pass
-
-    # Heuristic fallback
+    # A `headroom.detect_type(text)` call used to sit here, wrapped in a bare
+    # `except Exception: pass`. The function does not exist in headroom 0.34.0 (verified
+    # against the installed package, 2026-09-05), so it raised AttributeError on every
+    # single call and fell straight through to the heuristic below — which has therefore
+    # always been the only classifier. Removed rather than left as an import-shaped
+    # comment: a silent always-failing call is worse than no call, because it reads like
+    # a working integration to anyone tracing this path.
     stripped = text.strip()
 
     # JSON detection
@@ -320,6 +318,24 @@ def _detect_content_type(text: str, dominance_ratio: float = None) -> Optional[s
 
 
 # ─── Compressors ─────────────────────────────────────────────────────────────
+
+def _preserves_json_parseability(before: str, after: str) -> bool:
+    """True unless a compaction turned parseable JSON into something that is not.
+
+    Deliberately one-directional: if the INPUT was not valid JSON we have no contract to
+    uphold and return True. We only refuse the case that actually breaks a caller —
+    parseable in, unparseable out.
+    """
+    try:
+        json.loads(before)
+    except Exception:
+        return True          # nothing was promised about this payload
+    try:
+        json.loads(after)
+        return True
+    except Exception:
+        return False
+
 
 def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optional[str]:
     """Compress structured text. Routing:
@@ -353,12 +369,27 @@ def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optiona
         if enveloped is not None:
             return enveloped
 
-    # Headroom: JSON compaction (its strongest path); guard so we only keep a real reduction.
+    # Headroom: JSON compaction (its strongest path). Two guards, both load-bearing:
+    # a real reduction, AND the output still parses as JSON when the input did.
+    #
+    # Length alone was the only check until 2026-09-05 (backlog #45). That is not enough
+    # for a tool result: the client agent typically does `json.loads(result)`, so handing
+    # back something shorter but unparseable is a silent break on a billed 200. Measured
+    # on headroom 0.34.0 the compactor DOES preserve the envelope, so this guard is inert
+    # today — but that is a property of the vendored library, not of our code, and the
+    # same file already records two occasions where this transform destroyed content
+    # (the 11,492-char runbook above; the 2026-08-05 answer corruption). A version bump
+    # must not be able to reintroduce it silently.
     if _headroom_available and _smart_crusher is not None and content_type == "json":
         try:
             crushed = _smart_crusher.compact_document_json(text)
             if isinstance(crushed, str) and 0 < len(crushed) < len(text):
-                return crushed
+                if _preserves_json_parseability(text, crushed):
+                    return crushed
+                logger.warning(
+                    "G19: headroom compaction produced unparseable JSON (%d→%d chars) — "
+                    "discarded, using the built-in compactor", len(text), len(crushed),
+                )
         except Exception:
             pass  # fall through to built-in
 
