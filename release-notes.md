@@ -23,6 +23,17 @@ date changes.
 
 ## 2026-09-05
 
+### Cascade routing computed a complexity tier and discarded it — Bug fix
+
+Adaptive reasoning reuses the complexity tier the router already decided, rather than
+re-deciding it with a second, differently tuned classifier. One routing path broke that: the
+cascade-execution branch classifies the request for its own escalation cap, then never
+published the answer — so a deployment with cascade execution enabled silently fell back to
+the duplicate classifier, with nothing reporting the behaviour had gone. The shipped default
+has cascade execution off, so the default path was unaffected. Found while checking the
+running configuration before a measurement run, not by a failing test.
+
+
 ### Compressed tool output is now checked for validity, not just size — Bug fix
 
 When the optional compaction library shortened a tool result, the only check applied was

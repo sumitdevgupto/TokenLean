@@ -1109,6 +1109,13 @@ class G06Routing:
                     tier1_model = _select_from_tier(simple_models, eff_cfg, ctx, "simple")
                     cap_enabled = eff_cfg.get("cascade_cap_to_classified_tier", True)
                     request_tier, _ = _classify_heuristic(ctx.messages, ctx.params)
+                    # This branch classifies too — publish it like every other path does,
+                    # or the tier is computed here and thrown away. Without this,
+                    # `cascade_execution: true` silently disables G25's reuse of the
+                    # routing decision (backlog #42): the shipped config has it false, so
+                    # the default path was unaffected, but a tenant who turns it on would
+                    # have lost the behaviour with nothing reporting that it had gone.
+                    complexity = request_tier
                     ctx.cascade_plan = {
                         "tiers": tiers,
                         "cfg": eff_cfg,
