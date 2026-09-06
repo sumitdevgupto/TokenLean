@@ -174,7 +174,14 @@ for k in disable:
 # G16 is a no-op there; it only bites on the --workload agentic tool-heavy episodes.
 _block('G8_tools').update({'enabled': True, 'max_tools_per_agent': 20})
 _block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20,
-                                 'max_system_prompt_tokens': 800})
+                                 'max_system_prompt_tokens': 800,
+                                 # Explicit since 2026-09-06: the shipped default for an
+                                 # over-cap system prompt is now 'warn' (leave it intact), so
+                                 # this pin would otherwise be advisory and the agentic lever
+                                 # would quietly lose its prompt-cap component. 'compact' keeps
+                                 # the cap while preserving the prompt's opening and closing
+                                 # instructions instead of deleting its tail.
+                                 'system_prompt_overflow': 'compact'})
 # Provider-aware G06 routing. The template's tiers are OpenAI-only
 # (simple->gpt-4o-mini, ...), so a non-OpenAI `--ab --providers <p>` request
 # would be silently rerouted to gpt-4o-mini and the A/B would compare two

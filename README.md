@@ -433,7 +433,7 @@ tests/                      # Unit and integration tests (pytest)
 | **G13** | Batch/Compact | **36% measured** (TOON only) | TOON (Token-Optimized Object Notation) compaction — the measured figure, from the DS4 ablation. The other mechanism in this group is **not measured**: the opt-in **provider-native async batch lane** (`provider_native`), which claims the provider's **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs. It is not exercised by the ablation, so it does not contribute to this number. (A third mechanism, Kafka batching, was listed here until 2026-09-06; it was never reachable code and has been removed — batching runs on Redis Streams) |
 | **G14** | Tool Output | 15-30% | Dependency-aware parallel tool combining |
 | **G15** | Server Compute | Variable | MCP SDK server dispatch for external handlers |
-| **G16** | Agent Architecture | 5-20% enforced (truncation + tool pruning); 20-45% with manual role decomposition | LangGraph runtime with cost modeling |
+| **G16** | Agent Architecture | 5-20% enforced (tool pruning; system-prompt compaction is opt-in); 20-45% with manual role decomposition | LangGraph runtime with cost modeling |
 | **G17** | Loop Control | 10-20% | Inter-agent state via HTTP headers + token budgets |
 | **G18** | Observability | N/A | Langfuse tracing + Grafana dashboards + admin webhooks |
 | **G19** | Structured Pruning | up to ~40% | AST-aware compression of code/JSON/logs/text (Headroom); request + response |
@@ -484,7 +484,7 @@ On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **eve
 | **G13** Batch / TOON | `toon_require_net_savings` true; `toon_uniform_threshold` 1.0; `provider_native` false | relax uniformity; enable native batch lane | keep `toon_require_net_savings` on (never inflates) |
 | **G14** Tool Output | `field_whitelist.*`; `spreadsheet_compression` true | whitelist fewer fields; keep compression on | whitelist all fields the model needs downstream |
 | **G15** Server Compute | `hooks` (filter/sort/project on tool results) | add hooks that shrink tool payloads | keep hooks that drop only redundant data |
-| **G16** Agent Architecture | `max_system_prompt_tokens` 4096; `max_tools_per_agent` 20; `tool_selection_strategy` relevance | lower caps → more truncation/pruning | raise caps so prompts/tools aren't cut |
+| **G16** Agent Architecture | `max_system_prompt_tokens` 4096; `system_prompt_overflow` warn; `max_tools_per_agent` 20; `tool_selection_strategy` relevance | lower tool cap → more pruning; `system_prompt_overflow: compact` enforces the prompt cap by dropping the middle and keeping both ends | leave `system_prompt_overflow` at `warn` (your prompt is never edited); raise caps so tools aren't cut |
 | **G17** Loop Control | `max_iterations` 10; `starting_budget_tokens` 10000; `confidence_stop_threshold` 0.95 | fewer iterations, smaller budget, earlier stop | more iterations/budget for complex workflows |
 | **G18** Observability | *(no quality trade-off — pure metrics/tracing)* | — | — |
 | **G19** Structured Pruning | `min_length_to_compress` 50; `compression_strategies.{json,code,logs,text}` | lower min; enable more strip strategies | raise min; disable lossy strategies (e.g. `strip_comments`) |

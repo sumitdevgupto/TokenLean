@@ -87,24 +87,93 @@ class TestG16AgentArch:
         ctx = await G16AgentArch().process_request(ctx)
         assert not any(s.group == "G16" for s in ctx.savings.step_savings)
 
-    async def test_oversized_system_prompt_is_truncated(self, make_ctx):
-        # Threshold is 50 tokens in minimal_config
+    async def test_oversized_system_prompt_is_left_intact_by_default(self, make_ctx):
+        """CHANGED BY DESIGN 2026-09-06 (E15). This test previously asserted the prompt was
+        truncated. Silently deleting the end of a customer's instructions to save tokens is
+        not an optimisation: on DS3's real SRE playbook the cut removed the whole "Safety
+        Constraints & Guardrails" section, including the rule about when a ticket may be
+        closed. The default no longer edits the prompt at all; it warns and leaves it byte-
+        identical. Enforcement is available, and lossless at both ends, via
+        `system_prompt_overflow: compact`.
+        """
         huge_system = "You are a helpful assistant that handles many tasks. " * 15
         ctx = make_ctx([
             {"role": "system", "content": huge_system},
             {"role": "user", "content": "ok"},
         ])
         from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+
+        system_msg = next(m for m in ctx.messages if m["role"] == "system")
+        assert system_msg["content"] == huge_system
+        assert any("left intact" in w for w in ctx.params["_token_opt_warnings"])
+        assert not any(s.group == "G16" and s.absolute_saving > 0 for s in ctx.savings.step_savings)
+
+    async def test_compact_mode_enforces_the_cap(self, make_ctx):
+        huge_system = "You are a helpful assistant that handles many tasks.\n\n" * 15
+        ctx = make_ctx([
+            {"role": "system", "content": huge_system},
+            {"role": "user", "content": "ok"},
+        ])
+        ctx.config["groups"]["G16_agent_arch"]["system_prompt_overflow"] = "compact"
+        from middleware.g16_agent_arch import G16AgentArch
         from savings.calculator import count_messages_tokens
         ctx = await G16AgentArch().process_request(ctx)
 
         system_msg = next(m for m in ctx.messages if m["role"] == "system")
-        assert len(system_msg["content"]) < len(huge_system)
-        assert count_messages_tokens([system_msg], ctx.model) <= ctx.config["groups"]["G16_agent_arch"]["max_system_prompt_tokens"]
-
+        cap = ctx.config["groups"]["G16_agent_arch"]["max_system_prompt_tokens"]
+        assert count_messages_tokens([system_msg], ctx.model) <= cap
         step = next(s for s in ctx.savings.step_savings if s.group == "G16")
-        assert step.tokens_before > step.tokens_after
         assert step.absolute_saving > 0
+
+    async def test_an_unknown_overflow_mode_leaves_the_prompt_intact(self, make_ctx):
+        """Fail SAFE on a typo. `fnmatch`-style silent misbehaviour is the precedent being
+        avoided: an operator who writes `truncat` must not get an unannounced edit."""
+        huge_system = "You are a helpful assistant that handles many tasks. " * 15
+        ctx = make_ctx([
+            {"role": "system", "content": huge_system},
+            {"role": "user", "content": "ok"},
+        ])
+        ctx.config["groups"]["G16_agent_arch"]["system_prompt_overflow"] = "truncat"
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+        assert next(m for m in ctx.messages if m["role"] == "system")["content"] == huge_system
+
+    async def test_compact_does_not_claim_to_compact_a_multimodal_system_message(self, make_ctx):
+        """G16 only rewrites string content. With a list-content system message there is
+        nothing to compact, so the warning must not say it compacted anything."""
+        parts = [{"type": "text", "text": "You are an assistant. " * 40}]
+        ctx = make_ctx([
+            {"role": "system", "content": parts},
+            {"role": "user", "content": "ok"},
+        ])
+        ctx.config["groups"]["G16_agent_arch"]["system_prompt_overflow"] = "compact"
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = await G16AgentArch().process_request(ctx)
+        assert next(m for m in ctx.messages if m["role"] == "system")["content"] == parts
+        assert not any("compacted" in w for w in ctx.params.get("_token_opt_warnings", []))
+
+    async def test_compact_holds_the_cap_across_several_system_messages(self, make_ctx):
+        """Regression, 2026-09-06. Each system message was budgeted the FULL cap, so a prompt
+        split across messages tripped the threshold and was returned unchanged — while the
+        warning said "truncated to fit". Same customer, same tokens, opposite treatment
+        decided only by how many system messages they happened to write."""
+        block = ("policy line for the agent to follow\n\n" * 12)
+        ctx = make_ctx(
+            [{"role": "system", "content": block} for _ in range(3)]
+            + [{"role": "user", "content": "ok"}]
+        )
+        ctx.config["groups"]["G16_agent_arch"]["system_prompt_overflow"] = "compact"
+        from middleware.g16_agent_arch import G16AgentArch
+        from savings.calculator import count_messages_tokens
+        cap = ctx.config["groups"]["G16_agent_arch"]["max_system_prompt_tokens"]
+        before = sum(count_messages_tokens([m], ctx.model)
+                     for m in ctx.messages if m["role"] == "system")
+        assert before > cap  # the fixture must actually trip the threshold
+        ctx = await G16AgentArch().process_request(ctx)
+        after = sum(count_messages_tokens([m], ctx.model)
+                    for m in ctx.messages if m["role"] == "system")
+        assert after <= cap, "the cap must hold however the customer splits their system prompt"
 
     async def test_system_prompt_exactly_at_threshold_not_truncated(self, make_ctx):
         max_sys = 50  # from minimal_config
@@ -250,3 +319,84 @@ class TestG16RelevanceToolSelection:
         from middleware.g16_agent_arch import G16AgentArch
         ctx = await G16AgentArch().process_request(ctx)  # must not raise
         assert len(ctx.params["tools"]) == 3
+
+
+class TestCompactionKeepsBothEnds:
+    """E15. A system prompt's END carries operating policy — closure rules, escalation-audit
+    rules, "never include raw credentials". A tail cut deletes exactly those. Compaction drops
+    the MIDDLE instead, which costs the same tokens and keeps both the role and the rules.
+
+    Compaction is still lossy — a rule sitting in the middle is still dropped, which is why it
+    is opt-in and the default leaves the prompt alone.
+    """
+
+    def _prompt(self):
+        return (
+            "You are an SRE assistant for the payments platform.\n\n"
+            + "".join(f"{i}. Routine background paragraph about tooling.\n\n" for i in range(2, 40))
+            + "40. Safety Constraints. Do not close an incident ticket until the incident "
+              "record reflects a clear resolution status.\n"
+        )
+
+    def test_both_ends_survive_and_the_middle_goes(self):
+        from middleware.g16_agent_arch import _compact_to_tokens
+        from savings.calculator import estimate_tokens
+        text = self._prompt()
+        out = _compact_to_tokens(text, 120, "gpt-4o-mini")
+        assert estimate_tokens(out, "gpt-4o-mini") <= 120
+        assert "You are an SRE assistant" in out, "the role must survive"
+        assert "Do not close an incident ticket" in out, (
+            "the closing policy must survive — deleting it is the defect this replaces"
+        )
+        assert "20. Routine background" not in out, "the middle is what should go"
+
+    def test_the_elision_is_declared_to_the_model(self):
+        """A truncated policy that looks complete is worse than one marked incomplete."""
+        from middleware.g16_agent_arch import _compact_to_tokens
+        out = _compact_to_tokens(self._prompt(), 120, "gpt-4o-mini")
+        assert "omitted from the middle" in out
+
+    def test_a_prompt_under_budget_is_returned_byte_identical(self):
+        from middleware.g16_agent_arch import _compact_to_tokens
+        text = self._prompt()
+        assert _compact_to_tokens(text, 100_000, "gpt-4o-mini") == text
+
+    def test_a_prompt_with_no_line_structure_still_keeps_both_ends(self):
+        from middleware.g16_agent_arch import _compact_to_tokens
+        from savings.calculator import estimate_tokens
+        text = "START " + ("filler " * 4000) + " END-OF-POLICY"
+        out = _compact_to_tokens(text, 200, "gpt-4o-mini")
+        assert estimate_tokens(out, "gpt-4o-mini") <= 200
+        assert out.startswith("START")
+        assert out.endswith("END-OF-POLICY")
+
+    def test_a_budget_too_small_for_a_marker_keeps_the_end(self):
+        """When there is not even room to say content was removed, keep the policy, not the
+        greeting — the opposite of what a tail cut does."""
+        from middleware.g16_agent_arch import _compact_to_tokens
+        from savings.calculator import estimate_tokens
+        text = "hello there friend " * 200 + "NEVER LOG CREDENTIALS"
+        out = _compact_to_tokens(text, 3, "gpt-4o-mini")
+        assert estimate_tokens(out, "gpt-4o-mini") <= 3
+        assert "CREDENTIALS" in out
+
+    def test_dense_text_is_not_duplicated_by_the_char_fallback(self):
+        """`keep` is a character budget derived from a token budget. Dense scripts run well
+        under 4 chars/token, so the head and tail slices could overlap and return MORE text
+        than the input while claiming to have elided some."""
+        from middleware.g16_agent_arch import _compact_to_tokens
+        from savings.calculator import estimate_tokens
+        dense = "中文漢字" * 300 + "END"
+        out = _compact_to_tokens(dense, 40, "gpt-4o-mini")
+        assert estimate_tokens(out, "gpt-4o-mini") <= 40
+        assert len(out) < len(dense)
+        assert out.endswith("END")
+
+    def test_zero_budget_is_empty(self):
+        from middleware.g16_agent_arch import _compact_to_tokens
+        assert _compact_to_tokens("anything at all", 0, "gpt-4o-mini") == ""
+
+    def test_the_blind_tail_cut_is_gone(self):
+        """Gate 9: the harmful path is removed, not left one config flip away."""
+        import middleware.g16_agent_arch as g16
+        assert not hasattr(g16, "_truncate_to_tokens")

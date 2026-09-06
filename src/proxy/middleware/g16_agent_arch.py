@@ -1,7 +1,9 @@
 """
 G16 · Agent Architecture
 Stage: Across the Loop (companion guidance — not inline request modifier)
-Saving: 5–20% per-agent context via real enforcement (truncation + tool pruning);
+Saving: 5–20% per-agent context via real enforcement (tool pruning always;
+        system-prompt compaction only when the operator opts in, see
+        system_prompt_overflow);
         20–60% achievable with full role-decomposition (advisory, manual follow-up)
 Technique: Detect monolithic agent anti-patterns (role stacking, oversized context)
            and enforce hard limits — truncate oversized system prompts and prune
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 GROUP = "G16"
 
 _MAX_SYSTEM_PROMPT_TOKENS = 4096  # truncate above this (fallback when the config key is absent; matches config.yaml.template)
+_SYSTEM_PROMPT_OVERFLOW = "warn"  # warn | compact — what to do when the system prompt exceeds the cap
 _MAX_TOOLS_COUNT = 20             # prune above this (role stacking signal; fallback matches config.yaml.template)
 _TOOL_SELECTION_STRATEGY = "relevance"  # relevance | order — how to pick which tools to keep when over the cap
 _NAME_TOKEN_WEIGHT = 3.0          # a tool-name token matching the request is the strongest relevance signal
@@ -96,17 +99,109 @@ def _select_tools(tools: List[Dict[str, Any]], messages: List[Dict[str, Any]], m
     return [tools[i] for i in keep]
 
 
-def _truncate_to_tokens(text: str, max_tokens: int, model: str) -> str:
-    """Truncate text to at most max_tokens, using the same char/4 ceiling as estimate_tokens."""
+_ELISION = (
+    "\n\n[… {n} token(s) omitted from the middle of this system prompt to fit the "
+    "{cap}-token limit; the opening and closing instructions are intact …]\n\n"
+)
+_ELISION_PLAIN = " […] "
+
+
+def _split_blocks(text: str) -> List[str]:
+    """Paragraphs, else lines, else the whole string — the units kept or dropped whole."""
+    for sep in ("\n\n", "\n"):
+        if sep in text:
+            parts = text.split(sep)
+            return [p + sep for p in parts[:-1]] + [parts[-1]]
+    return [text]
+
+
+def _head_tail_chars(text: str, max_tokens: int, model: str) -> str:
+    """Character-level both-ends keep, for a prompt with no paragraph or line structure."""
+    if max_tokens <= 0:
+        return ""
+    if estimate_tokens(_ELISION_PLAIN, model) * 2 >= max_tokens:
+        # Too small to split usefully: a marker that eats half the budget leaves a fragment at
+        # each end and no instruction at either. Keep the END, where policy lives — the
+        # opposite of what the tail cut this replaces would do.
+        out = text[-max_tokens * 4:]
+        while out and estimate_tokens(out, model) > max_tokens:
+            out = out[50:] if len(out) > 50 else out[1:]
+        return out
+    keep = max_tokens * 4
+    while keep > 0:
+        half = keep // 2
+        tail_len = keep - half
+        if half + tail_len > len(text):
+            # `keep` is a CHARACTER budget derived from a TOKEN budget, and dense text can run
+            # well under 4 chars/token — so the two slices can overlap and duplicate content
+            # instead of eliding any. Clamp them to disjoint halves; the loop shrinks `keep`
+            # until the result genuinely fits.
+            half = len(text) // 2
+            tail_len = len(text) - half
+        out = text[:half] + _ELISION_PLAIN + text[len(text) - tail_len:]
+        if estimate_tokens(out, model) <= max_tokens:
+            return out
+        keep -= 50 if keep > 50 else 1
+    return ""
+
+
+def _compact_to_tokens(text: str, max_tokens: int, model: str) -> str:
+    """Fit `text` into `max_tokens` by dropping its MIDDLE, keeping both ends.
+
+    This replaces a straight tail cut (pre-2026-09-06). The END of a system prompt is where
+    operating policy lives — closure rules, escalation-audit rules, "never include raw
+    credentials" — so cutting the tail deletes exactly the instructions that most need to
+    survive, while the OPENING carries the role the model needs to behave at all. Keeping both
+    ends costs the same tokens as keeping one, and the elision marker tells the model something
+    was removed instead of letting it read a truncated policy as a complete one.
+
+    Deterministic: cuts land on paragraph (then line) boundaries, so no sentence is left
+    half-written; a prompt with no such boundaries falls back to a character-level both-ends
+    keep. Provider-agnostic — no model call, no provider strings.
+    """
     if max_tokens <= 0:
         return ""
     if estimate_tokens(text, model) <= max_tokens:
         return text
-    max_chars = max_tokens * 4
-    truncated = text[:max_chars]
-    while truncated and estimate_tokens(truncated, model) > max_tokens:
-        truncated = truncated[:-50] if len(truncated) > 50 else truncated[:-1]
-    return truncated
+
+    blocks = _split_blocks(text)
+    if len(blocks) < 3:
+        return _head_tail_chars(text, max_tokens, model)
+
+    marker_cost = estimate_tokens(_ELISION.format(n=len(text), cap=max_tokens), model)
+    budget = max_tokens - marker_cost
+    if budget <= 0:
+        return _head_tail_chars(text, max_tokens, model)
+
+    head: List[str] = []
+    tail: List[str] = []
+    used = 0
+    i, j = 0, len(blocks) - 1
+    prefer_head = True
+    stalled = 0
+    # Alternate ends so both survive without a magic head/tail ratio. Terminates: each pass
+    # either consumes a block or increments `stalled`, and `stalled` resets only on progress.
+    while i <= j and stalled < 2:
+        idx = i if prefer_head else j
+        cost = estimate_tokens(blocks[idx], model)
+        if used + cost <= budget:
+            used += cost
+            if prefer_head:
+                head.append(blocks[idx])
+                i += 1
+            else:
+                tail.append(blocks[idx])
+                j -= 1
+            stalled = 0
+        else:
+            stalled += 1
+        prefer_head = not prefer_head
+
+    if not head and not tail:
+        return _head_tail_chars(text, max_tokens, model)
+
+    dropped = estimate_tokens("".join(blocks[i:j + 1]), model)
+    return "".join(head) + _ELISION.format(n=dropped, cap=max_tokens) + "".join(reversed(tail))
 
 
 def _tools_tokens(tools: List[Dict[str, Any]], model: str) -> int:
@@ -134,16 +229,47 @@ class G16AgentArch:
             if m.get("role") == "system"
         )
         max_sys = cfg.get("max_system_prompt_tokens", _MAX_SYSTEM_PROMPT_TOKENS)
-        if system_tokens > max_sys:
-            for m in ctx.messages:
-                if m.get("role") == "system" and isinstance(m.get("content"), str):
-                    overhead = count_messages_tokens([{"role": m["role"], "content": ""}], ctx.model)
-                    content_budget = max(0, max_sys - overhead)
-                    m["content"] = _truncate_to_tokens(m["content"], content_budget, ctx.model)
-            warnings.append(
-                f"System prompt {system_tokens}t > {max_sys}t threshold — "
-                "truncated to fit (consider role decomposition, G16 one-role-one-agent)"
+        overflow = str(cfg.get("system_prompt_overflow", _SYSTEM_PROMPT_OVERFLOW)).strip().lower()
+        if overflow not in ("warn", "compact"):
+            logger.warning(
+                "[%s] G16 unknown system_prompt_overflow=%r — leaving the prompt intact",
+                ctx.request_id, overflow,
             )
+            overflow = "warn"
+        if system_tokens > max_sys:
+            compactable = [
+                m for m in ctx.messages
+                if m.get("role") == "system" and isinstance(m.get("content"), str)
+            ]
+            if overflow == "compact" and not compactable:
+                # Every system message is multimodal (list content), which this group does not
+                # rewrite. Say so, rather than reporting a compaction that did not happen.
+                overflow = "warn"
+            if overflow == "compact":
+                # Share the cap across the system messages in proportion to their size. Giving
+                # each message the FULL cap (pre-2026-09-06) enforced nothing whenever the
+                # prompt was split: three 2,006t blocks summed past a 4,096t cap, tripped the
+                # threshold, and were returned byte-identical — while the warning still
+                # said "truncated to fit". Same customer, same tokens, opposite treatment
+                # depending only on how many system messages they happened to write.
+                sys_msgs = compactable
+                sizes = [count_messages_tokens([m], ctx.model) for m in sys_msgs]
+                total = sum(sizes) or 1
+                for m, size in zip(sys_msgs, sizes):
+                    overhead = count_messages_tokens([{"role": m["role"], "content": ""}], ctx.model)
+                    budget = max(0, int(max_sys * (size / total)) - overhead)
+                    m["content"] = _compact_to_tokens(m["content"], budget, ctx.model)
+                warnings.append(
+                    f"System prompt {system_tokens}t > {max_sys}t threshold — compacted "
+                    "to fit by dropping the middle and keeping both ends (consider role "
+                    "decomposition, G16 one-role-one-agent)"
+                )
+            else:
+                warnings.append(
+                    f"System prompt {system_tokens}t > {max_sys}t threshold — left intact. "
+                    "Set groups.G16_agent_arch.system_prompt_overflow: compact to enforce the "
+                    "cap, or decompose the role (G16 one-role-one-agent)"
+                )
 
         # Enforce excessive tools (monolith signal) via pruning. When over the cap, keep the
         # tools most relevant to THIS request rather than the first N by list order — a blind

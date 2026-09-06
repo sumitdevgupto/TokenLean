@@ -1045,6 +1045,10 @@ groups:
   G16_agent_arch:
     enabled: true
     max_system_prompt_tokens: 4096
+    system_prompt_overflow: warn          # warn | compact — what to do when the system prompt exceeds the cap.
+                                          #   warn    = leave the customer's prompt byte-identical, record a warning (default)
+                                          #   compact = enforce the cap by dropping the MIDDLE, keeping the opening role and the
+                                          #             closing policy, with an explicit elision marker. Still lossy in the middle.
     max_tools_per_agent: 20               # keep all tools at/below this count; prune only above it
     tool_selection_strategy: relevance    # relevance | order — when over the cap, keep the tools most relevant to the request (relevance) vs the first N by list order (order)
   G17_loop:

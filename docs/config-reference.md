@@ -546,7 +546,8 @@ Agent-architecture enforcement — bounds system-prompt size and tool count.
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable agent-architecture enforcement |
-| `max_system_prompt_tokens` | `4096` | ⚠ Truncate oversized system prompts to this budget (too low silently strips instructions; code fallback when the key is absent is also 4096) |
+| `max_system_prompt_tokens` | `4096` | Budget above which an oversized system prompt is reported (and, in `compact` mode, enforced). Code fallback when the key is absent is also 4096 |
+| `system_prompt_overflow` | `warn` | `warn` — leave the prompt byte-identical and record a warning. `compact` — enforce the cap by dropping the **middle**, keeping the opening role and the closing policy, with an explicit elision marker. Before 2026-09-06 this was an unconditional blind **tail** cut, which deleted the end of the prompt — where closure rules, escalation rules and "never include credentials" instructions live. `compact` is still lossy in the middle, which is why `warn` is the default |
 | `max_tools_per_agent` | `20` | ⚠ Prune tools above this count |
 | `tool_selection_strategy` | `relevance` | When over the cap: `relevance` (keep most-relevant) vs `order` (first N) |
 

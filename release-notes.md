@@ -23,6 +23,22 @@ date changes.
 
 ## 2026-09-06
 
+### An oversized system prompt had its END deleted to fit a token cap — Bug fix
+
+G16 enforces a `max_system_prompt_tokens` cap. It did so with a straight tail cut, so what was
+removed was the *end* of the customer's instructions — which is where closure rules, escalation
+rules and "never include raw credentials in a summary" tend to live. On a real 1,510-token SRE
+playbook the cut took the entire closing "Safety Constraints & Guardrails" section; the only
+signal was a warning string in a response field. The cap now defaults to `system_prompt_overflow:
+warn` — the prompt is passed through byte-identical and reported, never edited. Operators who
+want the cap enforced set `compact`, which drops the **middle** on paragraph boundaries, keeps
+the opening role and the closing policy, and marks the elision so the model is not handed a
+truncated policy that looks complete. Compaction is still lossy in the middle, which is why it
+is opt-in. Also fixed: with the prompt split across several system messages the cap enforced
+nothing at all (each message was budgeted the full cap) while the warning still claimed it had
+truncated — 6,003 tokens passed a 4,096 cap untouched.
+
+
 ### A per-tenant setting in the operator config was ignored by most optimisations — Bug fix
 
 Operators can tune or disable an optimisation for one tenant under `tenants.<id>.groups.*` in
