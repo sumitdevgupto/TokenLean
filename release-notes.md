@@ -36,6 +36,14 @@ requirement plainly instead of implying the pruning works unconfigured.
 - **OSS:** `compress_descriptions` defaults to `true`; `registry_path` documented as a
   prerequisite for intent pruning.
 
+Code review of that change caught the code's own fallback still reading `False` — so a config
+that omitted the key would have silently reverted to the old behaviour despite the docs now
+saying `true`. Fixed to a named default matching the shipped value. Also fixed: a new unit test
+read the gitignored, developer-local `config/config.yaml` unconditionally, which would have
+failed on any clean checkout, in CI, and in the OSS gate's `git archive HEAD` tree — it now
+checks that file only when present and asserts the shipped contract against the tracked
+template, which is what the OSS gate actually ships.
+
 
 ### The deploy check could not tell whether the agent-limits optimisation worked — Bug fix
 

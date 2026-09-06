@@ -865,13 +865,12 @@ groups:
     # Compress tool/function DESCRIPTION prose (deterministic regex, zero-LLM via
     # prose_compress). Tool manifests ride every agentic request and descriptions
     # are otherwise verbatim; code/paths/identifiers are preserved byte-for-byte.
-    # Default off → byte-identical baseline. Turn on for large-manifest agent tenants.
-    compress_descriptions: true           # ON by default since 2026-09-06. Intent pruning below only ever
-                                          # acts on tools listed in `registry_path`; a tool that is absent is
-                                          # KEPT by construction, so for a deployment that has not populated
-                                          # the registry with its OWN tools this is the only part of G08 that
-                                          # does anything. It rewrites description prose (deterministic regex,
-                                          # zero-LLM, identifiers preserved) and never drops a tool.
+    # ON by default since 2026-09-06 (E17). Intent pruning below only ever acts on
+    # tools listed in `registry_path`; a tool that is absent is KEPT by construction,
+    # so for a deployment that has not populated the registry with its OWN tools this
+    # is the only part of G8 that does anything — it rewrites description prose and
+    # never drops a tool, so it is safe to leave on.
+    compress_descriptions: true
     compress_description_fields: [description]
     registry_cache_ttl_seconds: 300
     mcp_manifest_cache_ttl_seconds: 300

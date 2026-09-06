@@ -43,6 +43,13 @@ _TOOL_INACTIVITY_THRESHOLD_DAYS = int(_os.getenv("TOOL_INACTIVITY_THRESHOLD_DAYS
 _TOOL_MANIFEST_PREFIX = "tok_opt:tool:manifest:"
 _TOOL_USAGE_PREFIX = "tok_opt:tool:usage:"
 _TOOL_PRUNING_LOCK = "tok_opt:tool:pruning_lock"
+# ON by default since 2026-09-06 (E17): a tool absent from the registry is always kept
+# (fail-open — see the `reg_entry`/`tool_intents` filter below), so intent pruning is a
+# no-op until the operator populates their own tools. Compressing description prose is the
+# one part of G08 that helps a customer who has not done that. Matches the shipped default
+# in config.yaml.template — the code's own fallback must not silently disagree with it if a
+# hand-edited config or a per-tenant overlay omits the key.
+_COMPRESS_DESCRIPTIONS_DEFAULT = True
 
 
 # ── Config-first knob resolution (item 83a) ───────────────────────────────────
@@ -453,7 +460,7 @@ class G08ToolLoading:
         # G08 otherwise passes descriptions verbatim, so this trims tokens on every
         # tool-carrying call. Deep-copy first — never mutate the caller's tool dicts.
         desc_saved_chars = 0
-        if cfg.get("compress_descriptions", False) and relevant:
+        if cfg.get("compress_descriptions", _COMPRESS_DESCRIPTIONS_DEFAULT) and relevant:
             import copy
             fields = cfg.get("compress_description_fields", ["description"])
             relevant = copy.deepcopy(relevant)
