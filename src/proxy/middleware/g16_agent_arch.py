@@ -6,7 +6,7 @@ Saving: 5–20% per-agent context via real enforcement (truncation + tool prunin
 Technique: Detect monolithic agent anti-patterns (role stacking, oversized context)
            and enforce hard limits — truncate oversized system prompts and prune
            excess tool definitions — recording the real token delta. Starter kit
-           templates in src/templates/ provide LangGraph + Temporal OSS patterns
+           templates in src/templates/ provide LangGraph OSS patterns
            for the larger, advisory-only role-decomposition gains.
 """
 import json

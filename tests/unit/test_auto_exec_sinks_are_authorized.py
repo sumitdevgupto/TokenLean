@@ -41,17 +41,18 @@ _DISPATCH = re.compile(r"(?:await\s+)?handler\s*\(|_handlers\s*\.\s*get\s*\(|"
                        r"_task_handlers\s*\.\s*get\s*\(")
 
 # Reviewed 2026-09-06. Anything not on this list is a sink nobody has looked at yet.
-#   g15_server_compute / g28_ccr — LIVE, and both authorize at the dispatch site.
-#   g13_kafka / g16_temporal_runtime — dormant SDK modules, unwired and unreferenced. Their
-#     handler dicts are operator-registered and keyed by a queue topic / agent name rather
-#     than by a model-chosen tool name, so they are a different risk class. Their fate is
-#     tracked as E6 in session-close-todos-2026-09-06.md; this list is what stops them
-#     being forgotten again.
+# Both entries are LIVE and both authorize at the dispatch site.
+#
+# The list held two more for part of that day — `g13_kafka.py` and `g16_temporal_runtime.py`
+# — until they were deleted the same afternoon. They were a genuinely different risk class
+# (handler dicts keyed by a queue topic / an internally-built agent name, not by a
+# model-chosen tool name), so they were never the authorization hole the two deleted sinks
+# were. They went because nothing reached them: unwired, absent from every shipped config,
+# referenced by no code and no test, and in Kafka's case `aiokafka` was not installed, so
+# the module could not have run had anyone set its flags.
 _KNOWN_DISPATCH_SINKS = {
     "g15_server_compute.py",
     "g28_ccr.py",
-    "g13_kafka.py",
-    "g16_temporal_runtime.py",
 }
 
 _LIVE_AUTO_EXEC_SINKS = ("g15_server_compute.py", "g28_ccr.py")
@@ -125,16 +126,30 @@ class TestLiveSinksAuthorizeAtTheSink:
 
 
 class TestDeletedSinksStayDeleted:
-    @pytest.mark.parametrize("name", ["g15_mcp_dispatch.py", "g14_tool_combining.py"])
+    @pytest.mark.parametrize("name", ["g15_mcp_dispatch.py", "g14_tool_combining.py",
+                                      "g13_kafka.py", "g16_temporal_runtime.py"])
     def test_the_module_is_gone(self, name):
         assert not (_MIDDLEWARE / name).exists(), (
-            f"{name} was deleted 2026-09-06 as an unwired auto-exec sink. Re-adding it "
+            f"{name} was deleted 2026-09-06 as an unwired dispatch module. Re-adding one "
             f"needs authorize_dispatch at the sink, name validation, and — for the MCP "
-            f"one — validate_outbound_url."
+            f"one — validate_outbound_url. Re-adding the Temporal runtime also means "
+            f"re-pinning temporalio, which was dropped with it (58 MB of image)."
         )
 
+    def test_the_dropped_dependencies_stay_dropped(self):
+        """`temporalio` was pinned solely for the deleted runtime — 58 MB in the image for
+        code nothing reached. `aiokafka` was never pinned at all, which is why the Kafka
+        module could not have started even if someone had set its flags."""
+        root = pathlib.Path(__file__).resolve().parents[2]
+        reqs = (root / "src" / "proxy" / "requirements.txt").read_text(encoding="utf-8")
+        pinned = {line.split("==")[0] for line in reqs.splitlines() if "==" in line
+                  and not line.startswith((" ", "#"))}
+        for pkg in ("temporalio", "aiokafka", "nexus-rpc"):
+            assert pkg not in pinned, f"{pkg} is pinned again"
+
     @pytest.mark.parametrize("symbol", ["G15MCPDispatch", "MCPServerDispatch",
-                                        "G14ToolCombining", "ToolCallBatcher"])
+                                        "G14ToolCombining", "ToolCallBatcher",
+                                        "G13Kafka", "KafkaBatchProcessor", "TemporalRuntime"])
     def test_nothing_imports_the_removed_classes(self, symbol):
         for path in sorted(_MIDDLEWARE.glob("*.py")):
             assert symbol not in _code(path), f"{path.name} references removed {symbol}"
@@ -147,5 +162,6 @@ class TestDeletedSinksStayDeleted:
         for doc in ("README.md", "docs/request-flow-diagram.md"):
             text = (root / doc).read_text(encoding="utf-8")
             for symbol in ("g15_mcp_dispatch", "G15MCPDispatch",
-                           "g14_tool_combining", "ToolCallBatcher"):
+                           "g14_tool_combining", "ToolCallBatcher",
+                           "g13_kafka", "G13Kafka", "g16_temporal_runtime", "TemporalRuntime"):
                 assert symbol not in text, f"{doc} still advertises {symbol}"

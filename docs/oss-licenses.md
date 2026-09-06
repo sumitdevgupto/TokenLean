@@ -28,7 +28,6 @@ All **Python package dependencies** used by the Token Optimisation proxy. Every 
 | fastembed | >=0.3.0 | Apache-2.0 | Embedding inference |
 | prometheus-client | >=0.20.0 | Apache-2.0 | Metrics exposition |
 | instructor | >=1.3.0 | MIT | Structured LLM output |
-| temporalio | >=1.5.0 | MIT | Temporal workflow runtime |
 
 ## Optional Dependencies
 

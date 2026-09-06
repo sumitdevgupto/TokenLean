@@ -66,7 +66,7 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 - 🧩 **Route by policy** — declarative **per-tenant routing rules** pin any traffic segment (matched on keywords/regex, prompt size, requested model, tools, header tags, or user id) to a tier or specific model, with a portal **dry-run tester**; deterministic, cost-floor-protected, off by default (byte-identical when off)
 - 🔀 **Per-provider routing out of the box** — bring any provider and its requests cascade **within their own family** (a Claude request routes `claude-haiku → sonnet → opus`, a Gemini request `flash → pro`, …); the config ships ladders for all 10 native providers, so a non-OpenAI request is never silently rerouted to `gpt-4o-mini` — delete the providers you don't use and the rest pass through untouched
 - ♻️ **Hot-reload + self-tuning** — tune or A/B any technique without a redeploy; the proxy can also **learn per-tenant** which optimisations stop paying off and switch them off automatically (managed on Enterprise; the applying engine ships OSS)
-- 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, Temporal
+- 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, LangGraph
 
 ---
 
@@ -430,10 +430,10 @@ tests/                      # Unit and integration tests (pytest)
 | **G10** | Memory Management | 20-40% | Mem0 OSS integration for long-horizon conversation memory |
 | **G11** | Output Format | 10-25% | Auto max_tokens with Redis feedback loop (p95 tuning). Opt-in **output JSON-schema validation** (`validate_output`) — flag / one-shot repair / block a structured answer that isn't valid JSON or misses a schema field. Opt-in **terse-output steering** (`verbosity_steering.level`: lite/full/ultra) — a built-in "answer tersely" dial (safety carve-outs; cache-key-scoped) that subsumes the Caveman-style terseness prompt |
 | **G12** | Reasoning Budget | **not measured** | Injects the provider's reasoning parameter for the selected effort tier, including **`off`** — which omits it entirely. `off` genuinely disables reasoning on Claude and Gemini; OpenAI o-series models reason intrinsically, so there it selects the model default and is recorded as `off_unsupported` rather than counted as a saving. The old "10-30%" was never measured: the ablation's reasoning workload is **−2.7%**, and its three reasoning datasets are OpenAI-only, where `off` cannot help |
-| **G13** | Batch/Compact | **36% measured** (TOON only) | TOON (Token-Optimized Object Notation) compaction — the measured figure, from the DS4 ablation. The other two mechanisms in this group are **not measured**: Kafka batching, and the opt-in **provider-native async batch lane** (`provider_native`), which claims the provider's **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs. Neither is exercised by the ablation, so neither contributes to this number |
+| **G13** | Batch/Compact | **36% measured** (TOON only) | TOON (Token-Optimized Object Notation) compaction — the measured figure, from the DS4 ablation. The other mechanism in this group is **not measured**: the opt-in **provider-native async batch lane** (`provider_native`), which claims the provider's **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs. It is not exercised by the ablation, so it does not contribute to this number. (A third mechanism, Kafka batching, was listed here until 2026-09-06; it was never reachable code and has been removed — batching runs on Redis Streams) |
 | **G14** | Tool Output | 15-30% | Dependency-aware parallel tool combining |
 | **G15** | Server Compute | Variable | MCP SDK server dispatch for external handlers |
-| **G16** | Agent Architecture | 5-20% enforced (truncation + tool pruning); 20-45% with manual role decomposition | LangGraph + Temporal runtimes with cost modeling |
+| **G16** | Agent Architecture | 5-20% enforced (truncation + tool pruning); 20-45% with manual role decomposition | LangGraph runtime with cost modeling |
 | **G17** | Loop Control | 10-20% | Inter-agent state via HTTP headers + token budgets |
 | **G18** | Observability | N/A | Langfuse tracing + Grafana dashboards + admin webhooks |
 | **G19** | Structured Pruning | up to ~40% | AST-aware compression of code/JSON/logs/text (Headroom); request + response |
@@ -608,7 +608,7 @@ main._record_outcome ───────────────────�
 | **RAG** | Qdrant + sentence-transformers | Vector search (G7) |
 | **Routing** | RouteLLM | Model selection (G6) |
 | **Memory** | Mem0 OSS + Qdrant | Long-horizon conversation memory (G10) |
-| **Orchestration** | LangGraph + Temporal | Agent runtime (G16) |
+| **Orchestration** | LangGraph | Agent runtime (G16) |
 | **Observability** | Langfuse + Grafana + Prometheus | Tracing and dashboards (G18) |
 | **Infrastructure** | Terraform + GCP Cloud Run | Serverless deployment |
 | **Config** | GCS + hot-reload | Externalised configuration |

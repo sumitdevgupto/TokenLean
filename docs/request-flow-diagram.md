@@ -70,7 +70,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  ┌─────────────────────────────────────────────────────────────────────────────────────┐       │
 │  │  STAGE 3 — PARAMETER INJECTION (Inside the LLM)   [honours ctx.skip_groups]          │       │
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
-│  │  G16 Agent Arch       → anti-pattern advisories (LangGraph/Temporal guidance)       │       │
+│  │  G16 Agent Arch       → anti-pattern advisories (LangGraph guidance)                │       │
 │  │  G11 Output Format    → max_tokens enforcement + JSON schema + p95 feedback prep    │       │
 │  │  G25 Adaptive Reason. → classify complexity → set reasoning_effort (before G12)     │       │
 │  │  G12 Reasoning Budget → effort=low/med/high → provider-specific budget params       │       │
@@ -310,9 +310,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
   the same limitation the G29/G30 response scans carry. Default `mode: flag` with an empty
   policy, which can never deny anything, so a default install is byte-identical.
 
-**G16: Agent Architecture** (`g16_agent_arch.py` + `g16_langgraph_runtime.py` + `g16_temporal_runtime.py`)
+**G16: Agent Architecture** (`g16_agent_arch.py` + `g16_langgraph_runtime.py`)
 - Anti-pattern advisories (role stacking, oversized system prompts, tool sprawl)
-- Optional `LangGraphRuntime` / `TemporalRuntime` for durable, budget-aware agent execution
+- Optional `LangGraphRuntime` for budget-aware agent execution
 
 **G11: Output Format** (`g11_output_format.py`)
 - Enforce `max_tokens` (default 2× expected); inject JSON schema / `response_format`
@@ -327,9 +327,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
   - OpenAI o1/o3: `reasoning_effort`; Anthropic: `thinking.budget_tokens`; Gemini: `thinking_config`
 - Optional reasoning-suppression prompt injected at low/medium effort
 
-**G13: Batch Processing** (`g13_batch.py` + `g13_kafka.py` + `g13_toon.py`)
+**G13: Batch Processing** (`g13_batch.py` + `g13_toon.py`)
 - TOON compact notation (`#C1`/`#P1` code substitution, legend transmitted once)
-- Batch accumulation via Redis Streams (Kafka alternative); if batchable → `ctx.batch_deferred=True`, return 202
+- Batch accumulation via Redis Streams; if batchable → `ctx.batch_deferred=True`, return 202
 - Optional **provider-native batch lane** (`provider_native: true`, default off): a flushed batch is grouped by provider and submitted to a native Batch API for the 50% discount — **OpenAI** via direct SDK, **Anthropic/Gemini** via litellm's unified batch API; `poll_batch_jobs`/`start_batch_poller` map results back to each `request_id` for `/v1/batch/results/{id}`. Missing key / unsupported provider / errors fall back to the per-item loop (failed provider memoised per process)
 
 **G17: Loop Control** (`g17_loop_control.py`)
@@ -650,7 +650,6 @@ class InterAgentState(BaseModel):
 | **headroom (optional)** | L3 semantic cache, structured pruning, image/CCR compression | G05, G19, G27, G28 |
 | **LiteLLM** | LLM provider abstraction | `main.py` |
 | **Langfuse / Prometheus / OTLP** | Observability & tracing | G18, `langfuse_tracing.py`, `tracing/otel.py` |
-| **Kafka / Temporal (optional)** | Enterprise batch queue / durable workflows | G13, G16, G05 |
 | **Mem0 / Zep / Instructor (optional)** | Long-term memory / typed output | G10, G09 |
 
 ## Configuration Hot-Reload
@@ -667,7 +666,7 @@ Every 60 seconds, a daemon thread in `config_loader.py`:
 - **G05 Auto-TTL** — `AutoTTLManager` adjusts TTLs from hit-rate stats
 - **G08 Scheduled Pruning** — removes MCP tools inactive for 30 days
 - **G02 Template Deprecation** — scheduled stale-template checks
-- **G13 Batch Consumer** — Redis Streams / Kafka background consumers (TOON legend amortisation)
+- **G13 Batch Consumer** — Redis Streams background consumers (TOON legend amortisation)
 - **G20 Prompt Optimisation** — offline optimiser feeding G2/G20 learned templates
 - **G24 Rule Generation** — offline savings-pattern analysis feeds adaptive-bypass rules
 - **Langfuse / OTLP ingestion + Prometheus `/metrics`** — observability export
@@ -720,10 +719,10 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G10** | `g10_memory.py`, `g10_mem0_adapter.py` | Conversation memory, Mem0, Zep, skills |
 | **G11** | `g11_output_format.py` | max_tokens enforcement, p95 feedback loop |
 | **G12** | `g12_reasoning_budget.py` | Provider-specific reasoning budget, effort levels |
-| **G13** | `g13_batch.py`, `g13_kafka.py`, `g13_toon.py` | Batch processing, TOON notation, Kafka |
+| **G13** | `g13_batch.py`, `g13_toon.py` | Batch processing, TOON notation |
 | **G14** | `g14_tool_output.py` | Tool output projection and structural compaction |
 | **G15** | `g15_server_compute.py` | Server-side hooks for CCR tool dispatch |
-| **G16** | `g16_agent_arch.py`, `g16_langgraph_runtime.py`, `g16_temporal_runtime.py` | Agent advisories, LangGraph, Temporal |
+| **G16** | `g16_agent_arch.py`, `g16_langgraph_runtime.py` | Agent advisories, LangGraph |
 | **G17** | `g17_loop_control.py` | Loop control, InterAgentState, budget propagation |
 | **G18** | `g18_observability.py`, `langfuse_tracing.py` | Prometheus metrics, Langfuse tracing, usage records |
 | **G19** | `g19_headroom.py` | Structured (AST-aware) pruning — request + response |
@@ -750,7 +749,7 @@ All 28 optimisation slots are implemented — G26 filled the last reserved slot 
 context management — plus the four non-savings **trust & safety** groups
 (G29 PII, G30 injection, G31 context-trust, G32 tool-call eligibility) and the OSS-core
 **F2 Intent Orchestration** stage.
-Optional integrations (headroom, Mem0, Zep, Kafka, Temporal, Instructor, Presidio) degrade
+Optional integrations (headroom, Mem0, Zep, Instructor, Presidio) degrade
 gracefully when their packages or backing services are absent.
 
 ---

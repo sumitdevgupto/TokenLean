@@ -35,6 +35,21 @@ reference, and every compacted value is checked for one before it is accepted. M
 real tool payloads first: the removed library saved 55.3% of tokens against the built-in
 compactor's 54.5%, so this costs about eight tenths of a point and returns the answer.
 
+### Removed two unreachable modules and the docs that advertised them — Bug fix
+
+A Kafka batch backend and a Temporal agent runtime were both present as modules but reachable
+from nowhere: neither was registered in the request pipeline, neither had a flag in any shipped
+config, and neither was referenced by any other code or test. The Kafka one could not have run
+at all, because its client library was never a dependency. Both are deleted, and the Temporal
+library goes with them — 58 MB of image for code nothing called.
+
+The documentation was the more visible half. The configuration reference described a Kafka
+batch backend with four environment variables that nothing implemented, and the README listed
+Temporal in the stack, as the agent runtime, and in the orchestration table. Those are now
+corrected, along with five references in the architecture diagram and a source comment pointing
+at starter templates that only ever contained the LangGraph pattern. Batching runs on Redis
+Streams, which is not a fallback — it is the implementation.
+
 ### Removed a second unwired module that could execute a tool without checking policy — Bug fix
 
 A dormant tool-batching module looked up a handler by the tool name the model asked for and

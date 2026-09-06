@@ -957,7 +957,6 @@ per-tenant quality knobs.
 ### C. Env-only knobs (by design)
 | Group | Env var | Default | Purpose |
 |---|---|---|---|
-| `G13_batch` | `G13_USE_KAFKA`, `KAFKA_BROKERS`, `KAFKA_BATCH_TOPIC`, `KAFKA_CONSUMER_GROUP` | `false` / `localhost:9092` / … | Kafka batch backend (else Redis Streams) |
 | `G7_retrieval` | `QDRANT_LOCAL_NOAUTH` | `0` | Skip GCP token fetch on local/non-GCP |
 | `G3_doc_pipeline` | `OOD_SIMILARITY_THRESHOLD`, `OOD_MAX_RETRIES` | `0.65`, `3` | ⚠ Out-of-distribution detection for RAG fallback |
 
@@ -966,5 +965,13 @@ The following knobs are read by classes that the audit reports are **not registe
 `pipeline.py`**, so they are inert until the class is wired: `G4` `fuzzy_similarity_threshold`
 (`G04DBResolution`), `G5` `temporal_activity_cache` / `idempotent_activities` /
 `activity_cache_ttl_seconds` (`G05TemporalActivity`), `G8` `mcp_enabled` (`G08MCPLoader`),
-`G16` `langgraph_enabled` (`G16LangGraphRuntime`). (`G14` `combine_tool_calls` was on this list
-until 2026-09-06, when the never-wired `G14ToolCombining` was deleted rather than left inert.)
+`G16` `langgraph_enabled` (`G16LangGraphRuntime`).
+
+> **Removed 2026-09-06.** `G14` `combine_tool_calls` (`G14ToolCombining`) was on the list above,
+> and a `G13_batch` row here documented a **Kafka batch backend** (`G13_USE_KAFKA`,
+> `KAFKA_BROKERS`, `KAFKA_BATCH_TOPIC`, `KAFKA_CONSUMER_GROUP`). Neither was reachable: the
+> classes were never registered in `pipeline.py`, and in Kafka's case `aiokafka` was not even
+> a dependency, so the backend could not have started had anyone set the flags. Documenting
+> configuration that cannot take effect is worse than documenting none — the modules and these
+> rows were deleted together. Batching runs on Redis Streams, which is not "the fallback"; it
+> is the implementation.
