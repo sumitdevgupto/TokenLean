@@ -35,6 +35,21 @@ reference, and every compacted value is checked for one before it is accepted. M
 real tool payloads first: the removed library saved 55.3% of tokens against the built-in
 compactor's 54.5%, so this costs about eight tenths of a point and returns the answer.
 
+### Deployment readiness now distinguishes a group that worked from one that merely ran — Bug fix
+
+The readiness report gave a group a clean tick when its stage executed, which is the right
+answer to "did it run" and the wrong answer to the question an operator is actually asking.
+The image optimiser showed a tick on a build where it ran on every request and shrank nothing.
+Groups whose documented result is a token saving are now reported in three states rather than
+two: worked, ran without producing that saving, and never ran. The middle state still passes,
+because a no-op on a single smoke request is often legitimate, and it is never a reason to
+block a deploy — it is now simply visible instead of hidden behind a tick.
+
+The scope is deliberately narrow. A first version also treated a flat savings counter as proof
+of no effect, and against a live deployment that flagged eighteen of twenty-six groups, because
+only one group emits that counter there. It was reporting missing telemetry as a missing result,
+which is the same mistake in a new place. It now answers only where the evidence is direct.
+
 ### Removed two unreachable modules and the docs that advertised them — Bug fix
 
 A Kafka batch backend and a Temporal agent runtime were both present as modules but reachable
