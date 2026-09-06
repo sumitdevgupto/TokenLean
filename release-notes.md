@@ -34,7 +34,7 @@ warn` — the prompt is passed through byte-identical and reported, never edited
 want the cap enforced set `compact`, which drops the **middle** on paragraph boundaries, keeps
 the opening role and the closing policy, and marks the elision so the model is not handed a
 truncated policy that looks complete. Compaction is still lossy in the middle, which is why it
-is opt-in. Also fixed: with the prompt split across several system messages the cap enforced
+is opt-in, and it now spends the budget it is given — the first cut kept whole paragraphs only, so a single large paragraph was dropped entire and left most of the budget unused, discarding far more of the prompt than the cap required. Also fixed: with the prompt split across several system messages the cap enforced
 nothing at all (each message was budgeted the full cap) while the warning still claimed it had
 truncated — 6,003 tokens passed a 4,096 cap untouched.
 

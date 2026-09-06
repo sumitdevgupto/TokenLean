@@ -350,6 +350,40 @@ class TestCompactionKeepsBothEnds:
         )
         assert "20. Routine background" not in out, "the middle is what should go"
 
+    def test_it_actually_spends_the_budget_it_is_given(self):
+        """Regression, 2026-09-06 (found while measuring E22, hours after shipping E15).
+        Units are kept or dropped WHOLE, so a single oversized unit is dropped entire and its
+        budget goes unspent. On the benchmark's agentic system prompt — three paragraphs of
+        81 / 924 / 36 tokens — a 796-token budget kept only 152 tokens: 644 tokens of the
+        customer's instructions deleted for nothing. Every token of budget left unused is a
+        sentence of theirs thrown away, so the floor is a property worth pinning, not a
+        nice-to-have.
+        """
+        from middleware.g16_agent_arch import _compact_to_tokens
+        from savings.calculator import estimate_tokens
+        text = ("You are an operations agent.\n\n"
+                + " ".join(f"Step {i} explains a procedure in some detail." for i in range(400))
+                + "\n\nAlways end by summarising the outcome.\n")
+        assert estimate_tokens(text, "gpt-4o-mini") > 2000  # fixture must be over budget
+        out = _compact_to_tokens(text, 800, "gpt-4o-mini")
+        used = estimate_tokens(out, "gpt-4o-mini")
+        assert used <= 800
+        assert used >= 800 * 0.8, f"only {used}/800 tokens of budget used — the rest is deleted content"
+
+    def test_a_single_oversized_paragraph_does_not_waste_the_budget(self):
+        """The exact shape that failed: one paragraph far larger than the budget, between two
+        small ones. Dropping it whole is correct; dropping it whole and then stopping is not."""
+        from middleware.g16_agent_arch import _compact_to_tokens
+        from savings.calculator import estimate_tokens
+        text = ("Opening role line.\n\n"
+                + " ".join(f"Sentence number {i} carries a policy detail." for i in range(300))
+                + "\n\nClosing policy line.\n")
+        out = _compact_to_tokens(text, 600, "gpt-4o-mini")
+        used = estimate_tokens(out, "gpt-4o-mini")
+        assert used <= 600
+        assert used >= 600 * 0.8, f"only {used}/600 tokens of budget used"
+        assert "Opening role line" in out and "Closing policy line" in out
+
     def test_the_elision_is_declared_to_the_model(self):
         """A truncated policy that looks complete is worse than one marked incomplete."""
         from middleware.g16_agent_arch import _compact_to_tokens

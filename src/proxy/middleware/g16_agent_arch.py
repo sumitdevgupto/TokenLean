@@ -106,13 +106,43 @@ _ELISION = (
 _ELISION_PLAIN = " […] "
 
 
-def _split_blocks(text: str) -> List[str]:
-    """Paragraphs, else lines, else the whole string — the units kept or dropped whole."""
-    for sep in ("\n\n", "\n"):
-        if sep in text:
-            parts = text.split(sep)
-            return [p + sep for p in parts[:-1]] + [parts[-1]]
-    return [text]
+_BLOCK_SEPARATORS = ("\n\n", "\n", ". ")
+_HARD_SLICE_CHARS = 2000
+
+
+def _split_blocks(text: str, max_unit_chars: int = _HARD_SLICE_CHARS) -> List[str]:
+    """Split into paragraph-then-line-then-sentence units, kept or dropped whole.
+
+    Units are atomic, so their size is a floor on how precisely the budget can be filled.
+    Paragraphs alone are too coarse: a 924-token paragraph cannot fit a 796-token budget, is
+    dropped entire, and leaves 644 tokens of budget unspent — deleting far more of the
+    customer's prompt than the cap requires. Refining all the way to sentences fixes that.
+
+    It deliberately stops AT the sentence: splitting on words would fill the budget marginally
+    better while starting the surviving tail mid-sentence, which is the half-written text this
+    whole change exists to avoid. Only a unit with no usable boundary left — one still longer
+    than `max_unit_chars` after sentence splitting — is hard-sliced. That bound is kept
+    generous relative to the budget so ordinary sentences are never cut, while an unbroken run
+    (a pasted blob, minified text) is still divided finely enough to be placeable.
+    """
+    units = [text]
+    for sep in _BLOCK_SEPARATORS:
+        refined: List[str] = []
+        for u in units:
+            if sep in u:
+                parts = u.split(sep)
+                refined.extend([p + sep for p in parts[:-1]] + [parts[-1]])
+            else:
+                refined.append(u)
+        units = refined
+    out: List[str] = []
+    for u in units:
+        while len(u) > max_unit_chars:
+            out.append(u[:max_unit_chars])
+            u = u[max_unit_chars:]
+        if u:
+            out.append(u)
+    return out
 
 
 def _head_tail_chars(text: str, max_tokens: int, model: str) -> str:
@@ -164,13 +194,15 @@ def _compact_to_tokens(text: str, max_tokens: int, model: str) -> str:
     if estimate_tokens(text, model) <= max_tokens:
         return text
 
-    blocks = _split_blocks(text)
-    if len(blocks) < 3:
-        return _head_tail_chars(text, max_tokens, model)
-
     marker_cost = estimate_tokens(_ELISION.format(n=len(text), cap=max_tokens), model)
     budget = max_tokens - marker_cost
     if budget <= 0:
+        return _head_tail_chars(text, max_tokens, model)
+
+    # Keep the no-boundary fallback slice generous next to the budget: fine enough that a
+    # blob is placeable, coarse enough that a normal sentence is never cut in half.
+    blocks = _split_blocks(text, max_unit_chars=max(400, budget * 2))
+    if len(blocks) < 3:
         return _head_tail_chars(text, max_tokens, model)
 
     head: List[str] = []
