@@ -422,8 +422,8 @@ Lazy tool-definition loading + MCP manifest fetch + scheduled pruning.
 |---|---|---|
 | `enabled` | `true` | Enable tool loading |
 | `max_tools_per_agent` | `20` | ⚠ Prune tools beyond this count (too low → the model loses a tool it needs) |
-| `registry_path` | `gs://<bucket>/config/tool-registry.yaml` | Tool registry location |
-| `compress_descriptions` | `false` | Opt-in: compress tool/function `description` prose (deterministic regex, zero-LLM; manifests ride every agentic request). Code/paths/identifiers preserved byte-for-byte. |
+| `registry_path` | `gs://<bucket>/config/tool-registry.yaml` | Tool registry location. **Intent pruning only acts on tools listed here.** A requested tool with no registry entry is treated as intent `default` and is always KEPT — so until you add your own tools to this file, G08's pruning is a no-op and only `compress_descriptions` has any effect. The file ships seeded with example entries, not yours |
+| `compress_descriptions` | `true` | Compress tool/function `description` prose (deterministic regex, zero-LLM; manifests ride every agentic request). Code/paths/identifiers preserved byte-for-byte. |
 | `compress_description_fields` | `[description]` | Which string fields to compress when `compress_descriptions` is on |
 | `mcp_servers` | `null` | MCP servers — **list of `{url, filter_tools}` dicts** (not URL strings) |
 | `pruning.{enabled, inactivity_threshold_days, dry_run_first, schedule}` | `true / 30 / true / 0 2 * * *` | Scheduled removal of unused tools |

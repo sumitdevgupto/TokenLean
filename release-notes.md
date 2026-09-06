@@ -23,6 +23,20 @@ date changes.
 
 ## 2026-09-06
 
+### Tool pruning did nothing unless you had registered your own tools — Enhancement (OSS)
+
+G8's intent-based tool pruning only ever acted on tools listed in your `registry_path`. A tool
+with no registry entry is treated as intent `default` and always kept — the safe behaviour, since
+dropping a tool the caller sent would break their agent, but it means the pruning was inert on a
+fresh install and nothing said so. Measured across our own benchmark datasets, two example tools
+we had registered ourselves accounted for **all** of the pruning; two datasets pruned nothing at
+all. Tool-description compression, which works on anyone's tools and never drops one, is now **on
+by default**, so G8 contributes out of the box. The docs and the G8 row now state the registry
+requirement plainly instead of implying the pruning works unconfigured.
+- **OSS:** `compress_descriptions` defaults to `true`; `registry_path` documented as a
+  prerequisite for intent pruning.
+
+
 ### The deploy check could not tell whether the agent-limits optimisation worked — Bug fix
 
 Every deployment runs a readiness gate that verifies each optimisation actually fires, and a
