@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-09-06
 
+### The deploy check could not tell whether the agent-limits optimisation worked — Bug fix
+
+Every deployment runs a readiness gate that verifies each optimisation actually fires, and a
+NOT-READY verdict blocks the deploy. The probe for the agent-architecture limits sent 12 tools
+against a shipped cap of 20 and a 14-token system prompt against a 4,096-token cap — neither
+threshold could trip, so the group could not act on its own probe, and it passed on the fact
+that its pipeline stage had executed. That is the same "the stage ran, therefore it works"
+inference removed elsewhere in this release. The probe now carries 24 tools, so pruning is a
+real observable: the live gate reports a measured saving instead of a bare tick. If an operator
+raises the cap past 24 the check reports "ran, no effect" with the reason rather than failing —
+the cap is their setting to choose.
+
+
 ### The public benchmark measured a config nobody runs — its agentic figure is corrected down — Bug fix
 
 `examples/benchmark/run.sh` pins a known-good config so results do not depend on local toggles.
