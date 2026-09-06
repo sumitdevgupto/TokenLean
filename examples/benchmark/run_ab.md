@@ -234,7 +234,7 @@ derived arithmetic (see below).
 - **agentic** — a multi-turn BFCL tool loop (`agentic_dataset.jsonl`) run on both arms via
   `run_episode`. Reproduces the **tool-catalogue-pruning** lever (G08/G16) only; the larger
   tool-output-projection lever (G14/G15) **structurally cannot fire in a live single-loop A/B** (it
-  acts on `role:"tool"` results a live model never inlines), so this reads ~20% (run-variable 19–25%
+  acts on `role:"tool"` results a live model never inlines), so this reads ~12% (run-variable 7–22% over 7 runs
   under model nondeterminism) vs the internal 46% — disclosed, not hidden. Graded by a **relative
   tool-trajectory gate** (the proxy arm's tool calls must cover the direct arm's, minus forbidden)
   alongside the answer facts gate.
@@ -255,7 +255,7 @@ for a shared original.
 labelled **ILLUSTRATIVE** — never tuned to land on a target. The blend lands **below the internal
 54.1% by construction** (agentic only partially live-reproducible; recognized public prose payloads
 are small/stateless); recompute it with your own weights to see the sensitivity. On OpenAI at the
-default weights it prints **~34%**.
+default weights it prints **~32%** (31–34% across runs, inheriting the agentic lever's spread).
 
 ---
 

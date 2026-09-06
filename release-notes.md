@@ -23,6 +23,20 @@ date changes.
 
 ## 2026-09-06
 
+### The public benchmark measured a config nobody runs — its agentic figure is corrected down — Bug fix
+
+`examples/benchmark/run.sh` pins a known-good config so results do not depend on local toggles.
+One pinned value had drifted: G16's system-prompt cap was pinned to **800** tokens while the
+shipped default is **4096**, and every BFCL agentic episode carries a ~1,046-token system prompt.
+So the cap fired on all 15 episodes here and on none for anyone running defaults — in a harness
+whose entire claim is that a skeptic can reproduce it. The pin is gone; the benchmark now runs the
+shipped config. Re-measured over 7 runs, the **agentic lever is ~12% (7–22%), not ~20% (19–25%)**,
+and the illustrative blend is **~32% (31–34%)** rather than ~34%. Removing the pin also widened the
+spread, because the cap was a deterministic per-turn saving that damped it. A new test compares
+every knob the launcher pins against `config.yaml.template`, so this class of drift cannot return
+silently.
+
+
 ### An oversized system prompt had its END deleted to fit a token cap — Bug fix
 
 G16 enforces a `max_system_prompt_tokens` cap. It did so with a straight tail cut, so what was

@@ -169,19 +169,16 @@ for k in enable:
     _block(k)['enabled'] = True
 for k in disable:
     _block(k)['enabled'] = False
-# Agentic lever (G08/G16 tool-catalogue pruning + system-prompt cap). Safe to enable
-# globally: the standard/cache workloads carry no tools and <=32-token system prompts, so
-# G16 is a no-op there; it only bites on the --workload agentic tool-heavy episodes.
+# Agentic lever (G08/G16 tool-catalogue pruning). Safe to enable globally: the
+# standard/cache workloads carry no tools and <=32-token system prompts, so G16 is a no-op
+# there; it only bites on the --workload agentic tool-heavy episodes.
 _block('G8_tools').update({'enabled': True, 'max_tools_per_agent': 20})
-_block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20,
-                                 'max_system_prompt_tokens': 800,
-                                 # Explicit since 2026-09-06: the shipped default for an
-                                 # over-cap system prompt is now 'warn' (leave it intact), so
-                                 # this pin would otherwise be advisory and the agentic lever
-                                 # would quietly lose its prompt-cap component. 'compact' keeps
-                                 # the cap while preserving the prompt's opening and closing
-                                 # instructions instead of deleting its tail.
-                                 'system_prompt_overflow': 'compact'})
+# The system-prompt cap is deliberately NOT pinned here (2026-09-06). It used to be set to
+# 800 against a shipped default of 4096, and every BFCL episode carries a ~1,046-token system
+# prompt — so the cap fired on all 15 and contributed 7.22 percentage points of agentic savings
+# that nobody running a default install would ever see. This benchmark's whole claim is that a
+# skeptic can reproduce it, so it now runs the shipped default and reports whatever that gives.
+_block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20})
 # Provider-aware G06 routing. The template's tiers are OpenAI-only
 # (simple->gpt-4o-mini, ...), so a non-OpenAI `--ab --providers <p>` request
 # would be silently rerouted to gpt-4o-mini and the A/B would compare two

@@ -394,11 +394,22 @@ def test_relative_tool_gate():
     assert run_ab.relative_tool_gate([], tc("ls"))["graded"] is False
 
 
-def test_agentic_pin_enables_g16():
-    """The launcher's pinned config must enable G16 tool pruning + system-prompt cap so the
-    agentic lever actually fires (safe for standard/cache: no tools, tiny system prompts)."""
+def test_agentic_pin_enables_g16_tool_pruning_only():
+    """CHANGED BY DESIGN 2026-09-06 (E22). This previously REQUIRED the launcher to pin
+    `max_system_prompt_tokens` — it encoded the defect. The pinned value was 800 against a
+    shipped default of 4096, and every BFCL episode carries a ~1,046-token system prompt, so
+    the benchmark measured a cap no default install applies: worth ~8 points of a ~20%
+    published agentic figure, on the one harness whose claim is that anybody can reproduce it.
+
+    The launcher must still pin the tool cap (that IS the live-reproducible agentic lever, and
+    it matches the shipped default), and must NOT pin the system-prompt cap.
+    """
     sh = (BENCH / "run.sh").read_text(encoding="utf-8")
-    assert "G16_agent_arch" in sh and "max_tools_per_agent" in sh and "max_system_prompt_tokens" in sh
+    assert "G16_agent_arch" in sh and "max_tools_per_agent" in sh
+    assert "max_system_prompt_tokens" not in sh, (
+        "pinning the system-prompt cap makes the published agentic number depend on a config "
+        "a customer running defaults does not have (E22)"
+    )
 
 
 def test_agentic_builder_script_present():

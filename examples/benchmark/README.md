@@ -264,7 +264,7 @@ warm burst — every original precedes its repeats):
 - **agentic** (`--workload agentic`) — a multi-turn BFCL tool loop run on both arms. Reproduces the
   **tool-catalogue-pruning** lever (G08/G16) only; the larger tool-output-projection lever (G14/G15)
   **structurally cannot fire in a live single-loop A/B** (it acts on `role:"tool"` results a live
-  model never inlines), so this reads ~20% (run-variable 19–25% under model nondeterminism) vs the
+  model never inlines), so this reads ~12% (run-variable 7–22% over 7 runs under model nondeterminism) vs the
   internal 46% — disclosed, not hidden.
 
 ### Calibrated expected results (OpenAI, temperature-0)
@@ -275,11 +275,11 @@ items flip under model nondeterminism even at temperature-0), so treat them as b
 | Workload | Token savings | Notes |
 |---|---|---|
 | cache | **~90%** | warm repeats served locally; 0 fact drops |
-| agentic | **~20%** (19–25%) | G08/G16 tool pruning; only the 2 hardest multi-turn episodes drop a tool |
+| agentic | **~12%** (7–22%, n=7) | G08/G16 tool-catalogue pruning at the **shipped** config; 2–3 of 15 episodes drop a tool the direct arm called (`multi_turn_base_52` and `_55` every run, a third intermittently) |
 | prose (cold, recognized Q&A) | **~2–4%** | stateless floor on small public items |
 | ops (cold, production-shaped) | **~43%** | G19/G22 structured-pruning on verbose DevOps payloads; disclosed **non**-benchmark |
 | reasoning (cold) | **~0%** | reasoning traffic barely compresses — honest |
-| **illustrative blend** | **~34%** | disclosed weighted average (`--weights` tunable), **not** a headline |
+| **illustrative blend** | **~32%** (31–34%) | disclosed weighted average (`--weights` tunable), **not** a headline; the spread is the agentic lever's, carried at weight 0.20 |
 
 The **illustrative blend** (`--workload full`) is `Σ wᵢ·savingᵢ` over the reproducible parts, with
 default balanced weights `cache=0.30 prose=0.35 agentic=0.20 reasoning=0.15` echoed (with citations)
