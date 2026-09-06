@@ -571,6 +571,29 @@ async def list_models(request: Request):
     return {"object": "list", "data": models}
 
 
+@app.get("/v1/groups")
+async def list_group_enablement(request: Request):
+    """Effective per-tenant group enablement for the calling tenant: ids + booleans only.
+
+    Added 2026-09-06 to close a blind spot in `run-readiness`, which gates every deploy.
+    Its only enable signal was the COMMERCIAL `GET /portal/groups`; on the free image that
+    404s, so it assumed every group enabled. A disabled group's stage still RUNS (it
+    early-returns on its own `enabled` check) and therefore still moves the stage-duration
+    metric readiness accepts as proof of firing — so a group shipping `enabled: false`
+    scored a tick. G09 had been passing that way on every OSS deploy.
+
+    Returns booleans ONLY, never knob values: enough to tell "disabled by config" from
+    "enabled but did not fire", and nothing that leaks a sidecar URL, model or threshold
+    through a tenant-scoped endpoint. Keys are the REAL config keys the pipeline reads
+    (`G1_compression`, not `G01`) plus the top-level `rate_limit`, because that is what the
+    caller must reason about; `null` means the key carries no `enabled` field at all.
+    """
+    _user_id, _api_key, tenant_metadata = await _authenticate(request)
+    tenant_id = _caller_tenant_id(tenant_metadata) or "default"
+    groups = await _pipeline.effective_group_enablement(tenant_id)
+    return {"object": "list", "tenant_id": tenant_id, "groups": groups}
+
+
 # ---------------------------------------------------------------------------
 # Document ingestion webhook (G03)
 # ---------------------------------------------------------------------------

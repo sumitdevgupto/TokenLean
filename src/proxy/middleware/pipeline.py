@@ -3,7 +3,8 @@ import os
 import time
 from typing import Any, Awaitable, Dict, Optional, Tuple
 
-from middleware import RequestContext
+from config_loader import get_config
+from middleware import RequestContext, resolve_group_config
 from middleware.g00_rate_limit import G00RateLimit, RateLimitExceeded
 from providers import get_adapter
 from tenancy.resolver import resolve_tenant
@@ -128,6 +129,55 @@ class OptimisationPipeline:
             except Exception:  # never let metrics break the pipeline
                 pass
             otel.end_span(_s)
+
+    async def effective_group_enablement(self, tenant_id: str = "default") -> Dict[str, Optional[bool]]:
+        """``{config_key: enabled}`` for this tenant, resolved exactly as a request resolves it.
+
+        Added 2026-09-06. Until now the only machine-readable answer to "is this group
+        enabled on this deployment" was the COMMERCIAL ``GET /portal/groups``. On the free
+        image that 404s, so ``run_readiness`` fell back to assuming every group enabled —
+        and because a disabled group's stage still RUNS (each group early-returns on its own
+        ``enabled`` check), its stage-duration metric moves either way. A group shipping
+        ``enabled: false`` therefore scored a readiness tick. G09 had been doing exactly that.
+
+        Deliberately returns booleans only, never knob VALUES: the caller gets enough to tell
+        "disabled by config" from "enabled but did not fire", and nothing that would leak a
+        sidecar URL, a model name or a threshold through a tenant-scoped endpoint.
+
+        Goes through the SAME ``TenantConfigLoader`` instance the request path uses, so the
+        Postgres overlay and its cache are shared — the answer cannot drift from what traffic
+        actually gets. ``None`` means the key carries no ``enabled`` field at all.
+        """
+        import copy as _copy
+
+        class _ConfigShim:
+            __slots__ = ("config", "tenant_id")
+
+            def __init__(self, config, tid):
+                self.config = config
+                self.tenant_id = tid
+
+        shim = _ConfigShim(_copy.deepcopy(get_config()), tenant_id)
+        # Mechanism D1 (Postgres per-tenant overrides) — the live portal-written path.
+        try:
+            await self._tenant_config_loader.load(shim)
+        except Exception as exc:  # never let a config-store blip 500 a read-only probe
+            logger.warning("effective_group_enablement: tenant overlay unavailable: %s", exc)
+
+        out: Dict[str, Optional[bool]] = {}
+        groups = shim.config.get("groups")
+        if isinstance(groups, dict):
+            for key in groups:
+                # resolve_group_config also applies the OPERATOR path
+                # (`tenants.<id>.groups.<key>` in config.yaml), which the loader does not.
+                resolved = resolve_group_config(shim, key)
+                out[key] = resolved.get("enabled") if isinstance(resolved, dict) else None
+        # G00 lives at the top level, not under `groups` — same shape as the portal catalog's
+        # `config_root` escape hatch, and readiness scores it, so it must be answerable here.
+        rate_limit = shim.config.get("rate_limit")
+        if isinstance(rate_limit, dict):
+            out["rate_limit"] = rate_limit.get("enabled", True)
+        return out
 
     async def process_request(self, ctx: RequestContext, request_headers: Optional[Dict[str, str]] = None) -> RequestContext:
         """Run request through the pre-LLM optimisation pipeline."""

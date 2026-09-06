@@ -23,6 +23,33 @@ date changes.
 
 ## 2026-09-06
 
+### Deployment readiness was checking most optimisations against the wrong request — Bug fix
+
+Every deploy runs a readiness sweep and a failing verdict blocks it. That sweep sends one
+purpose-built request per optimisation — but on a warm cache most of them were answered from
+the cache, which returns before the optimisation being tested ever runs. Each one was then
+passed on a counter that other requests in the same sweep had moved, so a green verdict was
+not evidence about the optimisation it named. The sweep's requests now opt out of the cache
+(the two that exist to prove caching still use it), and a request that short-circuits is
+reported as **unverified** and blocks the deploy instead of quietly passing.
+
+### A group turned off in config was reported as working — Bug fix
+
+A disabled optimisation still enters its pipeline stage and returns immediately, so the
+timing signal readiness watched moved whether or not the group did anything. Readiness could
+only tell disabled from firing by asking the Enterprise portal, which self-hosted deployments
+do not run — so on those it assumed everything was on, and a group shipped off by default
+collected a clean tick on every deploy. New OSS endpoint `GET /v1/groups` reports the calling
+tenant's effective on/off state for each group, resolved exactly as a live request resolves
+it (operator overlay and per-tenant overrides included). It returns booleans only — no
+thresholds, models or service URLs — so it is safe on the same tenant-key auth as the rest of
+`/v1`. A group that is on but whose input nothing on the deployment produces is now reported
+as **unreachable** rather than scored, since a failure there is not something an operator can
+act on.
+- **OSS:** the `/v1/groups` endpoint and the corrected readiness verdicts ship in every tier.
+- **[Enterprise]:** the portal's group console remains the place to change these settings —
+  <https://tokenlean.cbeyond.cloud/>
+
 ### Long text fields in a tool result were replaced by an unusable placeholder — Bug fix
 
 When the proxy compacted a tool result, any text field of roughly 300 characters or more was

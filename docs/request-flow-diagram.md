@@ -448,6 +448,7 @@ Request → Auth → Context → G00 … G13 (batchable) → Return 202 Accepted
 | `/v1beta/models/{model}:generateContent` | POST | **Native Gemini ingress** (#4) — Gemini SDK (`x-goog-api-key` / `?key=`). Response re-serialised to Gemini `candidates` shape. `functionCall`/`functionResponse` round-trip structurally (id synthesised — Gemini carries none — and correlated by function name, FIFO; same-name parallel calls answered out of order can mis-bind — inherent to the id-less protocol) |
 | `/v1beta/models/{model}:streamGenerateContent` | POST | Native Gemini streaming ingress — SSE with `?alt=sse` (the Gemini wire contract); without it, a JSON array of `GenerateContentResponse`. `functionCall` deltas accumulate and emit structurally in the terminal frame |
 | `/v1/models` | GET | List available models from configured providers |
+| `/v1/groups` | GET | Effective optimisation-group enablement for the calling tenant — `{config_key: enabled}` booleans ONLY (no knob values, so it is safe on the same tenant-key auth as the rest of `/v1`). Reflects the operator `tenants.<id>.groups.*` overlay and the per-tenant DB overrides, i.e. what a REQUEST from that tenant would see. Exists so a deployment can distinguish "group disabled by config" from "group enabled but never fired" without the [Enterprise] portal |
 | `/v1/batch/results/{request_id}` | GET | Poll for deferred batch results |
 | `/ingest-doc` | POST | GCS pub/sub webhook for document ingestion (G03) |
 | `/health` | GET | Health check |
