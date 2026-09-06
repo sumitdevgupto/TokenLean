@@ -4,7 +4,7 @@ import time
 from typing import Any, Awaitable, Dict, Optional, Tuple
 
 from config_loader import get_config
-from middleware import RequestContext, resolve_group_config
+from middleware import RequestContext, apply_operator_overlay
 from middleware.g00_rate_limit import G00RateLimit, RateLimitExceeded
 from providers import get_adapter
 from tenancy.resolver import resolve_tenant
@@ -163,20 +163,25 @@ class OptimisationPipeline:
             await self._tenant_config_loader.load(shim)
         except Exception as exc:  # never let a config-store blip 500 a read-only probe
             logger.warning("effective_group_enablement: tenant overlay unavailable: %s", exc)
+        # The SAME merge process_request performs, so this reads what a group reading
+        # ctx.config["groups"][key] directly would read. Not resolve_group_config per key:
+        # that applied the overlay for every group when only 9 honoured it, which made this
+        # endpoint report groups as disabled that were still running (review of 9336dfa).
+        shim.config = apply_operator_overlay(shim.config, tenant_id)
 
         out: Dict[str, Optional[bool]] = {}
         groups = shim.config.get("groups")
         if isinstance(groups, dict):
-            for key in groups:
-                # resolve_group_config also applies the OPERATOR path
-                # (`tenants.<id>.groups.<key>` in config.yaml), which the loader does not.
-                resolved = resolve_group_config(shim, key)
-                out[key] = resolved.get("enabled") if isinstance(resolved, dict) else None
+            for key, block in groups.items():
+                out[key] = block.get("enabled") if isinstance(block, dict) else None
         # G00 lives at the top level, not under `groups` — same shape as the portal catalog's
         # `config_root` escape hatch, and readiness scores it, so it must be answerable here.
+        # Default False, because that is G00's own default (`rl_cfg.get("enabled", False)`):
+        # a `rate_limit:` block with no `enabled` key is OFF, and reporting it on would hand
+        # readiness the exact false tick this endpoint exists to close.
         rate_limit = shim.config.get("rate_limit")
         if isinstance(rate_limit, dict):
-            out["rate_limit"] = rate_limit.get("enabled", True)
+            out["rate_limit"] = rate_limit.get("enabled", False)
         return out
 
     async def process_request(self, ctx: RequestContext, request_headers: Optional[Dict[str, str]] = None) -> RequestContext:
@@ -220,6 +225,11 @@ class OptimisationPipeline:
 
         # Load per-tenant config overrides from Postgres (E3) — the LIVE mechanism (D1).
         await self._tenant_config_loader.load(ctx)
+        # Operator per-tenant overlay (`tenants.<id>.groups.*` in config.yaml), merged ONCE
+        # here so every group sees it — not only the 9 that call resolve_group_config.
+        # Applied AFTER the Postgres overlay so the operator path keeps winning, exactly as
+        # resolve_group_config already made it win for the groups that used it.
+        ctx.config = apply_operator_overlay(ctx.config, ctx.tenant_id)
 
         # Per-tenant default model: when the request omitted `model`, honour the tenant's
         # proxy.default_model / fallback_request_model from the now-merged ctx.config. This

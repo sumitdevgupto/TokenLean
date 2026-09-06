@@ -1118,8 +1118,14 @@ groups:
       text:
         dedupe_sentences: true
         max_sentence_len: 0
-  G20_prompt_optimization:
-    enabled: true
+  # Key is the lowercase `g20_prompt_optimizer` the middleware reads (fixed 2026-09-06 —
+  # backlog #6). It shipped as `G20_prompt_optimization`, a key nothing read, so the
+  # `enabled: true` there was a no-op and every template deploy ran with G20 OFF while
+  # readiness ticked it. `enabled: false` here is the behaviour deploys actually had;
+  # turning G20 on by default is a savings-affecting decision that needs a pitch-test-plan
+  # proof first, not a key rename.
+  g20_prompt_optimizer:
+    enabled: false
     optimizer: builtin
     model: gpt-4o-mini
     eval_sample_size: 100

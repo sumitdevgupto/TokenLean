@@ -23,6 +23,27 @@ date changes.
 
 ## 2026-09-06
 
+### A per-tenant setting in the operator config was ignored by most optimisations — Bug fix
+
+Operators can tune or disable an optimisation for one tenant under `tenants.<id>.groups.*` in
+`config.yaml`. That overlay was applied at read time by a helper only 9 of the 32 pipeline
+stages call, so for the rest — including prompt compression and structured pruning — a
+per-tenant `enabled: false` was silently ignored while the group kept running. The overlay is
+now merged once at pipeline entry, so every stage sees the same effective config. The new
+`GET /v1/groups` endpoint reflects that same merge (it had been reporting groups as disabled
+that were still running), defaults rate limiting to off when no `enabled` key is present
+(matching the rate limiter itself), and resolves the tenant exactly as traffic does — the
+key is authoritative and `X-Tenant-ID` is honoured only for admin keys.
+
+### Prompt optimisation shipped under a config key the proxy never read — Bug fix
+
+The template carried the G20 block as `G20_prompt_optimization`; the middleware reads
+`g20_prompt_optimizer`. So `enabled: true` there did nothing and every template-based
+deployment ran with G20 off. The block now ships under the key that is read, with
+`enabled: false` — the behaviour deployments already had. Turning it on by default is a
+savings-affecting change that needs a quality proof first; set
+`groups.g20_prompt_optimizer.enabled: true` to enable it now.
+
 ### Deployment readiness was checking most optimisations against the wrong request — Bug fix
 
 Every deploy runs a readiness sweep and a failing verdict blocks it. That sweep sends one

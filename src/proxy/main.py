@@ -38,6 +38,7 @@ from auth.api_key_manager import (
 )
 from net.ip_allowlist import client_ip_from_request, ip_allowed
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
+from tenancy.resolver import resolve_tenant
 from providers import get_adapter, apply_context_management, get_provider_entry
 from providers.key_resolver import resolve_provider_key, ProviderKeyError, ProviderKeyDecryptError
 from providers.resilience import (
@@ -588,10 +589,22 @@ async def list_group_enablement(request: Request):
     (`G1_compression`, not `G01`) plus the top-level `rate_limit`, because that is what the
     caller must reason about; `null` means the key carries no `enabled` field at all.
     """
-    _user_id, _api_key, tenant_metadata = await _authenticate(request)
-    tenant_id = _caller_tenant_id(tenant_metadata) or "default"
-    groups = await _pipeline.effective_group_enablement(tenant_id)
-    return {"object": "list", "tenant_id": tenant_id, "groups": groups}
+    _user_id, api_key, tenant_metadata = await _authenticate(request)
+    # Resolve the tenant EXACTLY as the pipeline does for traffic: the key is authoritative,
+    # and `X-Tenant-ID` is honoured only for admin keys (resolve_tenant enforces that).
+    # Reading the key alone here made an admin's `--tenant-id OTHER` readiness run score
+    # one tenant's traffic against another tenant's enable map (review of 9336dfa).
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    md = tenant_metadata if isinstance(tenant_metadata, dict) else {}
+    tenant = resolve_tenant(
+        headers,
+        key_tenant_id=_caller_tenant_id(tenant_metadata),
+        key_tier=md.get("tier", "free"),
+        key_is_admin=is_admin_key(tenant_metadata),
+        api_key_hash=hashlib.sha256((api_key or "").encode("utf-8")).hexdigest(),
+    )
+    groups = await _pipeline.effective_group_enablement(tenant.tenant_id)
+    return {"object": "list", "tenant_id": tenant.tenant_id, "groups": groups}
 
 
 # ---------------------------------------------------------------------------

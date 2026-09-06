@@ -593,11 +593,11 @@ Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and 
 ### g20_prompt_optimizer
 Inline application of prompts tuned by the offline optimiser (`scripts/run_prompt_optimization.py`). The heavy optimisation runs out-of-band; the middleware applies the learned templates.
 
-> **Key casing note:** the inline middleware reads this block at `groups.g20_prompt_optimizer` (lowercase). `config/config.yaml.template` still ships the block under the older `G20_prompt_optimization` key, which the middleware never reads — so `enabled: true` there is currently a no-op. That template fix is deliberately deferred (flipping the real key on is a savings-affecting behavior change that needs pitch-test-plan validation, not a docs-only change); until then, set `groups.g20_prompt_optimizer.enabled: true` explicitly to actually turn G20 on in a self-hosted deployment. The portal catalog already uses the correct key.
+> **Key note (fixed 2026-09-06):** the block is read at `groups.g20_prompt_optimizer` (lowercase) and the template now ships it under that key with `enabled: false`. It previously shipped as `G20_prompt_optimization` — a key the middleware never read — so its `enabled: true` was a no-op and every template-based deployment ran with G20 off. The shipped default is now explicitly what deployments were already getting. Turning G20 on by default is a savings-affecting change that needs a pitch-test-plan quality proof first; to enable it now, set `groups.g20_prompt_optimizer.enabled: true`.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Apply optimised prompts/templates inline |
+| `enabled` | `false` | Apply optimised prompts/templates inline (off by default — see key note) |
 | `optimizer` | `builtin` | `builtin` \| `MIPROv2` \| `HRPO` \| `MetaPrompt` \| `dspy` (offline pipeline) |
 | `model` | `gpt-4o-mini` | LLM used for optimisation trials |
 | `max_prompt_tokens` | `4000` | Upper bound on an optimised prompt |

@@ -48,9 +48,9 @@ class TestItReportsWhatARequestWouldSee:
         assert out["G1_compression"] is True
 
     async def test_the_operator_per_tenant_overlay_wins(self, pipeline, monkeypatch):
-        """`tenants.<id>.groups.<key>` is resolved at READ time by
-        `resolve_group_config`, not merged into the base — so reading `groups.<key>`
-        alone would report the global value and miss the tenant's actual state."""
+        """`tenants.<id>.groups.<key>` is the operator's per-tenant path. Since the
+        2026-09-06 review fix it is merged once at pipeline entry (apply_operator_overlay),
+        and this endpoint runs the same merge — so it must report the tenant's value."""
         _cfg(monkeypatch, {
             "groups": {"G1_compression": {"enabled": True}},
             "tenants": {"NOVA-STG-01": {"groups": {"G1_compression": {"enabled": False}}}},
@@ -63,6 +63,28 @@ class TestItReportsWhatARequestWouldSee:
         endpoint that only walked `groups.*` would leave it permanently unknowable."""
         _cfg(monkeypatch, {"groups": {}, "rate_limit": {"enabled": False}})
         assert (await pipeline.effective_group_enablement())["rate_limit"] is False
+
+    async def test_a_rate_limit_block_without_enabled_is_off_like_g00_says(self, pipeline, monkeypatch):
+        """Review of 9336dfa: this defaulted to True while G00 itself defaults to False
+        (`rl_cfg.get("enabled", False)`). A `rate_limit:` block with no `enabled` key
+        would have been reported on while G00 was off — handing readiness the exact
+        false tick the endpoint exists to close."""
+        _cfg(monkeypatch, {"groups": {}, "rate_limit": {"default": {"requests_per_minute": 60}}})
+        assert (await pipeline.effective_group_enablement())["rate_limit"] is False
+
+    async def test_the_answer_matches_a_group_that_reads_config_directly(self, pipeline, monkeypatch):
+        """Review of 9336dfa: the first cut applied the operator overlay per key through
+        resolve_group_config, which only 9 of 32 groups call. G19 reads
+        ctx.config["groups"]["G19_headroom"] directly, so the endpoint said `disabled`
+        while G19 kept running. Now both go through the same merge at pipeline entry."""
+        from middleware import apply_operator_overlay
+
+        cfg = {"groups": {"G19_headroom": {"enabled": True}},
+               "tenants": {"NOVA-STG-01": {"groups": {"G19_headroom": {"enabled": False}}}}}
+        _cfg(monkeypatch, cfg)
+        endpoint_view = (await pipeline.effective_group_enablement("NOVA-STG-01"))["G19_headroom"]
+        request_view = apply_operator_overlay(cfg, "NOVA-STG-01")["groups"]["G19_headroom"]["enabled"]
+        assert endpoint_view is request_view is False
 
     async def test_a_key_with_no_enabled_field_reads_none_not_false(self, pipeline, monkeypatch):
         """Unknown must not masquerade as disabled — readiness treats `False` as "do not
@@ -116,6 +138,42 @@ class TestTheRouteIsWiredAndAuthenticated:
             "group section of the deploy gate is blind on every OSS deployment"
         )
 
+    def test_an_admin_key_may_ask_about_another_tenant_but_a_plain_key_may_not(self, monkeypatch):
+        """Review of 9336dfa: readiness sends X-Tenant-ID and the DSR probes honour it for
+        admin keys (resolve_tenant), but the endpoint read the key's tenant only — so an
+        admin's `--tenant-id OTHER` run scored OTHER's traffic against the admin tenant's
+        enable map. The endpoint now resolves the tenant exactly as traffic does."""
+        from fastapi.testclient import TestClient
+
+        import main
+
+        async def _auth_as(md):
+            return "u@x.test", "tok-x", md
+
+        seen = []
+
+        async def _record(tenant_id="default"):
+            seen.append(tenant_id)
+            return {}
+
+        monkeypatch.setattr(main._pipeline, "effective_group_enablement", _record)
+        client = TestClient(main.app)
+
+        monkeypatch.setattr(main, "_authenticate",
+                            lambda request, proto=None: _auth_as({"tenant_id": "ADMIN-T", "admin": True}))
+        r = client.get("/v1/groups", headers={"Authorization": "Bearer tok-x",
+                                              "X-Tenant-ID": "NOVA-STG-01"})
+        assert r.status_code == 200 and r.json()["tenant_id"] == "NOVA-STG-01"
+
+        monkeypatch.setattr(main, "_authenticate",
+                            lambda request, proto=None: _auth_as({"tenant_id": "SHOP-STG-01", "admin": False}))
+        r = client.get("/v1/groups", headers={"Authorization": "Bearer tok-x",
+                                              "X-Tenant-ID": "NOVA-STG-01"})
+        assert r.status_code == 200 and r.json()["tenant_id"] == "SHOP-STG-01", (
+            "a non-admin key must never read another tenant's enable map"
+        )
+        assert seen == ["NOVA-STG-01", "SHOP-STG-01"]
+
     def test_it_authenticates(self):
         """Group enablement is tenant-scoped state. Unauthenticated it would also be a
         free fingerprint of the deployment's configuration."""
@@ -124,6 +182,7 @@ class TestTheRouteIsWiredAndAuthenticated:
         import main
         src = inspect.getsource(main.list_group_enablement)
         assert "_authenticate(request)" in src
-        assert "_caller_tenant_id" in src, (
-            "the answer must be scoped to the CALLER's tenant, not to `default`"
+        assert "resolve_tenant(" in src, (
+            "the tenant must be resolved the way traffic resolves it — key authoritative, "
+            "X-Tenant-ID honoured only for admin keys"
         )

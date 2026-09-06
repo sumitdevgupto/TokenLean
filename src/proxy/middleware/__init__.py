@@ -295,6 +295,55 @@ def resolve_group_config(ctx, config_key: str) -> Dict[str, Any]:
     return deep_merge(_copy.deepcopy(base), overlay)
 
 
+def operator_group_overlay(config: Any, tenant_id: str) -> Dict[str, Any]:
+    """The operator's ``tenants.<id>.groups`` block from config.yaml, or ``{}``.
+
+    Type-checked at every level for the same reason ``resolve_group_config`` is: a
+    mis-indented key in operator-edited YAML must degrade to "no overlay", never raise
+    inside the request path.
+    """
+    if not isinstance(config, dict):
+        return {}
+    tenants = config.get("tenants")
+    if not isinstance(tenants, dict):
+        return {}
+    block = tenants.get(tenant_id)
+    if not isinstance(block, dict):
+        return {}
+    groups = block.get("groups")
+    return groups if isinstance(groups, dict) else {}
+
+
+def apply_operator_overlay(config: Dict[str, Any], tenant_id: str) -> Dict[str, Any]:
+    """Return ``config`` with the operator per-tenant ``groups`` overlay merged in.
+
+    Added 2026-09-06. ``resolve_group_config`` applied the operator overlay at READ time,
+    which only helps a group that calls it — and a code review found that just 9 of the 32
+    middleware modules do. The other 23 read ``ctx.config["groups"][key]`` directly, so an
+    operator's ``tenants.<id>.groups.<key>.enabled: false`` was honoured by G29 and ignored
+    by G19: the per-tenant mechanism the docstring calls mandatory was silently a no-op for
+    most of the pipeline, and ``/v1/groups`` (which did apply it) reported groups as disabled
+    that were in fact running.
+
+    Merging ONCE at pipeline entry makes every group see the same effective config whether
+    or not it calls ``resolve_group_config`` — which stays correct, since re-applying the
+    same overlay is idempotent. Returns the SAME object when the tenant has no overlay
+    (no copy, no cost); otherwise a deep copy, because ``config`` is the process-wide
+    ``get_config()`` dict and merging in place would leak one tenant's overlay to all.
+    """
+    overlay = operator_group_overlay(config, tenant_id)
+    if not overlay:
+        return config
+    import copy as _copy
+    from tenancy.config import deep_merge
+    merged = _copy.deepcopy(config)
+    groups = merged.get("groups")
+    if not isinstance(groups, dict):
+        merged["groups"] = {}
+    deep_merge(merged["groups"], _copy.deepcopy(overlay))
+    return merged
+
+
 def coerce_mode(raw: Any, valid: Sequence[str], default: str) -> str:
     """Normalise a group's ``mode``-style config value against its allowed set.
 
