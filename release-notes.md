@@ -23,6 +23,19 @@ date changes.
 
 ## 2026-09-06
 
+### The published savings figure was measured with a default-off group switched on — Bug fix
+
+Our ablation harness built its `all-on` arm — the one that produces the published savings
+number — by force-enabling every optimisation in its registry, including the five that ship
+**off**. G28 (context compression) was the clearest cost: it advertises two extra tool
+definitions into every tool-carrying request, and on our agentic dataset that added **131
+tokens to all 54 requests while the model called those tools zero times**, which is most of why
+that dataset's optimised arm sent 13% *more* than its baseline. Customers were never affected —
+G28 ships disabled — but the number was being measured on a configuration nobody deploys. The
+arm now enables exactly what ships. Each default-off group is still measured on its own
+dedicated dataset, so nothing became unmeasurable.
+
+
 ### Tool pruning did nothing unless you had registered your own tools — Enhancement (OSS)
 
 G8's intent-based tool pruning only ever acted on tools listed in your `registry_path`. A tool
