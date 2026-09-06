@@ -4,11 +4,9 @@ Stage: After the Response
 Saving: 30–90% tool token spend
 Technique: Project tool results to only the fields the agent uses.
            Strip unused fields, truncate large text fields, compact arrays.
-           headroom SmartCrusher (crush / compact_document_json) applied to CSV/JSON-array outputs.
+           Built-in structural compaction of CSV / JSON-array outputs.
 """
-import json
 import logging
-import re
 from typing import Any, Dict, List, Optional
 
 from middleware import RequestContext
@@ -20,19 +18,25 @@ GROUP = "G14"
 _MAX_FIELD_TOKENS = 200   # truncate text fields exceeding this
 _MAX_RESULT_TOKENS = 500  # truncate entire result if exceeding this
 
-# ─── Optional headroom SmartCrusher (tabular / JSON-array compression) ────────
-# NOTE: the older headroom.compress_spreadsheet() expects a *file path*, not an
-# in-memory string, so it never worked here. SmartCrusher operates on strings:
-#   crush(text) -> CrushResult(.compressed)  ;  compact_document_json(json) -> str
-_smart_crusher = None
-try:
-    import headroom as _headroom_g14  # type: ignore
-    _smart_crusher = _headroom_g14.SmartCrusher()
-except (ImportError, AttributeError):
-    pass
+# G14 compacts tool output with its OWN compactor and calls no third-party library.
+#
+# Two entry points were removed here, both after measuring them on the installed
+# headroom 0.34.0 rather than reasoning about them:
+#   * `crush` (2026-09-05) — its CSV output was never SHORTER than the input at 10, 200
+#     or 2,000 rows, so the length guard discarded it every single time: a Rust round-trip
+#     per CSV tool result whose result was always thrown away.
+#   * `compact_document_json` (2026-09-06, backlog #48) — it replaces any JSON string leaf
+#     of roughly 300 characters or more with an unresolvable `<<ccr:HASH,string,NB>>`
+#     marker. The dropped bytes live in an in-process Rust store no route of ours exposes,
+#     so the caller receives a pointer to nothing on a billed 200. Reproduced through this
+#     function inside the deployed container: an array of incident records came back with
+#     every `summary` field replaced by a marker.
+#
+# The built-in `_builtin_compress_spreadsheet` is purely structural — it re-keys parsed
+# values into a schema/rows form and never synthesises a string — so it cannot produce
+# either failure. That is why there is no runtime marker guard here, only the test that
+# pins this file to calling no external compactor.
 
-# Detect CSV: first non-blank line contains commas, no JSON brackets
-_CSV_PATTERN = re.compile(r"^[^\[\{<\n]*,[^\n]+\n", re.MULTILINE)
 
 
 class G14ToolOutput:
@@ -67,7 +71,7 @@ class G14ToolOutput:
                 projected = _project(raw_result, field_whitelist.get(fn_name))
                 current = _truncate(projected, ctx.routed_model, max_field_tokens, max_result_tokens)
 
-                # Step 2: headroom.compress_spreadsheet for CSV / JSON-array outputs
+                # Step 2: structural compaction of CSV / JSON-array outputs
                 if spreadsheet_enabled:
                     current = _maybe_compress_spreadsheet(current, ctx.routed_model)
 
@@ -129,50 +133,13 @@ def _truncate(
 
 
 def _maybe_compress_spreadsheet(result: Any, model: str) -> Any:
-    """Apply headroom SmartCrusher to CSV strings and JSON arrays.
+    """Compact CSV strings and JSON arrays with the built-in structural compactor.
 
-    CSV strings use ``SmartCrusher.crush(text).compressed``; JSON arrays are
-    serialised and passed to ``compact_document_json()`` (returns compacted JSON
-    text). Falls back to the built-in compactor when headroom is unavailable or
-    the call raises.
+    Kept as a named seam (rather than inlining the call) so the pipeline step reads the
+    same as it always has and so the removal of the third-party path is one edit, not a
+    reshaping of `process_response`. See the module header for what was removed and why.
     """
-    if _smart_crusher is None:
-        return _builtin_compress_spreadsheet(result, model)
-
-    try:
-        # CSV strings: measured 2026-09-05 on headroom 0.34.0, `crush` returns output that
-        # is never SHORTER for CSV (10, 200 and 2,000 rows all came back longer), so the
-        # `len(compressed) < len(result)` guard below discarded it every time. The call was
-        # pure cost — a Rust round-trip per CSV tool result whose result was always thrown
-        # away. The built-in handles what it can; a CSV string passes through either way.
-        if isinstance(result, str) and _CSV_PATTERN.search(result):
-            return _builtin_compress_spreadsheet(result, model)
-
-        if isinstance(result, list) and len(result) >= 2:
-            raw = json.dumps(result, separators=(",", ":"))
-            # `compact_document_json`, not `crush`. On JSON input the two returned
-            # BYTE-IDENTICAL output when measured, and `crush` additionally owns a lossy
-            # row-dropping path that emits a `<<ccr:HASH>>` retrieval marker. Nothing in
-            # this repo resolves that marker — headroom keeps the dropped rows in an
-            # in-process Rust store no route of ours exposes — so a client would receive a
-            # pointer to nothing. That path does not fire on 0.34.0 (verified across
-            # queries and sizes), but calling the lossless entry point means a library
-            # change cannot switch it on underneath us. See backlog #45.
-            compressed = _smart_crusher.compact_document_json(raw)
-            if isinstance(compressed, str) and compressed and len(compressed) < len(raw):
-                try:
-                    return json.loads(compressed)
-                except (json.JSONDecodeError, TypeError):
-                    # Input was valid JSON (we serialised it); output is not. Returning it
-                    # would hand a caller doing json.loads() an unparseable tool result.
-                    logger.warning(
-                        "G14: headroom compaction produced unparseable JSON — discarded")
-                    return _builtin_compress_spreadsheet(result, model)
-    except Exception as exc:
-        logger.debug("G14 headroom SmartCrusher failed: %s — using built-in", exc)
-        return _builtin_compress_spreadsheet(result, model)
-
-    return result
+    return _builtin_compress_spreadsheet(result, model)
 
 
 def _builtin_compress_spreadsheet(result: Any, model: str) -> Any:

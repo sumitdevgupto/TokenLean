@@ -22,24 +22,25 @@ from tests.conftest import _make_savings
 
 
 @pytest.fixture(autouse=True)
-def _pin_the_builtin_compactor():
-    """Pin these tests to the BUILT-IN compactor, which is the contract they assert.
+def _there_is_only_one_compaction_path():
+    """These tests assert the built-in compactor's behaviour. Until 2026-09-06 that was an
+    ENVIRONMENT-dependent claim, so this fixture had to force the built-in branch: headroom
+    is a pinned production dependency present in the container and in CI but absent from a
+    typical dev machine, and it compacted arrays differently. The tests therefore passed
+    locally and for the OSS gate while failing in CI the moment the gate was widened to run
+    them (2026-09-04).
 
-    Without this they silently depend on whether the optional `headroom` package happens
-    to be installed. It is a pinned production dependency (`headroom-ai==0.34.0`) and IS
-    present in the container and in CI, but is absent from a typical dev machine — so
-    these four tests passed locally and for the OSS gate while failing in CI the moment
-    the gate was widened to run them (2026-09-04). `headroom.SmartCrusher` takes a
-    different path for arrays of records: it emits TOON-style compaction, so `results`
-    becomes a string rather than a list and empty keys are not pruned. Neither behaviour
-    is wrong; asserting one while running the other is.
-
-    `test_g19_structured.py` already patches this flag both ways; this applies the same
-    discipline here. The headroom path is covered explicitly at the bottom of this file.
+    Backlog #48 removed the third-party path entirely, so the fork is gone and the fixture
+    has nothing left to pin. It stays as an assertion rather than being deleted: if a
+    compactor is ever wired back in, these tests must fail HERE, with this explanation,
+    rather than somewhere downstream on a machine that happens to have the package.
     """
     from middleware import g19_headroom as mod
-    with patch.object(mod, "_headroom_available", False):
-        yield
+    assert not hasattr(mod, "_smart_crusher") and not hasattr(mod, "_headroom_available"), (
+        "G19 has a third-party compactor again — see backlog #48. Every test in this file "
+        "asserts built-in behaviour and would now be environment-dependent."
+    )
+    yield
 
 
 def _make_ctx(messages, config=None):

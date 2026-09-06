@@ -21,6 +21,66 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-06
+
+### Long text fields in a tool result were replaced by an unusable placeholder — Bug fix
+
+When the proxy compacted a tool result, any text field of roughly 300 characters or more was
+swapped for a short internal reference that nothing could resolve — so an agent asking for a
+runbook, an incident summary or a log excerpt received a placeholder instead of the content,
+on a request that had already been billed as successful. The result was still valid JSON and
+was genuinely shorter, so neither the size check nor the validity check added earlier could
+see it. Compaction now runs entirely on the proxy's own compactors, which cannot produce a
+reference, and every compacted value is checked for one before it is accepted. Measured on 70
+real tool payloads first: the removed library saved 55.3% of tokens against the built-in
+compactor's 54.5%, so this costs about eight tenths of a point and returns the answer.
+
+### A readiness check that could never pass on a local run now explains itself — Bug fix
+
+The check proving one tenant's contract change cannot affect a sibling tenant creates two
+probe tenants, which mints API keys into cloud secret storage. On a local run with no cloud
+project, minting fails and the check reported a flat FAIL — every time, forever. It is
+advisory so it never blocked a deployment, but a check that always fails is indistinguishable
+from one that has just started failing for a real reason. It now separates the two: if the
+probe tenants could not be created it reports as skipped and quotes the reason, while a
+genuine isolation failure is still reported red, including when an error occurred alongside it.
+
+### A dataset could be silently dropped from a savings run instead of measured — Bug fix
+
+A dataset can mark specific requests as essential to what it measures. If the run's sample
+size was smaller than that list, the run refused the dataset — and the runner then excluded
+it and carried on, so a dataset marked essential-to-measure was the one thing not measured.
+The sample is now enlarged to fit instead, announced with the arithmetic behind it. The first
+version of this fix enlarged it to exactly the required list, which removed the duplicate
+requests another guard needs to measure caching; the sample now reserves room for those too.
+
+### Removed a documented but unwired tool-dispatch module — Bug fix
+
+A low-level dispatch module built a request URL by pasting a model-supplied tool name straight
+into the path, with no validation. It was never wired into the request pipeline, but the
+README documented it as an extension point complete with a worked example, so it was code we
+were inviting people to use. It is deleted, along with its README section and doc references.
+The tool-dispatch path that actually runs is unaffected and keeps its existing authorisation
+check. No configuration key for the removed module existed in any shipped config file.
+
+### The temperature-0 methodology note now says which measurements it covers — Bug fix
+
+Published savings figures are described as measured at temperature 0. That holds for the
+OpenAI measurements every published number comes from, but not for Anthropic runs with
+extended thinking enabled: the provider rejects any temperature but 1 once thinking is on, and
+because it is the proxy that enables thinking, the adapter drops the caller's temperature
+rather than fail the request. No published figure is affected, but the claim was broader than
+the code. Both READMEs now scope it, and a test ties the wording to the adapter's behaviour.
+
+### The harness test suite was covered by no gate at all — Bug fix
+
+In September a release gate was widened after roughly 590 tests turned out to be executed by
+nothing. That fix stopped one directory short: the measurement harness's own 473 tests, which
+cover request sampling, cache reconciliation and the usage extractors, ran in no gate and no
+CI job. It was found the same way as last time — a test had been failing for days with nothing
+reporting it. The release gate now runs that suite too, and skips cleanly on a checkout that
+does not include it.
+
 ## 2026-09-05
 
 ### Turning the reasoning-budget group off broke every Claude request — Bug fix

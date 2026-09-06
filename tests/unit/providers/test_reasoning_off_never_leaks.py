@@ -110,3 +110,45 @@ class TestG25WithoutG12CannotBreakAnthropic:
     def test_openai_still_gets_its_native_key(self):
         out = _out({"reasoning_effort": "medium"}, OpenAIAdapter(), "o4-mini")
         assert out["reasoning_effort"] == "medium"
+
+
+class TestTheTemperatureZeroClaimMatchesTheCode:
+    """The published methodology says "temperature-0". Keep that honest (M2).
+
+    Anthropic rejects any temperature but 1 once extended thinking is enabled, and it is
+    the PROXY that enables thinking, so `_reconcile_thinking_sampling` drops the caller's
+    `temperature` rather than return a 502. Sampling then falls back to Anthropic's
+    default — which means an Anthropic thinking-on arm is NOT deterministic, whatever the
+    caller asked for.
+
+    No published figure is affected: the headline and every per-workload number are
+    measured on OpenAI, where `temperature: 0` is forwarded untouched. But the disclosure
+    added to README on 2026-09-06 has to keep describing what the code actually does, and
+    a prose note in a file no test reads will drift. These tests are what stop that.
+    """
+
+    def test_temperature_is_dropped_when_the_proxy_enables_thinking(self):
+        a = AnthropicAdapter()
+        out = a._reconcile_thinking_sampling(
+            {"thinking": {"type": "enabled", "budget_tokens": 2000},
+             "temperature": 0, "top_p": 0.9, "max_tokens": 4096})
+        assert "temperature" not in out and "top_p" not in out
+        assert out["max_tokens"] == 4096, "only the incompatible params come out"
+
+    def test_temperature_survives_when_thinking_is_not_enabled(self):
+        """The other half — this must not become a blanket temperature strip."""
+        a = AnthropicAdapter()
+        out = a._reconcile_thinking_sampling({"temperature": 0, "max_tokens": 4096})
+        assert out["temperature"] == 0
+
+    def test_the_readme_discloses_it(self):
+        """A claim about determinism that the code contradicts is the kind of thing a
+        customer finds before we do."""
+        import pathlib
+        readme = (pathlib.Path(__file__).resolve().parents[3] / "README.md").read_text(
+            encoding="utf-8")
+        assert 'What "temperature-0" covers' in readme, (
+            "README must scope the temperature-0 claim to the OpenAI arms"
+        )
+        window = readme[readme.index('What "temperature-0" covers'):][:900]
+        assert "Anthropic" in window and "thinking" in window

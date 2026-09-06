@@ -33,6 +33,15 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 
 **Per-workload is the primary result** — each number is independently reproducible on your own key (calibrated OpenAI, temperature-0; carries the same run-to-run variance as the headline):
 
+> **What "temperature-0" covers.** The headline and every per-workload figure above are
+> measured on OpenAI, where the caller's `temperature: 0` is sent through unchanged. It does
+> **not** hold for Anthropic traffic in an extended-thinking arm: Anthropic rejects any
+> temperature but 1 once thinking is enabled, and since it is the proxy that enables thinking
+> (via the reasoning-budget groups), the adapter drops `temperature` rather than fail the
+> request. Sampling is then Anthropic's default. No published number here is affected — none
+> is measured that way — but an Anthropic thinking-on run of your own is not temperature-0.
+
+
 | Workload | Public A/B (this harness) | Reproduce with |
 |---|---|---|
 | **cache** (warm-repeat traffic) | **~90%** | `--workload cache` |
@@ -651,9 +660,6 @@ groups:
 > - Manifest/registry cache TTLs and the pruning threshold are **environment variables**
 >   (`MCP_MANIFEST_CACHE_TTL_SECONDS`, `TOOL_REGISTRY_CACHE_TTL_SECONDS`,
 >   `TOOL_INACTIVITY_THRESHOLD_DAYS`), not config keys — see [docs/config-reference.md](docs/config-reference.md).
-> - The low-level dispatch handler registry (`G15MCPDispatch` in `g15_mcp_dispatch.py`, with
->   `mcp_dispatch_enabled` / `mcp_servers`) is an **SDK module not wired into the default pipeline**;
->   the wired server-compute path is `G15ServerCompute` shown above.
 
 ### How It Works
 
@@ -670,21 +676,6 @@ groups:
 - **Local Handlers**: Register custom handlers for tools not available on MCP servers
 - **Auto-Pruning**: Scheduled job removes tools unused for 30+ days
 
-### Registering Local Handlers
-
-```python
-from middleware.g15_mcp_dispatch import G15MCPDispatch, register_default_handlers
-
-g15 = G15MCPDispatch()
-
-# Register custom handler
-g15.register_handler("custom_query", async def handler(input_data):
-    return {"result": await my_custom_logic(input_data)}
-
-# Register by schema type
-g15.register_schema_handler("database-query", db_query_handler)
-```
-
 ### MCP Server Requirements
 
 Your MCP servers must expose:
@@ -692,7 +683,7 @@ Your MCP servers must expose:
 2. **Tool endpoint**: `POST /tools/{tool_name}` accepting JSON input and returning results
 
 The wired tool-loading path is `src/proxy/middleware/g08_tool_loading.py`. For the lower-level SDK
-modules (not in the default pipeline) see `g08_mcp_loader.py` and `g15_mcp_dispatch.py`.
+module (not in the default pipeline) see `g08_mcp_loader.py`.
 
 ## Security
 

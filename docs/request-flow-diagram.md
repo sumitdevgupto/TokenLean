@@ -379,7 +379,7 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 **G19: Headroom — response side** (`g19_headroom.py`)
 - AST-aware pruning of responses / tool outputs (same strategies as the request side)
 
-**G15: Server-Side Compute** (`g15_server_compute.py` + `g15_mcp_dispatch.py`)
+**G15: Server-Side Compute** (`g15_server_compute.py`)
 - Hook-based `filter_fn` / `sort_key` / `field_project` / `top_n`; headroom MCP tool dispatch
 - Offloads filter/sort/project to the server before the LLM re-ingests results
 
@@ -722,7 +722,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G12** | `g12_reasoning_budget.py` | Provider-specific reasoning budget, effort levels |
 | **G13** | `g13_batch.py`, `g13_kafka.py`, `g13_toon.py` | Batch processing, TOON notation, Kafka |
 | **G14** | `g14_tool_output.py`, `g14_tool_combining.py` | Tool output projection, parallel combining |
-| **G15** | `g15_server_compute.py`, `g15_mcp_dispatch.py` | Server-side hooks, MCP handler dispatch |
+| **G15** | `g15_server_compute.py` | Server-side hooks for CCR tool dispatch |
 | **G16** | `g16_agent_arch.py`, `g16_langgraph_runtime.py`, `g16_temporal_runtime.py` | Agent advisories, LangGraph, Temporal |
 | **G17** | `g17_loop_control.py` | Loop control, InterAgentState, budget propagation |
 | **G18** | `g18_observability.py`, `langfuse_tracing.py` | Prometheus metrics, Langfuse tracing, usage records |

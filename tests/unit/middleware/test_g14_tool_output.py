@@ -93,7 +93,7 @@ class TestG14ToolOutput:
 # ─── T32: spreadsheet compression ────────────────────────────────────────────
 
 class TestT32SpreadsheetCompression:
-    """Tests for headroom SmartCrusher integration in G14."""
+    """G14 compacts tool output structurally, with no third-party library."""
 
     def test_builtin_compresses_json_array_to_schema_rows(self):
         from middleware.g14_tool_output import _builtin_compress_spreadsheet
@@ -114,90 +114,54 @@ class TestT32SpreadsheetCompression:
         arr = [{"a": 1}]
         assert _builtin_compress_spreadsheet(arr, "gpt-4o") == arr
 
-    def test_maybe_compress_calls_builtin_for_json_array_when_headroom_absent(self):
-        from unittest.mock import patch
-        import middleware.g14_tool_output as mod
+    def test_maybe_compress_uses_the_builtin_compactor(self):
+        from middleware.g14_tool_output import _maybe_compress_spreadsheet
         rows = [{"id": i, "val": i * 2} for i in range(5)]
-        with patch.object(mod, "_smart_crusher", None):
-            from middleware.g14_tool_output import _maybe_compress_spreadsheet
-            result = _maybe_compress_spreadsheet(rows, "gpt-4o")
-        assert "_schema_" in result
+        assert "_schema_" in _maybe_compress_spreadsheet(rows, "gpt-4o")
 
-    def test_csv_no_longer_round_trips_through_the_rust_crusher(self):
-        """UPDATED 2026-09-05 - this test previously asserted `crush` IS called for CSV.
+    def test_a_csv_string_passes_through_unchanged(self):
+        """CSV had a `crush` round-trip until 2026-09-05. Measured on real headroom
+        0.34.0 at 10, 200 and 2,000 rows, its output was NEVER shorter than the input, so
+        the length guard discarded it every single time — a Rust call per CSV tool result
+        whose result was always thrown away."""
+        from middleware.g14_tool_output import _maybe_compress_spreadsheet
+        csv_text = "id,name,price" + chr(10) + chr(10).join(
+            f"{i},item-{i},{i * 10}" for i in range(20))
+        assert _maybe_compress_spreadsheet(csv_text, "gpt-4o") == csv_text
 
-        The mock made that look productive: it returned a short string, so the
-        `len(compressed) < len(result)` guard kept it. Real headroom 0.34.0 does not
-        behave that way. Measured on 10, 200 and 2,000-row CSV, `crush` returned output
-        that was **never shorter**, so the guard discarded it every time and the original
-        was returned. The call was a Rust round-trip per CSV tool result whose result was
-        always thrown away - and `crush` additionally owns a lossy row-dropping path
-        emitting a `<<ccr:HASH>>` marker that nothing in this repo can resolve.
+    def test_a_long_string_field_is_never_swapped_for_a_pointer(self):
+        """Backlog #48, at G14's own boundary.
 
-        The assertion is inverted deliberately: the mock pinned behaviour the library
-        never exhibited. A CSV string passes through unchanged, which is exactly what the
-        old code produced in production.
+        `compact_document_json` replaced any string leaf of roughly 300 characters or more
+        with `<<ccr:HASH,string,NB>>`, a pointer into an in-process Rust store this repo
+        exposes no route to. Reproduced through this function in the deployed container on
+        an array of incident records: every `summary` came back as a marker. The tool
+        result stayed valid JSON and got shorter, so neither guard in place at the time
+        could see it.
         """
-        from unittest.mock import MagicMock, patch
-        import middleware.g14_tool_output as mod
+        from middleware.g14_tool_output import _maybe_compress_spreadsheet
+        summary = ("Root cause: payment gateway TCP connection pool exhausted under load "
+                   "after a deploy changed pool settings. Mitigation: raise "
+                   "max_connections, enable the circuit breaker, roll back if needed. " * 2)
+        assert len(summary) > 300, "fixture must cross the trigger size"
+        rows = [{"id": f"inc-{i}", "service": "checkout", "summary": summary}
+                for i in range(3)]
 
-        # chr(10) rather than an escape: this file has already been mangled once by a
-        # scripted edit that ate the backslash and split the literal across lines.
-        csv_text = chr(10).join(
-            ["id,name,value", "1,foo,100", "2,bar,200", "3,baz,300"]) + chr(10)
-        mock_crusher = MagicMock()
+        result = json.dumps(_maybe_compress_spreadsheet(rows, "gpt-4o"))
+        assert "<<ccr:" not in result
+        assert "connection pool exhausted" in result
 
-        with patch.object(mod, "_smart_crusher", mock_crusher):
-            from middleware.g14_tool_output import _maybe_compress_spreadsheet
-            result = _maybe_compress_spreadsheet(csv_text, "gpt-4o")
-
-        mock_crusher.crush.assert_not_called()
-        assert result == csv_text, "a CSV string passes through, as it did before"
-
-    def test_the_lossy_entry_point_is_never_called_anywhere(self):
-        """`crush` can drop rows and emit a retrieval marker we cannot resolve.
-
-        The dropped rows live in headroom's in-process Rust store, which no route of ours
-        exposes and which does not survive a restart or span instances. It does not fire
-        on 0.34.0 (verified across queries and payload sizes), but the defence is to not
-        call the entry point at all rather than to trust the library's current defaults.
-        """
+    def test_no_third_party_compactor_is_called(self):
+        """Pinned by source, because the failure mode is someone re-adding the call —
+        which no behavioural test of the current code can detect."""
         import inspect
         import middleware.g14_tool_output as mod
-        assert "_smart_crusher.crush(" not in inspect.getsource(mod), (
-            "G14 must use the lossless compact_document_json, never crush()"
-        )
-
-    def test_maybe_compress_calls_smartcrusher_for_json_array(self):
-        from unittest.mock import MagicMock, patch
-        import middleware.g14_tool_output as mod
-
-        rows = [{"id": i, "val": i * 2} for i in range(5)]
-        compact = '[{"id":0,"val":0}]'  # shorter than the serialised input
-        mock_crusher = MagicMock()
-        mock_crusher.compact_document_json.return_value = compact
-
-        with patch.object(mod, "_smart_crusher", mock_crusher):
-            from middleware.g14_tool_output import _maybe_compress_spreadsheet
-            result = _maybe_compress_spreadsheet(rows, "gpt-4o")
-
-        mock_crusher.compact_document_json.assert_called_once()
-        assert result == [{"id": 0, "val": 0}]  # parsed back from compacted JSON
-
-    def test_smartcrusher_exception_falls_back_to_builtin(self):
-        from unittest.mock import MagicMock, patch
-        import middleware.g14_tool_output as mod
-
-        rows = [{"id": i, "val": i} for i in range(5)]
-        mock_crusher = MagicMock()
-        mock_crusher.compact_document_json.side_effect = RuntimeError("headroom error")
-
-        with patch.object(mod, "_smart_crusher", mock_crusher):
-            from middleware.g14_tool_output import _maybe_compress_spreadsheet
-            result = _maybe_compress_spreadsheet(rows, "gpt-4o")
-
-        # On failure G14 falls back to the built-in compactor (schema+rows form)
-        assert "_schema_" in result
+        code = chr(10).join(line for line in inspect.getsource(mod).splitlines()
+                            if not line.lstrip().startswith("#"))
+        for forbidden in ("SmartCrusher", "compact_document_json", ".crush("):
+            assert forbidden not in code, (
+                f"G14 calls {forbidden} again — see backlog #48"
+            )
 
     @pytest.mark.asyncio
     async def test_middleware_compresses_json_array_tool_output(self, make_ctx):

@@ -3,7 +3,7 @@ G19 · Structured Context Pruning
 Stage: Request-side (after G8 tool loading), Response-side (after G14 tool output)
 Saving: 40-95% on structured content (code, JSON, logs)
 Technique:
-  AST-aware compression via Headroom OSS library.
+  AST-aware compression via this module's own structural compressors.
   Auto-detects content type and applies optimal compressor:
     - Code:    strips imports, comments, whitespace; preserves logic
     - JSON:    removes empty fields, deduplicates repeated structures
@@ -25,19 +25,23 @@ from savings.calculator import count_messages_tokens, estimate_tokens
 logger = logging.getLogger(__name__)
 GROUP = "G19"
 
-# Headroom integration (optional — falls back to built-in compressors if unavailable).
-# headroom >= 0.27 exposes SmartCrusher (with compact_document_json for JSON). The older
-# CodeCompressor / detect_type entry points were removed upstream, so we use SmartCrusher
-# for JSON and the built-in compressors for logs/code/text. We log on failure so a future
-# API drift surfaces instead of silently disabling Headroom.
-_headroom_available = False
-_smart_crusher = None     # headroom.SmartCrusher instance
-try:
-    import headroom as _headroom_mod
-    _smart_crusher = _headroom_mod.SmartCrusher()
-    _headroom_available = True
-except Exception as _hr_exc:  # ImportError, AttributeError, or API drift
-    logger.warning("G19: Headroom unavailable (%s) — using built-in compressors", _hr_exc)
+# G19 compresses with its OWN compressors and calls no third-party compactor.
+#
+# It used to route JSON through `headroom.SmartCrusher.compact_document_json`. That was
+# REMOVED 2026-09-06 (backlog #48) because the library replaces any JSON string leaf of
+# roughly 300 characters or more with an unresolvable `<<ccr:HASH,string,NB>>` retrieval
+# marker: the bytes are handed to an in-process Rust store that this repo exposes no route
+# to, so the model receives a pointer to nothing on a billed 200. Confirmed on 2026-09-06
+# by running this middleware inside the deployed container against the shipped config —
+# a runbook tool result came back as `"summary":"<<ccr:884b9b5deca1,string,423B>>"`.
+#
+# The output is valid JSON, so the parseability guard added for backlog #45 did not catch
+# it; only a check on the CONTENT does, which is why `_is_faithful_compaction` exists below.
+#
+# Measured before removing it, in the container, on 70 real tool payloads harvested from
+# the datasets: SmartCrusher 55.3% of tokens removed vs the built-in JSON compactor 54.5%.
+# Eight tenths of a point is not worth a transform that silently deletes the answer, and
+# the library's largest single "win" in that sample WAS one of the deletions.
 
 
 class G19Headroom:
@@ -274,10 +278,9 @@ def _line_stats(text: str) -> tuple:
 def _detect_content_type(text: str, dominance_ratio: float = None) -> Optional[str]:
     """Detect whether text is JSON, code, logs, or plain text.
 
-    Uses Headroom's auto-detection if available, otherwise falls back
-    to pattern heuristics. Returns "text" for plain prose so SmartCrusher
-    can apply verbosity reduction — callers must have "text" in their
-    compression_strategies config to activate this path.
+    Pattern heuristics only. Returns "text" for plain prose so the text compressor can
+    apply verbosity reduction — callers must have "text" in their compression_strategies
+    config to activate this path.
 
     `dominance_ratio` is the fraction of non-blank lines that must be code-shaped
     (or log-shaped) before the payload counts as code/logs; None uses the module
@@ -313,11 +316,16 @@ def _detect_content_type(text: str, dominance_ratio: float = None) -> Optional[s
         if log_lines / total >= dominance_ratio:
             return "logs"
 
-    # Plain text — return "text" so SmartCrusher can apply verbosity reduction
+    # Plain text — return "text" so the text compressor can apply verbosity reduction
     return "text"
 
 
 # ─── Compressors ─────────────────────────────────────────────────────────────
+
+# A compaction that shortens a payload by DELETING it is not a compaction. Anything a
+# compactor emits that matches this is a reference into a store the caller cannot read.
+_UNRESOLVABLE_REFERENCE = re.compile(r"<<\s*ccr\s*:", re.IGNORECASE)
+
 
 def _preserves_json_parseability(before: str, after: str) -> bool:
     """True unless a compaction turned parseable JSON into something that is not.
@@ -337,12 +345,35 @@ def _preserves_json_parseability(before: str, after: str) -> bool:
         return False
 
 
+def _is_faithful_compaction(before: str, after: str) -> bool:
+    """The acceptance boundary for every value G19 substitutes into a message.
+
+    Two refusals, each one learned from a defect that shipped:
+
+      1. **Parseable in, unparseable out** (backlog #45). A tool result's consumer does
+         `json.loads(result)`, so shorter-but-broken is a silent failure on a billed 200.
+      2. **Content replaced by an unresolvable reference** (backlog #48). Valid JSON, so
+         (1) passes it, and shorter, so a length check passes it — and the answer is gone.
+
+    Length was the only test until 2026-09-05; (1) was added then and (2) on 2026-09-06.
+    Both are currently INERT against the compressors this module ships, which are
+    structural and cannot produce either failure. That is deliberate and worth the two
+    `json.loads`: the guard is here so that re-introducing ANY third-party compactor
+    cannot repeat #48 in silence. It is stated as a property of the output, not as a
+    blocklist against one library's sentinel, because the last time this was reasoned
+    about as "that library does not do that", the probe used the wrong input shape and
+    the conclusion was wrong for eight days.
+    """
+    if not _preserves_json_parseability(before, after):
+        return False
+    return not _UNRESOLVABLE_REFERENCE.search(after)
+
+
 def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optional[str]:
-    """Compress structured text. Routing:
-      json           → Headroom SmartCrusher.compact_document_json (best-in-class for JSON),
-                       falling back to the built-in JSON compactor if unavailable / no-op.
-      logs/code/text → built-in compressors (Headroom's query-less crush does not help
-                       these; the upstream CodeCompressor was removed).
+    """Compress structured text with this module's own compressors — json / code / logs /
+    text — every one of which must clear `_is_faithful_compaction` before it is returned.
+    No third-party compactor is called from here; see the note at the top of the file for
+    why the headroom JSON path was removed (backlog #48).
 
     Prose ("text") DOES reach here on the request side — the shipped config enables the
     `text` strategy so repeated boilerplate in a pasted payload is deduped. ANSWER content
@@ -355,54 +386,38 @@ def _compress(text: str, content_type: str, strategy: Dict[str, Any]) -> Optiona
     """
     # A JSON payload dominated by ONE long string leaf is prose in an envelope, not
     # structured data — the exact shape of a tool result carrying a document
-    # ({"text": "<11k-char runbook>"}). SmartCrusher's compact_document_json is built for
-    # arrays of records and reduced that shape 11,492 → 45 chars in the live container
-    # (2026-09-03, DS22 all-on turn 2): the model retrieved the document, G15 attached it,
-    # and G19 destroyed it before the model could read it — every thread then fabricated
-    # the facts, while the only-G28 arm answered correctly. Treat the leaf as the prose it
-    # is: same text strategy the identical content gets when it arrives unwrapped.
-    # (The unit-test environment has no `headroom` package, so the destructive path was
-    # invisible to the suite — the fallback compactor is benign. Tests now fake the
-    # crusher; do not assume local behaviour matches the container's.)
+    # ({"text": "<11k-char runbook>"}). Record-array compaction mangles that shape: the
+    # since-removed SmartCrusher path reduced one such payload 11,492 → 45 chars in the
+    # live container (2026-09-03, DS22 all-on turn 2), the model then fabricated the facts
+    # it could no longer read, and the only-G28 arm answered correctly. This branch stays
+    # even though that compactor is gone (#48), because it is what makes the leaf take the
+    # SAME text strategy the identical content gets when it arrives unwrapped.
     if content_type == "json":
         enveloped = _compress_prose_envelope(text, strategy)
         if enveloped is not None:
             return enveloped
 
-    # Headroom: JSON compaction (its strongest path). Two guards, both load-bearing:
-    # a real reduction, AND the output still parses as JSON when the input did.
-    #
-    # Length alone was the only check until 2026-09-05 (backlog #45). That is not enough
-    # for a tool result: the client agent typically does `json.loads(result)`, so handing
-    # back something shorter but unparseable is a silent break on a billed 200. Measured
-    # on headroom 0.34.0 the compactor DOES preserve the envelope, so this guard is inert
-    # today — but that is a property of the vendored library, not of our code, and the
-    # same file already records two occasions where this transform destroyed content
-    # (the 11,492-char runbook above; the 2026-08-05 answer corruption). A version bump
-    # must not be able to reintroduce it silently.
-    if _headroom_available and _smart_crusher is not None and content_type == "json":
-        try:
-            crushed = _smart_crusher.compact_document_json(text)
-            if isinstance(crushed, str) and 0 < len(crushed) < len(text):
-                if _preserves_json_parseability(text, crushed):
-                    return crushed
-                logger.warning(
-                    "G19: headroom compaction produced unparseable JSON (%d→%d chars) — "
-                    "discarded, using the built-in compactor", len(text), len(crushed),
-                )
-        except Exception:
-            pass  # fall through to built-in
-
-    # Built-in fallback compressors (no headroom dependency)
     if content_type == "json":
-        return _compress_json(text, strategy)
+        compacted = _compress_json(text, strategy)
     elif content_type == "code":
-        return _compress_code(text, strategy)
+        compacted = _compress_code(text, strategy)
     elif content_type == "logs":
-        return _compress_logs(text, strategy)
+        compacted = _compress_logs(text, strategy)
     elif content_type == "text":
-        return _compress_text(text, strategy)
-    return None
+        compacted = _compress_text(text, strategy)
+    else:
+        return None
+
+    # Nothing leaves here without passing the fidelity boundary. Keeping the original is
+    # always the safe outcome: the caller treats None as "not compressible" and sends the
+    # payload whole, which costs tokens and loses nothing.
+    if compacted is not None and not _is_faithful_compaction(text, compacted):
+        logger.warning(
+            "G19: %s compaction rejected as unfaithful (%d→%d chars) — sending the "
+            "payload uncompressed", content_type, len(text), len(compacted),
+        )
+        return None
+    return compacted
 
 
 _ENVELOPE_DOMINANCE = 0.7  # a single string leaf carrying >70% of the payload IS the payload
@@ -606,8 +621,8 @@ def _compress_import_lines(lines: List[str]) -> List[str]:
 
 def _compress_text(text: str, strategy: Dict[str, Any]) -> Optional[str]:
     """Reduce verbosity of plain prose by deduplicating repeated sentences and
-    stripping filler phrases. Built-in fallback when headroom.SmartCrusher is
-    not available.
+    stripping filler phrases. The only text compressor there is — prose never had a
+    headroom path, and JSON's was removed in #48.
 
     Strategy keys:
       dedupe_sentences (bool, default True)  — collapse exact-duplicate sentences

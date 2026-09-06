@@ -27,6 +27,7 @@ from middleware.g19_headroom import (
     _compress_code,
     _compress_logs,
     _compress_text,
+    _compress_prose_envelope,
     _dedupe_repeated_structures,
 )
 
@@ -441,86 +442,48 @@ async def test_original_messages_not_mutated():
     assert ctx.original_messages == original_before
 
 
-# ─── T10: CodeCompressor / SmartCrusher routing ──────────────────────────────
+# ─── T10: compressor routing ─────────────────────────────────────────────────
 
 class TestT10CompressorRouting:
-    """Verify _compress() routing for headroom >= 0.27 (CodeCompressor / SmartCrusher.compress
-    were removed upstream): JSON -> SmartCrusher.compact_document_json (best-in-class for JSON);
-    logs/code/text -> built-in compressors; built-ins also serve as fallback."""
+    """Every content type routes to a built-in compressor, and nothing else exists.
 
-    def test_json_routes_to_headroom_compact(self):
-        """JSON uses SmartCrusher.compact_document_json() when Headroom is available."""
-        from unittest.mock import MagicMock, patch
-        import middleware.g19_headroom as mod
+    Before 2026-09-06 this class asserted a FORK: JSON went to
+    `headroom.SmartCrusher.compact_document_json` when the package was importable, and to
+    the built-in compactor otherwise. Backlog #48 removed the third-party branch — it
+    replaced any JSON string leaf of roughly 300 characters or more with an unresolvable
+    `<<ccr:...>>` marker, and measured only 0.8 points better than the built-in on 70 real
+    tool payloads. What is left is one path on every machine.
+    """
 
-        mock_sc = MagicMock()
-        mock_sc.compact_document_json.return_value = '{"k":1}'  # shorter than input
+    def test_json_uses_the_builtin_compactor(self):
+        result = _compress('{"key": 1, "empty": null}', "json", {"remove_empty": True})
+        assert result is not None and "empty" not in result
 
-        with patch.object(mod, "_headroom_available", True), \
-             patch.object(mod, "_smart_crusher", mock_sc):
-            result = _compress('{"key": 1, "empty": null}', "json", {"remove_empty": True})
-
-        mock_sc.compact_document_json.assert_called_once_with('{"key": 1, "empty": null}')
-        assert result == '{"k":1}'
-
-    def test_json_falls_back_to_builtin_on_headroom_failure(self):
-        """If Headroom is a no-op or raises, fall through to the built-in JSON compactor."""
-        from unittest.mock import MagicMock, patch
-        import middleware.g19_headroom as mod
-
-        for ret in (None, RuntimeError("boom")):
-            mock_sc = MagicMock()
-            if isinstance(ret, Exception):
-                mock_sc.compact_document_json.side_effect = ret
-            else:
-                mock_sc.compact_document_json.return_value = ret
-            with patch.object(mod, "_headroom_available", True), \
-                 patch.object(mod, "_smart_crusher", mock_sc):
-                result = _compress('{"key": 1, "empty": null}', "json", {"remove_empty": True})
-            assert result is not None and "empty" not in result  # built-in removed the empty field
-
-    def test_code_uses_builtin_not_headroom(self):
-        """Code uses the built-in compressor (upstream CodeCompressor was removed in 0.27)."""
-        from unittest.mock import MagicMock, patch
-        import middleware.g19_headroom as mod
-
-        mock_sc = MagicMock()
-        code = "# comment\ndef foo():\n    pass"
-        with patch.object(mod, "_headroom_available", True), \
-             patch.object(mod, "_smart_crusher", mock_sc):
-            result = _compress(code, "code", {"strip_comments": True, "strip_whitespace": True, "compress_imports": True})
-
-        mock_sc.compact_document_json.assert_not_called()
+    def test_code_uses_the_builtin_compressor(self):
+        code = chr(10).join(["# comment", "def foo():", "    pass"])
+        result = _compress(code, "code",
+                           {"strip_comments": True, "strip_whitespace": True,
+                            "compress_imports": True})
         assert result is not None and "# comment" not in result
 
-    def test_logs_use_builtin_not_headroom(self):
-        """Logs use the built-in compressor (query-less crush does not help logs)."""
-        from unittest.mock import MagicMock, patch
+    def test_logs_use_the_builtin_compressor(self):
+        logs = chr(10).join("2024-01-01 INFO duplicate line" for _ in range(5))
+        assert _compress(logs, "logs", {"dedupe_lines": True}) is not None
+
+    def test_an_unknown_content_type_compresses_nothing(self):
+        assert _compress('{"key": 1}', "spreadsheet", {}) is None
+
+    def test_routing_does_not_depend_on_an_optional_package(self):
+        """The regression this class was rewritten to prevent.
+
+        The old fork made every assertion here conditional on whether `headroom` happened
+        to be importable — which is why these tests passed on a dev box and for the OSS
+        gate while failing in CI, where the pinned production dependency IS installed.
+        """
         import middleware.g19_headroom as mod
+        assert not hasattr(mod, "_headroom_available")
+        assert not hasattr(mod, "_smart_crusher")
 
-        mock_sc = MagicMock()
-        logs = "\n".join("2024-01-01 INFO duplicate line" for _ in range(5))
-        with patch.object(mod, "_headroom_available", True), \
-             patch.object(mod, "_smart_crusher", mock_sc):
-            result = _compress(logs, "logs", {"dedupe_lines": True})
-
-        mock_sc.compact_document_json.assert_not_called()
-        assert result is not None  # built-in dedupe collapses the repeated lines
-
-    def test_fallback_to_builtin_when_headroom_unavailable(self):
-        """When _headroom_available=False, built-in compressors handle all types."""
-        from unittest.mock import patch
-        import middleware.g19_headroom as mod
-
-        code = "# comment\ndef foo():\n    pass"
-        with patch.object(mod, "_headroom_available", False):
-            result = _compress(code, "code", {"strip_comments": True, "strip_whitespace": True, "compress_imports": True})
-
-        assert result is not None
-        assert "# comment" not in result
-
-
-# ─── T10: Plain text (_compress_text) ─────────────────────────────────────────
 
 class TestCompressText:
     """Tests for the built-in plain-text fallback compressor."""
@@ -565,18 +528,10 @@ class TestCompressText:
         result = _compress_text(text, {"dedupe_sentences": True})
         assert result is None
 
-    def test_text_uses_builtin_not_headroom(self):
-        """'text' content uses the built-in text compressor (no Headroom call)."""
-        from unittest.mock import MagicMock, patch
-        import middleware.g19_headroom as mod
-
-        mock_sc = MagicMock()
-        text = "Repeat me. Repeat me. Repeat me."
-        with patch.object(mod, "_headroom_available", True), \
-             patch.object(mod, "_smart_crusher", mock_sc):
-            result = _compress(text, "text", {"dedupe_sentences": True})
-
-        mock_sc.compact_document_json.assert_not_called()
+    def test_text_uses_the_builtin_text_compressor(self):
+        """Prose never had a third-party path, and after backlog #48 neither does JSON."""
+        result = _compress("Repeat me. Repeat me. Repeat me.", "text",
+                           {"dedupe_sentences": True})
         assert result is not None and result.count("Repeat me") == 1
 
     @pytest.mark.asyncio
@@ -806,42 +761,36 @@ class TestProseEnvelopeIsNeverCrushedAsStructure:
            + "\n".join(f"Step {i}: drain, verify parity, then promote the standby replica "
                        f"for shard group {i} before unfreezing writes." for i in range(120)))
 
-    class _DestructiveCrusher:
-        """What SmartCrusher actually did in the container: near-total loss."""
-        @staticmethod
-        def compact_document_json(text):
-            return '{"text":"<compacted document: 1 field>"}'
-
-    def _with_fake_crusher(self, monkeypatch):
-        import middleware.g19_headroom as g19
-        monkeypatch.setattr(g19, "_headroom_available", True)
-        monkeypatch.setattr(g19, "_smart_crusher", self._DestructiveCrusher())
-        return g19
-
-    def test_tool_result_document_survives_the_crusher(self, monkeypatch):
-        g19 = self._with_fake_crusher(monkeypatch)
+    def test_tool_result_document_survives_compaction(self):
+        """A retrieved document inside a JSON envelope must reach the model intact."""
         payload = json.dumps({"text": self.DOC})
-        out = g19._compress(payload, "json", {"remove_empty": True, "dedupe_keys": True})
+        out = _compress(payload, "json", {"remove_empty": True, "dedupe_keys": True})
         kept = out if out else payload
         assert "eu-west-2" in kept and "Saturday 02:00-04:00 UTC" in kept, (
             "the retrieved document's facts must survive request-side pruning")
-        assert "<compacted document" not in kept, "SmartCrusher must not see prose envelopes"
 
-    def test_structured_json_still_reaches_the_crusher(self, monkeypatch):
-        """The reroute is for envelopes ONLY - real record arrays keep the strong path."""
-        g19 = self._with_fake_crusher(monkeypatch)
+    def test_an_envelope_is_compressed_as_prose_not_as_structure(self):
+        """The reroute is the mechanism, so assert the mechanism, not a stand-in library.
+
+        Record-array compaction treats the envelope's one long leaf as a column and
+        mangles it; the text strategy treats it as the prose it is. `_compress_prose_envelope`
+        returning non-None IS the reroute, and the normal JSON path never sees the payload.
+        """
+        payload = json.dumps({"text": self.DOC})
+        assert _compress_prose_envelope(payload, {}) is not None
+
+    def test_structured_json_still_takes_the_normal_json_path(self):
+        """The reroute is for envelopes ONLY — real record arrays must not be diverted."""
         records = json.dumps([{"id": i, "status": "ok", "region": "eu"} for i in range(200)])
-        out = g19._compress(records, "json", {})
-        assert out == '{"text":"<compacted document: 1 field>"}', (
-            "genuinely structured JSON should still take the SmartCrusher path")
+        assert _compress_prose_envelope(records, {}) is None
+        out = _compress(records, "json", {})
+        assert out is not None and len(out) < len(records)
 
-    def test_incompressible_envelope_is_kept_whole(self, monkeypatch):
-        """When the leaf resists text compression, keep the ORIGINAL - content beats tokens."""
-        g19 = self._with_fake_crusher(monkeypatch)
+    def test_incompressible_envelope_is_kept_whole(self):
+        """When the leaf resists text compression, keep the ORIGINAL — content beats tokens."""
         unique_prose = " ".join(f"Fact number {i} is distinct." for i in range(400))
         payload = json.dumps({"text": unique_prose})
-        out = g19._compress(payload, "json", {})
-        assert out == payload
+        assert _compress(payload, "json", {}) == payload
 
     def test_nested_leaf_is_found(self):
         from middleware.g19_headroom import _largest_string_leaf
