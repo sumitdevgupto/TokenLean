@@ -366,9 +366,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
   block withholds the unsafe answer with a content-filter response. Verdict on
   `ctx.guardrail_response_action` (kept separate from the request verdict). Non-streaming only
 
-**G14: Tool Output** (`g14_tool_output.py` + `g14_tool_combining.py`)
+**G14: Tool Output** (`g14_tool_output.py`)
 - Field projection (whitelist) + truncation (`max_field_tokens`, `max_result_tokens`)
-- `ToolCallBatcher` runs independent tool calls in parallel with dependency-graph ordering
+- Structural compaction of JSON-array results (schema + rows)
 
 **G28: CCR — response side** (`g28_ccr.py`)
 - Compresses repeated verbatim blocks in the response for downstream reuse / memory
@@ -721,7 +721,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G11** | `g11_output_format.py` | max_tokens enforcement, p95 feedback loop |
 | **G12** | `g12_reasoning_budget.py` | Provider-specific reasoning budget, effort levels |
 | **G13** | `g13_batch.py`, `g13_kafka.py`, `g13_toon.py` | Batch processing, TOON notation, Kafka |
-| **G14** | `g14_tool_output.py`, `g14_tool_combining.py` | Tool output projection, parallel combining |
+| **G14** | `g14_tool_output.py` | Tool output projection and structural compaction |
 | **G15** | `g15_server_compute.py` | Server-side hooks for CCR tool dispatch |
 | **G16** | `g16_agent_arch.py`, `g16_langgraph_runtime.py`, `g16_temporal_runtime.py` | Agent advisories, LangGraph, Temporal |
 | **G17** | `g17_loop_control.py` | Loop control, InterAgentState, budget propagation |

@@ -965,5 +965,6 @@ per-tenant quality knobs.
 The following knobs are read by classes that the audit reports are **not registered in
 `pipeline.py`**, so they are inert until the class is wired: `G4` `fuzzy_similarity_threshold`
 (`G04DBResolution`), `G5` `temporal_activity_cache` / `idempotent_activities` /
-`activity_cache_ttl_seconds` (`G05TemporalActivity`), `G8` `mcp_enabled` (`G08MCPLoader`), `G14`
-`combine_tool_calls` (`G14ToolCombining`), `G16` `langgraph_enabled` (`G16LangGraphRuntime`).
+`activity_cache_ttl_seconds` (`G05TemporalActivity`), `G8` `mcp_enabled` (`G08MCPLoader`),
+`G16` `langgraph_enabled` (`G16LangGraphRuntime`). (`G14` `combine_tool_calls` was on this list
+until 2026-09-06, when the never-wired `G14ToolCombining` was deleted rather than left inert.)

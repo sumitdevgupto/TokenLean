@@ -35,6 +35,17 @@ reference, and every compacted value is checked for one before it is accepted. M
 real tool payloads first: the removed library saved 55.3% of tokens against the built-in
 compactor's 54.5%, so this costs about eight tenths of a point and returns the answer.
 
+### Removed a second unwired module that could execute a tool without checking policy — Bug fix
+
+A dormant tool-batching module looked up a handler by the tool name the model asked for and
+ran it, without consulting the tool policy that governs every other place the proxy executes
+something on a model's say-so. It was never wired into the request pipeline, its configuration
+key existed in no shipped config file, and the config reference already listed it as pending
+wiring — but had it ever been switched on it would have reopened a hole closed in September.
+It is deleted, with its documentation references. A new test now pins the complete set of
+places that dispatch a handler, so the next one cannot appear unnoticed rather than being
+found by hand.
+
 ### A readiness check that could never pass on a local run now explains itself — Bug fix
 
 The check proving one tenant's contract change cannot affect a sibling tenant creates two
