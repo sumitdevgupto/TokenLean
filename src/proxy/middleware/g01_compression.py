@@ -163,6 +163,72 @@ class SelectiveContextPruner:
 
 # ─── Kompress-v2-base fallback ────────────────────────────────────────────────
 
+# ── Faithfulness boundary for every compressed message (E26, 2026-09-06) ──────
+# DS9 shipped a wrong answer to a customer through this module. The assistant message
+# said:
+#
+#     "employees may carry over up to 5 unused PTO days into the following calendar
+#      year. Any PTO EXCEEDING THIS LIMIT is forfeited on January 1st."
+#
+# LLMLingua-2 at ratio 0.5 returned:
+#
+#     "Section 4. 2 HR Policy Manual : 5 PTO days. PTO FORFEITED January 1st."
+#
+# Deleting "exceeding this limit" does not lose a detail — it INVERTS the rule, turning a
+# carry-over allowance into a blanket forfeiture. The model then reported that inversion
+# faithfully: "unused PTO days are forfeited... you are not permitted to carry over any."
+#
+# What makes this worth a permanent guard rather than a tuning change: G01's output was
+# BYTE-IDENTICAL in the run where DS9 passed (2026-08-07) and the one where it failed
+# (2026-09-06) — 207t → 181t, saving 26, both times. The compressor did not get worse. The
+# model simply stopped reconstructing the fact we had destroyed. So eleven consecutive
+# PASSes never showed the compression was safe; they showed the model was repairing it, and
+# that repair is not something we can keep buying. `force_reserve_digit` already protects
+# the NUMBER ("5"); nothing protected the words that bound it.
+#
+# Deliberately a property of the OUTPUT, not a blocklist against one library — the same
+# reasoning as `_is_faithful_compaction` in g19_headroom.py, and for the same reason: the
+# last time a compressor's behaviour was argued from "it does not do that", the conclusion
+# was wrong.
+_NEGATIONS = frozenset({
+    "no", "not", "never", "none", "cannot", "cant", "dont", "doesnt", "didnt", "wont",
+    "shouldnt", "wouldnt", "couldnt", "isnt", "arent", "wasnt", "werent", "without",
+    "nor", "neither", "nothing", "nobody", "unable", "excluded", "prohibited",
+})
+# Words that BOUND a claim. Delete one and a limited rule becomes an unlimited one.
+_SCOPE_LIMITERS = frozenset({
+    "except", "unless", "exceeding", "exceeds", "exceed", "excess", "only", "limit",
+    "limited", "maximum", "minimum", "max", "min", "cap", "capped", "subject",
+    "provided", "eligible", "ineligible", "required", "optional", "up", "least", "most",
+    "before", "after", "unused", "remaining",
+})
+# NOT included, deliberately: "per". It reads as a scope word but in practice appears as a
+# CITATION ("Per Section 4.2 of the HR Policy Manual"), so including it refused compressions
+# that had preserved every actual bound — a false positive found by this guard's own tests.
+_MEANING_CRITICAL = _NEGATIONS | _SCOPE_LIMITERS
+_WORD_RE = _re.compile(r"[a-z0-9']+")
+
+
+def _is_faithful_compression(before: str, after: str) -> bool:
+    """Refuse a compression that drops a negation or a scope-limiting qualifier.
+
+    One refusal, learned from one defect (E26): if a meaning-critical word appears in the
+    source and not in the output, the output may assert something the source did not. We
+    cannot tell "harmlessly terse" from "inverted" without reading it, so the compression is
+    declined and the ORIGINAL is sent — the same fail-safe direction as every other guard in
+    this codebase: a request that costs more is recoverable, a wrong answer is not.
+
+    Word-level and case-insensitive, so it is deterministic, provider-agnostic and cheap
+    enough to run on every compressed message.
+    """
+    if not before or not after:
+        return bool(after) or not before
+    src_words = set(_WORD_RE.findall(before.lower()))
+    out_words = set(_WORD_RE.findall(after.lower()))
+    dropped = (src_words & _MEANING_CRITICAL) - out_words
+    return not dropped
+
+
 _LOG_ERROR_PATTERNS = [
     _re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}", _re.MULTILINE),   # timestamps
     _re.compile(r"^\[?(INFO|DEBUG|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]?", _re.MULTILINE),
@@ -332,6 +398,17 @@ class G01Compression:
                         if det and len(det) < len(compressed):
                             compressed = det
                             reduction_info.append("DET")
+
+                    if compressed != content and not _is_faithful_compression(content, compressed):
+                        # Guarded here rather than per-compressor so LLMLingua, Kompress and
+                        # the deterministic fallback are all held to the same boundary, and
+                        # so any future compressor is too (E26).
+                        logger.warning(
+                            "[%s] G01 refused an unfaithful compression of a %s message "
+                            "(%d->%d chars): a negation or scope qualifier was dropped",
+                            ctx.request_id, role, len(content), len(compressed),
+                        )
+                        compressed = content
 
                     if compressed != content:
                         compressed_messages.append({**msg, "content": compressed})

@@ -487,10 +487,20 @@ class TestG01DeterministicFallback:
 
     async def test_does_not_double_compress_when_sidecar_reduced(self, make_ctx):
         # If LLMLingua DID reduce, the deterministic path must NOT also run.
+        #
+        # FIXTURE CHANGED 2026-09-06 (E26): the stand-in used to be the placeholder
+        # "LLML2_SHORT_OUTPUT", which drops every word of the source. G01 now refuses a
+        # compression that deletes a negation or scope qualifier and sends the original
+        # instead, so that placeholder no longer reaches the message and this test was
+        # asserting against a value the guard had already rejected. The stand-in now keeps
+        # the source's meaning-critical words ("before", "limit") — which is what a real
+        # LLMLingua reduction does — so the double-compression property is still what is
+        # under test rather than the guard.
+        faithful_short = "run tests before push, check `RATE_LIMIT` at /etc/app/x.yaml"
         ctx = make_ctx([{"role": "assistant", "content": _FILLER_ASSISTANT}])
         _g01_cfg(ctx, deterministic_fallback=True)
         from middleware.g01_compression import G01Compression
         with _patch("middleware.g01_compression._call_llmlingua",
-                    new=_AsyncMock(return_value="LLML2_SHORT_OUTPUT")):
+                    new=_AsyncMock(return_value=faithful_short)):
             ctx = await G01Compression().process_request(ctx)
-        assert ctx.messages[0]["content"] == "LLML2_SHORT_OUTPUT"  # DET did not re-run
+        assert ctx.messages[0]["content"] == faithful_short  # DET did not re-run

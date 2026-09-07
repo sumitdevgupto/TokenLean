@@ -23,6 +23,21 @@ date changes.
 
 ## 2026-09-06
 
+### Prompt compression could invert the meaning of a policy it shortened — Bug fix
+
+G1 compresses long messages in the conversation. On an HR policy answer it turned *"employees
+may carry over up to 5 unused PTO days... Any PTO **exceeding this limit** is forfeited"* into
+*"5 PTO days. **PTO forfeited** January 1st."* Deleting the qualifier does not lose a detail —
+it turns an allowance into a blanket denial, and the model then told the user they could not
+carry over any PTO at all. Digit preservation had protected the number; nothing protected the
+words that bounded it. Compression is now checked before it is accepted: if a negation or a
+scope-limiting qualifier present in the source is missing from the result, the compression is
+declined and the original text is sent. The check covers every compression path, so a future
+compressor inherits it. Measured across our benchmark corpus it declines about a quarter of
+compressions and keeps roughly three quarters of the token savings — the declined ones include
+*"None of these has fully resolved"* compressed to a list of things that had **not** worked.
+
+
 ### The published savings figure was measured with a default-off group switched on — Bug fix
 
 Our ablation harness built its `all-on` arm — the one that produces the published savings
