@@ -139,13 +139,46 @@ class TestDeletedSinksStayDeleted:
     def test_the_dropped_dependencies_stay_dropped(self):
         """`temporalio` was pinned solely for the deleted runtime — 58 MB in the image for
         code nothing reached. `aiokafka` was never pinned at all, which is why the Kafka
-        module could not have started even if someone had set its flags."""
+        module could not have started even if someone had set its flags.
+
+        `headroom-ai` joined them on 2026-09-07 (~38 MB, incl. a ~20 MB compiled Rust
+        extension). Its last runtime user was G27, whose image lever would have recorded
+        `bytes // 4` as a token saving — a unit this proxy's ledger does not carry, since
+        `count_messages_tokens` counts only text parts. Latent rather than observed: the
+        lever returned early when `bytes_after >= bytes_before` and the installed build
+        returned the probe JPEG byte-identical. `ast-grep-cli` and `tomlkit` came in solely
+        with it and went out with it."""
         root = pathlib.Path(__file__).resolve().parents[2]
         reqs = (root / "src" / "proxy" / "requirements.txt").read_text(encoding="utf-8")
         pinned = {line.split("==")[0] for line in reqs.splitlines() if "==" in line
                   and not line.startswith((" ", "#"))}
-        for pkg in ("temporalio", "aiokafka", "nexus-rpc"):
+        for pkg in ("temporalio", "aiokafka", "nexus-rpc",
+                    "headroom-ai", "ast-grep-cli", "tomlkit"):
             assert pkg not in pinned, f"{pkg} is pinned again"
+
+    def test_no_proxy_module_imports_the_dropped_image_library(self):
+        """Three modules imported `headroom` when the pin was dropped: G27 (the only one
+        that ran), the G05 L3 cache (unimported by anything) and a G11 verbosity probe that
+        could never succeed. An import that resolves to nothing is a silent no-op; one that
+        resolves to a re-added package is a re-added lossy transform. Pin the absence."""
+        src = pathlib.Path(__file__).resolve().parents[2] / "src" / "proxy"
+        offenders = [p.relative_to(src).as_posix() for p in sorted(src.rglob("*.py"))
+                     if re.search(r"^\s*(import\s+headroom|from\s+headroom)", _code(p),
+                                  re.MULTILINE)]
+        assert offenders == [], (
+            f"{offenders} import the dropped `headroom` package. The MCP tool NAMES "
+            f"(headroom_compress/retrieve/stats) are a shipped API surface and are fine; "
+            f"importing the library is not."
+        )
+
+    def test_the_l3_cache_module_stays_deleted(self):
+        """`g05_cache_gptcache.py` defined the L3 semantic cache. Nothing imported it, its
+        backing object was hard-wired to None, and it was the only file that imported the
+        dropped library for caching. L1/L2 are the shipped tiers."""
+        assert not (_MIDDLEWARE / "g05_cache_gptcache.py").exists(), (
+            "g05_cache_gptcache.py was deleted 2026-09-07 with the L3 tier. A new semantic "
+            "cache tier must re-establish its own tenant scoping — do not restore this one."
+        )
 
     @pytest.mark.parametrize("symbol", ["G15MCPDispatch", "MCPServerDispatch",
                                         "G14ToolCombining", "ToolCallBatcher",

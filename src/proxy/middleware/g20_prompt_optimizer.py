@@ -13,6 +13,8 @@ import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
+from middleware import cache_floor
+
 logger = logging.getLogger(__name__)
 
 _SHA_PREFIX_LEN = 16  # first 16 hex chars used as fingerprint key
@@ -77,9 +79,19 @@ class G20PromptOptimizer:
         original_tokens = len(original_content.split())
         optimised_tokens = len(optimised.split())
 
+        # Snapshot the list BEFORE the in-place swap: `messages` is `ctx.messages`, so
+        # the assignment below mutates it and an "original" captured afterwards would
+        # already be the rewrite.
+        _pre_swap_messages = list(messages)
         messages[idx] = dict(messages[idx])
         messages[idx]["content"] = optimised
         ctx.messages = messages
+        # Keep the prefix-cache floor reservation describing the messages that now exist.
+        # It identifies its span by CONTENT, and this swap rewrites the FIRST system
+        # message — squarely inside the span a marker-based provider measures. Without
+        # this the span reads as empty downstream and the floor arithmetic concludes
+        # there is nothing to protect. In-place, so the lists stay index-aligned.
+        cache_floor.resnapshot(ctx, _pre_swap_messages, ctx.messages)
 
         ctx.savings.add_step(
             group="G20",

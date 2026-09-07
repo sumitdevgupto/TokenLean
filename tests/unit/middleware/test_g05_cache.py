@@ -742,22 +742,11 @@ class TestG05SystemPromptScope:
         ctx.messages = [self.SYS_LAX, self.USER]      # mutate after first read
         assert _system_scope_tag(ctx) == first        # memoised → store matches lookup
 
-    # ── L3 honours the same contract (future-proofing: L3 is currently inert) ──
-    def test_L3_query_isolates_across_system_prompts(self, make_ctx):
-        """The L3 semantic query must fold the scope tags like L1/L2 do — else a
-        tenant+system operator is protected on L1/L2 but collides on L3 the moment
-        the L3 rewrite lands."""
-        from middleware.g05_cache import _l3_query
-        a = make_ctx(messages=[self.SYS_STRICT, self.USER]); self._scope(a, "tenant+system")
-        b = make_ctx(messages=[self.SYS_LAX, self.USER]); self._scope(b, "tenant+system")
-        assert _l3_query(a) != _l3_query(b)
-
-    def test_L3_query_unchanged_under_default_scope(self, make_ctx):
-        """Default scope → L3 query byte-identical to the pre-feature user-turns
-        text (no invalidation of any existing L3 store)."""
-        from middleware.g05_cache import _l3_query, _semantic_query_text
-        ctx = make_ctx(messages=[self.SYS_STRICT, self.USER])
-        assert _l3_query(ctx) == _semantic_query_text(ctx.messages)
+    # (The two `_l3_query` scope tests that sat here were removed 2026-09-07 with the L3
+    #  tier. They were explicitly labelled future-proofing for "the moment the L3 rewrite
+    #  lands" — that rewrite will not land: L3 never executed and its library is gone.
+    #  The scope contract they were protecting is asserted above for L1 and L2, which are
+    #  the tiers that actually run.)
 
 
 # ── M2: L2 embedding-window truncation guard ─────────────────────────────────

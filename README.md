@@ -60,6 +60,7 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 - 🪄 **Drop-in** — change one line (`base_url`), not your prompts or your SDK. Works from the **OpenAI SDK** (`/v1/chat/completions`), the **Anthropic SDK / Claude Code** (`/v1/messages`), and the **Gemini SDK** (`generateContent`) — the proxy translates each natively while applying every optimisation
 - 📉 **Broad reduction** — 28 stacked techniques from the Token Optimisation Playbook v7, not just caching
 - 🔍 **Always measured** — every response carries a `_token_opt` savings breakdown **and machine-readable `x-tokenlean-*` headers** (routed model, cache hit, tokens/%/$ saved, latency) — emitted **even on cache hits and bypasses** — so your FinOps pipeline attributes cost per call without parsing the body; per-call → quarterly Grafana dashboards; plus a separate **application-quality** metrics surface (retrieval hit-rate, context freshness, grounding coverage) kept distinct from operational health
+- 🪞 **Prompt echo (configurable, off by default)** — ask for the exact prompt the proxy sent to the provider, returned with the response — the fastest way to answer "why did the model answer as if it had not been told X?". Requires both an operator opt-in (`observability.echo_sent_prompt`) and a per-request flag (`x_echo_prompt`); never includes provider credentials; not available on streamed responses, and on the OpenAI-compatible route only.
 - 🏢 **Multi-tenant by default** — per-tenant Redis/Qdrant namespacing, rate limits, config overrides
 - 🛡️ **Reliable & safe** — provider **failover** (circuit breaker + retry + per-tenant cooldown + optional **per-model lockout** that quarantines one degraded model while the provider's others keep serving) keeps a request serving when an upstream degrades; **trust & safety** guardrails (G30 injection / G29 PII / G31 context-trust) run non-bypassably before any tokens are spent
 - 🧭 **Agent-aware** — a configurable **intent-orchestration** layer can route each request to the right downstream agent ("refund my invoice" → billing agent, "server is down" → SRE agent) with **no routing code in your app**; off by default (byte-identical when off) and isolated per tenant
@@ -88,7 +89,7 @@ Gateways route, meter, and observe. TokenLean's edge is what happens *between* t
 | Stacked transparent token optimisations, one pass | **28** | few (cache, routing) | some (cache, guardrails) | observability-focused | few (cache, load-balancing) | inference-focused |
 | Quality-gated **measured** savings across all optimisations | ✅ 54.1% (50.8–55.8 band) | — | — | — | — | — |
 | Inline prompt compression (LLMLingua-2) | ✅ | — | — | — | — | — |
-| Multi-level + semantic cache (L1/L2/L3) | ✅ | basic | ✅ | ✅ (proxy) | ✅ | partial |
+| Multi-level + semantic cache (L1/L2) | ✅ | basic | ✅ | ✅ (proxy) | ✅ | partial |
 | Model routing / cascade | ✅ (+ RouteLLM) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | PII redaction · injection guardrails | ✅ | ✅ | ✅ | partial | ✅ | — |
 | **Indirect / RAG-injection defence + retrieved-context PII pass** (2nd trust boundary) | ✅ | — | — | — | — | — |
@@ -102,14 +103,14 @@ Gateways route, meter, and observe. TokenLean's edge is what happens *between* t
 
 ### vs the DIY point-tool stack
 
-You could assemble these yourself — LLMLingua for compression, GPTCache for caching, RouteLLM for routing, a Caveman-style prompt for terseness — and wire each into your app. **TokenLean is the drop-in proxy that subsumes the whole stack** and measures the combined result under one quality gate.
+You could assemble these yourself — LLMLingua for compression, a semantic cache such as GPTCache for caching, RouteLLM for routing, a Caveman-style prompt for terseness — and wire each into your app. **TokenLean is the drop-in proxy that subsumes the whole stack** and measures the combined result under one quality gate.
 
 | Capability | **TokenLean** | Caveman | LLMLingua | GPTCache | RouteLLM |
 |---|---|---|---|---|---|
 | What it is | **Drop-in proxy** | Prompt-style skill (+ compression lib) | Compression lib | Semantic-cache lib | Routing lib |
 | Integration effort | one-line `base_url` | adopt prompt style per app | code changes | code changes | code changes |
 | Prompt compression | ✅ (embeds LLMLingua-2 + structural pruning) | ✅ style-based | ✅ (it *is* the lib) | — | — |
-| Semantic caching | ✅ (GPTCache powers the L3 tier) | — | — | ✅ | — |
+| Semantic caching | ✅ (L1 exact + L2 pgvector semantic, tenant-scoped) | — | — | ✅ | — |
 | Quality-aware model routing | ✅ (embeds RouteLLM in a 3-tier cascade) | — | — | — | ✅ quality-gated |
 | **All of the above stacked & measured together, one quality gate** | ✅ | — | — | — | — |
 | Guardrails · multi-tenancy · failover · observability included | ✅ | — | — | — | — |
@@ -250,7 +251,7 @@ flowchart TB
     Gate["`**1 · Gate**
     G0 Rate-limit → G24 Adaptive-bypass (loads skip_groups) →
     G30 Guardrails → G29 PII-redaction (non-bypassable trust & safety) →
-    G4 Rules-bypass → G5 Cache read (L1/L2/L3) → G6 Route (3-tier cascade) →
+    G4 Rules-bypass → G5 Cache read (L1/L2) → G6 Route (3-tier cascade) →
     F2 Intent-orchestration (dispatch to a registered agent short-circuits)`"]
 
     ReqOpt["`**2 · Request-side optimisation** (each stage skippable via G24)
@@ -297,7 +298,7 @@ flowchart TB
 > (`:generateContent` / `:streamGenerateContent`) request into the OpenAI shape the pipeline speaks,
 > then re-serialises the response — so the pipeline stays protocol-agnostic and the OpenAI path is
 > unchanged. **G24 runs first** and can skip any later stage per request; **G21** is the last step
-> before the provider call. **G4 bypass**, an **L1/L2/L3 cache hit**, and an **F2 agent dispatch**
+> before the provider call. **G4 bypass**, an **L1/L2 cache hit**, and an **F2 agent dispatch**
 > short-circuit straight to the response — but **G32 still runs on them**, so a cached answer
 > carrying a tool call cannot escape the policy. **G3** is an offline ingestion job that feeds the G7 RAG index.
 > **G26** is the budget backstop: it runs last in the prompt-optimisation stage and compacts
@@ -418,11 +419,11 @@ tests/                      # Unit and integration tests (pytest)
 
 | Group | Technique | Savings | Key Implementation |
 |-------|-----------|---------|-------------------|
-| **G1** | Prompt Compression | 20-50% | LLMLingua-2 sidecar with layered composition (base→role→task→dynamic). Opt-in **deterministic regex fallback** (`deterministic_fallback`) keeps compressing when the sidecar is down — zero-LLM, zero-latency, code preserved byte-for-byte |
+| **G1** | Prompt Compression | 20-50% | LLMLingua-2 sidecar with layered composition (base→role→task→dynamic). **Cacheable-prefix guard** (`preserve_cacheable_prefix`, off by default): span-scoped and cost-gated — compresses the span your provider caches *down to* its minimum rather than below it, keeps the never-cached remainder fully compressed, and holds tokens back only when the provider's published cache rates and observed reuse make that cheaper; shared with G8/G19. Opt-in **deterministic regex fallback** (`deterministic_fallback`) keeps compressing when the sidecar is down — zero-LLM, zero-latency, code preserved byte-for-byte |
 | **G2** | Template Registry | 10-30% | Versioned templates with PR-diff token checks |
 | **G3** | Knowledge Strategy | 15-40% | RAG with OOD detection, fine-tuning pipeline with break-even detection. Opt-in **PII/PHI redaction at ingest** (`INGEST_PII_MODE`) so the vector store never holds raw personal data; **freshness metadata** (`ingested_at`/`source_date`) with a `max_age_days` stale-context filter |
 | **G4** | Rules-Based Bypass | 100% | PostgreSQL cache with exact/fuzzy matching (pg_trgm) |
-| **G5** | Response Caching | 30-80% | L1 Redis exact-match + L2 pgvector semantic + L3 GPTCache. `cache_scope`: `tenant` (default — reuse across providers), `tenant+model` (isolate per requested model), `tenant+system` (isolate per system-prompt fingerprint, so personas/apps sharing one key never get each other's cached answers), or `tenant+model+system` |
+| **G5** | Response Caching | 30-80% | L1 Redis exact-match + L2 pgvector semantic. `cache_scope`: `tenant` (default — reuse across providers), `tenant+model` (isolate per requested model), `tenant+system` (isolate per system-prompt fingerprint, so personas/apps sharing one key never get each other's cached answers), or `tenant+model+system` |
 | **G6** | Model Routing | 40-70% | Three-tier cascade (fast→confidence check→escalation→rollback) + opt-in strategies (canary / weighted / round-robin / least-latency) |
 | **G7** | Retrieval Optimisation | 20-35% | Hybrid RAG (dense + sparse) with reranking |
 | **G8** | Tool Loading | varies — see note | MCP lazy-load manifest protocol with scheduled pruning. **Intent-based pruning only acts on tools you have listed in your own `registry_path`** — a tool with no registry entry is always kept, so on a fresh install this part of G8 is a no-op until you register your tools. **Tool-description compression** (`compress_descriptions`, on by default) trims the prose in tool schemas that ride every agentic request — code/paths/identifiers preserved byte-for-byte, no tool ever dropped — and is what G8 contributes out of the box |
@@ -436,15 +437,15 @@ tests/                      # Unit and integration tests (pytest)
 | **G16** | Agent Architecture | 5-20% enforced (tool pruning; system-prompt compaction is opt-in); 20-45% with manual role decomposition | LangGraph runtime with cost modeling |
 | **G17** | Loop Control | 10-20% | Inter-agent state via HTTP headers + token budgets |
 | **G18** | Observability | N/A | Langfuse tracing + Grafana dashboards + admin webhooks |
-| **G19** | Structured Pruning | up to ~40% | AST-aware compression of code/JSON/logs/text (Headroom); request + response |
+| **G19** | Structured Pruning | up to ~40% | Built-in structured pruning of JSON / logs / prose (duplicate-sentence dedupe, JSON compaction); request + response. Honours the cacheable-prefix floor when G1's guard is on |
 | **G20** | Prompt Optimization | 5-15% | Inline application of offline-optimised prompts (Opik/DSPy) |
-| **G21** | Cache Alignment | measured per call (not modelled) | Reorder messages for provider prefix-caching (zero quality risk). **Cache policy v2**: deterministic tenant-scoped `prompt_cache_key` + per-provider `cache_read_multiplier`. **Cache accounting**: both halves of provider cache billing — reads *and* writes — are captured from the response and reported per call, per tenant and per day (`cache_read_tokens` / `cache_write_tokens` / `cache_share_of_bill_pct`), so a cost line can be reconciled against a provider invoice. Opt-in per-tenant Anthropic `cache_control` marker + native `context_editing` |
+| **G21** | Cache Alignment | measured per call (not modelled) | Reorder messages for provider prefix-caching (zero quality risk); reports when the prefix it is about to mark is below the provider's cacheable minimum. **Cache policy v2**: deterministic tenant-scoped `prompt_cache_key` + per-provider `cache_read_multiplier`. **Cache accounting**: both halves of provider cache billing — reads *and* writes — are captured from the response and reported per call, per tenant and per day (`cache_read_tokens` / `cache_write_tokens` / `cache_share_of_bill_pct`), so a cost line can be reconciled against a provider invoice. Opt-in per-tenant Anthropic `cache_control` marker + native `context_editing` |
 | **G22** | Deduplication | 5-20% | Collapse near-duplicate conversation turns (cosine / n-gram) |
 | **G23** | Streaming Compression | Variable | Collapse repeated n-grams in response output |
 | **G24** | Adaptive Bypass | Variable | Skip groups with historically negative savings per request pattern |
 | **G25** | Adaptive Reasoning | **not measured** | Picks the reasoning effort before G12 applies it. Reuses the complexity tier **G06 already decided** for routing rather than running a second, differently tuned classifier over the same text; when G06 says `simple`, selects `off`. Falls back to keyword classification otherwise. The old "10-30%" was never measured — see G12 |
 | **G26** | Context Budget Compaction | 20-60%¹ | Compact history when the prompt passes X% of the usable context window: prune duplicates/stale tool output → compress wording → cached summary → opt-in drop-oldest. **Compaction is lossy from rung 3 on** — a summary keeps the gist, so a specific value inside the compacted span can be dropped and the model will answer without it. Raise `keep_recent_turns`, or use **G28** for content that must come back verbatim. Default off |
-| **G27** | Multimodal Optimizer | Variable | Compress inline base64 images (Headroom + LRU cache) |
+| **G27** | Multimodal Optimizer | none (reserved) | Reserved slot — no image transform ships. Image content is invisible to the proxy's token accounting, so a byte-level image lever cannot reduce a billed token; off by default |
 | **G28** | Context Compression & Reuse | **−63% / +30%** — see note | Park a large recurring block once and send a short `[CCR:sha256]` reference instead, so re-sending the same document costs a few tokens rather than thousands. The store is Redis-backed and **content-addressed** (key = sha256 of the content), so identical content from different apps in one tenant resolves to a single stored copy and concurrent writers are idempotent. **Agent clients only** — the proxy will not substitute a reference until a client has demonstrated it can fetch one back, and refuses entirely if the durable store is unreachable. **The figure is two-sided on purpose:** savings depend entirely on how often the parked document is read back. At a **17% expansion rate** it cut input tokens **63%** (cost 20%) with the quality gate passing; at **100% expansion** it *costs* **30% more**, because the read-back re-sends the document. Break-even is near 75-80% expansion. Enable it for context a client parks once and rarely reopens; leave it off otherwise. Default off. |
 | **G29** | PII Redaction *(trust & safety)* | — | Detect + `off\|flag\|mask\|block` personal data (email/SSN/card/phone/IP + optional Presidio) before the provider call. Opt-in **PHI** (DEA/NPI/MRN/ICD-10) via `phi: true` |
 | **G30** | Injection Guardrails *(trust & safety)* | — | Detect prompt-injection / jailbreak attempts in the user prompt; `allow\|flag\|block`; non-bypassable, runs before optimisation spends tokens. Optional response-side scan (`scan_response`) also checks the model's **output** |
@@ -473,7 +474,7 @@ On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **eve
 | **G2** Template Registry | `budgets.<id>.{system_prompt_max, total_input_max, output_max}` | tighter token budgets per template | looser budgets; leave `budget.truncate_enabled` off |
 | **G3** Knowledge Strategy | `chunk_size_tokens` 400; `rag_fallback.top_k` 5; `rag_fallback.similarity_threshold` 0.85 | fewer/smaller chunks, higher threshold | more chunks, lower threshold for recall |
 | **G4** Rules Bypass | `default_confidence_threshold` 0.7; `keyword_weight` 0.4 / `pattern_weight` 0.6 | lower threshold → bypass more | raise threshold → only high-confidence bypass |
-| **G5** Response Caching | `l2_similarity_threshold` 0.9; `l3_similarity_threshold` 0.85; `semantic_skip_multiturn` true; `cache_scope` tenant | lower thresholds → more cache hits | raise thresholds; keep multi-turn skip on; `tenant+model` / `tenant+system` scope |
+| **G5** Response Caching | `l2_similarity_threshold` 0.9; `semantic_skip_multiturn` true; `cache_scope` tenant | lower thresholds → more cache hits | raise thresholds; keep multi-turn skip on; `tenant+model` / `tenant+system` scope |
 | **G6** Model Routing | `tiers.{simple,medium,complex}`; `cascade_confidence_threshold` 0.7; `routellm.threshold`; `strategy` priority (+ `strategy_weights`, `canary_pct`) | route more to cheap tier (lower threshold); split within a tier via canary/weighted/round-robin/least-latency | raise threshold → escalate sooner; default `strategy: priority` keeps the measured baseline byte-identical |
 | **G7** Retrieval | `top_k` 3; `top_k_after_rerank` 1; `similarity_threshold` 0.85; `max_total_context_tokens` 4000 | fewer chunks, higher threshold, smaller context | more chunks / larger context for completeness |
 | **G8** Tool Loading | `max_tools_per_agent` 20 | fewer tools injected | raise cap so no needed tool is pruned |

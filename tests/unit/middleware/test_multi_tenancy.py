@@ -92,38 +92,10 @@ class TestG05L2TenantIsolation:
         assert model_scope_alpha == ""  # default "tenant" scope stores empty model_scope
 
 
-@pytest.mark.asyncio
-class TestG05L3GPTCacheTenantIsolation:
-    async def test_lookup_and_store_scope_query_by_tenant(self):
-        from middleware.g05_cache import _l3_scope_query
-
-        scoped_alpha = _l3_scope_query("capital of France", "tenant-alpha")
-        scoped_beta = _l3_scope_query("capital of France", "tenant-beta")
-        assert scoped_alpha != scoped_beta
-        assert "tenant-alpha" in scoped_alpha
-        assert "tenant-beta" in scoped_beta
-
-    async def test_gptcache_lookup_passes_scoped_query_to_cache_search(self):
-        mock_cache = MagicMock()
-        mock_cache.search = MagicMock(return_value=[])
-
-        with patch("middleware.g05_cache._semantic_cache", mock_cache):
-            from middleware.g05_cache import _l3_lookup
-            await _l3_lookup("capital of France", 0.85, tenant_id="tenant-alpha")
-
-        called_query = mock_cache.search.call_args.args[0]
-        assert "tenant-alpha" in called_query
-
-    async def test_gptcache_store_passes_scoped_query_to_cache_put(self):
-        mock_cache = MagicMock()
-        mock_cache.put = MagicMock()
-
-        with patch("middleware.g05_cache._semantic_cache", mock_cache):
-            from middleware.g05_cache import _l3_store
-            await _l3_store("capital of France", {"choices": []}, 3600, tenant_id="tenant-beta")
-
-        called_query = mock_cache.put.call_args.args[0]
-        assert "tenant-beta" in called_query
+# (TestG05L3GPTCacheTenantIsolation removed 2026-09-07 with the G05 L3 tier. Its three
+#  tests asserted tenant scoping inside `_l3_scope_query` / `_l3_lookup` / `_l3_store`,
+#  helpers that no longer exist — L3 never executed, and its library has been dropped.
+#  L1/L2 tenant isolation is unaffected and is covered by the classes above and below.)
 
 
 @pytest.mark.asyncio
@@ -460,10 +432,11 @@ class TestG04BypassStatsKeyTenantIsolation:
 class TestTenantIsolationCallSiteLint:
     """CI lint: assert that soft-isolation helpers have exactly one call site each.
 
-    A second call site that bypasses the scoped-id helpers (_gptcache_lookup,
-    _gptcache_store, Mem0MemoryClient.retrieve_memories / store_memory,
-    ZepMemoryClient.add_message / get_memory) would silently cross tenant
-    boundaries.  These tests catch that before it ships.
+    A second call site that bypasses the scoped-id helpers
+    (Mem0MemoryClient.retrieve_memories / store_memory, ZepMemoryClient.add_message /
+    get_memory) would silently cross tenant boundaries.  These tests catch that before it
+    ships. The L3 cache helpers that used to head this list were removed with the tier on
+    2026-09-07; `test_l3_helpers_stay_gone` below now asserts ZERO call sites for them.
 
     The search is done with a simple string scan of the source tree so there
     is no import-time dependency on the middleware itself.
@@ -485,20 +458,21 @@ class TestTenantIsolationCallSiteLint:
                         hits.append((fname, lineno, line.rstrip()))
         return hits
 
-    def test_gptcache_lookup_single_call_site(self):
-        # Only count actual await-call lines for the L3 lookup helper
-        hits = self._grep(r"await _l3_lookup\(")
-        assert len(hits) == 1, (
-            f"_l3_lookup has {len(hits)} await call sites (expected 1). "
-            f"New call sites bypass tenant isolation scoping: {hits}"
-        )
+    def test_l3_helpers_stay_gone(self):
+        """Replaces the two single-call-site guards for `_l3_lookup` / `_l3_store`.
 
-    def test_gptcache_store_single_call_site(self):
-        hits = self._grep(r"await _l3_store\(")
-        assert len(hits) == 1, (
-            f"_l3_store has {len(hits)} await call sites (expected 1). "
-            f"New call sites bypass tenant isolation scoping: {hits}"
-        )
+        Those guards existed because a SECOND call site would have bypassed L3's
+        tenant-scoping. The tier was removed on 2026-09-07 (it never executed, and its
+        library is gone), so the stronger invariant is that the helpers do not come back
+        at all — a reintroduced L3 would need its tenant scoping designed again, not
+        inherited from a helper nobody has exercised.
+        """
+        for helper in (r"_l3_lookup\(", r"_l3_store\(", r"_l3_scope_query\("):
+            hits = self._grep(helper)
+            assert hits == [], (
+                f"{helper} is back in middleware. L3 was removed; a new semantic-cache "
+                f"tier must re-establish tenant scoping explicitly: {hits}"
+            )
 
     def test_mem0_retrieve_memories_single_call_site(self):
         # The only external call site: `await mem0.retrieve_memories(...)`

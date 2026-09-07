@@ -35,7 +35,6 @@ Imported via `try/except` in middleware. Install only when the corresponding fea
 
 | Package | Version | SPDX License | Used By | Feature |
 |---|---|---|---|---|
-| headroom-ai | ==0.34.0 | Apache-2.0 | G14, G19 (G05 L3 imports it, but L3 is disabled) | JSON/document compaction via `SmartCrusher.compact_document_json`. Ships a ~20 MB compiled Rust extension (`headroom._core`); `ast-grep-cli` and `tomlkit` come in solely with it |
 | mem0ai | >=2.0.7 | Apache-2.0 | G10 | Long-term conversation memory |
 | zep-python | >=2.0.2 | Apache-2.0 | G10 | Zep memory backend |
 
@@ -43,7 +42,6 @@ Imported via `try/except` in middleware. Install only when the corresponding fea
 
 | Package | Verified Via |
 |---|---|
-| headroom-ai | PyPI `license_expression` field: `Apache-2.0` |
 | mem0ai | PyPI `license_expression` field: `Apache-2.0` |
 | zep-python | GitHub repo (`getzep/zep-python`) `license.spdx_id`: `Apache-2.0` |
 | All others | PyPI `license_expression` or `license` field, or OSI classifier |
@@ -61,5 +59,5 @@ Imported via `try/except` in middleware. Install only when the corresponding fea
 - All **imported** Python dependencies are permissive (MIT, BSD-3-Clause, Apache-2.0). No GPL, LGPL, AGPL, or SSPL code is imported. (Two transitive deps — `certifi`, `tqdm` — carry MPL-2.0, a file-level weak copyleft that does not affect Apache-2.0 redistribution; see `THIRD_PARTY_LICENSES.md`.)
 - Copyleft *services* run separately: Grafana (AGPL-3.0) is deployed as an unmodified upstream container accessed over the network — not linked into this Work. See `THIRD_PARTY_LICENSES.md`.
 - Google Cloud packages are optional at runtime when `STORAGE_BACKEND=local` (T40). They remain in `requirements.txt` for GCP deployments.
-- `headroom-ai`, `mem0ai`, and `zep-python` are safe for commercial use under Apache-2.0 and MIT respectively.
+- `mem0ai` and `zep-python` are safe for commercial use under Apache-2.0 and MIT respectively.
 - No dependency requires attribution in the binary or restricts sublicensing.

@@ -28,11 +28,28 @@ repeats: 1              # no median at this budget — one pass
 # A rotating slice keeps a single $5 run cheap; run repeatedly (or bump to
 # MODE_25) to cover the rest. `datasets: all` would still fit but leaves little
 # gpt-4.5 headroom, so we cap the vertical/DS subset here.
+#
+# RETUNED 2026-09-07 (backlog #43). The sampler now reserves every fact-covered
+# request, so no arm is scored on answers nothing graded — and on this subset that
+# raised the sweep from 156 to 275 requests and the harness's own cost estimate by
+# 1.67x, which put the projected spend at ~$5.71 against a HARD $5 abort. The cap
+# was not raised and the reservation was not made optional: both exist for reasons
+# that outrank a mode's dataset list.
+#
+# DS5 -> DS11 is what pays for it. DS5 alone was $0.744 of the $0.827 this subset
+# estimates — 90% — because its 50 requests are o1 and it is the dataset the note
+# below calls the gpt-4.5 driver; and its 10 fact ids mean the reservation takes 10
+# where a head slice took 6, on the most expensive dataset in the mode. DS11 is the
+# other reasoning dataset (o4-mini), so reasoning coverage survives at a fraction of
+# the price. Post-change estimate for this subset: $0.088 with reservation on.
+# Cascade/gpt-4.5 exposure is deliberately traded away at THIS budget only —
+# `--mode 25` and `--mode 100` still carry DS5 and both measured under their caps
+# with the reservation on ($19.70/$25 and $77.95/$100).
 dataset_subset:
   - DS1     # support (simple)  — G01/G02/G11
   - DS2     # RAG KB (medium)   — G03/G06/G07/G09/G10
   - DS7     # DevOps agent      — G08/G14/G15/G16/G19
-  - DS5     # reasoning/cascade — G06/G12 (drives gpt-4.5 HIGH tier)
+  - DS11    # reasoning budget  — G12/G25 (o4-mini; replaced DS5's o1 at this budget)
   - DS9     # dedup             — G22
 max_datasets: 5
 
@@ -68,6 +85,14 @@ config_overrides:
         complex: ["gpt-4-5"]
 
 # ── Estimated spend (calibrate against --dry-run-cost before committing) ──────
-# ~$3.42 (68% of the $5 cap); ~$1.58 reserve. Figure assumes ~1K-in / 300-500-out
-# per request; gpt-4.5 output length is the volatile term.
-est_spend_usd: 3.42
+# ~$1.20 (24% of the $5 cap). RE-SIZED 2026-09-07 with the fact reservation on and
+# DS5 replaced by DS11 (see "Dataset selection"). The old $3.42 was sized around
+# DS5's o1/gpt-4.5 exposure, which this subset no longer carries; the harness's own
+# estimator prices this subset at $0.088 against $0.827 for the DS5 subset under the
+# same reservation. The figure below is deliberately CONSERVATIVE relative to that
+# ratio rather than scaled from it: the estimator prices each dataset's REQUESTED
+# model, so it under-counts wherever G06 routes UP to the gpt-4.5 complex tier, and
+# a headroom-free number derived from an under-counting estimator is not a budget.
+# Confirm with `--dry-run-cost` before a paid run; the hard `spend_cap_usd` abort
+# remains the real guard, not this line.
+est_spend_usd: 1.20

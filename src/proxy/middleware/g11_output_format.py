@@ -126,8 +126,7 @@ async def _record_max_tokens_pair(
 # `level`, adapted from caveman-shrink's SKILL.md ruleset (github.com/JuliusBrussee/
 # caveman, MIT — attribution in docs/oss-licenses.md), with SAFETY carve-outs so
 # security warnings and destructive-action confirmations stay in normal prose.
-# Default off → byte-identical when disabled. The headroom.verbosity_model hook
-# (future, per-tenant trained model) still takes priority when it ships.
+# Default off → byte-identical when disabled.
 
 # Bundled terse-output presets. Each is appended to the system message when
 # `verbosity_steering.level` selects it and no explicit suffix override is set.
@@ -158,21 +157,16 @@ def _get_verbosity_suffix(tenant_id: str, verbosity_cfg: Dict[str, Any]) -> Opti
     """Return the verbosity suffix to append, or None if nothing should be added.
 
     Priority:
-    1. headroom.verbosity_model.predict(tenant_id) — future; no-op today
-    2. verbosity_cfg["per_tenant_suffix"][tenant_id]  — static per-tenant override
-    3. verbosity_cfg["default_suffix"] (non-empty)    — explicit global override
-    4. _VERBOSITY_PRESETS[verbosity_cfg["level"]]     — bundled lite/full/ultra preset
-    """
-    try:
-        import headroom as _hm  # type: ignore
-        model = getattr(_hm, "verbosity_model", None)
-        if model is not None:
-            predicted = model.predict(tenant_id)
-            if predicted:
-                return predicted
-    except (ImportError, AttributeError, Exception):
-        pass  # headroom verbosity model not available yet — fall through
+    1. verbosity_cfg["per_tenant_suffix"][tenant_id]  — static per-tenant override
+    2. verbosity_cfg["default_suffix"] (non-empty)    — explicit global override
+    3. _VERBOSITY_PRESETS[verbosity_cfg["level"]]     — bundled lite/full/ultra preset
 
+    (A fourth, higher-priority rung used to probe an optional third-party package for a
+    trained per-tenant verbosity model. The package WAS installed, so the import succeeded —
+    it simply never defined the attribute, and `getattr(pkg, "verbosity_model", None)`
+    returned None on every call, falling straight through to rung 1. It was removed with the
+    dependency on 2026-09-07. Behaviour is unchanged.)
+    """
     per_tenant = verbosity_cfg.get("per_tenant_suffix", {})
     if tenant_id in per_tenant:
         return per_tenant[tenant_id]
@@ -534,7 +528,7 @@ class G11OutputFormat:
                 changed = True
 
         # 4. Verbosity steering — terse-output suffix (bundled lite/full/ultra presets,
-        #    or an explicit per-tenant/default suffix, or a future headroom model).
+        #    or an explicit per-tenant/default suffix).
         #    Appended to the system message to steer the model toward shorter answers;
         #    default off. The suffix is folded into the G05 cache key (verbosity_cache_tag)
         #    so a terse answer is never served to a verbose-configured request.

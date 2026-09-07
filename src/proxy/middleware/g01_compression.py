@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from middleware import RequestContext
+from middleware import cache_floor
 from middleware import langfuse_tracing
 from middleware.prose_compress import compress_text as _prose_compress_text
 from savings.calculator import count_messages_tokens
@@ -358,7 +359,10 @@ class G01Compression:
             roles.append("user")
         compressible_roles = tuple(roles)
 
-        for msg in ctx.messages:
+        # Index of every message this pass actually rewrote, so the cacheable-prefix guard
+        # below can accept or reject candidates INDIVIDUALLY instead of all-or-nothing.
+        changed_indices: List[int] = []
+        for _i, msg in enumerate(ctx.messages):
             role = msg.get("role", "")
             if role in compressible_roles:
                 content = msg.get("content", "")
@@ -412,6 +416,7 @@ class G01Compression:
 
                     if compressed != content:
                         compressed_messages.append({**msg, "content": compressed})
+                        changed_indices.append(_i)
                         changed = True
                         continue
             compressed_messages.append(msg)
@@ -424,34 +429,96 @@ class G01Compression:
         # paid 2.5x MORE for input than G21 alone, because a ~90% discount on ~51.7k
         # tokens was forfeited.
         #
-        # Whether that trade is bad is WORKLOAD-SHAPED — it only bites when a prefix
-        # actually repeats, and on a workload with no repetition compression wins
-        # outright. So this ships OFF: enabling it is an operator decision made with
-        # evidence, and with it off the behaviour is byte-identical.
-        #
-        # The check runs AFTER compression rather than predicting it: the real post-
-        # compression size is known here, so no estimate can be wrong.
-        if changed and cfg.get("preserve_cacheable_prefix", False):
-            try:
-                floor = ctx.provider_adapter.min_cacheable_prompt_tokens(ctx.config, ctx.model)
-            except Exception:  # an adapter without the method must never break a request
-                floor = 0
-            if floor:
-                projected = count_messages_tokens(compressed_messages, ctx.model)
-                if tokens_before >= floor > projected:
+        # Three things this must get right, each of which the first cut got wrong:
+        #   * it is the provider's CACHEABLE SPAN that has a minimum, not the prompt —
+        #     on a marker-based provider that is tools + system, and the rest of the
+        #     prompt is billed the same either way;
+        #   * the suffix is never cached, so its compression is free money and must be
+        #     kept even when the span is held back;
+        #   * whether holding tokens back is cheaper is ARITHMETIC over the provider's own
+        #     cache rates and the observed reuse, not a threshold. On DS8 the right answer
+        #     is opposite between providers, so a bare floor test costs one of them money.
+        # All of that lives in `cache_floor`; G01's job is to offer it the cheapest
+        # candidate it can produce. `ratio` is a keep-fraction, so aiming the span just
+        # above the floor is one more sidecar call, not a search.
+        floor_state = cache_floor.get(ctx)
+        if changed and floor_state.active:
+            span_before = cache_floor.span_tokens(ctx, ctx.messages)
+            span_after = cache_floor.span_tokens_paired(
+                ctx, ctx.messages, compressed_messages)
+            if not cache_floor.allows_shrink(ctx, span_before, span_after, "G01"):
+                in_span = [i for i in changed_indices if floor_state.covers(ctx.messages[i])]
+                # Arm C — re-compress the in-span messages at a milder, floor-targeted
+                # rate. Anything outside the span keeps its full compression regardless.
+                # The rate is derived from the SHRINKABLE subset only: the rest of the
+                # span (untouched messages, tool definitions) is fixed, so aiming the
+                # whole-span ratio at the subset lands it well above the target and gives
+                # back tokens for nothing.
+                shrinkable = count_messages_tokens(
+                    [ctx.messages[i] for i in in_span], ctx.model)
+                rate = cache_floor.target_rate(
+                    ctx, shrinkable, fixed_tokens=span_before - shrinkable)
+                floored = list(compressed_messages)
+                any_floored = False
+                if rate is not None:
+                    for i in in_span:
+                        original = ctx.messages[i].get("content", "")
+                        if not isinstance(original, str):
+                            continue
+                        milder = await _call_llmlingua(
+                            sidecar_url, original, rate, force_reserve_digit)
+                        if (milder and len(milder) < len(original)
+                                and _is_faithful_compression(original, milder)):
+                            floored[i] = {**ctx.messages[i], "content": milder}
+                            any_floored = True
+                        else:
+                            floored[i] = ctx.messages[i]
+                else:
+                    for i in in_span:
+                        floored[i] = ctx.messages[i]
+                # `any_floored` matters for honesty, not for correctness: when the milder
+                # pass produced nothing (no sidecar, or a refused compression) the result
+                # IS arm B, and reporting it as "floored" would claim a mechanism fired
+                # that did not. The observable exists so a measurement can assert the
+                # mechanism rather than infer it (Gate 8.6) — mislabelling here would
+                # defeat exactly that.
+                floored_span = cache_floor.span_tokens_paired(ctx, ctx.messages, floored)
+                if any_floored and floored_span >= floor_state.floor:
+                    compressed_messages = floored
+                    cache_floor.record_action(ctx, cache_floor.ACTION_FLOORED)
                     logger.info(
-                        "[%s] G01: skipping compression — it would take the prompt from %d to "
-                        "%d tokens, below this provider's %d-token minimum cacheable size, "
-                        "forfeiting the prefix-cache discount (preserve_cacheable_prefix)",
-                        ctx.request_id, tokens_before, projected, floor,
+                        "[%s] G01: compressed the cacheable span down to the provider's "
+                        "%d-token minimum instead of below it (span %d→%dt, reuse=%d)",
+                        ctx.request_id, floor_state.floor, span_before,
+                        floored_span, floor_state.reuse,
                     )
+                else:
+                    # Arm B — the milder rate still undershot. Keep the span whole; the
+                    # suffix stays compressed, which is the half that was never at stake.
+                    preserved = list(compressed_messages)
+                    for i in in_span:
+                        preserved[i] = ctx.messages[i]
+                    compressed_messages = preserved
                     ctx.g01_cache_floor_skips = getattr(ctx, "g01_cache_floor_skips", 0) + 1
-                    changed = False
+                    cache_floor.record_action(ctx, cache_floor.ACTION_PRESERVED)
+                    logger.info(
+                        "[%s] G01: holding the cacheable span at %d tokens — compressing it "
+                        "to %d would fall under this provider's %d-token minimum and "
+                        "forfeit the prefix-cache discount (preserve_cacheable_prefix)",
+                        ctx.request_id, span_before, span_after, floor_state.floor,
+                    )
+                changed = any(a != b for a, b in zip(ctx.messages, compressed_messages))
 
         if changed:
             original_messages = ctx.messages
             compressed_count = sum(1 for a, b in zip(original_messages, compressed_messages) if a != b)
             ctx.messages = compressed_messages
+            # The floor reservation identifies its span by content, so the assignment
+            # above has just invalidated it — and an invalid snapshot reads as an EMPTY
+            # span, which the arithmetic treats as "nothing to protect" and lets G08/G19
+            # shrink freely. That would undo an arm-C landing on the very next stage.
+            # Covers both paths: arm C and plain compression share this assignment.
+            cache_floor.resnapshot(ctx, original_messages, ctx.messages)
             tokens_after = count_messages_tokens(ctx.messages, ctx.model)
             ctx.savings.add_step(
                 GROUP,

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 import yaml
 
 from middleware import RequestContext
+from middleware import cache_floor
 from middleware.prose_compress import compress_descriptions_in_place
 from savings.calculator import count_tools_tokens, estimate_tokens
 
@@ -467,6 +468,31 @@ class G08ToolLoading:
             desc_saved_chars = compress_descriptions_in_place(relevant, fields)
 
         pruned = len(existing_tools) - len(relevant)
+
+        # Prefix-cache floor (backlog #41). Tool definitions sit inside the span a
+        # provider measures against its minimum cacheable size — first in the block on a
+        # marker-based provider — so trimming descriptions or dropping tools can push it
+        # under the floor and silently forfeit the whole prefix discount, exactly as
+        # prompt compression can. No rate dial here, so the choice is binary: take the
+        # trim, or keep the tool list whole. Inert unless a floor was reserved.
+        _floor_state = cache_floor.get(ctx)
+        if (pruned > 0 or desc_saved_chars > 0) and _floor_state.active:
+            _span_before = cache_floor.span_tokens(ctx, ctx.messages)
+            _held = ctx.params.get("tools")
+            ctx.params["tools"] = relevant
+            _span_after = cache_floor.span_tokens(ctx, ctx.messages)
+            ctx.params["tools"] = _held
+            if not cache_floor.allows_shrink(ctx, _span_before, _span_after, "G08"):
+                cache_floor.record_action(ctx, cache_floor.ACTION_PRESERVED)
+                logger.info(
+                    "[%s] G08: keeping the tool list whole — trimming it would take the "
+                    "cacheable span from %d to %d tokens, under this provider's %d-token "
+                    "minimum cacheable size",
+                    ctx.request_id, _span_before, _span_after, _floor_state.floor,
+                )
+                relevant = existing_tools
+                pruned, desc_saved_chars = 0, 0
+
         if pruned > 0 or desc_saved_chars > 0:
             ctx.params["tools"] = relevant
             tokens_after = count_tools_tokens(relevant, ctx.model)

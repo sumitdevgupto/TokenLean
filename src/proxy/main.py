@@ -8,6 +8,7 @@ Authentication: Bearer <proxy-key>  (issued per developer/team, stored in Secret
                 Developers NEVER receive LLM provider keys.
 """
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -1410,6 +1411,118 @@ def _batch_result_headers(request_id: str, stored: Dict) -> Dict[str, str]:
     return headers
 
 
+# ── Sent-prompt echo (E4) ────────────────────────────────────────────────────
+# Every optimisation acts on the PROMPT, so the prompt is the only place its defects are
+# visible — and it was the one thing no artefact kept. The #48 compaction defect destroyed
+# customer tool-result content on billed 200s and nothing recorded what the model had
+# actually received. This is the opt-in way to keep it.
+#
+# TWO gates, both required: the caller asks per request with `x_echo_prompt`, and the
+# operator has to have allowed it with `observability.echo_sent_prompt`. The operator gate
+# exists because the echo can contain content the CALLER never sent — G07 retrieved chunks,
+# G10 memories, G02 templates, G28-resolved blocks — so a tenant must not be able to
+# self-serve it with a request parameter alone.
+# Exact names, not substrings. The first version matched the bare substring "token", which
+# silently censored `max_tokens` and `max_completion_tokens` — the two parameters most worth
+# seeing in an echo, since they are what an output-budget group changes. A redaction that
+# quietly removes real data is the same class of defect as an echo that quietly shortens a
+# prompt: the artefact reads as evidence while being something else.
+_ECHO_SECRET_EXACT_NAMES = frozenset({
+    "api_key", "apikey", "api_base", "authorization", "auth", "access_token", "auth_token",
+    "bearer_token", "id_token", "refresh_token", "session_token", "password", "secret",
+    "credential", "credentials", "aws_secret_access_key", "aws_access_key_id",
+})
+# Suffixes are deliberately narrow: `<something>_key` / `_secret` / `_password` / `_token`
+# are credential SHAPES, and no provider sampling parameter uses them (`max_tokens` and
+# `max_completion_tokens` end in `_tokens`, plural — which is not a suffix here).
+_ECHO_SECRET_SUFFIXES = ("_key", "_secret", "_password", "_token", "_credential")
+# Real provider parameters that a suffix rule would otherwise eat. `prompt_cache_key` is
+# G21's OpenAI prefix-cache key — a routing hint, not a credential, and the single most
+# useful field in an echo when diagnosing why a provider cache did not hit. Found by the
+# test written for the `max_tokens` regression, which is the point of parametrising it.
+_ECHO_NEVER_REDACT = frozenset({"prompt_cache_key", "user", "safety_identifier"})
+
+
+def _echo_enabled(ctx) -> bool:
+    """Both gates, resolved with the per-tenant operator overlay already applied to
+    ctx.config at pipeline entry. Fails CLOSED on anything unexpected — an echo that
+    should not have happened cannot be un-sent."""
+    try:
+        if str(ctx.params.get("x_echo_prompt", "")).lower() not in ("true", "1", "yes"):
+            return False
+        return bool((ctx.config.get("observability") or {}).get("echo_sent_prompt", False))
+    except Exception:
+        return False
+
+
+def _is_credential_key(name: str) -> bool:
+    """Exact auth names, plus a short list of credential-shaped SUFFIXES.
+
+    Not substring matching: `"token" in "max_tokens"` is True, and censoring the caller's
+    output budget out of a diagnostic is a data-loss bug wearing a security costume.
+    """
+    low = str(name).lower()
+    if low in _ECHO_NEVER_REDACT:
+        return False
+    return low in _ECHO_SECRET_EXACT_NAMES or low.endswith(_ECHO_SECRET_SUFFIXES)
+
+
+def _sanitise_echo_params(params: Dict) -> Dict:
+    """Belt-and-braces. The echo is built from `outgoing_params`, which by construction
+    never contains the provider credential (that lives in the adapter's `build_call`
+    kwargs and is passed separately) — but a future adapter change must not turn this
+    into a credential leak, so anything credential-SHAPED is dropped by name as well."""
+    return {k: v for k, v in (params or {}).items() if not _is_credential_key(k)}
+
+
+def capture_sent_prompt(ctx, messages, outgoing_params: Dict, model: str) -> None:
+    """Record what is about to go to the provider, on `ctx.sent_prompt`.
+
+    Called immediately before the provider call so a G06 cascade tier or a failover target
+    is recorded as the thing that actually served, not as the thing we first intended.
+    """
+    if not _echo_enabled(ctx):
+        return
+    try:
+        limit = int((ctx.config.get("observability") or {}).get("max_echo_chars", 200000))
+    except Exception:
+        limit = 200000
+    payload = {
+        "model": model,
+        "messages": copy.deepcopy(messages) if messages else [],
+        "params": _sanitise_echo_params(outgoing_params),
+        "truncated": False,
+    }
+    try:
+        size = len(json.dumps(payload, default=str))
+    except Exception:
+        size = 0
+    if limit > 0 and size > limit:
+        # Truncate LOUDLY. A silently shortened prompt is worse than no prompt at all —
+        # it would read as evidence of what the model saw while being something else.
+        payload["truncated"] = True
+        payload["original_chars"] = size
+        payload["messages"] = [
+            {"role": m.get("role"), "content": str(m.get("content"))[:2000]}
+            for m in (payload["messages"] or [])
+        ]
+    ctx.sent_prompt = payload
+
+
+def _attach_sent_prompt(ctx, response_dict: Dict, not_sent_reason: Optional[str] = None) -> None:
+    """Attach the echo (or an explicit 'nothing was sent') under `_token_opt.sent`."""
+    if not _echo_enabled(ctx):
+        return
+    block = response_dict.setdefault("_token_opt", {})
+    if not_sent_reason is not None:
+        # A cache hit / bypass / content-filter block never reached a provider. Saying so
+        # explicitly stops an artefact from ever implying a prompt was sent when none was.
+        block["sent"] = None
+        block["sent_skipped_reason"] = not_sent_reason
+        return
+    block["sent"] = ctx.sent_prompt
+
+
 def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResponse:
     """Finalise a served 2xx response: attach savings metadata + headers, record
     SLA/billing (`_record_outcome`), and return the JSONResponse.
@@ -1419,6 +1532,7 @@ def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResp
     """
     meta = ctx.savings.to_langfuse_metadata()
     response_dict.setdefault("_token_opt", {}).update(meta)
+    _attach_sent_prompt(ctx, response_dict)
     headers = _savings_headers(ctx, request_start)
     # C1: SLA metrics + the billable usage_events row, centralised so every
     # 2xx-served path bills exactly once.
@@ -1592,6 +1706,7 @@ async def _serve_core(
     if ctx.security_blocked and ctx.security_block_response is not None:
         response = ctx.security_block_response
         response.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
+        _attach_sent_prompt(ctx, response, not_sent_reason="security_block")
         langfuse_tracing.finish_trace(ctx, response)
         _record_outcome(ctx, _request_start, "200", response)
         return JSONResponse(content=response, headers=_savings_headers(ctx, _request_start))
@@ -1611,6 +1726,11 @@ async def _serve_core(
         # fix into a double-record/double-store bug.
         response = await _apply_tool_eligibility_on_short_circuit(ctx, response)
         response.setdefault("_token_opt", {}).update(ctx.savings.to_langfuse_metadata())
+        # E4: no provider call happened on this path. `response` here is the object G05
+        # served from the cache — attaching the echo AFTER the store/lookup, and only as an
+        # explicit null, keeps a request-specific field out of any cached body.
+        _attach_sent_prompt(
+            ctx, response, not_sent_reason="cache_hit" if ctx.cache_hit else "bypassed")
         langfuse_tracing.finish_trace(ctx, response)
         _record_outcome(ctx, _request_start, "200", response)  # C1: bill cache hit / bypass
         # Attach the x-tokenlean-* headers here too so cache hits / bypasses carry per-call
@@ -1784,6 +1904,11 @@ async def _serve_core(
     _rcfg = ResilienceConfig.resolve(eff_cfg, provider)
 
     async def _invoke_primary():
+        # E4: snapshot INSIDE the invoke, not before building the target list — the
+        # resilience layer may run a failover target instead, and each target captures
+        # its own, so what is echoed is what the provider that actually served received.
+        # Deliberately NOT `**_call_kwargs`: that is where the provider credential lives.
+        capture_sent_prompt(ctx, ctx.messages, outgoing_params, _call_model)
         resp = await litellm.acompletion(
             model=_call_model, messages=ctx.messages, **_call_kwargs, **outgoing_params,
         )
@@ -2274,12 +2399,21 @@ def _lazy_fallback_target(ctx, model: str, eff_cfg: Dict[str, Any], request_id: 
         call_model, call_kwargs = adapter.build_call(
             model, get_provider_entry(model, providers_cfg) or {}, key
         )
+        _failover_messages = _sanitized_failover_messages(ctx.messages)
+        _failover_outgoing = {
+            **outgoing,
+            **({"tools": _sanitized_failover_tools(outgoing.get("tools"))}
+               if outgoing.get("tools") is not None else {}),
+        }
+        # E4: a failover target sends DIFFERENT bytes (sanitised messages/tools, a different
+        # model). Capturing here overwrites the primary's snapshot, so the echo describes
+        # the call that actually served rather than the one that failed.
+        capture_sent_prompt(ctx, _failover_messages, _failover_outgoing, call_model)
         resp = await litellm.acompletion(
             model=call_model,
-            messages=_sanitized_failover_messages(ctx.messages),
+            messages=_failover_messages,
             **call_kwargs,
-            **{**outgoing, **({"tools": _sanitized_failover_tools(outgoing.get("tools"))}
-                              if outgoing.get("tools") is not None else {})},
+            **_failover_outgoing,
         )
         if stream:
             return resp  # the stream iterator; caller relays it

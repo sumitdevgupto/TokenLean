@@ -156,6 +156,18 @@ class RequestContext:
     # ASSIGNED (not appended), so writing them from a dispatch site would erase G32's own
     # list from the audit row. Distinct field -> distinct metric + distinct audit action.
     tool_dispatch_blocked: List[str] = field(default_factory=list)
+    # The provider prefix-cache floor reserved for this request (a
+    # `cache_floor.CacheFloor`, or None when nothing was reserved). Set once before Stage
+    # 3 and read by every group that shrinks the prompt, so they all measure the same
+    # span against the same floor instead of each guessing. Typed loosely to keep
+    # `middleware/__init__` free of an import cycle with `middleware.cache_floor`.
+    cache_floor: Optional[Any] = None
+    # What the floor actually did: "none" | "floored" (the span was compressed down to
+    # the minimum instead of below it) | "preserved" (compression stood down entirely).
+    # Recorded so a measurement can assert the mechanism FIRED rather than infer it from
+    # a token delta — an arm that is silently inert has looked like a working one here
+    # before (Gate 8.6).
+    cache_floor_action: str = "none"
     # The complexity tier G06's classifier actually chose for THIS request
     # ("simple" | "medium" | "complex"), or None when no classifier ran — a caller
     # x_complexity override, a routing rule, a cascade plan, or G06 disabled entirely.
@@ -189,6 +201,17 @@ class RequestContext:
     # this on both read and store. (flag mode leaves content unmasked → keys stay
     # unique → caching is safe and this stays False.)
     no_cache: bool = False
+    # Snapshot of what was actually SENT to the provider — messages + the hygienic
+    # outgoing params + the resolved model — captured immediately before the provider
+    # call, so it reflects the cascade/failover target that really served the request.
+    # Populated ONLY when the caller sets `x_echo_prompt` AND the operator has enabled
+    # `observability.echo_sent_prompt`. Capture happens in `_invoke_primary`, which
+    # serves streams too, so on a STREAMED response it IS captured — it is simply never
+    # attached, because a streamed response carries no `_token_opt` block to attach it
+    # to. None on cache/bypass short-circuits, where nothing was sent at all. Never
+    # contains the provider credential: it is built from `outgoing_params`, never from
+    # the adapter's `build_call` kwargs.
+    sent_prompt: Optional[Dict[str, Any]] = None
 
     @property
     def current_token_count(self) -> int:

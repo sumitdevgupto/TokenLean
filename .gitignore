@@ -178,6 +178,7 @@ examples/benchmark/.venv-verify/
 
 # ─── Scratch / debugging output ───────────────────────────────────────────────
 temp/
+agent-swarm/
 analysis/
 
 # ─── Internal documentation (commercial strategy + internal roadmap — NOT public) ─

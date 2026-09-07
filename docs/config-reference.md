@@ -21,6 +21,53 @@ commonly tuned keys per group, not every field.
 | `retention` | Optional periodic purge of aged `audit_events` / `usage_events` / expired `cache_l2` (default OFF) |
 | `groups` | Per-group enable/disable + tuning parameters |
 | `savings` | Token-savings **estimate** tuning (reporting only — never billed) |
+| `observability` | Operator-only diagnostics — what a response may disclose about the proxy's own internals |
+
+### `observability` — the prompt the proxy actually sent
+
+Operator-only, and **not** portal knobs: these govern disclosure, which is a deployment
+decision rather than a per-tenant preference.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `observability.echo_sent_prompt` | `false` | Allow a caller to receive the prompt the proxy actually sent to the provider, echoed under `_token_opt.sent` as `{model, messages, params}` |
+| `observability.max_echo_chars` | `200000` | Ceiling on one echo's serialised size; over it the message content is clipped and `truncated: true` is set |
+
+Two gates are required, and neither works alone: the operator sets
+`observability.echo_sent_prompt: true`, **and** the caller sends `x_echo_prompt: true` in
+the request body (an `x_`-prefixed parameter, stripped before the provider call exactly like
+`x_no_cache`). The response then carries:
+
+```json
+"_token_opt": {
+  "sent": {
+    "model": "gpt-4o-mini",
+    "messages": [ ... the messages the provider received ... ],
+    "params": { "temperature": 0, "max_tokens": 256, "tools": [ ... ] },
+    "truncated": false
+  }
+}
+```
+
+**Why it is off by default.** The echoed prompt is what the *provider* received, not what
+the caller sent — so it can contain retrieved document chunks (G07), conversation memories
+(G10), registry templates (G02) and compression-resolved blocks (G28). Within one tenant
+that is that tenant's own data, but on a shared deployment an end user is not necessarily
+entitled to everything the retriever pulled, so a tenant must not be able to switch
+disclosure on with a request parameter alone. The provider credential is never included:
+the echo is built from the outgoing parameter set, never from the adapter's connection
+kwargs.
+
+**What it is for.** Every optimisation acts on the prompt, so the prompt is the only place
+its defects are visible — and it was the one thing no artefact kept. Turn it on when
+diagnosing "the model answered as if it had not been told X".
+
+**Limitations, both deliberate:** streamed responses carry no `_token_opt` at all, so they
+carry no echo; and the native Anthropic (`/v1/messages`) and Gemini
+(`:generateContent`) ingress routes drop `_token_opt` when re-serialising, so the echo is
+available on the OpenAI route only. A request served from cache, bypassed, or refused by the
+guardrails never reached a provider — those echo `"sent": null` with a
+`sent_skipped_reason`, rather than implying a prompt was sent.
 
 ### Per-tenant configuration precedence
 
@@ -103,6 +150,19 @@ configured; add more here. See [extensibility.md](extensibility.md) for the full
 | `supports_reasoning` | Generic: opt in to reasoning-param injection (default off) |
 | `reasoning_models` | Optional list narrowing which of this provider's models actually reason. Every Claude model reports reasoning-capable by default, so this is the only way to say "my simple tier must not think" on a provider where reasoning is a request parameter rather than a separate model. Never widens: a model the adapter rejects stays rejected. |
 | `can_disable_reasoning` | Generic only: assert that omitting the reasoning param genuinely stops this endpoint reasoning. Default `false` so the proxy under-claims rather than reporting a saving it cannot demonstrate. |
+| `min_cacheable_tokens` | Smallest prompt this provider will cache a prefix for; `0` (the default for a provider that omits it) leaves every dependent feature inert. Consulted only when `groups.G1_compression.preserve_cacheable_prefix` is on. |
+| `min_cacheable_tokens_by_model` | Per-model override of the above. **Every key is a prefix match, with or without a trailing `*`** — `gpt-4o` also matches `gpt-4o-mini`, so list the more specific model too when the two differ. The longest matching key wins. Needed because at least one provider's minimum is model-dependent, so a single per-provider number is wrong for part of its catalog. |
+
+The shipped values for both come **from provider documentation, 2026-09** — not from a
+measurement of ours. Verify them against your provider's current docs before turning
+`preserve_cacheable_prefix` on. Providers also differ in *what* the minimum is measured
+over: some measure the entire serialized prompt prefix, while a marker-based provider
+measures only the block up to its last cache-control marker (its tools and system
+prompt). That distinction is owned by the provider adapter, not by configuration.
+A marker-based provider caches **nothing** until its marker is enabled
+(`groups.G21_cache_alignment.providers.<name>.marker`, default off), so with the marker
+off it reports no cacheable span at all and the guard stands down — it will not hold
+tokens back for a discount that cannot arrive.
 
 `pricing:` is a flat map of `model-fragment → {input, output}` (USD per 1k tokens, reporting only —
 billing is per-request); add a row per new provider model.
@@ -209,6 +269,32 @@ Request throttling at the gate (token bucket). Lives at the top level, not under
 | `compress_system_prompt` | `false` | ⚠ Opt-in: compress the system prompt (keep off — losing system policy/facts degrades answers) |
 
 Also in the template: `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates), the Kompress-v2 fallback `kompress_enabled` (true) / `kompress_model` / `kompress_max_new_tokens` (256), and `deterministic_fallback` (false — a zero-LLM regex prose compressor that engages only when neither LLMLingua nor Kompress reduced a message, e.g. sidecar down; protects code/paths/identifiers byte-for-byte).
+
+#### Prefix-cache floor (operator-only, default off)
+
+Providers only cache a prompt prefix once it is large enough, and they decline in
+**silence** — no cache read, no cache write, no error. A prompt compressed below that
+minimum therefore sends fewer tokens and can still cost more, because the discount on a
+repeated prefix is forfeited with nothing to notice. These settings let the proxy weigh
+the two bills instead. They live on `G1_compression` but are honoured by **G08 and G19
+as well**, since tool-description trimming and structured pruning shrink the same span.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `preserve_cacheable_prefix` | `false` | Stop shrinking the span your provider measures against its minimum cacheable size once doing so would cross that minimum. **Not** a blanket "stop compressing": the decision is arithmetic over the provider's own cache rates and the reuse actually observed, and G01 aims the span just *above* the minimum rather than abandoning the compression. Content outside the span is never cached, so it stays fully compressed either way. **Aiming at the minimum requires the LLMLingua compression sidecar** (`sidecar_url`) — it is the only engine here with a rate dial. Without it (not deployed, unreachable, or unable to land above the minimum) the span is instead **preserved whole**: still cheaper on a repeating prefix, but it gives back the whole prefix's compression rather than only the part that was at stake. |
+| `cacheable_prefix_margin` | `0.05` | Headroom above the minimum when aiming at it. Token counts are estimates and undershooting forfeits the entire discount. |
+| `assumed_prefix_reuse` | `1` | Reuse to assume before any has been observed. `1` means "assume none", which keeps the feature standing down until repeats are actually seen. Raising it on traffic whose prefixes do not repeat **costs money**. |
+| `prefix_reuse_window_seconds` | `300` | How long a prefix sighting counts toward the reuse total, as a **fixed** window: the first sighting starts the clock, and the count restarts once it expires (it is not renewed by later sightings, which would turn the reuse total into a lifetime count). Track your provider's prompt-cache TTL; too long over-counts reuse that has already expired. |
+
+**Why it ships off.** At the first sighting of a prefix there is no reuse to bank on, and
+the first request pays a cache *write* on a bigger span — so a floor applied there costs
+1.6–3.5x what compressing costs. A provider can also evict a cached block before the
+reuse arrives. Turn it on for workloads with a genuinely repeated prefix (a long stable
+system prompt, RAG with a fixed preamble, an agent loop), and measure.
+
+Reuse is counted in Redis under your tenant prefix, so it is correct across workers and
+instances. If Redis is unavailable the reuse is unknown and the feature stays inert —
+unknown reuse must never buy a cache write.
 
 ### G2_template_registry
 Versioned prompt templates with per-template token budgets.
@@ -527,17 +613,17 @@ Minimises tool-result payloads before they re-enter context.
 |---|---|---|
 | `enabled` | `true` | Enable tool-output minimisation |
 | `field_whitelist.<tool>` | `{}` | ⚠ Keep only these fields per tool (all others dropped — whitelist everything the model needs downstream) |
-| `spreadsheet_compression` | `true` | ⚠ Apply Headroom SmartCrusher to CSV/JSON arrays |
+| `spreadsheet_compression` | `true` | ⚠ Compact CSV/JSON arrays with the built-in structural compactor (a third-party compactor was used until 2026-09-06; it replaced long JSON string leaves with an unresolvable reference) |
 | `max_field_tokens` | `200` | ⚠ Truncate any single tool-result text field above this |
 | `max_result_tokens` | `500` | ⚠ Truncate/compact an entire tool result above this |
 
 ### G15_server_compute
-Server-side compute dispatch + Headroom MCP tool hosting.
+Server-side compute dispatch + `headroom_*` MCP tool hosting (a G28 tool-name prefix, not a third-party package).
 
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable server-side compute hooks |
-| `headroom_mcp_server` | `true` | Host Headroom MCP tools (`headroom_compress`/`retrieve`/`stats`) — the proxy executes these **server-side** rather than returning them to the caller. Only tools **G28 itself injected** are ever executed: a same-named tool you declare, or a name the model produces unprompted, is passed back to you untouched. Each execution is also re-checked against the G32 tool policy at the moment of acting. Honours the per-tenant overlay. |
+| `headroom_mcp_server` | `true` | Host the `headroom_compress`/`retrieve`/`stats` MCP tools — the proxy executes these **server-side** rather than returning them to the caller. Only tools **G28 itself injected** are ever executed: a same-named tool you declare, or a name the model produces unprompted, is passed back to you untouched. Each execution is also re-checked against the G32 tool policy at the moment of acting. Honours the per-tenant overlay. |
 | `hooks` | `[]` | ⚠ Config-driven transforms (filter/sort/project) applied to tool results before they return |
 
 ### G16_agent_arch
@@ -591,6 +677,12 @@ Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and 
 | `compression_strategies.logs` | `{dedupe_lines, truncate_long_lines: 200, always_keep_severities: [ERROR, FATAL, CRITICAL, PANIC]}` | Dedupe repeated log lines, truncate long lines. Lines matching an `always_keep_severities` entry (whole-word, case-insensitive) are never folded into the dedup count — every occurrence survives verbatim (a recurring error is diagnostic signal, not noise); empty list reverts to timestamp-blind dedup of every line |
 | `compression_strategies.text` | `{dedupe_sentences, max_sentence_len: 0}` | Collapse duplicate sentences (`0` = no truncation) |
 
+G19 rewrites **every** role, including `system`, so it can shrink the span a provider
+measures against its minimum cacheable size. When
+`groups.G1_compression.preserve_cacheable_prefix` is on, G19 leaves the in-span messages
+whole rather than pruning them under that minimum; everything outside the span is pruned
+as usual. No new knob — see the prefix-cache floor under `G1_compression`.
+
 ### g20_prompt_optimizer
 Inline application of prompts tuned by the offline optimiser (`scripts/run_prompt_optimization.py`). The heavy optimisation runs out-of-band; the middleware applies the learned templates.
 
@@ -617,6 +709,13 @@ Reorders messages so shared prefixes are contiguous for provider auto-caching, *
 | `stabilise.relocate_to` | `trailing_system` | The only supported target. Never the first user turn: G05's L2 store recomputes its semantic key from post-G21 user turns, so writing there would desynchronise store from lookup |
 | `stabilise.max_relocated_chars` | `2000` | Budget for relocated content. An over-budget span is left in place rather than truncated — a partial identifier reaching the model is worse than an unstable prefix |
 | `prefix_profile` | `""` | Pin the provider cache-shard key so several artefacts sharing a system prompt land on ONE cached copy instead of each building their own. Per-request override: `X-Prefix-Profile` header |
+
+**Alignment cannot pay out below the provider's minimum cacheable size.** G21 now logs a
+line (`cacheable span is N tokens, under <provider>'s M-token minimum`) whenever the span
+it is about to mark is too small to be cached — the provider declines in silence, so a
+cost that quietly fails to fall was previously the only evidence. It is reported whether
+or not `groups.G1_compression.preserve_cacheable_prefix` is enabled, because the default
+is off and this is exactly the observation an operator needs before turning it on.
 | `providers.openai.prompt_cache_key` | `true` | Emit a deterministic, tenant-scoped `prompt_cache_key` (pure upside; set `false` to disable) |
 | `providers.openai.prompt_cache_key_len` | `32` | Hex chars of the sha256 cache key |
 | `providers.openai.prompt_cache_retention` | *(unset)* | Optional OpenAI cache retention (`"24h"` \| `"in-memory"`); unset = provider default |
@@ -747,19 +846,16 @@ Related: **`context_editing`** (above) delegates the same job to Anthropic's nat
 All keys are per-tenant overridable under `tenants.<id>.groups.G26_context_budget`. `model_context_window` is deliberately operator-level only in the portal — a wrong value there forces premature compaction for every request.
 
 ### G27_multimodal
-Compresses inline base64 image blocks before the LLM call via `headroom.compress_image()`, with a SHA256-keyed LRU cache for repeated images. No-op when headroom is absent or there are no image blocks.
+> **Reserved slot — no image transform ships, and it is off by default.** This proxy's token accounting does not measure image content: `count_messages_tokens` sums only `text` content parts, no pricing entry prices an image, and no provider adapter models one. A byte-level image optimisation therefore cannot reduce a token this proxy measures or bills, while re-encoding would silently alter your payload. The previous implementation delegated to a third-party image compressor and recorded `bytes // 4` as a token saving — a unit that appears nowhere else in the ledger, which nonetheless reached `usage_events.group_savings`. Both were removed on 2026-09-07, along with the `min_bytes`, `quality` and `provider` knobs. Enabling this group is harmless: the request passes through unchanged and no savings step is recorded. A real multimodal optimisation needs an image-token model, image-aware pricing and a vision quality gate first.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Enable multimodal image optimisation |
-| `min_bytes` | `4096` | ⚠ Skip images smaller than this (raw bytes) |
-| `quality` | `75` | ⚠ JPEG quality target (1–95; lower = more compression, less detail) |
-| `provider` | `null` | Optional Headroom provider hint; `null` = auto-detect from the active adapter |
+| `enabled` | `false` | Reserved. `true` changes nothing today. |
 
 ### G28_ccr
 > **Available since 2026-09-03, still off by default.** The earlier availability guard is lifted: the content store is now Redis-backed and content-addressed (key = sha256 of the block), so a `[CCR:ref]` survives a restart and resolves across instances, and `ttl_seconds` is honoured. Measured savings are **regime-dependent and published two-sided**: **−63% tokens at a 17% expansion rate, +30% at 100%** (break-even around 75–80%) — CCR pays only when parked content is rarely read back. It substitutes only for a client that has **proven** it can resolve a reference (`require_proven_resolver`), refuses to substitute at all when the store is unreachable, and revokes that proof the moment a client answers without resolving one. For plain long conversations prefer **G26 Budget-Aware Context Management**.
 
-Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token before the call, then exposes MCP tools (`headroom_compress`/`retrieve`/`stats`) so the model can fetch the full text on demand. Runs on both request and response paths. Falls back gracefully without `headroom.ccr` or Redis.
+Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token before the call, then exposes MCP tools (`headroom_compress`/`retrieve`/`stats`) so the model can fetch the full text on demand. Runs on both request and response paths. The `headroom_*` tool names are a shipped API surface; no third-party package is involved. Without Redis it refuses to substitute a reference rather than storing one nothing can resolve.
 
 **Off by default.** A `[CCR:ref]` is only resolvable by a client that runs the `headroom_retrieve` agent loop (calls the tool, re-sends the result). In a plain pass-through chat completion the model can't resolve the reference and answers from a gutted context, so enable G28 only for cooperating agent clients. The **system instruction is never replaced** unless `compress_system_prompt` is explicitly set true — losing it silently strips the policy/facts the answer depends on.
 
@@ -937,7 +1033,6 @@ for reference (all now appear in their group's section above):
 | `G11_output` | `fallback_max_tokens` | `null` | Optional static `max_tokens` cap while no completion-size evidence exists (replaces the removed input-derived heuristic + `absolute_default_max_tokens`) |
 | `G14_tool_output` | `max_field_tokens` / `max_result_tokens` | `200` / `500` | ⚠ Per-field / whole-result truncation caps (were module constants) |
 | `G16_agent_arch` | *(fallback alignment)* | — | `_MAX_SYSTEM_PROMPT_TOKENS`/`_MAX_TOOLS_COUNT` absent-key fallbacks realigned 800→4096 / 10→20 to match the template |
-| `G27_multimodal` | `provider` | `null` | Override the Headroom provider hint (else auto-detected) |
 
 ### B. Config-first knobs — config wins, env is the fallback (item 83a)
 These read from `groups.<GROUP>.*` in the hot-reloaded proxy config **first**; if a key is absent

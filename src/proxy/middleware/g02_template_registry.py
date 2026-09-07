@@ -18,6 +18,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from middleware import RequestContext
+from middleware import cache_floor
 from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -263,9 +264,17 @@ class G02TemplateRegistry:
                 strategy = budget_cfg.get("truncate_strategy", "tail_system")
                 min_keep_user = budget_cfg.get("min_keep_user_turns", 1)
                 
+                _pre_truncate_messages = ctx.messages
                 ctx.messages = self._truncate_messages(
                     ctx.messages, max_input, strategy, min_keep_user, ctx.model
                 )
+                # Keep the prefix-cache floor reservation describing the messages that now
+                # exist. It identifies its span by CONTENT, so a rewrite it does not know
+                # about makes the span read as empty downstream — which the floor
+                # arithmetic would take as "nothing to protect". `_truncate_messages`
+                # rewrites in place (it empties a message's content rather than removing
+                # the message, deliberately), so the lists stay index-aligned.
+                cache_floor.resnapshot(ctx, _pre_truncate_messages, ctx.messages)
                 tokens_after = count_messages_tokens(ctx.messages, ctx.model)
                 
                 logger.warning(

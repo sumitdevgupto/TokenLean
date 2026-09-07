@@ -1,5 +1,5 @@
 """
-G28 · Contextual Content Reuse (CCR) — headroom.ccr
+G28 · Contextual Content Reuse (CCR)
 Stage: Into the LLM (request-side), tool result retrieval (response-side)
 Saving: context tokens, but ONLY net-positive when a stateful agent client reuses
         the reference across turns. Off by default — see the pass-through caveat.
@@ -24,8 +24,13 @@ Technique (two-part):
   is never replaced. Building a server-side resolve loop is rejected on purpose: it
   would re-inject the retrieved text into a second LLM call (net-negative tokens).
 
-  When headroom is not installed, the module is a transparent no-op on both
-  paths. When Redis is unavailable, the request-side path uses an in-process store.
+  NOTE ON THE TOOL NAMES: the three MCP tools keep their ``headroom_*`` names because
+  they are a shipped API surface that clients already call; nothing here depends on any
+  third-party package. (An earlier version of this docstring claimed the module was "a
+  transparent no-op when headroom is not installed" — it never imported that package at
+  all, so the claim was never true; it was corrected on 2026-09-07 when the dependency
+  was dropped.) When Redis is unavailable, `_store` refuses to substitute a reference
+  rather than falling back to process memory — see the content-store note below.
 
 Config key: G28_ccr
 """
@@ -36,18 +41,20 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext, resolve_group_config
+from middleware import cache_floor
 from middleware import langfuse_tracing
 from savings.calculator import estimate_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G28"
 
-# ─── Headroom CCR integration: DISABLED ───────────────────────────────────────
-# The real headroom.ccr module is a tool-injection / MCP architecture
-# (CCRToolInjector, ContextTracker, …) with NO module-level compress()/retrieve(),
-# so this import always failed and G28 has always used the built-in
-# [CCR:sha256] + Redis store below. Wiring Headroom's CCR is a dedicated MCP task;
-# the built-in implements the same concept. (_ccr_available stays False.)
+# ─── Third-party CCR integration: NEVER WIRED ─────────────────────────────────
+# G28 has always used the built-in [CCR:sha256] + Redis store below; the optional
+# third-party CCR module these flags were reserved for was a tool-injection / MCP
+# architecture with no module-level compress()/retrieve(), so it was never imported
+# and the flags were never set. The package was dropped from the image on
+# 2026-09-07. The flags are kept as inert constants because the branches below read
+# them; they stay False.
 _ccr_available = False
 _ccr_compress_fn = None
 _ccr_retrieve_fn = None
@@ -646,7 +653,16 @@ class G28CCR:
         )
 
         if tokens_after < tokens_before:
+            _pre_ccr_messages = ctx.messages
             ctx.messages = new_messages
+            # Keep the prefix-cache floor reservation describing the messages that now
+            # exist. It identifies its span by CONTENT, and substituting a reference for a
+            # block rewrites that content — including `system` when `compress_system` is
+            # on, which is inside the span a marker-based provider measures. Without this
+            # the span reads as empty downstream and the floor arithmetic concludes there
+            # is nothing to protect. `_process_messages` appends exactly one output per
+            # input, so the lists stay index-aligned.
+            cache_floor.resnapshot(ctx, _pre_ccr_messages, ctx.messages)
             # The response side needs to know a reference actually went out this turn, so it
             # can tell "the model answered without resolving" from "there was nothing to
             # resolve". Only substitution counts — storing alone changes nothing the model sees.

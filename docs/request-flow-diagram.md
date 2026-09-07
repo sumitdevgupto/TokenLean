@@ -41,7 +41,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G29 PII Redaction    → detect PII → flag | mask | block (before cache/RAG/memory)  │       │
 │  │  ────────────────────────────────────────────────────────────────────────────────────│       │
 │  │  G04 Bypass Rules     → DB-first PostgreSQL → confidence score → zero-cost response │       │
-│  │  G05 Cache            → L1 Redis → L2 pgvector → L3 headroom SemanticCache → cached  │       │
+│  │  G05 Cache            → L1 Redis → L2 pgvector → cached response                     │       │
 │  │  G06 Routing          → cascade / heuristic / RouteLLM → ctx.routed_model           │       │
 │  │  F2 Intent Orchestr.  → intent match → dispatch to downstream agent (short-circuit) │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
@@ -51,13 +51,13 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  STAGE 2 — TOKEN REDUCTION (Into the LLM)   [each stage honours ctx.skip_groups]     │       │
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
 │  │  G01 Compression   → base→role→task→dynamic + Selective Context + LLMLingua-2       │       │
-│  │  G27 Multimodal    → compress inline base64 images (headroom.compress_image + LRU)  │       │
+│  │  G27 Multimodal    → reserved slot: no transform ships, request passes through      │       │
 │  │  G02 Templates     → versioning, deprecation, per-template budget tracking            │       │
 │  │  G20 Prompt Opt    → apply offline-optimised prompts/templates inline                 │       │
 │  │  G07 Retrieval     → hybrid dense+sparse Qdrant RRF → ChunkGuard → injected context │       │
 │  │  G08 Tool Loading  → intent-based filtering + MCP lazy-load manifest + pruning      │       │
-│  │  G28 CCR (req)     → replace repeated blocks with [CCR:sha256] + expose headroom MCP │       │
-│  │  G19 Headroom (req)→ AST-aware pruning of code/JSON/logs/text                        │       │
+│  │  G28 CCR (req)     → replace repeated blocks with [CCR:sha256] + expose ccr MCP tools│       │
+│  │  G19 Headroom (req)→ structural pruning of code/JSON/logs/text                       │       │
 │  │  G09 Schema        → prose detection → Instructor typed output → compact handoffs    │       │
 │  │  G10 Memory        → sliding window + Mem0 + Zep + Qdrant skills → injected recall │       │
 │  │  G22 Dedup         → collapse near-duplicate conversation turns (cosine / n-gram)    │       │
@@ -96,8 +96,8 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G14 Tool Output    → field projection + truncation + parallel combining            │       │
 │  │  G28 CCR (resp)     → compress repeated response blocks for downstream reuse         │       │
 │  │  G23 Streaming Comp.→ collapse repeated n-grams → response["x_compressed_content"]  │       │
-│  │  G19 Headroom (resp)→ AST-aware pruning of response / tool outputs                   │       │
-│  │  G15 Server Compute → hook-based filter/sort/project + headroom MCP dispatch        │       │
+│  │  G19 Headroom (resp)→ structural pruning of response / tool outputs                  │       │
+│  │  G15 Server Compute → hook-based filter/sort/project + G28 MCP tool dispatch        │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
 │             │                                                                                    │
 │             ▼                                                                                    │
@@ -196,10 +196,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Confidence scoring: keyword (40%) + pattern (60%); dispatch `static_response` or `backend_url`
 - If match: set `ctx.bypassed=True`, skip LLM call entirely
 
-**G05: Cache** (`g05_cache.py` + `g05_cache_gptcache.py`)
+**G05: Cache** (`g05_cache.py`)
 - L1: exact-match Redis (SHA256 of normalised prompt)
 - L2: semantic pgvector cosine similarity (threshold from config)
-- L3: headroom `SemanticCache` (hybrid scorer; falls back gracefully when headroom is absent)
 - Auto-TTL: dynamic TTL from hit rates; Temporal activity replay for idempotent steps
 - If hit: set `ctx.cache_hit=True`, return cached response
 
@@ -227,9 +226,11 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Compresses system/assistant messages only by default (user messages opt-in)
 
 **G27: Multimodal Optimizer** (`g27_multimodal_optimizer.py`)
-- Compresses inline base64 image blocks via `headroom.compress_image()`
-- SHA256-keyed in-process LRU cache avoids re-compressing identical images
-- No-op when headroom is absent or no image blocks are present
+- **Reserved slot — no image transform ships; the group is off by default and records no savings**
+- Image content is invisible to this proxy's token accounting (only `text` parts are counted and
+  nothing prices an image), so a byte-level image lever could not reduce a billed token; the
+  removed implementation nonetheless recorded `bytes // 4` as one
+- Enabling it passes the request through unchanged
 
 **G02: Template Registry** (`g02_template_registry.py`)
 - `TemplateMetadata`: versioning, author, sunset; 30-day deprecation auto-flag
@@ -252,10 +253,11 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Replaces repeated verbatim blocks (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token
 - Stores full text in Redis (TTL) and injects `headroom_compress/retrieve/stats` MCP tools so the
   model can fetch original text on demand
-- Falls back gracefully when `headroom.ccr` or Redis is unavailable
+- Without Redis it refuses to substitute a reference rather than storing one nothing can resolve
 
 **G19: Headroom — request side** (`g19_headroom.py`)
-- AST-aware structured pruning of code / JSON / logs / text (additive to G1's NL compression)
+- Structural pruning of code / JSON / logs / text — line-wise and sentence-wise cleanup plus
+  compaction over decoded JSON; nothing parses a syntax tree (additive to G1's NL compression)
 - Per-type strategies: drop empty JSON fields, strip code comments/whitespace, dedupe log lines
 
 **G09: Context Schema** (`g09_context_schema.py`)
@@ -377,10 +379,10 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Collapses repeated n-gram patterns in response text → `response["x_compressed_content"]`
 
 **G19: Headroom — response side** (`g19_headroom.py`)
-- AST-aware pruning of responses / tool outputs (same strategies as the request side)
+- Structural pruning of responses / tool outputs (same strategies as the request side)
 
 **G15: Server-Side Compute** (`g15_server_compute.py`)
-- Hook-based `filter_fn` / `sort_key` / `field_project` / `top_n`; headroom MCP tool dispatch
+- Hook-based `filter_fn` / `sort_key` / `field_project` / `top_n`; G28 MCP tool dispatch
 - Offloads filter/sort/project to the server before the LLM re-ingests results
 
 **STAGE 5b — Feedback Loop**
@@ -429,9 +431,9 @@ Request → Auth → Context → G00 → G24 → G04 (bypass match) → Return b
 
 ### Path C: Cache Hit (G05)
 ```
-Request → Auth → Context → G00 → G24 → G04 (no bypass) → G05 (L1/L2/L3 hit) → Return cached
+Request → Auth → Context → G00 → G24 → G04 (no bypass) → G05 (L1/L2 hit) → Return cached
 ```
-- No LLM call; sub-ms (L1), ~10ms (L2), ~50ms (L3)
+- No LLM call; sub-ms (L1), ~10ms (L2)
 
 ### Path D: Batch Deferred (G13)
 ```
@@ -582,7 +584,7 @@ class RequestContext:
 
     bypassed: bool = False             # G04 set True → skip LLM call
     cache_hit: bool = False            # G05 set True → return cached response
-    cache_level: Optional[str] = None  # "L1" | "L2" | "L3"
+    cache_level: Optional[str] = None  # "L1" | "L2"
     cache_response: Optional[Dict] = None
     batch_deferred: bool = False       # G13 batched this request
     skip_groups: List[str] = []        # G24 populates → later stages skip themselves
@@ -648,7 +650,6 @@ class InterAgentState(BaseModel):
 | **LLMLingua-2 sidecar** | Runtime prompt compression | G01 |
 | **Tika sidecar** | Document text extraction | G03 |
 | **RouteLLM sidecar** | Model routing classifier | G06 |
-| **headroom (optional)** | L3 semantic cache, structured pruning, image/CCR compression | G05, G19, G27, G28 |
 | **LiteLLM** | LLM provider abstraction | `main.py` |
 | **Langfuse / Prometheus / OTLP** | Observability & tracing | G18, `langfuse_tracing.py`, `tracing/otel.py` |
 | **Mem0 / Zep / Instructor (optional)** | Long-term memory / typed output | G10, G09 |
@@ -712,7 +713,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G02** | `g02_template_registry.py` | Template management, deprecation, budget |
 | **G03** | `g03_doc_pipeline.py` (+ `src/doc-pipeline/`, `src/finetune-pipeline/`, `src/tika-sidecar/`) | Document ingestion, RAG fallback, fine-tuning |
 | **G04** | `g04_bypass.py`, `g04_db_resolution.py` | Rules-based bypass with DB-first resolution |
-| **G05** | `g05_cache.py`, `g05_cache_gptcache.py` | L1/L2/L3 caching, Auto-TTL, activity replay (`G05Cache.temporal_activity_replay`) |
+| **G05** | `g05_cache.py` | L1/L2 caching, Auto-TTL, activity replay (`G05Cache.temporal_activity_replay`) |
 | **G06** | `g06_routing.py` | Model routing/cascade with confidence scoring |
 | **G07** | `g07_retrieval.py`, `g07_pgvector_fallback.py` | Hybrid RAG retrieval, pgvector fallback |
 | **G08** | `g08_tool_loading.py`, `g08_mcp_loader.py` | Intent-based tool loading, MCP lazy manifest |
@@ -726,7 +727,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G16** | `g16_agent_arch.py`, `g16_langgraph_runtime.py` | Agent advisories, LangGraph |
 | **G17** | `g17_loop_control.py` | Loop control, InterAgentState, budget propagation |
 | **G18** | `g18_observability.py`, `langfuse_tracing.py` | Prometheus metrics, Langfuse tracing, usage records |
-| **G19** | `g19_headroom.py` | Structured (AST-aware) pruning — request + response |
+| **G19** | `g19_headroom.py` | Structural pruning (line/sentence/JSON, not AST) — request + response |
 | **G20** | `g20_prompt_optimizer.py` | Inline prompt optimisation (Opik/DSPy-fed) |
 | **G21** | `g21_cache_alignment.py` | Provider prefix-cache alignment (final pre-send) |
 | **G22** | `g22_deduplication.py` | Semantic deduplication of near-duplicate turns |
@@ -750,7 +751,7 @@ All 28 optimisation slots are implemented — G26 filled the last reserved slot 
 context management — plus the four non-savings **trust & safety** groups
 (G29 PII, G30 injection, G31 context-trust, G32 tool-call eligibility) and the OSS-core
 **F2 Intent Orchestration** stage.
-Optional integrations (headroom, Mem0, Zep, Instructor, Presidio) degrade
+Optional integrations (Mem0, Zep, Instructor, Presidio) degrade
 gracefully when their packages or backing services are absent.
 
 ---

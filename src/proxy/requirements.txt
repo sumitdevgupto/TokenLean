@@ -26,8 +26,6 @@ anyio==4.14.2
     #   openai
     #   starlette
     #   watchfiles
-ast-grep-cli==0.45.0
-    # via headroom-ai
 asyncpg==0.31.0
     # via -r requirements.in
 attrs==26.1.0
@@ -63,7 +61,6 @@ charset-normalizer==3.4.9
     # via requests
 click==8.4.2
     # via
-    #   headroom-ai
     #   huggingface-hub
     #   litellm
     #   presidio-analyzer
@@ -183,8 +180,6 @@ h11==0.16.0
     #   uvicorn
 h2==4.4.1
     # via httpx
-headroom-ai==0.34.0
-    # via -r requirements.in
 hf-xet==1.6.0
     # via huggingface-hub
 hpack==4.2.0
@@ -277,9 +272,7 @@ langgraph-sdk==0.4.2
 langsmith==0.10.16
     # via langchain-core
 litellm==1.95.0
-    # via
-    #   -r requirements.in
-    #   headroom-ai
+    # via -r requirements.in
 loguru==0.7.3
     # via fastembed
 markdown-it-py==4.2.0
@@ -355,7 +348,6 @@ openai==2.53.0
     #   mem0ai
 opentelemetry-api==1.44.0
     # via
-    #   headroom-ai
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-sdk
@@ -452,7 +444,6 @@ pycparser==3.0
 pydantic==2.13.4
     # via
     #   fastapi
-    #   headroom-ai
     #   instructor
     #   langchain-core
     #   langfuse
@@ -484,7 +475,6 @@ pytz==2026.3.post1
 pyyaml==6.0.3
     # via
     #   -r requirements.in
-    #   headroom-ai
     #   huggingface-hub
     #   langchain-core
     #   presidio-analyzer
@@ -526,7 +516,6 @@ requests-toolbelt==1.0.0
     # via langsmith
 rich==14.3.4
     # via
-    #   headroom-ai
     #   instructor
     #   typer
 rpds-py==2026.6.3
@@ -589,7 +578,6 @@ threadpoolctl==3.6.0
 tiktoken==0.13.0
     # via
     #   -r requirements.in
-    #   headroom-ai
     #   litellm
 tldextract==5.3.1
     # via presidio-analyzer
@@ -599,8 +587,6 @@ tokenizers==0.22.2
     #   litellm
     #   sentence-transformers
     #   transformers
-tomlkit==0.15.1
-    # via headroom-ai
 tqdm==4.70.0
     # via
     #   fastembed

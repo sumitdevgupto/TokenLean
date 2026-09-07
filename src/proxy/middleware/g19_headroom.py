@@ -3,7 +3,9 @@ G19 · Structured Context Pruning
 Stage: Request-side (after G8 tool loading), Response-side (after G14 tool output)
 Saving: 40-95% on structured content (code, JSON, logs)
 Technique:
-  AST-aware compression via this module's own structural compressors.
+  Structural compression via this module's own compressors. NOT AST-based: nothing here
+  parses a syntax tree — the compressors work line-wise, sentence-wise and over decoded
+  JSON structure. ("AST-aware" was claimed here until 2026-09-07; `ast` is not imported.)
   Auto-detects content type and applies optimal compressor:
     - Code:    strips imports, comments, whitespace; preserves logic
     - JSON:    removes empty fields, deduplicates repeated structures
@@ -19,6 +21,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext
+from middleware import cache_floor
 from middleware import langfuse_tracing
 from savings.calculator import count_messages_tokens, estimate_tokens
 
@@ -77,8 +80,49 @@ class G19Headroom:
                         continue
             compressed_messages.append(msg)
 
+        # Prefix-cache floor (backlog #41). G19 rewrites EVERY role including `system`,
+        # so it can push a provider's cacheable span under the minimum size just as
+        # compression can — and it runs after G01, so a guard that lived only there could
+        # be undone here. It has no compression-rate dial, so the choice is binary: take
+        # the shrink, or keep the in-span messages whole. Everything outside the span is
+        # compressed either way; it is never cached, so its saving is never at stake.
         if changed:
+            floor_state = cache_floor.get(ctx)
+            if floor_state.active and not cache_floor.allows_shrink(
+                ctx,
+                cache_floor.span_tokens(ctx, ctx.messages),
+                cache_floor.span_tokens_paired(ctx, ctx.messages, compressed_messages),
+                "G19",
+            ):
+                # Membership is decided on the ORIGINAL at each index, never on the
+                # rewrite: a compressed message no longer matches the reservation's
+                # snapshot, so testing it would restore nothing. And when the snapshot is
+                # STALE (some earlier group rewrote the messages without re-taking it)
+                # `covers` answers False to everything — so refusing the shrink and then
+                # restoring by `covers` would restore nothing and take the shrink anyway.
+                # Stale means "we cannot tell what is in the span": restore all of it.
+                _stale = cache_floor.snapshot_is_stale(ctx)
+                compressed_messages = [
+                    (ctx.messages[i] if (_stale or floor_state.covers(ctx.messages[i])) else m)
+                    for i, m in enumerate(compressed_messages)
+                ]
+                changed = any(a != b for a, b in zip(ctx.messages, compressed_messages))
+                cache_floor.record_action(ctx, cache_floor.ACTION_PRESERVED)
+                logger.info(
+                    "[%s] G19: holding the cacheable span whole — pruning it would fall "
+                    "under this provider's %d-token minimum cacheable size",
+                    ctx.request_id, floor_state.floor,
+                )
+
+        if changed:
+            _pre_g19_messages = ctx.messages
             ctx.messages = compressed_messages
+            # Keep the floor reservation describing the messages that now exist — a
+            # content-keyed snapshot that no longer matches reads as an EMPTY span, which
+            # the arithmetic treats as "nothing to protect". G19 is the last consumer
+            # today, so this is the invariant rather than a live fix; leaving it stale
+            # would make the next group added after G19 fail open silently.
+            cache_floor.resnapshot(ctx, _pre_g19_messages, ctx.messages)
             tokens_after = ctx.current_token_count
             ctx.savings.add_step(
                 GROUP,

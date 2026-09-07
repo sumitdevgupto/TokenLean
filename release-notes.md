@@ -23,6 +23,83 @@ date changes.
 
 ## 2026-09-07
 
+### Quality-gate console print now agrees with the gate's own verdict — Bug fix
+
+The harness console summary read a judge sub-report's raw `passed` field, so a prose judge that
+graded 0 pairs (an agentic dataset answers in tool calls) printed `— FAIL` while the gate itself
+correctly treats "nothing to assess" as not-applicable; the layer that actually decided the dataset,
+`tool_judge`, was never printed. The `results.md` FAIL-evidence line had the identical latent defect.
+Both now render through one shared three-state rule: a 0-pair / 0-checked layer prints `n/a` with its
+reason, `tool_facts`/`tool_judge` rows print whenever present, and a FAIL names the deciding layer.
+Gate logic (`passed`/`verdict`/`invalid_for_roi`) is byte-identical — reporting only, no number moves.
+
+### Dropped the bundled image-compression library; G27 is an honest reserved slot — Bug fix
+
+- G27 Multimodal shipped `enabled: true` and handed inline images to a bundled third-party re-encoder on
+  every vision request. It could not save a billable token (this proxy counts only text parts; nothing prices
+  an image), and on any byte reduction it would have recorded `bytes // 4` as a token saving, a unit the
+  ledger never carries, straight into `usage_events.group_savings`. The lever and its `quality`, `min_bytes`
+  and `provider` knobs are removed; G27 is a reserved slot that ships off and records nothing.
+- The same library backed the G05 "L3" tier, which never executed, and a G11 hook that probed for an
+  attribute the library never had; both removed, `l3_enabled`/`l3_similarity_threshold` retired. L1 and L2
+  caching are unchanged.
+- Three packages and roughly 38 MB leave the image with no other pin changed; docs no longer describe
+  headroom APIs, an L3 tier, or AST-aware pruning that the code does not have.
+
+### The harness never once ran adaptive reasoning — Bug fix
+
+The ablation harness's base config had no block for the adaptive-reasoning group, so its flag fell to
+the code default of off and the group ran in no arm of any run — including the dataset registered to
+measure it. A shipped, on-by-default, customer-reachable group was therefore unmeasured and its answer
+quality ungraded. It now mirrors the shipped defaults exactly and sits in the ablation registry,
+scored on reasoning tokens (it cannot reduce input tokens by construction), registered against the two
+reasoning-model datasets only. This can move the published figure in either direction.
+
+### Ablation arms could be scored on answers nothing had checked — Bug fix
+
+The sampler kept the requests a dataset declared essential but not the requests carrying curated
+facts, the only ones the deterministic gate can grade; on the default profile one dataset graded zero
+answers in every per-group arm and still reported PASS. The sampler now reserves fact-covered requests
+too, and the size coercion accounts for duplicate-pair headroom, which had made the two protections
+mutually exclusive. Grading more can only reveal degradation: this moves the figure down or not at all.
+The extra volume is paid for out of the affected profile's own sizing: the $5 profile swaps its most
+expensive dataset for a cheaper reasoning one and now estimates well under its cap rather than the cap
+being raised; the $25 and $100 profiles measured under their caps unchanged.
+
+### Ask the proxy for the prompt it actually sent — Enhancement (OSS)
+
+The prompt is the only place an optimisation's defects are visible, and nothing kept it. A caller can now
+receive the exact messages and parameters the provider got, alongside the usual savings metadata. Off by default and double-gated: an operator must allow it
+and the caller must ask per request, because the sent prompt can include retrieved documents and
+memories the caller never sent. Provider credentials are never included, real parameters such as the
+output budget are never censored, oversized prompts are marked clipped, a cache-served request says so
+instead of implying a prompt was sent, and every turn of a tool round trip is recorded, including the one
+carrying tool results back to the model. Not available on streamed responses, and on the OpenAI-compatible
+route only (the native Anthropic and Gemini endpoints drop it). The deploy gate now probes
+it: the fail-closed default is verified on every deploy, and an opted-in deployment must echo a sanitised
+request.
+- **OSS:** `observability.echo_sent_prompt` (default `false`) + `max_echo_chars`; per-request
+  `x_echo_prompt`. The ablation harness stores the prompt behind every graded answer.
+
+### Compression no longer silently forfeits the provider's prefix-cache discount — Enhancement (OSS)
+
+Providers only cache a prompt prefix above a minimum size, and they decline in silence: no read, no
+write, no error. A compression that crosses that line can send far fewer tokens and still cost more,
+because a large discount on a repeated prefix is lost. The guard that shipped on 2026-09-04 was
+whole-prompt, all-or-nothing, G01-only and cost-blind; it is replaced. The prefix guard now measures
+the span the provider actually caches, compresses it *down to* the minimum instead of abandoning the
+whole compression, leaves the never-cached remainder fully compressed, and holds tokens back only when
+the provider's own published cache rates and the observed reuse make that cheaper. Off by default.
+It needs the compression sidecar to compress to the floor (without it the span is preserved whole), and a
+provider whose prefix-cache marker is off reports no cacheable span at all, so nothing is ever held back for
+a discount that cannot arrive. The reservation survives being handed from one optimisation to the next,
+and if it ever becomes unmeasurable the guard holds the prompt whole rather than compressing blind. The
+deploy gate probes the guard in both tiers, and the prefix-cache probe pair now carries a genuinely
+cacheable prefix so a missing cache read is a real signal, not a note.
+- **OSS:** `groups.G1_compression.preserve_cacheable_prefix` (semantics changed), `cacheable_prefix_margin`,
+  `assumed_prefix_reuse`, `prefix_reuse_window_seconds`; `providers.<name>.min_cacheable_tokens[_by_model]`;
+  the shared floor is honoured by compression, structured pruning and tool-description trimming alike.
+
 ### Deployments did not verify the Anthropic and Gemini endpoints they serve — Bug fix
 
 Every deploy runs a readiness gate, and a NOT-READY verdict blocks it. That gate skipped the

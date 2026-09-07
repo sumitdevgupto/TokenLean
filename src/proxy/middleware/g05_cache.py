@@ -5,7 +5,6 @@ Saving: 40–70% API calls eliminated
 Technique:
   L1 Exact-match: hash(normalised_prompt) → Redis lookup (sub-millisecond)
   L2 Semantic:    embed query → pgvector cosine similarity (threshold from config)
-  L3 GPTCache:    OSS semantic caching with similarity threshold
   Temporal:       Activity replay for durable step cache execution
   Auto-TTL:       Dynamic TTL based on hit rate and access patterns
 """
@@ -16,7 +15,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from middleware import langfuse_tracing
 
@@ -31,14 +30,15 @@ def _get_cache_hits_counter():
 # Configurable embedding model for L2 semantic cache
 _DEFAULT_L2_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-# L3 semantic cache (Headroom) — DISABLED.
-# The real headroom.SemanticCache API differs from what the _l3_* helpers below
-# assume: the ctor is SemanticCache(config, embedding_fn) (no scorer=) and the
-# methods are get()/put(query, response, messages_hash) — no .search()/ttl=.
-# Wiring it needs an embedding_fn + config rewrite and provides no TTL, while
-# L1 (hash) + L2 (semantic) already cover caching. Left disabled pending a scoped
-# rewrite; the _l3_lookup/_l3_store helpers below no-op while this is None.
-_semantic_cache = None
+# L3 semantic cache — REMOVED 2026-09-07.
+# L3 was a third-party semantic cache that never executed: its backing object was
+# hard-wired to None because the installed library's API did not match what the
+# _l3_* helpers assumed, so every L3 call site short-circuited. The library itself
+# has now been dropped from the image, which makes the "pending a scoped rewrite"
+# note un-keepable — there is no longer a class to rewrite. The helpers, both call
+# sites and the `l3_enabled` / `l3_similarity_threshold` config keys went with it.
+# L1 (exact hash) and L2 (semantic) are unchanged and remain the shipped cache.
+# Note `_semantic_cache_disabled` below is NOT part of L3: it gates L2 and stays.
 
 def _get_redis():
     from cache.redis_pool import get_redis as _pool_get_redis
@@ -109,78 +109,6 @@ class AutoTTLManager:
             return base_ttl
 
 
-def _l3_scope_query(query: str, tenant_id: str) -> str:
-    """Prefix query with tenant_id so SemanticCache similarity search never
-    crosses tenant boundaries. Scoping the query text is the primary isolation
-    guard; `_tenant_id` metadata tag in stored payloads is defense-in-depth."""
-    return f"tenant:{tenant_id}|{query}"
-
-
-def _l3_query(ctx) -> str:
-    """The query text BOTH L3 call sites (lookup + store) must use.
-
-    Folds `_scope_value(ctx)` (model/verbosity/system tags per `cache_scope`) into
-    the semantic query so L3 honours the same isolation contract as L1/L2 — without
-    this, a `tenant+system` operator would be protected on L1/L2 but still collide
-    across system prompts the moment the L3 rewrite lands (`_semantic_cache` is
-    currently None, so this is future-proofing the contract, not a live fix). The
-    scope tags are memoised on ctx.params, so lookup (request) and store (response,
-    after G01/G19 mutate messages) always agree."""
-    scope = _scope_value(ctx)
-    query = _semantic_query_text(ctx.messages)
-    return f"scope:{scope}|{query}" if scope else query
-
-
-async def _l3_lookup(query: str, threshold: float, tenant_id: str = "default") -> Tuple[Optional[Dict], float]:
-    """Search headroom.SemanticCache with similarity threshold, scoped to tenant.
-
-    Defense-in-depth: after a hit, verify the stored `_tenant_id` tag matches
-    the caller's tenant — catches any future bypass where a caller passes an
-    unscoped query to a second lookup call site.
-    """
-    if _semantic_cache is None:
-        return None, 0.0
-
-    scoped_query = _l3_scope_query(query, tenant_id)
-    try:
-        result = await asyncio.to_thread(
-            lambda: _semantic_cache.search(scoped_query, threshold)
-        )
-        if result and len(result) > 0:
-            data = result[0]
-            response = data.get("response")
-            similarity = data.get("similarity", 0.0)
-            if isinstance(response, dict):
-                stored_tenant = response.get("_tenant_id", "")
-                if stored_tenant and stored_tenant != tenant_id:
-                    logger.warning(
-                        "L3 cross-tenant hit rejected: stored=%s caller=%s",
-                        stored_tenant, tenant_id,
-                    )
-                    return None, 0.0
-            return response, similarity
-        return None, 0.0
-    except Exception as exc:
-        logger.debug("L3 SemanticCache lookup failed: %s", exc)
-        return None, 0.0
-
-
-async def _l3_store(query: str, response: Dict, ttl: int, tenant_id: str = "default") -> None:
-    """Store response in headroom.SemanticCache, scoped to tenant_id."""
-    if _semantic_cache is None:
-        return
-
-    scoped_query = _l3_scope_query(query, tenant_id)
-    tagged_response = {**response, "_tenant_id": tenant_id}
-    try:
-        await asyncio.to_thread(
-            lambda: _semantic_cache.put(scoped_query, {"response": tagged_response}, ttl=ttl)
-        )
-        logger.debug("L3 SemanticCache stored response")
-    except Exception as exc:
-        logger.debug("L3 SemanticCache store failed: %s", exc)
-
-
 def _normalise(messages: list) -> str:
     """Normalise messages for the L1 exact-match key: strip whitespace, lowercase.
 
@@ -197,7 +125,7 @@ def _normalise(messages: list) -> str:
 
 
 def _semantic_query_text(messages: list) -> str:
-    """Text to embed for L2/L3 semantic matching: the user turns only.
+    """Text to embed for L2 semantic matching: the user turns only.
 
     The system prompt is fixed infrastructure (role, policies, formatting). Embedding
     it lets a prompt longer than the embedding window (~512 tokens for bge-small)
@@ -237,7 +165,7 @@ def _is_multiturn_continuation(ctx) -> bool:
 
     For such a request the correct response is a function of the accumulated
     conversation state (what was already said, which tools ran and what they
-    returned), not just the embeddable user text. A *fuzzy* L2/L3 semantic match
+    returned), not just the embeddable user text. A *fuzzy* L2 semantic match
     between two different continuations can therefore return a response generated
     for a DIFFERENT state — e.g. one turn's tool plan served for another turn's
     question. (Observed: a follow-up asking for a user profile matched the prior
@@ -253,7 +181,7 @@ def _is_multiturn_continuation(ctx) -> bool:
 
 
 def _semantic_cache_disabled(ctx) -> bool:
-    """Whether L2/L3 *semantic* caching must be skipped for this request.
+    """Whether L2 *semantic* caching must be skipped for this request.
 
     L1 exact-match caching is unaffected. Two triggers:
       * **Explicit opt-out** via ``x_cache_semantic=false`` — exact-only caching
@@ -471,7 +399,7 @@ def _hash_args(args: tuple, kwargs: dict) -> str:
 
 
 class G05Cache:
-    """G05 cache with L1 (Redis exact), L2 (pgvector semantic), L3 (GPTCache), and auto-TTL."""
+    """G05 cache with L1 (Redis exact), L2 (pgvector semantic), and auto-TTL."""
     
     def __init__(self):
         # One AutoTTLManager per tenant prefix (I4) — stats must not be shared
@@ -599,47 +527,7 @@ class G05Cache:
         except Exception as exc:
             logger.warning("G05 L2 pgvector error: %s", exc)
 
-        # L3 — headroom.SemanticCache(scorer="hybrid")
-        # Config key: l3_enabled (preferred) or gptcache_enabled (backward compat)
-        l3_enabled = cfg.get("l3_enabled", cfg.get("gptcache_enabled", False))
-        if l3_enabled and _semantic_cache is not None and not _semantic_cache_disabled(ctx):
-            l3_threshold = cfg.get("l3_similarity_threshold", cfg.get("gptcache_similarity_threshold", 0.85))
-            try:
-                cached_response, score = await _l3_lookup(
-                    _l3_query(ctx), l3_threshold,
-                    tenant_id=getattr(ctx, "tenant_id", "default"),
-                )
-                if cached_response:
-                    ctx.cache_hit = True
-                    ctx.cache_level = "L3"
-                    ctx.cache_response = cached_response
-                    ctx.savings.cache_hit = True
-                    ctx.savings.cache_level = "L3"
-                    ctx.savings.final_tokens_sent = 0
-                    ctx.savings.proxy_optimised_tokens = 0   # B1: nothing sent to LLM
-                    ctx.savings.provider_prompt_tokens = 0
-                    ctx.savings.add_step(
-                        GROUP,
-                        f"L3 SemanticCache hit (score={score:.3f})",
-                        tokens_before,
-                        0,
-                    )
-                    langfuse_tracing.add_span(
-                        ctx,
-                        name="G05-cache",
-                        span_input={"tokens_before": tokens_before, "l3_threshold": l3_threshold},
-                        output={"cache_level": "L3", "tokens_after": 0},
-                        metadata={"cache_hit": True, "level": "L3", "similarity_score": round(score, 3)},
-                    )
-                    logger.debug("[%s] G05 L3 SemanticCache hit score=%.3f", ctx.request_id, score)
-                    if ttl_manager:
-                        await ttl_manager.record_hit("L3")
-                    return ctx
-                else:
-                    if ttl_manager:
-                        await ttl_manager.record_miss("L3")
-            except Exception as exc:
-                logger.debug("G05 L3 SemanticCache error: %s", exc)
+        # (L3 removed 2026-09-07 — see the note at the top of this module.)
 
         # Step-level idempotent cache (only when x_step_name is present)
         if cfg.get("step_cache_enabled", True):
@@ -690,7 +578,7 @@ class G05Cache:
     async def store_response(
         self, ctx: "RequestContext", response: Dict[str, Any]
     ) -> None:
-        """Store the LLM response in L1, L2, L3, and step caches after a successful call."""
+        """Store the LLM response in L1, L2, and step caches after a successful call."""
         # F2-dispatched answers come from a tenant-registered downstream agent, not the
         # main LLM — caching them would let a later matching prompt be served straight
         # from cache (G05's lookup runs BEFORE F2 in the pipeline), bypassing intent
@@ -734,16 +622,7 @@ class G05Cache:
         except Exception as exc:
             logger.warning("G05 L2 store failed: %s", exc)
 
-        # L3 SemanticCache store
-        l3_enabled = cfg.get("l3_enabled", cfg.get("gptcache_enabled", False))
-        if l3_enabled and _semantic_cache is not None and not _semantic_cache_disabled(ctx):
-            try:
-                await _l3_store(
-                    _l3_query(ctx), response, l2_ttl,
-                    tenant_id=getattr(ctx, "tenant_id", "default"),
-                )
-            except Exception as exc:
-                logger.debug("G05 L3 SemanticCache store failed: %s", exc)
+        # (L3 store removed 2026-09-07 — see the note at the top of this module.)
 
         # Step cache store
         if cfg.get("step_cache_enabled", True):

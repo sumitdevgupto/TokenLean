@@ -19,6 +19,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext, resolve_group_config
+from middleware import cache_floor
 from middleware import langfuse_tracing
 from savings.calculator import count_messages_tokens
 
@@ -204,6 +205,34 @@ class G21CacheAlignment:
         except Exception as exc:
             logger.debug("[%s] G21 align_prefix failed: %s", ctx.request_id, exc)
             reordered = False
+
+        # Say so when the markers cannot possibly pay out (backlog #41). A provider that
+        # will not cache a span this small declines in SILENCE — no read, no write, no
+        # error — so without this line the only visible evidence is a cost that quietly
+        # fails to fall. Reported whether or not the prefix-floor guard is enabled,
+        # because the default is off and this is exactly the case an operator needs to
+        # see before deciding to turn it on.
+        try:
+            floor = adapter.min_cacheable_prompt_tokens(ctx.config, ctx.routed_model)
+            if floor:
+                span = cache_floor.span_tokens_for(adapter, ctx, ctx.messages, ctx.config)
+                if 0 < span < floor:
+                    # INFO only when it is actionable: a marker was actually placed (so
+                    # something concrete cannot pay out), or the operator turned the floor
+                    # guard on and is looking for exactly this. Otherwise it is one line
+                    # per request on a shipped default that nobody asked for, which buries
+                    # the case that matters.
+                    g01_cfg = resolve_group_config(ctx, "G1_compression") or {}
+                    actionable = reordered or g01_cfg.get("preserve_cacheable_prefix", False)
+                    logger.log(
+                        logging.INFO if actionable else logging.DEBUG,
+                        "[%s] G21: cacheable span is %d tokens, under %s's %d-token "
+                        "minimum — this prefix will not be cached and the alignment "
+                        "cannot pay out",
+                        ctx.request_id, span, provider, floor,
+                    )
+        except Exception as exc:  # never fail a request over a diagnostic
+            logger.debug("[%s] G21 floor check failed: %s", ctx.request_id, exc)
 
         # Provider cache policy (e.g. OpenAI prompt_cache_key) — provider-agnostic,
         # delegated to the adapter so middleware stays free of provider strings.

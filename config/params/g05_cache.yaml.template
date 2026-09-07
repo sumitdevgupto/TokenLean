@@ -1,5 +1,5 @@
 # G05 — Response & Step Caching
-# Controls L1 (Redis exact), L2 (pgvector semantic), L3 (GPTCache), step, and
+# Controls L1 (Redis exact), L2 (pgvector semantic), step, and
 # temporal-activity caching layers.
 #
 # Copy to config/params/g05_cache.yaml and fill in values for your environment.

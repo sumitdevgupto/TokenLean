@@ -247,12 +247,53 @@ class ProviderAdapter(ABC):
         Returned from config so an operator can track a provider's published minimum
         without a redeploy; 0 (the default here) leaves every dependent guard inert, so
         an adapter that does not override this changes nothing.
+
+        ``min_cacheable_tokens_by_model`` wins over the flat value when one of its
+        patterns matches: at least one provider's minimum is model-dependent, and a
+        single per-provider number would be wrong for half that provider's catalog.
+        Patterns are matched longest-first so a specific model beats a family prefix.
+        Model names live in CONFIG, never here — the same rule that keeps provider name
+        strings out of middleware.
         """
         entry = self._provider_entry(config)
+        by_model = entry.get("min_cacheable_tokens_by_model")
+        if isinstance(by_model, dict) and model:
+            lowered = str(model).lower()
+            for pattern in sorted(by_model, key=lambda p: -len(str(p))):
+                pat = str(pattern).lower().rstrip("*")
+                if pat and lowered.startswith(pat):
+                    try:
+                        return max(0, int(by_model[pattern] or 0))
+                    except (TypeError, ValueError):
+                        break
         try:
             return max(0, int(entry.get("min_cacheable_tokens", 0) or 0))
         except (TypeError, ValueError):
             return 0
+
+    def cacheable_span_messages(
+        self, messages: List[Dict], params: Dict, config: Dict
+    ) -> List[Dict]:
+        """The messages this provider measures its cacheable-prefix minimum over.
+
+        Not every provider measures the same thing. Some cache the entire serialized
+        prefix and apply the minimum to the whole prompt; others cache only the block up
+        to an explicit marker, and apply the minimum to that block alone. Comparing the
+        wrong quantity against the floor produces a guard that fires on the wrong
+        requests and stands down on the right ones.
+
+        ``config`` is the FULL config — the same contract as
+        :meth:`cache_read_cost_multiplier` — because an adapter whose span exists only
+        when the operator enabled a marker has to be able to see whether they did.
+        Returning ``[]`` says "no cacheable span on this deployment", and every caller
+        treats that as nothing to protect.
+
+        Default: the whole prompt — which is both the commoner shape and the behaviour
+        that existed before any of this, so an adapter that does not override changes
+        nothing. ``align_prefix`` and this method must agree: whichever messages an
+        adapter marks are the messages whose size decides whether the marker pays out.
+        """
+        return list(messages)
 
     def render_tools_for_counting(self, tools: List[Dict]) -> Optional[Tuple[str, int]]:
         """(body_text, constant_overhead) approximating how THIS provider bills tool

@@ -106,6 +106,36 @@ class AnthropicAdapter(ProviderAdapter):
             changed = True
         return changed
 
+    def cacheable_span_messages(
+        self, messages: List[Dict], params: Dict, config: Dict
+    ) -> List[Dict]:
+        """This provider caches the block up to the LAST cache_control marker, not the
+        whole prompt — so its minimum is measured over tools + system only.
+
+        Kept deliberately in step with ``align_prefix`` above, which places that marker on
+        the last system message and the last tool: the block whose size decides whether
+        the marker pays out is exactly the block the marker covers. Tool definitions are
+        counted by the caller from ``params["tools"]``; they sit first inside the block and
+        are the reason a tool-description trim can push it under the minimum.
+
+        **No marker, no span.** This provider caches nothing unless ``align_prefix``
+        placed a ``cache_control`` marker, and that is opt-in and ships OFF. Reporting a
+        span anyway would have the floor guard hold tokens back to defend a discount the
+        provider was never going to grant — a straight loss for the customer, on the
+        shipped default. ``config`` is the full config, same as the multipliers below.
+
+        From provider docs, 2026-09 — verify before any default flip.
+        """
+        provider_cfg = (
+            (config or {}).get("groups", {})
+            .get("G21_cache_alignment", {})
+            .get("providers", {})
+            .get("anthropic", {})
+        )
+        if not provider_cfg.get("marker", False):
+            return []
+        return [m for m in messages if m.get("role") == "system"]
+
     def map_structured_output(
         self,
         format_type: str,

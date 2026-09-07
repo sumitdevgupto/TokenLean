@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Dict, Optional, Tuple
 
 from config_loader import get_config
 from middleware import RequestContext, apply_operator_overlay
+from middleware import cache_floor
 from middleware.g00_rate_limit import G00RateLimit, RateLimitExceeded
 from providers import get_adapter
 from tenancy.resolver import resolve_tenant
@@ -313,6 +314,13 @@ class OptimisationPipeline:
             logger.info("[%s] F2 dispatched to downstream agent '%s'", ctx.request_id, ctx.agent_id)
             otel.end_span(pipeline_span)
             return ctx
+
+        # Prefix-cache floor reservation. Must run BEFORE Stage 3 and cannot live in G21,
+        # which is the LAST request-side stage: by the time G21 executes every compressor
+        # has already shrunk the prompt, so it can align what it is handed but cannot
+        # protect it. Reserved once here so G01, G08 and G19 all measure the same span
+        # against the same floor. Default-off and fail-safe: any unknown leaves it inert.
+        await cache_floor.reserve(ctx)
 
         # Stage 3 — Into the LLM
         for _name, _mid, _group in [

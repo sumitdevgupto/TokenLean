@@ -117,8 +117,15 @@ providers:
   # Smallest prompt this provider will cache a prefix for. Below it the provider
   # silently declines to cache -- no read, no write, no error. Only consulted when a
   # feature opts in (groups.G1_compression.preserve_cacheable_prefix); 0 disables it.
-  # Verify against the provider's current docs before changing.
+  # This provider measures the minimum over the ENTIRE prompt prefix in serialized
+  # order. From provider docs, 2026-09 -- verify before any default flip.
   min_cacheable_tokens: 1024
+  # Per-model override, longest matching prefix wins. Every key is a PREFIX match with
+  # or without a trailing `*` -- `gpt-4o` also matches `gpt-4o-mini`, so list the more
+  # specific model too when they differ. This provider's minimum is flat across its
+  # catalog, so the map is illustrative rather than required:
+  #   min_cacheable_tokens_by_model:
+  #     gpt-4o: 1024
   # Optional per-provider resilience override (merges over the top-level `resilience:`
   # block). E.g. a flakier provider can trip its breaker sooner:
   #   resilience:
@@ -160,9 +167,19 @@ providers:
   - ada
 - name: anthropic
   api_base: https://api.anthropic.com/v1
-  # See the openai entry: 1024 for Sonnet/Opus-class models, higher for the
-  # smallest ones -- check the provider's docs for the models you route to.
+  # See the openai entry, with two differences. This provider measures the minimum
+  # over the BLOCK up to its last cache_control marker -- tools, then system, then any
+  # marked messages -- not over the whole prompt. And its minimum is model-dependent,
+  # so the by-model map below is the value that actually applies; the flat entry is
+  # only the fallback for a model no pattern matches.
+  # From provider docs, 2026-09 -- verify before any default flip.
   min_cacheable_tokens: 1024
+  min_cacheable_tokens_by_model:
+    claude-opus: 1024
+    claude-sonnet: 1024
+    claude-3-haiku: 2048
+    claude-3-5-haiku: 2048
+    claude-haiku-4-5: 4096
   models:                        # verified 2026-08-06
   - claude-opus-5                # current Opus
   - claude-sonnet-5
@@ -178,6 +195,15 @@ providers:
 # so only model_prefixes are required. Set the matching LLM_KEY_<NAME> / llm-key-<name>.
 # models[] lead with each provider's cheapest model (verify exact IDs against the provider).
 - name: gemini
+  # Measured over the whole prompt prefix, like the openai entry, but model-dependent.
+  # From provider docs, 2026-09 -- verify before any default flip.
+  min_cacheable_tokens: 1024
+  min_cacheable_tokens_by_model:
+    gemini-3.6-flash: 1024
+    gemini-3.5-flash: 1024
+    gemini-flash: 1024
+    gemini-3.1-pro: 2048
+    gemini-pro: 2048
   models:                      # verified 2026-08-06
   - gemini-3.6-flash           # current stable flash
   - gemini-3.5-flash
@@ -524,15 +550,43 @@ groups:
   G1_compression:
     enabled: true
     min_tokens_to_compress: 200
-    # Default OFF. When true, G01 abandons a compression that would take the prompt
-    # BELOW the routed provider's minimum cacheable size (providers.<name>.
-    # min_cacheable_tokens). Below that floor a provider silently stops caching the
-    # prefix -- no read, no write, no error -- so a prompt that compresses under it
-    # can cost MORE than the uncompressed one on a workload whose prefix repeats
-    # (measured: 63% fewer tokens sent, 2.5x the input cost). Whether that trade is
-    # bad depends entirely on whether YOUR prefix repeats, which is why this is
-    # opt-in rather than a default.
+    # Default OFF. When true, G01, G08 and G19 stop shrinking the span your provider
+    # measures against its minimum cacheable size (providers.<name>.min_cacheable_tokens
+    # / min_cacheable_tokens_by_model) past that minimum. Below the minimum a provider
+    # silently stops caching the prefix -- no read, no write, no error -- so a prompt
+    # compressed under it can cost MORE than the uncompressed one on a workload whose
+    # prefix repeats (measured: 63% fewer tokens sent, 2.5x the input cost).
+    #
+    # This is NOT a blanket "stop compressing". It compares the two bills using your
+    # provider's own published cache rates and the reuse it actually observes, and holds
+    # tokens back only when that is cheaper. G01 aims the span just ABOVE the minimum
+    # rather than abandoning the compression, and content outside the span (which is
+    # never cached) stays fully compressed either way. On a workload whose prefix does
+    # NOT repeat, or on a provider whose cache discount is small, the arithmetic says
+    # compress and nothing is held back.
+    #
+    # Aiming the span AT the minimum needs a compression engine with a rate dial, which
+    # here is the LLMLingua sidecar (`sidecar_url` below). Without it -- sidecar not
+    # deployed, unreachable, or unable to land above the minimum -- there is nothing to
+    # aim, and the span is PRESERVED WHOLE instead. That is still correct and still
+    # cheaper on a repeating prefix, but it gives back the whole prefix's compression
+    # rather than only the part that was at stake. Content outside the span stays
+    # compressed either way.
+    #
+    # Still opt-in: at the first sighting of a prefix there is no reuse to bank on, and
+    # a provider may evict a cached block before the reuse arrives.
     preserve_cacheable_prefix: false
+    # Headroom above the minimum when aiming the span at it (0.05 = stop ~5% above).
+    # Token counts are estimates; undershooting forfeits the whole discount.
+    cacheable_prefix_margin: 0.05
+    # Reuse to assume before any has been observed. 1 = assume none, which makes the
+    # guard stand down until repeats are actually seen. Raising it on a deployment whose
+    # prefixes do not repeat costs money -- evidence, not optimism.
+    assumed_prefix_reuse: 1
+    # How long a prefix sighting counts toward the reuse total, as a FIXED window: the
+    # first sighting starts the clock and the count restarts when it runs out. Track your
+    # provider's prompt-cache TTL; too long over-counts reuse that has already expired.
+    prefix_reuse_window_seconds: 300
     compression_ratio_target: 0.5
     force_reserve_digit: true        # preserve digit tokens (dates/IDs/amounts) so compression can't corrupt a tool argument
     sidecar_url: http://llmlingua-svc:8080/compress
@@ -649,8 +703,9 @@ groups:
     l2_ttl_seconds: 86400
     step_cache_enabled: true
     step_cache_ttl_seconds: 86400
-    l3_enabled: true
-    l3_similarity_threshold: 0.85
+    # (l3_enabled / l3_similarity_threshold removed 2026-09-07 — the L3 tier never
+    #  executed and its library has been dropped. L1 exact-match and L2 semantic are
+    #  the shipped cache tiers. A leftover l3_* key in an existing config is ignored.)
     auto_ttl_enabled: true
     auto_ttl_min_multiplier: 0.25
     auto_ttl_max_multiplier: 2.0
@@ -1243,11 +1298,14 @@ groups:
     max_store_chars: 200000
     compress_system_prompt: false  # keep false — the system instruction must stay verbatim
                                    # (the model can't resolve a CCR ref for it in pass-through)
+  # Reserved slot. No image/audio transform ships in this release: this proxy's token
+  # accounting does not measure image content (only text parts are counted, and nothing
+  # prices an image), so a byte-level image optimisation could not reduce a token we
+  # measure or bill, while re-encoding would silently alter your payload. Turning this
+  # on is harmless but changes nothing and records no savings. The `min_bytes`,
+  # `quality` and `provider` knobs were removed on 2026-09-07 with the library they tuned.
   G27_multimodal:
-    enabled: true
-    min_bytes: 4096
-    quality: 75
-    provider: null                   # optional Headroom provider hint; null = auto-detect from the active adapter
+    enabled: false
   G24_adaptive_bypass:
     enabled: true
     rules_file: config/adaptive_bypass_rules.yaml
@@ -1478,3 +1536,34 @@ orchestration:
     #   api_key_env: BILLING_AGENT_KEY # optional: env var holding the agent's API key
     #   max_tokens: 1024              # optional: per-agent output budget (governance)
     #   timeout_seconds: 60           # optional: dispatch timeout before fallback
+
+# ── Observability — operator-only diagnostics ────────────────────────────────
+# OPERATOR-ONLY on purpose: these are NOT tenant-facing portal knobs. They govern what a
+# response is allowed to disclose about the proxy's own internals, which is a deployment
+# decision, not a per-tenant preference — so they are deliberately absent from the portal
+# group catalog.
+observability:
+  # Allow a caller to ask for the prompt the proxy ACTUALLY SENT to the provider, echoed
+  # back under `_token_opt.sent` as {model, messages, params}. Requires BOTH this flag and
+  # the per-request parameter `x_echo_prompt: true` — neither alone does anything, and the
+  # default below means no deployment discloses it until an operator decides to.
+  #
+  # Why it exists: every optimisation acts on the prompt, so the prompt is the only place
+  # its defects are visible, and it was the one thing nothing kept. A 2026-09-06 compaction
+  # defect replaced customer tool-result content with an unresolvable reference on billed
+  # 200s and no artefact could show what the model had received.
+  #
+  # Why it is off by default: the echoed prompt can contain content the CALLER never sent —
+  # retrieved document chunks (G07), conversation memories (G10), registry templates (G02),
+  # compression-resolved blocks (G28). Inside one tenant that is that tenant's own data,
+  # but on a shared deployment an end user is not necessarily entitled to everything the
+  # retriever pulled. The provider credential is never included: the echo is built from the
+  # outgoing parameter set, never from the adapter's connection kwargs.
+  #
+  # Not available on streamed responses (they return before response metadata is attached)
+  # and not on the native Anthropic/Gemini ingress routes (which drop `_token_opt`).
+  echo_sent_prompt: false
+  # Size ceiling for one echo, in characters of serialised JSON. Over it, message content is
+  # clipped and `truncated: true` is set — never silently shortened, because a quietly
+  # trimmed prompt reads as evidence of what the model saw while being something else.
+  max_echo_chars: 200000

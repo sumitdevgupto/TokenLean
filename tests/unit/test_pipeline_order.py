@@ -108,6 +108,19 @@ class TestPipelineStageOrdering:
             f"Expected G02({g02_pos}) < G20({g20_pos}) < G07({g07_pos}), got: {call_log}"
         )
 
+        # G27 is a RESERVED no-op (no image transform ships since 2026-09-07), which makes
+        # it the one stage a future cleanup could delete without any test noticing. Pin the
+        # slot AND its position: a reserved stage is only worth keeping if it is still wired
+        # where a real multimodal optimisation would have to run.
+        assert "G27" in call_log, (
+            f"G27's reserved stage is no longer in the pipeline: {call_log}"
+        )
+        g01_pos = call_log.index("G01")
+        g27_pos = call_log.index("G27")
+        assert g01_pos < g27_pos < g02_pos, (
+            f"Expected G01({g01_pos}) < G27({g27_pos}) < G02({g02_pos}), got: {call_log}"
+        )
+
     @pytest.mark.asyncio
     async def test_g22_runs_after_g10_and_before_g16(self):
         """G22 must appear in call order between G10 and G16."""
@@ -249,6 +262,58 @@ class TestPipelineStageOrdering:
         g01_pos = call_log.index("G01")
         assert g06_pos < f2_pos < g01_pos, (
             f"Expected G06({g06_pos}) < F2({f2_pos}) < G01({g01_pos}), got: {call_log}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cache_floor_is_reserved_before_every_group_that_shrinks_the_prompt(self):
+        """The prefix-cache floor must be reserved BEFORE Stage 3 (backlog #41).
+
+        It cannot live in G21, which is the last request-side stage: by then G01, G08 and
+        G19 have already shrunk the prompt, so G21 can align what it is handed but cannot
+        protect it. Reserving once here is also what makes all three groups measure the
+        SAME span against the SAME floor — the first cut guarded only G01, and G08/G19
+        ran afterwards and undid it.
+        """
+        from middleware.pipeline import OptimisationPipeline
+
+        call_log = []
+        pipeline = OptimisationPipeline.__new__(OptimisationPipeline)
+
+        def _make(name):
+            return self._tracked_mock(call_log, name)
+
+        pipeline._tenant_config_loader = AsyncMock()
+        pipeline._tenant_config_loader.load = AsyncMock()
+        for _n in ("g00", "g01", "g02", "g04", "g05", "g06", "g07", "g08", "g09", "g10",
+                   "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g24",
+                   "g25", "g26", "g27", "g28", "g29", "g30", "g31", "g15"):
+            setattr(pipeline, _n, _make(_n.upper()))
+        pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
+        pipeline.f2 = _make("F2")
+        pipeline.g18 = MagicMock()
+
+        async def _reserve(ctx):
+            call_log.append("CACHE_FLOOR")
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel, \
+             patch("middleware.pipeline.cache_floor") as mock_cf:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            mock_cf.reserve = _reserve
+
+            ctx = _make_ctx()
+            await pipeline.process_request(ctx)
+
+        assert "CACHE_FLOOR" in call_log, "the floor was never reserved"
+        reserve_pos = call_log.index("CACHE_FLOOR")
+        for group in ("G01", "G08", "G19"):
+            assert reserve_pos < call_log.index(group), (
+                f"{group} shrinks the prompt and ran BEFORE the floor was reserved, so it "
+                f"had nothing to honour: {call_log}"
+            )
+        assert call_log.index("G06") < reserve_pos, (
+            "the floor depends on the ROUTED model's provider, so G06 must have run"
         )
 
     @pytest.mark.asyncio
