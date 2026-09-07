@@ -21,6 +21,19 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-07
+
+### Deployments did not verify the Anthropic and Gemini endpoints they serve — Bug fix
+
+Every deploy runs a readiness gate, and a NOT-READY verdict blocks it. That gate skipped the
+protocol matrix, so the native Anthropic `/v1/messages` and Gemini `generateContent` endpoints —
+the ones a Claude or Gemini SDK talks to — were never exercised on an ordinary deploy; they were
+checked only in the deeper pre-release tier. The verdict already knew how to fail on a protocol
+error, but in the quick tier it was handed a placeholder that always reported success. The two
+checks now run on every deploy. They cost two 32-token calls against the roughly two dozen the
+gate already makes. Note what they establish: request/response translation for each endpoint,
+not the Anthropic or Gemini services themselves.
+
 ## 2026-09-06
 
 ### Prompt compression could invert the meaning of a policy it shortened — Bug fix
