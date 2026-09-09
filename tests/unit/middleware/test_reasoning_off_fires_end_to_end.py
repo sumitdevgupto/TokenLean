@@ -85,11 +85,32 @@ class TestTheChainFiresOnTheWorkloadThatMotivatedIt:
     async def test_disabling_the_bridge_restores_the_old_billing_shape(
             self, make_ctx, minimal_config):
         """The before-picture, kept executable: with the bridge off, thinking comes back
-        at a 5,000-token budget on a one-line FAQ lookup."""
+        at a 5,000-token budget on a one-line FAQ lookup.
+
+        Re-expressed under leader decision D-076 (2026-09-08). It now takes TWO opt-outs
+        to reach that shape, not one: G25 also clamps to the routed PROVIDER's own default
+        effort, and on Anthropic that is `off` — extended thinking is opt-in there, so
+        selecting `medium` never lowered a bill, it raised one. The before-picture is
+        therefore only reachable with `escalate_above_provider_default: true`, which is
+        the whole content of the fix; the subject of this test (what the old shape looked
+        like, and that the bridge is what removes it) is unchanged."""
         out = await _run(make_ctx, minimal_config, "claude-sonnet-4-5", AnthropicAdapter(),
-                         use_routing_complexity=False)
+                         use_routing_complexity=False,
+                         escalate_above_provider_default=True)
         assert out.params["thinking"] == {"type": "enabled", "budget_tokens": 5000}
         assert out.reasoning_mode == "medium"
+
+    async def test_without_that_opt_in_anthropic_thinking_stays_off(
+            self, make_ctx, minimal_config):
+        """The D-076 fix at the end of the real chain: even with the G06 bridge disabled
+        and the classifier free to say `medium`, G25 does not turn Anthropic extended
+        thinking on for a caller who never asked for it. This is the request the customer
+        would have got without the proxy — which is what "non-increasing" has to mean."""
+        out = await _run(make_ctx, minimal_config, "claude-sonnet-4-5", AnthropicAdapter(),
+                         use_routing_complexity=False)
+        assert "thinking" not in out.params
+        assert "reasoning_effort" not in out.params
+        assert out.reasoning_mode == "off_honoured"
 
 
 @pytest.mark.asyncio

@@ -128,6 +128,24 @@ class GeminiAdapter(ProviderAdapter):
             return {}
         return {"thinking_config": {"thinking_budget": budget}}
 
+    def default_reasoning_effort(self, model: str, config: Optional[Dict] = None) -> str:
+        """``medium`` — Gemini's thinking models think by default.
+
+        Deliberately NOT the base ``off``. Omitting ``thinking_config`` on this provider
+        does not mean "no thinking": the 2.5 family applies its own dynamic budget, and
+        ``off`` here is an EXPLICIT ``thinking_budget: 0`` (see ``map_reasoning_effort``).
+        Reporting ``off`` as the provider default would make the caller of this method
+        clamp every Gemini request down to a hard disable — a change to what the provider
+        would have done, in the quality-losing direction, dressed up as "non-increasing".
+        The honest answer is the middle tier: G25 may still lower effort from here, and
+        `high` is refused unless the operator opts into escalation.
+
+        An operator whose Gemini models do not think by default states it on the provider
+        entry with ``default_reasoning_effort: 'off'``.
+        """
+        override = self._configured_default_reasoning_effort(config)
+        return override if override is not None else "medium"
+
     def cap_reasoning_params(self, params: Dict, max_tokens: Optional[int]) -> Dict:
         """Keep ``thinking_config.thinking_budget`` below ``max_tokens`` (0 disables thinking)."""
         if not max_tokens:

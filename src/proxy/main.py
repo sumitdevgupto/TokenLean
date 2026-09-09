@@ -63,9 +63,12 @@ from middleware.g18_observability import (
 )
 from protocols import OPENAI, ANTHROPIC, GEMINI
 import events
-from middleware import RequestContext
+from middleware import RequestContext, record_provider_call
 from middleware.g00_rate_limit import RateLimitExceeded
 from middleware.g03_doc_pipeline import trigger_doc_ingestion
+# The SAME predicate G05 uses to refuse STORING an empty answer, reused here to refuse
+# SERVING one that is already stored. One definition, so the two sides cannot drift.
+from middleware.g05_cache import _is_empty_answer as _is_empty_cached_answer
 from middleware.g13_batch import start_batch_consumer, start_batch_poller
 from middleware.pipeline import OptimisationPipeline
 from middleware import langfuse_tracing
@@ -762,21 +765,91 @@ _audit_logger = None  # core AuditLogger for G29/G30 security events (lifespan-w
 
 def _schedule_security_audit(ctx) -> None:
     """Fire-and-forget PII-free ``audit_events`` rows for any G29 redaction / G30
-    guardrail / G31 context-trust / G32 tool-eligibility activity on this request. No-op
-    without ctx / a wired audit logger / a running loop, and skips the task entirely when
-    nothing was flagged. Best-effort: audit must never block or break the response path."""
+    guardrail / G31 context-trust / G32 tool-eligibility activity on this request — and
+    for an empty billed completion. No-op without ctx / a wired audit logger / a running
+    loop, and skips the task entirely when nothing was flagged. Best-effort: audit must
+    never block or break the response path.
+
+    This gate is the ONLY dispatcher of ``log_security_events``. Every condition that
+    file can write a row for must therefore appear here: a signal missing from this
+    tuple is a signal whose row can only ever be emitted as a side effect of some
+    unrelated event firing on the same request. ``empty_completion`` was exactly that
+    until 2026-09-09 — the writer existed, six tests certified it, and every one of them
+    called ``log_security_events`` directly and so never crossed this line."""
     if ctx is None or _audit_logger is None:
         return
     if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)
             or getattr(ctx, "context_trust_action", None)
             or getattr(ctx, "context_trust_pii_action", None)
             or getattr(ctx, "tool_eligibility_action", None)
-            or getattr(ctx, "tool_dispatch_blocked", None)):
+            or getattr(ctx, "tool_dispatch_blocked", None)
+            or getattr(ctx, "empty_completion", None)):
         return
     try:
         asyncio.create_task(_audit_logger.log_security_events(ctx))
     except RuntimeError:  # no running loop (not the request path) — skip
         logger.debug("[%s] security audit skipped: no loop", getattr(ctx, "request_id", "?"))
+
+
+def _refuse_empty_cache_hit(ctx) -> bool:
+    """Refuse a cache HIT whose stored answer is empty, so the request falls through to
+    the provider. Returns True when the hit was refused.
+
+    The store-side guard in ``g05_cache.store_response`` stops NEW empty answers going
+    in; it can do nothing about the ones already there. Those entries keep their full TTL
+    (L1 1h, L2 24h) and this branch returns without running the response pipeline at all,
+    so the empty-completion detector never sees them either — every look-alike question
+    from that tenant would be answered, and billed, with nothing, until the TTL expired.
+    A READ-side refusal is the only layer that reaches them.
+
+    Deliberately confined to ``cache_hit``: ``bypassed`` shares the branch but its
+    response never came from the cache, and a bypass rule may legitimately serve a
+    content-less canned reply.
+
+    ``no_cache`` is deliberately NOT set. The fresh provider answer stores under the same
+    key and so OVERWRITES the poisoned entry — the path self-heals on the first refusal
+    instead of refusing, and paying for, every request for the rest of the TTL. If that
+    answer is empty too, ``g05_cache.store_response``'s own guard refuses it, so a bad
+    entry can never be re-created here.
+
+    Mirrors the G32 hoist immediately below — the same reasoning about this branch
+    returning before the response pipeline, applied to the other thing that pipeline
+    would have caught.
+    """
+    try:
+        if not getattr(ctx, "cache_hit", False):
+            return False
+        cached = getattr(ctx, "cache_response", None)
+        if not isinstance(cached, dict) or not _is_empty_cached_answer(cached):
+            return False
+        logger.warning(
+            "[%s] G05 refusing an EMPTY cached answer (level=%s, finish_reason=%s) — "
+            "falling through to the provider rather than billing for nothing",
+            getattr(ctx, "request_id", "?"), getattr(ctx, "cache_level", "?"),
+            ((cached.get("choices") or [{}])[0] or {}).get("finish_reason") or "(none)",
+        )
+        ctx.cache_hit = False
+        ctx.cache_response = None
+        ctx.cache_level = None
+        savings = getattr(ctx, "savings", None)
+        if savings is not None:
+            for _attr, _val in (("cache_hit", False), ("cache_level", None)):
+                if hasattr(savings, _attr):
+                    setattr(savings, _attr, _val)
+            # G05 records "L1 exact-match cache hit" with tokens_after=0 at LOOKUP time.
+            # If that step survived a refused hit, the ledger would claim a 100% saving
+            # for a request that then went to the provider in full — the same plan-time
+            # phantom D-073 removed from G06, arriving through a different door. The
+            # cache did not serve this request, so it gets no step.
+            _steps = getattr(savings, "step_savings", None)
+            if isinstance(_steps, list):
+                savings.step_savings = [s for s in _steps
+                                        if getattr(s, "group", None) != "G05"]
+        return True
+    except Exception as exc:  # noqa: BLE001 — never turn a served hit into an error
+        logger.debug("[%s] empty-cache-hit check failed: %s",
+                     getattr(ctx, "request_id", "?"), exc)
+        return False
 
 
 async def _apply_tool_eligibility_on_short_circuit(ctx, response: Dict) -> Dict:
@@ -1225,6 +1298,15 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
             # output-side savings the (skipped) response pipeline would have. The live chunks
             # are emitted unchanged — rewriting them mid-stream would corrupt the SSE output.
             _apply_stream_g23(ctx, "".join(parts))
+            # G06's routing step is written on the RESPONSE now (from the model that
+            # actually answered), and the response pipeline — G18 included — is skipped
+            # for streams. Without this a streamed request would disclose no route at
+            # all, which is the same silence in the other direction. Idempotent.
+            try:
+                from middleware.g06_routing import record_routing_step
+                record_routing_step(ctx)
+            except Exception as exc:  # noqa: BLE001 — accounting never breaks a stream
+                logger.debug("[%s] streaming routing-step record failed: %s", request_id, exc)
             # The response pipeline (incl. G18) is skipped for streamed calls, so wire the
             # provider's real usage from the final chunk into savings here — otherwise the
             # billed row records real input/output tokens (z / response_tokens) as 0.
@@ -1362,6 +1444,26 @@ def _savings_headers(ctx, request_start: float) -> Dict[str, str]:
         "x-tokenlean-cache-read-tokens": meta.get("cache_read_tokens"),
         "x-tokenlean-cache-write-tokens": meta.get("cache_write_tokens"),
         "x-tokenlean-cache-share-pct": meta.get("cache_share_of_bill_pct"),
+        # Two disclosures the caller cannot infer from the body. The budget raise
+        # INCREASES what they can be billed for output, so it is stated, not assumed;
+        # the empty-completion flag says a billed response contains nothing, which is
+        # otherwise indistinguishable from a model that simply had little to say.
+        "x-tokenlean-output-budget-raised": (
+            None if not getattr(ctx, "output_budget_raised", None)
+            else "{param}:{frm}->{to}".format(
+                param=ctx.output_budget_raised.get("param"),
+                frm=ctx.output_budget_raised.get("from"),
+                to=ctx.output_budget_raised.get("to"),
+            )
+        ),
+        "x-tokenlean-empty-completion": (
+            None if not getattr(ctx, "empty_completion", None)
+            else ctx.empty_completion.get("reason")
+        ),
+        # The caller's explicit model choice was overridden (unconfigured model → the
+        # configured default). Absent on every request that got the model it asked for
+        # or that was routed by G06, which routed_model already discloses.
+        "x-tokenlean-model-substituted": getattr(ctx, "model_substituted", "") or None,
     }
     for _k, _v in header_fields.items():
         if _v is not None:
@@ -1532,6 +1634,20 @@ def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResp
     """
     meta = ctx.savings.to_langfuse_metadata()
     response_dict.setdefault("_token_opt", {}).update(meta)
+    # Disclose the two facts the savings ledger cannot express. `output_budget_raised`
+    # is a cost INCREASE the proxy chose on the caller's behalf; `empty_completion` says
+    # this billed response delivered nothing (the ledger would otherwise report a small
+    # positive saving on it, which is worse than silence). Both omitted when absent.
+    if getattr(ctx, "output_budget_raised", None):
+        response_dict["_token_opt"]["output_budget_raised"] = ctx.output_budget_raised
+    if getattr(ctx, "empty_completion", None):
+        response_dict["_token_opt"]["empty_completion"] = ctx.empty_completion
+    # The proxy served a model the caller neither asked for nor chose (an unconfigured
+    # model swapped for the configured default). Routing to a cheaper tier is the product
+    # and is disclosed by routed_model; this is the case where the caller's own explicit
+    # choice was overridden, and it was previously invisible in every surface.
+    if getattr(ctx, "model_substituted", ""):
+        response_dict["_token_opt"]["model_substituted"] = ctx.model_substituted
     _attach_sent_prompt(ctx, response_dict)
     headers = _savings_headers(ctx, request_start)
     # C1: SLA metrics + the billable usage_events row, centralised so every
@@ -1710,6 +1826,13 @@ async def _serve_core(
         langfuse_tracing.finish_trace(ctx, response)
         _record_outcome(ctx, _request_start, "200", response)
         return JSONResponse(content=response, headers=_savings_headers(ctx, _request_start))
+
+    # An empty answer cached before the store-side guard existed is still live for the
+    # rest of its TTL, and this branch returns without the response pipeline, so nothing
+    # downstream can notice. Refusing the hit here sends the request to the provider
+    # instead of billing the customer for nothing a second time. Checked BEFORE the
+    # short-circuit so a refused hit falls through to the normal call path.
+    _refuse_empty_cache_hit(ctx)
 
     # Short-circuit: bypass or cache hit
     if ctx.bypassed or ctx.cache_hit:
@@ -1968,6 +2091,12 @@ async def _serve_core(
         _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "502")
         raise HTTPException(status_code=502, detail="LLM provider error (upstream call failed)")
+
+    # Book the served call against ctx.provider_calls, so G18's cost is the sum over
+    # every provider call this request paid for rather than the price of one. Recorded
+    # once, after resilience settled, at the model that actually won (_make_pin_winner
+    # has already pinned it) — failed attempts cost nothing and are not recorded.
+    record_provider_call(ctx, ctx.routed_model, response_dict)
 
     _llm_ms = (time.time() - _llm_start) * 1000
     # += (not =) so any provider time already accumulated by middleware (G06 judge/cascade
@@ -2443,6 +2572,11 @@ def _make_pin_winner(ctx, request_id: str, label: str = "failover"):
         if t.model != ctx.routed_model:
             logger.info("[%s] %s: %s → %s", request_id, label, ctx.routed_model, t.model)
         ctx.routed_model = t.model
+        # The ledger must name the model that ANSWERED. Pinning only ctx.routed_model
+        # priced the failover correctly (G18 reads it) while _token_opt.routed_model, the
+        # portal and the export all kept naming the model that had just FAILED.
+        if getattr(ctx, "savings", None) is not None:
+            ctx.savings.routed_model = t.model
         if t.adapter is not None:
             ctx.provider_adapter = t.adapter
     return _pin

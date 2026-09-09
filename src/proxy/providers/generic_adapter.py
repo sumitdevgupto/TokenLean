@@ -13,7 +13,7 @@ structured-output and reasoning use OpenAI-shaped defaults that LiteLLM normalis
 """
 from typing import Dict, Optional
 
-from providers import ProviderAdapter, REASONING_OFF
+from providers import ProviderAdapter, REASONING_OFF, REASONING_TIERS
 
 
 class GenericLiteLLMAdapter(ProviderAdapter):
@@ -80,6 +80,20 @@ class GenericLiteLLMAdapter(ProviderAdapter):
         opts in with ``can_disable_reasoning: true`` on its config entry.
         """
         return bool(self._cfg.get("can_disable_reasoning", False))
+
+    def default_reasoning_effort(self, model: str, config: Optional[Dict] = None) -> str:
+        """Conservative default ``off``, overridable per provider entry.
+
+        Reads this adapter's OWN construction config, like the two methods around it, so
+        an operator who declared ``supports_reasoning: true`` on an OpenAI-compatible
+        endpoint states its default in the same place:
+        ``default_reasoning_effort: medium``. Unknown providers keep the base answer,
+        which stops the proxy raising effort on a provider whose billing it cannot model.
+        """
+        value = self._cfg.get("default_reasoning_effort")
+        if isinstance(value, str) and value.lower() in REASONING_TIERS:
+            return value.lower()
+        return REASONING_OFF
 
     def supports_reasoning(self, model: str, config: Optional[Dict] = None) -> bool:
         """Conservative default off — opt in per provider via ``supports_reasoning: true``.

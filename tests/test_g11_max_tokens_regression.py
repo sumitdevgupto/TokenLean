@@ -217,6 +217,82 @@ class TestG11MaxTokensCapping:
         assert ctx.params["max_tokens"] <= 4096
 
     @pytest.mark.asyncio
+    async def test_catch_all_bucket_is_never_capped(self, g11_config):
+        """2026-09-08 truncation defect. `workflow_id`/`template_id` both default to
+        "default", and ordinary traffic, every readiness probe and every pitch dataset set
+        neither — so one bucket per tenant held every workload's answer sizes and a
+        long-form answer was capped from short-form ones. Measured: 4 of 54 DS1 answers and
+        6 of 27 live readiness probes returned `finish_reason=length` on billed 200s. With
+        no way to tell the workloads apart there is no honest cap, so there is no cap."""
+        g11_config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        g11_config["groups"]["G11_output"]["fallback_max_tokens"] = None
+        ctx = RequestContext.create(
+            request_id="catch-all",
+            user_id="test-user",
+            messages=[{"role": "user", "content": "Summarise the incident."}],
+            model="gpt-4o-mini",
+            params={},                      # no workflow_id, no template_id
+            config=g11_config,
+        )
+        mock_redis = AsyncMock()
+        mock_redis.zrevrange = AsyncMock(return_value=[
+            b'{"max_tokens": 0, "completion_tokens": 120}' for _ in range(10)
+        ])
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert "max_tokens" not in ctx.params
+        mock_redis.zrevrange.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sanity_floor_is_never_the_applied_cap(self, g11_config):
+        """A cap only the 64-token floor justifies is the floor deciding the answer length,
+        not the evidence — three readiness probes were served capped at 64/74 that way.
+        Degenerate evidence must decline to cap, not clamp up to the floor."""
+        g11_config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        g11_config["groups"]["G11_output"]["fallback_max_tokens"] = None
+        ctx = RequestContext.create(
+            request_id="degenerate-evidence",
+            user_id="test-user",
+            messages=[{"role": "user", "content": "Explain the outage."}],
+            model="gpt-4o-mini",
+            params={"workflow_id": "wf-test", "template_id": "tmpl-test"},
+            config=g11_config,
+        )
+        mock_redis = AsyncMock()
+        mock_redis.zrevrange = AsyncMock(return_value=[
+            b'{"max_tokens": 0, "completion_tokens": 2}' for _ in range(10)
+        ])
+        mock_redis.get = AsyncMock(return_value=None)
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert "max_tokens" not in ctx.params
+
+    @pytest.mark.asyncio
+    async def test_sticky_floor_cannot_exceed_the_model_limit(self, g11_config):
+        """The floor may only raise a cap within the provider's own ceiling — the contract
+        this file exists for still holds when a truncation has raised it."""
+        g11_config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx = RequestContext.create(
+            request_id="floor-vs-model-limit",
+            user_id="test-user",
+            messages=[{"role": "user", "content": "Explain quantum physics."}],
+            model="claude-3-haiku",
+            params={"workflow_id": "wf-test", "template_id": "tmpl-test"},
+            config=g11_config,
+        )
+        mock_redis = AsyncMock()
+        mock_redis.zrevrange = AsyncMock(return_value=[
+            b'{"max_tokens": 0, "completion_tokens": 100}' for _ in range(10)
+        ])
+        mock_redis.get = AsyncMock(return_value=b"999999")   # an absurd sticky floor
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
     async def test_explicit_max_tokens_not_overwritten(self, g11_config):
         """When developer sets max_tokens explicitly, G11 does not overwrite it."""
         ctx = RequestContext.create(

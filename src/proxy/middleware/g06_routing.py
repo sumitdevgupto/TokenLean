@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import litellm
 
-from middleware import RequestContext
+from middleware import RequestContext, record_provider_call
 from middleware import langfuse_tracing
 from middleware.g06_rules import effective_cfg, match_for_ctx
 from savings.calculator import count_messages_tokens, estimate_cost
@@ -41,11 +41,20 @@ async def _timed_llm(ctx: RequestContext, coro, model: str = ""):
     breaker via ``note_provider_outcome`` (observation only — the cascade keeps
     its own tier-fallback behaviour and is never gated). Without this, the
     breaker would be blind to cascade traffic and open late on a true outage.
+
+    It ALSO records the call's usage on ``ctx.provider_calls`` so G18 prices it. A
+    cascade that escalates pays for the tier-1 probe whether or not that probe's answer
+    is served; recording only the elapsed time meant the proxy billed two or three
+    provider calls and reported the cost of one — an under-statement that flattered the
+    savings figure. Only completed calls are recorded (a failed tier costs nothing).
     """
     t0 = time.time()
     _exc = None
     try:
-        return await coro
+        _result = await coro
+        if model:
+            record_provider_call(ctx, model, _result)
+        return _result
     except BaseException as exc:
         _exc = exc
         raise
@@ -60,6 +69,67 @@ async def _timed_llm(ctx: RequestContext, coro, model: str = ""):
                 note_provider_outcome(_tier_provider(model) or "", _exc, ctx.config)
             except Exception:
                 pass
+
+
+def record_routing_step(ctx: RequestContext) -> None:
+    """Record G06's savings step AFTER the request was served, from the model that
+    actually answered.
+
+    G06 used to write this step at PLAN time, from its own pick. When the plan did not
+    survive — the deferred cascade erroring, main.py reverting ``routed_model`` to the
+    caller's model — nothing removed the step, so the ledger, ``_token_opt``,
+    ``usage_events.group_savings``, the portal and the learning loop all carried a route
+    that never happened (54/54 rows of DS11 in two consecutive mints). Patching the two
+    revert sites would have fixed those two; moving the recording point means a future
+    revert cannot reintroduce it, because there is no step to revert.
+
+    Reads ``savings.routed_model`` (assigned by every site that changes which model
+    serves: G06, the cascade success/error paths, failover) against
+    ``savings.model_requested``. No difference, no step. Idempotent — it runs from
+    ``G06Routing.process_response`` and from G18, and both fire on the cascade-served
+    path.
+    """
+    savings = getattr(ctx, "savings", None)
+    if savings is None or getattr(ctx, "routing_step_recorded", False):
+        return
+    served = getattr(savings, "routed_model", "") or ""
+    requested = getattr(savings, "model_requested", "") or ""
+    ctx.routing_step_recorded = True
+    if not served or not requested or served == requested:
+        return
+    detail = getattr(ctx, "routing_detail", "") or ""
+    # No dollar figure here. It used to carry an INPUT-ONLY estimate computed before the
+    # answer existed, which can be wrong in SIGN when the cheaper-per-input model is the
+    # more verbose one — a second, differently-based cost number sitting beside G18's
+    # input+output cost_baseline_usd/cost_actual_usd. Cost is disclosed once, in the cost
+    # fields; this text says only what was routed where.
+    tokens = int(getattr(ctx, "current_token_count", 0) or 0)
+    savings.add_step(
+        GROUP,
+        f"Routed {requested} → {served}" + (f" ({detail})" if detail else ""),
+        tokens,
+        tokens,  # token count unchanged; routing changes cost, not prompt size
+    )
+
+
+def _record_substitution(ctx: RequestContext, substitute: str) -> None:
+    """Serve ``substitute`` in place of an unconfigured requested model, and SAY SO.
+
+    Both routing-disabled paths swapped ``ctx.model``/``ctx.routed_model`` for the
+    configured default but left ``savings.routed_model`` at the caller's ask — so a
+    customer who asked for a reasoning model, was answered by the cheap default, and paid
+    for the cheap default was told in ``_token_opt.routed_model`` that their own model had
+    served. The substitution itself is long-standing behaviour and is unchanged here; only
+    the disclosure is. ``model_requested`` stays the caller's ask — that is what they asked
+    for, and overwriting it would erase the evidence that a swap happened at all.
+    """
+    ctx.model = substitute
+    ctx.routed_model = substitute
+    ctx.model_substituted = substitute
+    savings = getattr(ctx, "savings", None)
+    if savings is not None:
+        savings.routed_model = substitute
+    ctx.routing_detail = "unconfigured model → configured default"
 
 
 def _openai_key_available() -> bool:
@@ -85,6 +155,65 @@ def _is_configured_model(model: str) -> bool:
         return True
     from config_loader import get_provider_model_prefixes
     return any(model.startswith(p) for p in get_provider_model_prefixes().keys())
+
+
+def _caller_output_budget(params: Dict[str, Any]) -> Optional[int]:
+    """The output budget the caller actually set, whichever key they used.
+
+    Reasoning models take ``max_completion_tokens``; everything else takes
+    ``max_tokens``. Reading only the latter silently priced every reasoning tier off the
+    ``expected_output_tokens_estimate`` guess, which exists for requests that named no
+    budget at all — not for requests whose budget lives under a different key.
+    Returns None when the caller set neither (the provider's own default applies).
+    """
+    for key in ("max_completion_tokens", "max_tokens"):
+        value = params.get(key)
+        if value is None:
+            continue
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
+def _reasoning_budget_starved(
+    ctx: RequestContext, model: str, budget: Optional[int]
+) -> bool:
+    """True when routing to ``model`` would spend the caller's whole output budget on
+    hidden reasoning and return nothing.
+
+    On providers that bill reasoning INSIDE the output budget, a budget sized for the
+    answer alone buys a full-price empty reply — measured at 18 of 54 requests on
+    2026-09-07. Whether a model reasons, and how much room its effort tier needs, are
+    both provider questions, so both are ASKED through the adapter
+    (``reasoning_headroom_needed``): this middleware carries no model-name or
+    provider-name strings, and — the reason this is a call and not a copy — one policy
+    must not have two derivations. It did: this function read config only, while the
+    adapter merged config over its own defaults, so a deployment with no
+    ``reasoning_headroom`` block had G06 demanding 4608 tokens for ``off`` where the
+    adapter would have asked for 1536, and G06 refused routes the reservation would have
+    handled by itself.
+
+    Fails OPEN (returns False) on any error — a routing guard that cannot answer must
+    not block routing; the reservation at the provider seam and the empty-completion
+    detector on the response path are the other two layers.
+    """
+    if not budget:
+        return False   # no caller budget → the provider's own default applies
+    try:
+        adapter = get_adapter(model, ctx.config.get("providers", []))
+        needed = adapter.reasoning_headroom_needed(
+            model, ctx.config, ctx.params.get("reasoning_effort")
+        )
+        if not needed:
+            return False   # this model does not reason here, or the operator opted out
+        return budget < int(needed)
+    except Exception as exc:
+        logger.debug("G06 reasoning-budget floor check failed for %s: %s", model, exc)
+        return False
 
 
 def _tier_provider(model: str) -> Optional[str]:
@@ -541,8 +670,12 @@ async def _execute_three_tier_cascade(
     # Cost is judged as input + expected output (0-output undercounts reasoning tiers,
     # whose output tokens dominate cost), as a delta vs the previous tier and against
     # the caller's own model.
+    # Reasoning callers set their budget under `max_completion_tokens`; reading only
+    # `max_tokens` priced every one of them off the estimate meant for requests that
+    # named no budget at all, so the escalation guards judged a 512-token guess against
+    # a caller who had asked for 1,024.
     expected_output_tokens = int(
-        ctx.params.get("max_tokens") or cfg.get("expected_output_tokens_estimate", 512)
+        _caller_output_budget(ctx.params) or cfg.get("expected_output_tokens_estimate", 512)
     )
     requested_cost = estimate_cost(ctx.current_token_count, expected_output_tokens, ctx.model)
 
@@ -569,16 +702,30 @@ async def _execute_three_tier_cascade(
         # injection entirely, leaving the provider default). ``injected_cap`` records
         # that the cap is ours, not the caller's — a response truncated by OUR cap
         # must never be served as the final answer (see _serve below).
-        caller_max_tokens = ctx.params.get("max_tokens")
+        #
+        # The budget goes under the ONE key this call already speaks. A reasoning
+        # caller's budget arrives as `max_completion_tokens` and the passthrough carries
+        # it; adding `max_tokens` on top sent BOTH keys, which the provider rejects
+        # outright — `Setting 'max_tokens' and 'max_completion_tokens' at the same time
+        # is not supported` (108 such 400s in the deployed container). Every tier-1 call
+        # from a reasoning caller therefore failed, the whole cascade collapsed to a
+        # silent fallback, and the plan-time saving stayed on the ledger. Never both keys.
+        caller_max_tokens = _caller_output_budget(ctx.params)
         _cap_cfg = int(cfg.get("cascade_tier1_max_tokens", 512) or 0)
         injected_cap: Optional[int] = None
         tier1_temperature = ctx.params.get("temperature", 0.0)
         _t1_passthrough = _tier_params(tier1_model)
+        _budget_key = (
+            "max_completion_tokens" if "max_completion_tokens" in _t1_passthrough
+            else "max_tokens"
+        )
+        _has_budget = _t1_passthrough.get(_budget_key) is not None
         if caller_max_tokens:
-            _t1_passthrough.setdefault("max_tokens", caller_max_tokens)
-        elif _cap_cfg > 0:
+            if not _has_budget:
+                _t1_passthrough[_budget_key] = caller_max_tokens
+        elif _cap_cfg > 0 and not _has_budget:
             injected_cap = _cap_cfg
-            _t1_passthrough.setdefault("max_tokens", _cap_cfg)
+            _t1_passthrough[_budget_key] = _cap_cfg
         _t1_passthrough.setdefault("temperature", tier1_temperature)
         _t1_model, _t1_kwargs = build_litellm_call(tier1_model, get_providers(), provider_key)
         tier1_response = await _timed_llm(ctx, litellm.acompletion(
@@ -608,8 +755,11 @@ async def _execute_three_tier_cascade(
                 _fr = (_choices[0] or {}).get("finish_reason") if _choices else None
                 if _fr == "length":
                     try:
+                        # Pop the key we actually SET (a reasoning caller's budget lives
+                        # under max_completion_tokens); popping the other one would leave
+                        # our own cap in place and retry into the same truncation.
                         _retry_pt = dict(_t1_passthrough)
-                        _retry_pt.pop("max_tokens", None)
+                        _retry_pt.pop(_budget_key, None)
                         retry_response = await _timed_llm(ctx, litellm.acompletion(
                             model=_t1_model,
                             messages=ctx.messages,
@@ -978,8 +1128,7 @@ class G06Routing:
                 # Only downgrade to a real configured default; never blank the
                 # model when default is unset/misconfigured (preserve original).
                 if default_model and ctx.model != default_model:
-                    ctx.model = default_model
-                    ctx.routed_model = default_model
+                    _record_substitution(ctx, default_model)
                     logger.debug(
                         "[%s] G06 routing disabled, unknown model → default: %s",
                         ctx.request_id,
@@ -1005,8 +1154,7 @@ class G06Routing:
                 # Only downgrade to a real configured default; never blank the
                 # model when default is unset/misconfigured (preserve original).
                 if default_model and ctx.model != default_model:
-                    ctx.model = default_model
-                    ctx.routed_model = default_model
+                    _record_substitution(ctx, default_model)
                     logger.debug(
                         "[%s] G06 no tiers configured, unknown model → default: %s",
                         ctx.request_id,
@@ -1195,18 +1343,39 @@ class G06Routing:
                 and not user_override
                 and ctx.savings.routing_mode != "cascade_execution"
                 and not eff_cfg.get("allow_escalation_above_requested", False)):
-            _out = int(ctx.params.get("max_tokens") or eff_cfg.get("expected_output_tokens_estimate", 512))
+            # Read the budget the caller ACTUALLY set. Reasoning models take
+            # `max_completion_tokens`, so reading `max_tokens` alone priced every
+            # reasoning tier off a 512-token guess — the guess is for requests that
+            # named no budget at all, not for requests whose budget is under a
+            # different key.
+            _budget = _caller_output_budget(ctx.params)
+            _out = int(_budget or eff_cfg.get("expected_output_tokens_estimate", 512))
             _req_cost = estimate_cost(ctx.current_token_count, _out, model_requested)
             _sel_cost = estimate_cost(ctx.current_token_count, _out, selected_model)
-            if _sel_cost > _req_cost:
-                logger.info(
-                    "[%s] G06 cost-floor: routed %r ($%.6f) costs more than requested %r "
-                    "($%.6f) — reverting to the requested model (never route above the "
-                    "caller's model; set allow_escalation_above_requested to opt in).",
-                    ctx.request_id, selected_model, _sel_cost, model_requested, _req_cost)
+            # Never move a request onto a reasoning model whose thinking cannot fit
+            # inside the budget the caller set. There the hidden reasoning is billed
+            # from the same allowance as the answer, so a budget sized for the answer
+            # buys a full-price EMPTY reply. Cheaper per token is not cheaper when it
+            # returns nothing (charter 2.1: quality wins).
+            _reasoning_starved = _reasoning_budget_starved(ctx, selected_model, _budget)
+            if _sel_cost > _req_cost or _reasoning_starved:
+                if _reasoning_starved:
+                    logger.info(
+                        "[%s] G06 reasoning-budget floor: %r reasons inside the caller's "
+                        "output budget of %s tokens, which cannot hold thinking plus an "
+                        "answer — reverting to the requested model %r rather than "
+                        "delivering a full-price empty reply.",
+                        ctx.request_id, selected_model, _budget, model_requested)
+                else:
+                    logger.info(
+                        "[%s] G06 cost-floor: routed %r ($%.6f) costs more than requested %r "
+                        "($%.6f) — reverting to the requested model (never route above the "
+                        "caller's model; set allow_escalation_above_requested to opt in).",
+                        ctx.request_id, selected_model, _sel_cost, model_requested, _req_cost)
                 selected_model = model_requested
                 ctx.savings.routing_mode = (
-                    getattr(ctx.savings, "routing_mode", None) or "route") + "+cost_floor"
+                    getattr(ctx.savings, "routing_mode", None) or "route"
+                ) + ("+reasoning_budget_floor" if _reasoning_starved else "+cost_floor")
 
         # 2d. Plan consistency (review S7): if 2b/2c rerouted away from the planned
         # tier-1 (unreachable provider, or a pricier-than-requested pick), a cascade
@@ -1220,18 +1389,15 @@ class G06Routing:
             )
             ctx.cascade_plan = None
 
-        # 3. Savings logic
+        # 3. Routing decision. Cost is owned by G18, which computes baseline and actual on
+        # a consistent input+output basis at response time (baseline at model_requested,
+        # actual at routed_model) — G06 must not pre-seed either field.
+        #
+        # The savings STEP is deliberately not written here. This is plan time: the
+        # deferred cascade may still fail and main.py revert routed_model, or failover may
+        # serve a different model entirely. record_routing_step() writes it on the response
+        # from savings.routed_model — the model that actually answered.
         if selected_model != ctx.model:
-            # Input-only estimate, used ONLY for the human-readable step description below.
-            # Do NOT mutate ctx.savings.cost_{baseline,actual}_usd here: those are owned by
-            # G18, which computes both on a consistent input+output basis at response time
-            # (baseline at model_requested, actual at routed_model). Writing an input-only
-            # value here previously left baseline output-less while G18 overwrote actual
-            # with output included → "actual" looked ~200x "baseline".
-            baseline_cost = estimate_cost(ctx.current_token_count, 0, ctx.model)
-            routed_cost = estimate_cost(ctx.current_token_count, 0, selected_model)
-            cost_saving = max(0.0, baseline_cost - routed_cost)
-
             ctx.routed_model = selected_model
             ctx.savings.routed_model = selected_model
 
@@ -1241,14 +1407,8 @@ class G06Routing:
                 routing_detail = f"rule={matched_rule_id}"
             else:
                 routing_detail = f"classifier={cfg.get('classifier', 'cascade')}, complexity={complexity}"
+            ctx.routing_detail = routing_detail
 
-            ctx.savings.add_step(
-                GROUP,
-                f"Routed {ctx.model} → {selected_model} ({routing_detail}, "
-                f"cost saving ≈ ${cost_saving:.6f})",
-                ctx.current_token_count,
-                ctx.current_token_count,  # token count unchanged, cost changes
-            )
             logger.debug(
                 "[%s] G06 routed %s → %s (%s)",
                 ctx.request_id,
@@ -1272,3 +1432,17 @@ class G06Routing:
         )
 
         return ctx
+
+    async def process_response(
+        self, ctx: RequestContext, response: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Record the routing step from the model that actually answered.
+
+        pipeline.py does not yet run a G06 response stage; G18 calls
+        ``record_routing_step`` so the step is written on every served path (including
+        the cascade short-circuit, which returns before the normal call site). This
+        method exists so wiring G06 into the response chain is a one-liner, and
+        ``record_routing_step`` is idempotent so doing so cannot double-record.
+        """
+        record_routing_step(ctx)
+        return response

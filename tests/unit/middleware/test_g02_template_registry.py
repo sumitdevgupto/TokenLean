@@ -2,8 +2,11 @@
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
+import copy
 import json
 import time
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock, PropertyMock, patch
 
@@ -239,53 +242,46 @@ class TestTemplateMetadataDeprecation:
 
 
 @pytest.mark.asyncio
-class TestG02BudgetTruncation:
-    """Item 83(c) — the `budget.truncate_*` enforcement path (previously untested)."""
+class TestG02NeverEditsTheRequest:
+    """G02 is a read-only budget OBSERVER (D-056, 2026-09-08).
+
+    The class this replaces (`TestG02BudgetTruncation`, item 83c) pinned the opt-in
+    `budget.truncate_*` path, which cut the tail off the caller's system prompt until the
+    request fit `total_input_max`. Measured on DS1 it removed 691 characters of policy text
+    per request and CHANGED THE ANSWERS on billed 200s - a refund reply stopped naming the
+    disputed amount, an SLA reply stopped naming the breach - while the source text for both
+    facts was still in the prompt it sent. The path was deleted, not guarded, so these tests
+    now pin the OPPOSITE contract: over budget, G02 warns and forwards the request unchanged.
+    """
 
     _LONG_SYSTEM = "You are a very detailed and extremely thorough assistant. " * 10
 
-    async def test_truncate_enabled_shrinks_over_budget_messages(self, make_ctx):
-        """budget.truncate_enabled=True → over-budget messages are truncated and a
-        'truncated to budget' savings step is recorded."""
+    async def test_over_budget_request_is_forwarded_byte_identical(self, make_ctx):
+        """Over budget -> a zero-saving OVER step, and not one byte of the request changes."""
         ctx = make_ctx(
             [{"role": "system", "content": self._LONG_SYSTEM}, {"role": "user", "content": "hi"}],
             params={"template_id": "test-template"},
         )
-        ctx.config["groups"]["G2_template_registry"]["budget"] = {
-            "truncate_enabled": True,
-            "truncate_strategy": "tail_system",
-            "min_keep_user_turns": 1,
-        }
-        original_system_len = len(ctx.messages[0]["content"])
+        before = copy.deepcopy(ctx.messages)
 
         from middleware.g02_template_registry import G02TemplateRegistry
         ctx = await G02TemplateRegistry().process_request(ctx)
 
-        # system prompt was trimmed to fit the budget
-        assert len(ctx.messages[0]["content"]) < original_system_len
-        # last user turn is preserved (min_keep_user_turns=1)
-        assert ctx.messages[-1] == {"role": "user", "content": "hi"}
-        descs = [s.description for s in ctx.savings.step_savings]
-        assert any("truncated to budget" in d for d in descs)
+        assert ctx.messages == before
+        assert ctx.messages[0]["content"] == self._LONG_SYSTEM
+        steps = ctx.savings.step_savings
+        assert len(steps) == 1 and steps[0].group == "G02"
+        assert "OVER" in steps[0].description
+        assert not any("truncat" in s.description.lower() for s in steps)
+        # report-only: the step must claim no saving at all
+        assert steps[0].tokens_before == steps[0].tokens_after
 
-    async def test_truncate_disabled_leaves_messages_untouched(self, make_ctx):
-        """Default (truncate_enabled absent/False) → OVER warning only; messages unchanged."""
-        ctx = make_ctx(
-            [{"role": "system", "content": self._LONG_SYSTEM}, {"role": "user", "content": "hi"}],
-            params={"template_id": "test-template"},
-        )
-        # no budget block at all → truncate_enabled defaults False
-        from middleware.g02_template_registry import G02TemplateRegistry
-        ctx = await G02TemplateRegistry().process_request(ctx)
+    async def test_legacy_truncate_knobs_are_inert(self, make_ctx):
+        """A config left over from before the removal must not resurrect the behaviour.
 
-        assert ctx.messages[0]["content"] == self._LONG_SYSTEM  # untouched
-        descs = [s.description for s in ctx.savings.step_savings]
-        assert any("OVER" in d for d in descs)
-        assert not any("truncated" in d for d in descs)
-
-    async def test_truncate_strategy_and_min_keep_read_from_config(self, make_ctx):
-        """The strategy + min_keep_user_turns are read config-first (not hardcoded):
-        min_keep_user_turns=2 keeps both user turns."""
+        An operator (or a stale GCS config) can still carry `budget.truncate_enabled: true`.
+        Nothing reads it any more, and this asserts that stays true.
+        """
         ctx = make_ctx(
             [
                 {"role": "system", "content": self._LONG_SYSTEM},
@@ -298,10 +294,102 @@ class TestG02BudgetTruncation:
         ctx.config["groups"]["G2_template_registry"]["budget"] = {
             "truncate_enabled": True,
             "truncate_strategy": "tail_system",
-            "min_keep_user_turns": 2,
+            "min_keep_user_turns": 1,
         }
+        before = copy.deepcopy(ctx.messages)
+
         from middleware.g02_template_registry import G02TemplateRegistry
         ctx = await G02TemplateRegistry().process_request(ctx)
 
-        user_contents = [m["content"] for m in ctx.messages if m.get("role") == "user"]
-        assert "first" in user_contents and "second" in user_contents
+        assert ctx.messages == before
+        assert not any("truncat" in s.description.lower() for s in ctx.savings.step_savings)
+
+    async def test_multiple_system_messages_all_survive(self, make_ctx):
+        """The deleted second pass emptied EVERY system message (its guard counted roles,
+        which emptying never changes), despite a comment promising to keep one. Pinned so a
+        reintroduction cannot pass silently."""
+        ctx = make_ctx(
+            [
+                {"role": "system", "content": self._LONG_SYSTEM},
+                {"role": "system", "content": self._LONG_SYSTEM},
+                {"role": "user", "content": "hi"},
+            ],
+            params={"template_id": "test-template"},
+        )
+        from middleware.g02_template_registry import G02TemplateRegistry
+        ctx = await G02TemplateRegistry().process_request(ctx)
+
+        assert [m["content"] for m in ctx.messages if m["role"] == "system"] == [
+            self._LONG_SYSTEM,
+            self._LONG_SYSTEM,
+        ]
+
+
+class TestG02SourceContract:
+    """Source-inspection pins - the mutation path must not come back by any door."""
+
+    @staticmethod
+    def _source() -> str:
+        import middleware.g02_template_registry as mod
+        return Path(mod.__file__).read_text(encoding="utf-8")
+
+    def test_no_code_path_edits_messages(self):
+        src = self._source()
+        assert "_truncate_messages" not in src
+        assert "ctx.messages =" not in src
+        assert "ctx.messages[" not in src
+        # in-place mutation of a message dict
+        assert '["content"] =' not in src and "['content'] =" not in src
+        # W17-R-G02 F7: rebinding and item assignment are not the only doors. `ctx.messages`
+        # is a list and every message is a dict, so a list method or a dict `.update(` would
+        # rewrite the request while sailing past the checks above.
+        for door in ("ctx.messages.pop", "ctx.messages.append", "ctx.messages.insert",
+                     "ctx.messages.extend", "ctx.messages.clear", "ctx.messages.remove",
+                     "ctx.messages.sort", "ctx.messages.reverse", ".update("):
+            assert door not in src, f"{door} would let G02 edit the request"
+
+    def test_mutation_only_imports_are_absent(self):
+        """`cache_floor` existed only to re-snapshot G02's rewrite and the token counter only
+        to measure it. Their absence is the cheapest signal that no rewrite exists."""
+        src = self._source()
+        assert "cache_floor" not in src.replace("`cache_floor`", "")
+        assert "count_messages_tokens" not in src
+
+    def test_removed_knobs_are_gone_from_the_config_template(self):
+        import yaml
+        root = Path(__file__).resolve().parents[3]
+        cfg = yaml.safe_load((root / "config" / "config.yaml.template").read_text(encoding="utf-8"))
+        g2 = cfg["groups"]["G2_template_registry"]
+        assert "budget" not in g2, "the singular `budget` truncation block must stay removed"
+        flat = yaml.safe_dump(g2)
+        for knob in ("truncate_enabled", "truncate_strategy", "min_keep_user_turns",
+                     "output_max"):
+            assert knob not in flat, f"{knob} was removed on 2026-09-08 and must not return"
+        # the budget that IS still read - and warned against - stays
+        assert all("total_input_max" in b for b in g2["budgets"].values())
+
+    def test_system_prompt_max_survives_because_ci_reads_it(self):
+        """`system_prompt_max` is NOT a dead key and must not be tidied away with the runtime
+        truncation knobs. scripts/ci/validate-templates.sh and scripts/ci/pr-diff-token-check.py
+        both read it out of config.yaml.template to block a template whose system prompt has
+        outgrown its registration. Deleting the key does not raise the limit for either:
+        validate-templates.sh treats a missing value as "no budget" and SKIPS the check, while
+        pr-diff-token-check.py falls back to its own hard default of 500 — a different limit
+        from the registered one (stricter, for this template's 400)."""
+        import yaml
+        root = Path(__file__).resolve().parents[3]
+        cfg = yaml.safe_load((root / "config" / "config.yaml.template").read_text(encoding="utf-8"))
+        budgets = cfg["groups"]["G2_template_registry"]["budgets"]
+        assert all("system_prompt_max" in b for b in budgets.values())
+        ci = root / "scripts" / "ci"
+        # validate-templates.sh: missing -> 0 -> the `if max_system and ...` guard never fires
+        validate = (ci / "validate-templates.sh").read_text(encoding="utf-8")
+        assert 'budget.get("system_prompt_max", 0)' in validate, (
+            "validate-templates.sh no longer reads it — re-check before removing the key")
+        # pr-diff-token-check.py: missing -> its OWN default, not "no budget"
+        prdiff = (ci / "pr-diff-token-check.py").read_text(encoding="utf-8")
+        assert 'budget["system_prompt_max"]' in prdiff, (
+            "pr-diff-token-check.py no longer reads it — re-check before removing the key")
+        assert '"system_prompt_max": 500' in prdiff, (
+            "the hard fallback documented in config.yaml.template / config-reference has "
+            "changed — update both before this test is edited")

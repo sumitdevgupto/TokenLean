@@ -71,7 +71,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  STAGE 3 — PARAMETER INJECTION (Inside the LLM)   [honours ctx.skip_groups]          │       │
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
 │  │  G16 Agent Arch       → anti-pattern advisories (LangGraph guidance)                │       │
-│  │  G11 Output Format    → max_tokens enforcement + JSON schema + p95 feedback prep    │       │
+│  │  G11 Output Format    → JSON schema + opt-in per-workflow max_tokens cap (OFF)      │       │
 │  │  G25 Adaptive Reason. → classify complexity → set reasoning_effort (before G12)     │       │
 │  │  G12 Reasoning Budget → effort=low/med/high → provider-specific budget params       │       │
 │  │  G13 Batch/TOON       → code-substitution (#C1) + batch queue → 202 if deferred    │       │
@@ -104,7 +104,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  ┌─────────────────────────────────────────────────────────────────────────────────────┐       │
 │  │  STAGE 6 — FEEDBACK & OBSERVABILITY                                                  │       │
 │  ├─────────────────────────────────────────────────────────────────────────────────────┤       │
-│  │  G11 Feedback Loop → record output tokens → Redis p95 → auto-tighten future          │       │
+│  │  G11 Feedback Loop → record output tokens per workflow (only when opted in)          │       │
 │  │  Quality metrics   → emit_grounding (RAG grounding coverage; no-op for non-RAG)      │       │
 │  │  G18 Observability → Prometheus counters + Langfuse trace + usage records           │       │
 │  │  G05 Store Cache   → save to L1 Redis + L2 pgvector (skip if bypass/cache-hit)    │       │
@@ -317,7 +317,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Optional `LangGraphRuntime` for budget-aware agent execution
 
 **G11: Output Format** (`g11_output_format.py`)
-- Enforce `max_tokens` (default 2× expected); inject JSON schema / `response_format`
+- Optionally cap `max_tokens` from past answer sizes — **off by default**
+  (`max_tokens_auto_tighten: false`), and even when on, only for a request that names its
+  own `workflow_id`/`template_id`; inject JSON schema / `response_format`
 - Provider-specific structured output via `ctx.provider_adapter`
 
 **G25: Adaptive Reasoning** (`g25_adaptive_reasoning.py`)
@@ -388,7 +390,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 **STAGE 5b — Feedback Loop**
 
 **G11: Output Format** (`process_response()`)
-- Record actual output token count in a Redis ZSET; auto-tighten future `max_tokens` from p95
+- Record actual output token counts in a Redis ZSET, per `workflow_id`/`template_id` bucket,
+  **only while `max_tokens_auto_tighten` is on** (it ships off, so the default records nothing);
+  a request naming neither id is never recorded and never capped
 
 **Application-quality: grounding coverage** (`middleware/quality_metrics.py:emit_grounding`)
 - Correlates the retrieved chunks (stashed by G07) with the produced answer to emit a RAG
@@ -719,7 +723,7 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G08** | `g08_tool_loading.py`, `g08_mcp_loader.py` | Intent-based tool loading, MCP lazy manifest |
 | **G09** | `g09_context_schema.py` | Prose detection, Instructor schema enforcement |
 | **G10** | `g10_memory.py`, `g10_mem0_adapter.py` | Conversation memory, Mem0, Zep, skills |
-| **G11** | `g11_output_format.py` | max_tokens enforcement, p95 feedback loop |
+| **G11** | `g11_output_format.py` | JSON schema / `response_format`; opt-in (default OFF) per-workflow `max_tokens` cap |
 | **G12** | `g12_reasoning_budget.py` | Provider-specific reasoning budget, effort levels |
 | **G13** | `g13_batch.py`, `g13_toon.py` | Batch processing, TOON notation |
 | **G14** | `g14_tool_output.py` | Tool output projection and structural compaction |

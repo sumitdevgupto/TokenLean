@@ -148,12 +148,23 @@ class TestG06Routing:
         assert ctx.routed_model == "gpt-4-5"
 
     async def test_routing_records_step_saving(self, make_ctx):
+        """The step is recorded on the RESPONSE, from the model that answered.
+
+        It is deliberately absent after process_request: at plan time the cascade can
+        still fail and main.py revert the route, which is exactly how a step for a route
+        that never happened used to reach the ledger.
+        """
         ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
         from middleware.g06_routing import G06Routing
-        ctx = await G06Routing().process_request(ctx)
+        g06 = G06Routing()
+        ctx = await g06.process_request(ctx)
         ctx = await _drive_deferred_cascade(ctx)
-        if ctx.routed_model != ctx.model:
-            assert any(s.group == "G06" for s in ctx.savings.step_savings)
+        assert not [s for s in ctx.savings.step_savings if s.group == "G06"]
+        await g06.process_response(ctx, {})
+        if ctx.savings.routed_model != ctx.savings.model_requested:
+            steps = [s for s in ctx.savings.step_savings if s.group == "G06"]
+            assert len(steps) == 1
+            assert ctx.savings.routed_model in steps[0].description
 
     async def test_already_cheapest_no_step_saved(self, make_ctx):
         ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o-mini")
@@ -1154,6 +1165,64 @@ class TestG06CascadeTier1CapAndTruncation:
 
         assert seen.get("max_tokens") == 256
         assert ctx.routed_model == "gpt-4o-mini"
+
+    async def test_reasoning_callers_budget_is_not_sent_alongside_a_second_key(self, make_ctx):
+        """A reasoning caller's budget arrives as `max_completion_tokens`. Injecting our
+        probe cap as `max_tokens` sent BOTH keys, which the provider rejects outright
+        (`Setting 'max_tokens' and 'max_completion_tokens' at the same time is not
+        supported` — 108 such 400s in the deployed container). Every tier-1 call from an
+        o-series caller failed, the cascade collapsed to a silent fallback, and the
+        plan-time saving stayed on the ledger."""
+        ctx = make_ctx(
+            [{"role": "user", "content": "What is 2+2?"}],
+            model="gpt-4o",
+            params={"max_completion_tokens": 1024},
+        )
+        self._cascade_cfg(ctx, cascade_tier1_max_tokens=512)
+        seen = {}
+
+        async def mock_acompletion(*args, **kwargs):
+            seen.update(kwargs)
+            return _mk_resp("gpt-4o-mini", content="4")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
+
+        assert not ("max_tokens" in seen and "max_completion_tokens" in seen)
+        # The caller named a budget, so ours is never injected on top of it.
+        assert seen.get("max_completion_tokens") == 1024
+        assert ctx.savings.routing_mode == "cascade_execution"
+
+    async def test_uncapped_retry_pops_the_key_it_set(self, make_ctx):
+        """The never-serve-a-self-truncated-answer retry must drop OUR cap. Popping
+        `max_tokens` when the cap went out as `max_completion_tokens` would retry into
+        exactly the same truncation."""
+        ctx = make_ctx([{"role": "user", "content": "Prove it."}], model="gpt-4o",
+                       params={"max_completion_tokens": None})
+        ctx.params.pop("max_completion_tokens")
+        self._cascade_cfg(ctx, cascade_tier1_max_tokens=512,
+                          cascade_confidence_threshold=0.0)
+        calls = []
+
+        async def mock_acompletion(*args, **kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                return _mk_resp("gpt-4o-mini", content="tru", finish_reason="length")
+            return _mk_resp("gpt-4o-mini", content="truncated no more")
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
+
+        assert len(calls) >= 2
+        assert calls[0].get("max_tokens") == 512
+        assert "max_tokens" not in calls[-1]
+        assert "max_completion_tokens" not in calls[-1]
 
     async def test_tier1_cap_zero_means_no_injection(self, make_ctx):
         """cascade_tier1_max_tokens: 0 -> no max_tokens sent to tier-1 at all."""

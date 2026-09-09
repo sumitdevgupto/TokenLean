@@ -233,10 +233,30 @@ class TestG25ProcessRequest:
         assert len(ctx.savings.step_savings) == 0
 
     @pytest.mark.asyncio
-    async def test_high_complexity_sets_high_effort(self):
+    async def test_high_complexity_is_capped_at_the_default_ceiling(self):
+        """Re-expressed under leader decision D-060 (2026-09-08). The classifier still
+        reads this as high-complexity; the APPLIED effort is now capped at the default
+        ceiling `medium`, which IS the o-series provider default, so G25 never raises a
+        customer's reasoning bill above what they would have been served anyway. With
+        the old `high` ceiling an isolated G25 arm spent 2.7x the reasoning tokens on
+        byte-identical prompts while its facts gate passed 30/30. Escalation is now an
+        explicit operator opt-in — proven by the companion test below."""
         from middleware.g25_adaptive_reasoning import G25AdaptiveReasoning
         msgs = [{"role": "user", "content": "Prove that the halting problem is undecidable using Turing reduction."}]
         ctx = _make_ctx(messages=msgs, model="o3-mini")
+        ctx = await G25AdaptiveReasoning().process_request(ctx)
+        assert ctx.params["reasoning_effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_high_complexity_reaches_high_when_the_operator_raises_the_ceiling(self):
+        from middleware.g25_adaptive_reasoning import G25AdaptiveReasoning
+        msgs = [{"role": "user", "content": "Prove that the halting problem is undecidable using Turing reduction."}]
+        # D-076 (2026-09-08): the provider's own default effort is a second ceiling, so
+        # escalation above it is a separate, explicit opt-in. Subject unchanged — an
+        # operator who wants `high` can still have it.
+        ctx = _make_ctx(messages=msgs, model="o3-mini",
+                        cfg_extra={"effort_ceiling": "high",
+                                   "escalate_above_provider_default": True})
         ctx = await G25AdaptiveReasoning().process_request(ctx)
         assert ctx.params["reasoning_effort"] == "high"
 
@@ -285,9 +305,15 @@ class TestG25ProcessRequest:
     async def test_custom_high_keywords_via_config(self):
         from middleware.g25_adaptive_reasoning import G25AdaptiveReasoning
         msgs = [{"role": "user", "content": "Please quant-optimise this trading strategy."}]
+        # The subject here is the CUSTOM KEYWORD, not the ceiling: raise the ceiling so
+        # the operator's own high-keyword can still be observed reaching `high` after
+        # D-060 made the shipped ceiling `medium` (the clamp has its own test).
+        # D-076 added the provider-default ceiling; the escalation opt-in goes with the
+        # raised ceiling for the same reason as above.
         ctx = _make_ctx(
             messages=msgs, model="o1-mini",
-            cfg_extra={"high_keywords": [r"\bquant-optimise\b"]},
+            cfg_extra={"high_keywords": [r"\bquant-optimise\b"], "effort_ceiling": "high",
+                       "escalate_above_provider_default": True},
         )
         ctx = await G25AdaptiveReasoning().process_request(ctx)
         assert ctx.params["reasoning_effort"] == "high"
@@ -324,8 +350,27 @@ class TestG25ProcessRequest:
 
     @pytest.mark.asyncio
     async def test_claude_model_also_classified(self):
+        """Re-expressed under leader decision D-076 (2026-09-08). The subject is that a
+        Claude model is CLASSIFIED rather than skipped as non-reasoning, and it still is:
+        G25 fires and writes an effort. What changed is the value. Anthropic's extended
+        thinking is opt-in — omitting `thinking` is the provider's own default — so the
+        provider ceiling holds the request at `off`, i.e. exactly the request the caller
+        would have sent without the proxy. Asserting `in (high, medium, low)` here would
+        now be asserting that the proxy is allowed to turn thinking ON unasked, which is
+        the defect F2 reported, so both halves are pinned explicitly."""
         from middleware.g25_adaptive_reasoning import G25AdaptiveReasoning
         msgs = [{"role": "user", "content": "What is the time complexity of merge sort?"}]
         ctx = _make_ctx(messages=msgs, model="claude-sonnet-4-5")
         ctx = await G25AdaptiveReasoning().process_request(ctx)
-        assert ctx.params.get("reasoning_effort") in ("high", "medium", "low")
+        assert ctx.params.get("reasoning_effort") == "off", (
+            "G25 must classify Claude models, but must not raise their effort above the "
+            "provider default (no extended thinking unless the request asks for it)"
+        )
+
+        escalating = _make_ctx(messages=msgs, model="claude-sonnet-4-5",
+                               cfg_extra={"escalate_above_provider_default": True})
+        escalating = await G25AdaptiveReasoning().process_request(escalating)
+        assert escalating.params.get("reasoning_effort") in ("high", "medium", "low"), (
+            "with escalation opted in, the classifier's own tier must come through — "
+            "otherwise the clamp above would be hiding a group that never fires at all"
+        )

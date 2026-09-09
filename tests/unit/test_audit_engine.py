@@ -90,6 +90,8 @@ class _SecCtx:
         self.context_trust_pii_action = kw.get("context_trust_pii_action")
         self.context_trust_pii_entities = kw.get("context_trust_pii_entities", [])
         self.context_trust_pii_redactions = kw.get("context_trust_pii_redactions", 0)
+        self.empty_completion = kw.get("empty_completion")
+        self.routed_model = kw.get("routed_model", "o4-mini")
 
 
 async def test_security_events_guardrail_flag_row():
@@ -196,3 +198,71 @@ async def test_security_events_pii_zero_count_skipped():
 
 async def test_security_events_noop_without_pool():
     await AuditLogger(None).log_security_events(_SecCtx(guardrail_action="flag"))  # no raise
+
+
+# ── completion.empty — a billed response that delivered nothing (tracker 23.18) ───
+# The customer paid for output that contains no output. Until 2026-09-08 that left no
+# trace anywhere: billed as a normal 200, no metric, no header, and the savings ledger
+# recorded a small POSITIVE saving on it. It belongs on the PII-free ledger because it
+# is the one outcome a customer should be able to evidence rather than infer from a bill.
+
+_EMPTY = {"finish_reason": "length", "reason": "length",
+          "completion_tokens": 1024, "reasoning_tokens": 1024}
+
+
+async def test_empty_completion_writes_a_row():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(_SecCtx(empty_completion=_EMPTY))
+    assert len(conn.calls) == 1
+    _, args = conn.calls[0]
+    assert args[3] == "completion.empty"
+    details = json.loads(args[5])
+    assert details == {
+        "finish_reason": "length", "reason": "length",
+        "completion_tokens": 1024, "reasoning_tokens": 1024, "model": "o4-mini",
+    }
+
+
+async def test_empty_completion_row_is_pii_free():
+    """Counts and the provider's stop reason ONLY — never the prompt, never the answer.
+    GDPR erasure nulls user_id but never details, which is why this is enforced at the
+    write rather than at the export."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(_SecCtx(empty_completion=_EMPTY))
+    details = json.loads(conn.calls[0][1][5])
+    assert set(details) == {"finish_reason", "reason", "completion_tokens",
+                            "reasoning_tokens", "model"}
+    for value in details.values():
+        assert isinstance(value, (int, str))
+
+
+async def test_empty_completion_absent_writes_nothing():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(_SecCtx(empty_completion=None))
+    assert conn.calls == []
+
+
+async def test_empty_completion_ignores_a_non_dict():
+    """A truthy non-dict on the ctx must not produce a malformed row."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(_SecCtx(empty_completion="yes"))
+    assert conn.calls == []
+
+
+async def test_empty_completion_tolerates_missing_fields():
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(empty_completion={"reason": "empty"}, routed_model=None))
+    details = json.loads(conn.calls[0][1][5])
+    assert details == {"finish_reason": "", "reason": "empty",
+                       "completion_tokens": 0, "reasoning_tokens": 0, "model": ""}
+
+
+async def test_empty_completion_coexists_with_a_security_row():
+    """Its own action, alongside the trust & safety rows — never folded into one of
+    them, which would make an empty answer look like a guardrail decision."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(guardrail_action="flag", guardrail_categories=["x"],
+                empty_completion=_EMPTY))
+    assert [c[1][3] for c in conn.calls] == ["guardrail.flagged", "completion.empty"]

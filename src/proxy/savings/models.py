@@ -57,6 +57,13 @@ class SavingsRecord:
     routellm_router_used: Optional[str] = None  # e.g., "mf"
     routellm_threshold: Optional[float] = None
     routellm_confidence: Optional[float] = None
+    # Multi-call disclosure. A G06 cascade that escalates, or an llm_judge classifier,
+    # makes more than one provider call for one request; cost_actual_usd sums them all,
+    # while final_tokens_sent (y) stays the FINAL call's prompt so it remains comparable
+    # with every past measurement. These two say what y cannot. Both stay 0 — and are
+    # omitted from the disclosure entirely — on the ordinary single-call path.
+    provider_call_count: int = 0
+    provider_call_prompt_tokens: int = 0
 
     def add_step(
         self,
@@ -185,6 +192,11 @@ class SavingsRecord:
         share = self.cache_share_of_bill_pct
         if share is not None:
             metadata["cache_share_of_bill_pct"] = share
+        # Only when the request really did pay for more than one provider call — an
+        # absent pair means the ordinary one call, not an unknown.
+        if self.provider_call_count > 1:
+            metadata["provider_call_count"] = self.provider_call_count
+            metadata["provider_call_prompt_tokens"] = self.provider_call_prompt_tokens
         # Add G6 routing-specific metadata if available
         if self.routing_mode:
             metadata["routing_mode"] = self.routing_mode

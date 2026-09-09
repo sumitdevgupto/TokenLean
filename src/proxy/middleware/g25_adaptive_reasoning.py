@@ -30,6 +30,10 @@ from providers import REASONING_OFF, REASONING_TIERS
 logger = logging.getLogger(__name__)
 GROUP = "G25"
 
+# Ceiling used when config supplies none — and when it supplies one this module cannot
+# read (see G25AdaptiveReasoning._resolve_ceiling). Gate 2: equals the shipped template.
+_CODE_DEFAULT_CEILING = "medium"
+
 # ─── Default keyword sets ─────────────────────────────────────────────────────
 
 _DEFAULT_HIGH_KEYWORDS = [
@@ -138,6 +142,9 @@ class G25AdaptiveReasoning:
         self._medium_patterns: Optional[List[re.Pattern]] = None
         self._low_patterns: Optional[List[re.Pattern]] = None
         self._patterns_cfg_hash: Optional[int] = None
+        # Distinct malformed `effort_ceiling` values already warned about (see
+        # _resolve_ceiling) — a per-request WARNING would otherwise flood the log.
+        self._warned_ceilings: set = set()
 
     def _get_patterns(self, cfg: Dict[str, Any]) -> Tuple[
         List[re.Pattern], List[re.Pattern], List[re.Pattern]
@@ -155,6 +162,68 @@ class G25AdaptiveReasoning:
             self._patterns_cfg_hash = cfg_hash
 
         return self._high_patterns, self._medium_patterns, self._low_patterns  # type: ignore[return-value]
+
+    def _resolve_ceiling(self, cfg: Dict[str, Any], ctx: RequestContext) -> str:
+        """The configured ceiling, or the CODE default when it is not a known tier.
+
+        A ceiling read from YAML can be anything: `null`, a typo, or — the one that made
+        this a defect rather than a nicety — a bare `off`, which YAML parses as the
+        boolean False and `str().lower()` turns into `"false"`. The config's own
+        `effort_floor` comment tells operators to quote `off` for exactly that reason, so
+        the idiom is one the file invites. The previous fallback was the LAST tier, so
+        every unrecognised value silently became `high`: a malformed ceiling failed OPEN
+        to the most expensive setting the group can select, on billed traffic, with no
+        warning anywhere. Falling back to the code default (`medium`, the o-series
+        provider default) keeps G25 non-increasing while the misconfiguration is visible.
+        """
+        raw = cfg.get("effort_ceiling", _CODE_DEFAULT_CEILING)
+        value = str(raw).lower()
+        if value in REASONING_TIERS:
+            return value
+        if value not in self._warned_ceilings:
+            # Warn once per distinct bad value: this runs on every request, and a config
+            # error should be loud once, not 10,000 times. Keyed on the STRINGIFIED value
+            # because YAML can hand us a list or a dict, which a set cannot hold.
+            # Bounded so a hot-reloading config cannot grow the set without limit.
+            if len(self._warned_ceilings) > 32:
+                self._warned_ceilings.clear()
+            self._warned_ceilings.add(value)
+            logger.warning(
+                "G25 effort_ceiling=%r is not one of %s — using the code default %r. "
+                "A bare `off` in YAML parses as the boolean False; quote it.",
+                raw, list(REASONING_TIERS), _CODE_DEFAULT_CEILING,
+            )
+        return _CODE_DEFAULT_CEILING
+
+    def _provider_ceiling(self, cfg: Dict[str, Any], ctx: RequestContext) -> str:
+        """The routed provider's OWN default effort — the second, per-provider ceiling.
+
+        "G25 is non-increasing" was only ever true of the OpenAI o-series, whose default
+        effort is `medium`. Where reasoning is opt-in — Anthropic's extended thinking is
+        off unless the request asks for it — selecting `medium` does not lower a bill, it
+        turns thinking ON and raises one, which is the opposite of what the group claims
+        and of what an operator reading `effort_ceiling: medium` expects. So the effective
+        ceiling is the LOWER of the configured ceiling and what the provider would have
+        served on its own; the adapter answers for its own family (middleware carries no
+        provider name strings).
+
+        Returns the TOP tier — i.e. no additional clamp — when escalation is opted into,
+        when there is no adapter to ask (nothing is known about the provider, so nothing
+        is claimed), or when the adapter answers with something unrecognised.
+        """
+        if cfg.get("escalate_above_provider_default", False):
+            return REASONING_TIERS[-1]
+        adapter = getattr(ctx, "provider_adapter", None)
+        if adapter is None:
+            return REASONING_TIERS[-1]
+        try:
+            value = adapter.default_reasoning_effort(ctx.routed_model, ctx.config)
+        except Exception as exc:                       # pragma: no cover - defensive
+            logger.debug("[%s] G25: provider default effort unavailable: %s",
+                         ctx.request_id, exc)
+            return REASONING_TIERS[-1]
+        value = str(value).lower()
+        return value if value in REASONING_TIERS else REASONING_TIERS[-1]
 
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         cfg = ctx.config.get("groups", {}).get("G25_adaptive_reasoning", {})
@@ -221,15 +290,52 @@ class G25AdaptiveReasoning:
         # literal means the config file says exactly what happens.
         # Migration note: a deployment whose config predates the `off` rung and says
         # `effort_floor: low` keeps reasoning at low or above until that value is changed.
+        #
+        # TWO ceilings apply, and the effective one is the lower: the operator's
+        # `effort_ceiling` (default `medium`) and the routed PROVIDER's own default
+        # effort, asked of the adapter. The config ceiling alone made G25 non-increasing
+        # only on the OpenAI o-series, whose default IS medium; where reasoning is opt-in
+        # (Anthropic extended thinking) `medium` turns thinking ON for a caller who never
+        # asked for it, so the same config that lowers an OpenAI bill raises an Anthropic
+        # one — under a knob whose comment promised the opposite. With the provider
+        # ceiling in place G25 is non-increasing on EVERY provider: it may lower effort
+        # (`off` via the G06 tier bridge, `low` via the keyword classifier) but never
+        # raise it above what the caller would have been served anyway, unless the
+        # operator sets `escalate_above_provider_default: true`. An explicit `effort_floor`
+        # ABOVE the provider default still wins, deliberately: that is an operator saying
+        # "every request gets at least this much reasoning", not the proxy deciding.
+        # Measured on DS18 (2026-09-07): with the
+        # old `high` ceiling the isolated G25 arm sent byte-identical prompts and spent
+        # 39,168 reasoning tokens against all-off's 14,528 (+169.6%) and 37.8% more
+        # output tokens, while its own facts gate passed 30/30 — the escalation bought
+        # no checked fact and the customer paid for it. An operator who wants escalation
+        # sets `effort_ceiling: high` deliberately; the default no longer decides that
+        # for them. The code default is changed alongside the shipped YAML on purpose:
+        # a config predating this line would otherwise keep escalating (Gate 9.2).
         effort_floor: str = str(cfg.get("effort_floor", REASONING_OFF)).lower()
-        effort_ceiling: str = str(cfg.get("effort_ceiling", "high")).lower()
+        effort_ceiling: str = self._resolve_ceiling(cfg, ctx)
+        provider_ceiling: str = self._provider_ceiling(cfg, ctx)
         _order = {tier: i for i, tier in enumerate(REASONING_TIERS)}
-        _last = len(REASONING_TIERS) - 1
+        # The floor's fallback stays 0 (`off`) — an unreadable floor must not RAISE
+        # anything, so failing to the bottom rung is the safe direction there. The
+        # ceiling's fallback is handled in `_resolve_ceiling`, because failing a ceiling
+        # to the top rung fails OPEN to the most expensive setting.
         effort_idx = max(
             _order.get(effort_floor, 0),
-            min(_order.get(effort_ceiling, _last), _order.get(effort, _order["medium"])),
+            min(
+                _order[effort_ceiling],
+                _order[provider_ceiling],
+                _order.get(effort, _order["medium"]),
+            ),
         )
-        effort = REASONING_TIERS[effort_idx]
+        selected, effort = effort, REASONING_TIERS[effort_idx]
+        if effort != selected and _order[provider_ceiling] < _order.get(
+            selected, _order["medium"]
+        ) <= _order[effort_ceiling]:
+            # Say WHICH ceiling bound the request. Without this the log and the savings
+            # step read as if the classifier chose this tier, and an operator debugging
+            # "why is my ceiling: high not taking effect" has nothing to look at.
+            reason = f"{reason}; clamped to the provider default {provider_ceiling!r}"
 
         ctx.params["reasoning_effort"] = effort
         logger.debug(

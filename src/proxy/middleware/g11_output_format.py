@@ -1,11 +1,20 @@
 """
 G11 · Output Length & Format Control
 Stage: Inside the LLM (parameter injection)
-Saving: 30–60% output tokens
+Saving: not measured as a token saving. The ablation measured G11 at +0.00% input
+  tokens, and the only output reduction ever observed from the deleted auto-tighten
+  heuristic was missing answer content on billed 200s. Treat the cap as a spend
+  CEILING an operator opts into, not as a saving this group earns.
 Technique:
   1. Enforce max_tokens from OBSERVED completion-size evidence: p95 of completed
      answers × tighten_multiplier. No evidence → no cap (output length is not
      derivable from input length), unless `fallback_max_tokens` is configured.
+     Ships OFF (`max_tokens_auto_tighten: false`) since 2026-09-08: capping from
+     evidence a request cannot be matched to is how it cut 7-22% of answers
+     mid-sentence on billed 200s. When an operator opts in, a cap is only derived
+     from a bucket the caller identified (`workflow_id`/`template_id`), over the
+     whole retained history rather than the last ten answers, and never below a
+     sticky floor that any truncation of ours raises.
   2. Inject JSON schema / response_format via ctx.provider_adapter.map_structured_output().
 """
 import hashlib
@@ -22,6 +31,43 @@ GROUP = "G11"
 
 _DEFAULT_MODEL_MAX_TOKENS = 4096  # Safe default for unknown models
 _DEFAULT_TRUNCATION_BACKOFF = 2.0
+# Headroom over the observed quantile. 1.2 shipped until 2026-09-08 and was BELOW the
+# measured same-prompt spread: on DS1 at temperature 0 + seed 42, gpt-4o-mini's answer to
+# an IDENTICAL prompt exceeded 1.2x another repeat's length in 15 of 108 ordered pairs
+# (13.9%), with a per-request spread up to 2.03x. A margin under the model's own variance
+# truncates answers it has already been shown to produce.
+# HONEST CLAIM, by this comment's own evidence: 2.0 is BELOW the 2.03x worst observed
+# spread, and `history_max_entries: 200` with `tighten_quantile: 0.95` leaves ~10 of 200
+# retained answers above the percentile by construction. So the multiplier REDUCES
+# truncation and, with the sticky floor, RECOVERS from it — it does not stop it. The first
+# occurrence in a bucket can still be cut, on a billed 200. Raising 2.0 would need a
+# measured truncation rate on a real workload, or a per-bucket max/p99 estimate; neither
+# exists yet, so the number is not raised on a guess.
+_DEFAULT_TIGHTEN_MULTIPLIER = 2.0
+_DEFAULT_HISTORY_MIN_ENTRIES = 5
+_DEFAULT_HISTORY_MAX_ENTRIES = 200
+# A cap below this is not evidence, it is a degenerate sample — G11 declines to cap rather
+# than clamping UP to it. The old `max(64, ...)` clamp made 64 the APPLIED value whenever
+# the estimate collapsed (three readiness probes were served capped at 64/74 on 2026-09-07),
+# which is the floor deciding the answer length instead of the evidence.
+# TRADE-OFF, stated rather than hidden: 64 is inherited from that old clamp, not derived
+# from a measurement, and it is used here with the OPPOSITE meaning. A genuinely short
+# workload — a classifier whose p95 is 20, so 20 × 2.0 = 40 — is therefore never capped,
+# and that is the feature's best case being refused. Direction on the published number:
+# DOWN (less capping, so less output-cost reduction). Kept because the alternative is
+# indistinguishable from a degenerate sample, and under charter 2.1 quality wins: not
+# capping costs money, capping wrongly costs the customer their answer.
+_MIN_SANE_CAP = 64
+# `_get_sticky_floor` returns this when the floor could NOT be read, which is not the same
+# as "no floor stored". See its docstring: the two must not collapse into None.
+_FLOOR_UNREADABLE = object()
+# Longest caller-supplied discriminator kept verbatim in a Redis key. Beyond it the value is
+# hashed, as `g05_cache._system_scope_tag` does, so a caller cannot choose our key length.
+_MAX_BUCKET_ID_CHARS = 48
+# `workflow_id`/`template_id` both absent → one catch-all bucket per tenant holding every
+# workload's answer sizes. A long-form request then inherits a cap learned from short-form
+# ones. G11 will not cap from it; see `_history_key`.
+_CATCH_ALL_BUCKET = "default"
 
 
 def _get_model_max_tokens(model: Optional[str], cfg: Optional[Dict[str, Any]] = None) -> int:
@@ -56,14 +102,162 @@ def _get_redis():
     return _pool_get_redis()
 
 
-def _history_key(ctx: RequestContext) -> str:
-    workflow_id = ctx.params.get("workflow_id") or ctx.params.get("x_workflow_id") or "default"
-    template_id = ctx.params.get("template_id") or ctx.params.get("x_template_id") or "default"
-    return f"{getattr(ctx, 'redis_prefix', '')}tok_opt:max_tokens_history:{workflow_id}:{template_id}"
+def _is_streaming(ctx: RequestContext) -> bool:
+    """True when the caller asked for a streamed response."""
+    value = ctx.params.get("stream")
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _history_key(ctx: RequestContext) -> Optional[str]:
+    """Redis key for this request's completion-size evidence, or None when the request
+    carries no workload discriminator at all.
+
+    Returning None for the catch-all is the fix for the 2026-09-08 truncation defect. Both
+    ids default to "default", and neither is set by ordinary traffic, by any readiness probe
+    or by any pitch dataset — so every workload a tenant runs pooled into ONE bucket and a
+    long-form request was capped from short-form answers. Live evidence: within a single
+    readiness sweep that one bucket produced caps of 64 and 367, and 6 of 27 probes came back
+    `finish_reason=length` on billed 200s. A cap must be learned from answers to work of the
+    same shape, so with no way to tell the shapes apart G11 declines to cap.
+    """
+    workflow_id = ctx.params.get("workflow_id") or ctx.params.get("x_workflow_id") or _CATCH_ALL_BUCKET
+    template_id = ctx.params.get("template_id") or ctx.params.get("x_template_id") or _CATCH_ALL_BUCKET
+    if workflow_id == _CATCH_ALL_BUCKET and template_id == _CATCH_ALL_BUCKET:
+        return None
+    wf = _bucket_tag(workflow_id)
+    tpl = _bucket_tag(template_id)
+    return f"{getattr(ctx, 'redis_prefix', '')}tok_opt:max_tokens_history:{wf}:{tpl}"
+
+
+def _bucket_tag(value: Any) -> str:
+    """Key-safe form of a caller-supplied bucket id.
+
+    These values come straight off the wire, and until 2026-09-09 they were interpolated
+    into a Redis key verbatim — no length bound, no charset limit. A caller could choose
+    both the length and the shape of a key on shared Memorystore. Long or odd values are
+    hashed to a 16-char digest, exactly as `g05_cache` hashes its system-prompt scope tag.
+    Short, plainly-safe ids stay legible so an operator can read a key in `redis-cli`.
+    (Cardinality is a separate problem — a caller stamping a unique id per request still
+    makes a bucket per request. That is why recording is gated on the auto-tighten switch;
+    see `process_response`.)
+    """
+    text = str(value)
+    if len(text) <= _MAX_BUCKET_ID_CHARS and all(
+        c.isalnum() or c in "-_." for c in text
+    ):
+        return text
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _floor_key(history_key: str) -> str:
+    """Sticky-floor key for a history bucket — same tenant prefix and discriminator."""
+    return history_key.replace(
+        "tok_opt:max_tokens_history:", "tok_opt:max_tokens_floor:", 1
+    )
+
+
+async def _get_sticky_floor(redis, key: str):
+    """Lowest cap this bucket is still allowed to apply.
+
+    Returns an int (a floor is stored), None (no floor stored) or `_FLOOR_UNREADABLE`
+    (the read itself failed). The caller MUST keep those three apart.
+
+    Raised by `_raise_sticky_floor` whenever a G11-set cap truncated an answer. It exists
+    because the percentile alone OSCILLATES: the escalated `truncated` entry is one sample
+    among many and ages out, so the estimate falls back to where it was and cuts the same
+    request again (observed on DS1: ds1-08 cut at 232, raised to 256, back to 224, cut
+    again). A floor is monotone within its TTL, so the loop converges instead.
+
+    Until 2026-09-09 this swallowed every exception and returned None, and the caller then
+    applied the percentile cap anyway. Its docstring claimed an absent floor "only means a
+    less-informed cap, never a wrong one". That was FALSE and in the one direction that
+    hurts: the floor exists precisely because that percentile cap has already been proven
+    to truncate THIS bucket, so a transient GET failure — or an eviction under maxmemory —
+    reinstated the cap that cut the last answer. A read error is now distinguishable and
+    the caller declines to cap on it: fail CLOSED, the same asymmetry as
+    `g32_tool_eligibility.authorize_dispatch`, and safe for the same reason — declining
+    leaves the request uncapped, which is the ordinary shipped path, not an outage.
+    """
+    try:
+        raw = await redis.get(key)
+    except Exception as exc:
+        logger.warning("G11 could not read the max_tokens floor for %s: %s", key, exc)
+        return _FLOOR_UNREADABLE
+    try:
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        value = int(raw)
+        return value if value > 0 else None
+    except Exception as exc:
+        # A stored value we cannot parse is not a read failure — there is no floor to
+        # honour, and the bucket's next truncation rewrites it. Safe to treat as absent.
+        logger.warning("G11 ignored an unparseable max_tokens floor at %s: %s", key, exc)
+        return None
+
+
+# Compare-and-set for the floor. Chosen over `ZADD key GT CH` on a single-member sorted
+# set for one concrete reason: the floor key already exists as a STRING in every deployment
+# that has ever truncated, and ZADD against a string key raises WRONGTYPE forever after —
+# the switch would need a migration and would silently disable the floor until the TTL ran
+# out. EVAL keeps the type, is one round trip, and is atomic on the server, which is what
+# the invariant needs. Non-atomic read-modify-write was the defect: two workers read 100,
+# one raised to 464, the other to 150, last write won, and the floor was LOWERED against a
+# docstring asserting it never is. Reachable on `max_instances > 1` and on multiple uvicorn
+# workers (the #39/#40 precedents).
+_FLOOR_CAS_LUA = """
+local cur = redis.call('GET', KEYS[1])
+local want = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+if cur then
+  local have = tonumber(cur)
+  if have and have >= want then
+    redis.call('EXPIRE', KEYS[1], ttl)
+    return have
+  end
+end
+redis.call('SET', KEYS[1], want, 'EX', ttl)
+return want
+"""
+
+
+async def _raise_sticky_floor(redis, key: str, value: int, ttl_seconds: int) -> None:
+    """Raise the bucket's floor to `value`, never lower it — ATOMICALLY.
+
+    Refreshes the TTL so a bucket that keeps truncating keeps its floor; a bucket that
+    stops simply lets it expire. The monotonicity is enforced server-side by
+    `_FLOOR_CAS_LUA`; the read-modify-write fallback below is only for a Redis that
+    refuses EVAL, and it logs that the invariant is best-effort there.
+    """
+    value = int(value)
+    try:
+        await redis.eval(_FLOOR_CAS_LUA, 1, key, value, int(ttl_seconds))
+        return
+    except Exception as exc:
+        logger.warning(
+            "G11 could not raise the max_tokens floor atomically (%s); falling back to a "
+            "read-modify-write, which is NOT safe against a concurrent raise", exc,
+        )
+    try:
+        current = await _get_sticky_floor(redis, key)
+        if isinstance(current, int) and current >= value:
+            await redis.expire(key, ttl_seconds)
+            return
+        if current is _FLOOR_UNREADABLE:
+            # Cannot prove we are not lowering it. Raising blindly could LOWER a higher
+            # floor; leaving it alone only costs one slower convergence.
+            return
+        await redis.set(key, value, ex=ttl_seconds)
+    except Exception as exc:
+        logger.warning("G11 failed to raise the max_tokens floor: %s", exc)
 
 
 async def _get_historical_p95(
-    redis, key: str, quantile: float = 0.95, min_entries: int = 5,
+    redis, key: str, quantile: float = 0.95,
+    min_entries: int = _DEFAULT_HISTORY_MIN_ENTRIES,
     truncation_backoff: float = _DEFAULT_TRUNCATION_BACKOFF,
 ) -> Optional[int]:
     """p95 of OBSERVED completion sizes from the Redis ZSET history.
@@ -73,9 +267,17 @@ async def _get_historical_p95(
     answer cut off by a G11-set cap) count as `completion × truncation_backoff`:
     a truncation only proves the answer wanted MORE than the cap, so it must push
     the estimate up, never anchor it down.
+
+    Reads the WHOLE retained history. Until 2026-09-08 it read `0, min_entries*2-1`
+    — the 10 most recent entries — which is not a percentile: over 10 samples
+    `int((10-1)*0.95)` is index 8, the second-largest, and any long answer aged out
+    after ten requests. On DS1 the true pooled p95 was 257 while that window
+    produced caps of 224-260, and it is what discarded the truncation escalation
+    before it could take effect. The retained set is bounded at write time
+    (`history_max_entries`), so the read is bounded too.
     """
     try:
-        entries = await redis.zrevrange(key, 0, min_entries * 2 - 1, withscores=False)
+        entries = await redis.zrevrange(key, 0, -1, withscores=False)
         if not entries or len(entries) < min_entries:
             return None
         completion_values: List[int] = []
@@ -103,9 +305,15 @@ async def _get_historical_p95(
 
 async def _record_max_tokens_pair(
     redis, key: str, max_tokens: int, completion_tokens: int, ttl_seconds: int,
-    truncated: bool = False,
+    truncated: bool = False, max_entries: int = _DEFAULT_HISTORY_MAX_ENTRIES,
 ) -> None:
-    """Record a (max_tokens, completion_tokens) pair to Redis ZSET with TTL."""
+    """Record a (max_tokens, completion_tokens) pair to Redis ZSET with TTL.
+
+    Trims to the newest `max_entries` by rank so the whole-set read in
+    `_get_historical_p95` stays bounded — the bound lives here, at write time, rather
+    than in the read, so the percentile is taken over a real population instead of a
+    ten-entry sliding window.
+    """
     try:
         pair: Dict[str, Any] = {"max_tokens": max_tokens, "completion_tokens": completion_tokens}
         if truncated:
@@ -114,6 +322,8 @@ async def _record_max_tokens_pair(
         score = time.time()
         await redis.zadd(key, {member: score})
         await redis.expire(key, ttl_seconds)
+        if max_entries and max_entries > 0:
+            await redis.zremrangebyrank(key, 0, -(int(max_entries) + 1))
     except Exception as exc:
         logger.warning("G11 failed to record max_tokens history: %s", exc)
 
@@ -437,29 +647,87 @@ class G11OutputFormat:
             elif ("max_tokens" not in ctx.params or ctx.params.get("max_tokens") is None) and \
                     "max_completion_tokens" not in ctx.params:
                 auto_tighten = cfg.get("max_tokens_auto_tighten", False)
+                # A streamed response never reaches `process_response` (main.py routes it
+                # to the stream finaliser instead), so a cap applied here can never be
+                # observed: no `finish_reason=length` is recorded, no history entry is
+                # written and the sticky floor — the entire convergence mechanism of this
+                # feature — never fires. Non-streaming answers keep feeding the same
+                # bucket's p95, so the stream would be cut on EVERY request, permanently,
+                # with nothing able to correct it. A cap we cannot observe is a cap we
+                # cannot correct, so we do not apply one. (Better follow-up: a targeted
+                # G11 recording call from the stream finaliser, which already reassembles
+                # the content and reads usage off the final chunk — same one-call shape as
+                # the G32 hoist. That belongs in main.py, which this change does not touch.)
+                if auto_tighten and _is_streaming(ctx):
+                    auto_tighten = False
+                    logger.debug(
+                        "[%s] G11: auto-tighten declined — streamed responses skip the "
+                        "response pipeline, so a cap could never be recovered from",
+                        ctx.request_id,
+                    )
                 historical_p95 = None
-                if auto_tighten:
+                sticky_floor = None
+                floor_unreadable = False
+                key = _history_key(ctx)   # None → catch-all bucket, see _history_key
+                if auto_tighten and key is not None:
                     try:
                         redis = _get_redis()
-                        key = _history_key(ctx)
                         tighten_q = cfg.get("tighten_quantile", 0.95)
                         backoff = cfg.get("truncation_backoff_multiplier", _DEFAULT_TRUNCATION_BACKOFF)
+                        min_entries = cfg.get("history_min_entries", _DEFAULT_HISTORY_MIN_ENTRIES)
                         historical_p95 = await _get_historical_p95(
-                            redis, key, quantile=tighten_q, truncation_backoff=backoff
+                            redis, key, quantile=tighten_q, min_entries=min_entries,
+                            truncation_backoff=backoff,
                         )
+                        sticky_floor = await _get_sticky_floor(redis, _floor_key(key))
+                        if sticky_floor is _FLOOR_UNREADABLE:
+                            floor_unreadable = True
+                            sticky_floor = None
                     except Exception as exc:
                         logger.warning("G11 auto_tighten lookup failed: %s", exc)
+                        floor_unreadable = True
+                elif auto_tighten:
+                    logger.debug(
+                        "[%s] G11: auto-tighten declined — request carries no workflow_id/"
+                        "template_id, so its only evidence would be other workloads' answers",
+                        ctx.request_id,
+                    )
 
                 model_limit = _get_model_max_tokens(ctx.params.get("model"), cfg)
-                if historical_p95:
-                    tighten_mult = cfg.get("tighten_multiplier", 1.2)
-                    ctx.params["max_tokens"] = min(max(64, int(historical_p95 * tighten_mult)), model_limit)
-                    ctx.params["_g11_max_tokens_set"] = True
-                    notes.append(
-                        f"max_tokens tightened to {ctx.params['max_tokens']} "
-                        f"(completion p95×{tighten_mult}, cap={model_limit})"
+                if floor_unreadable:
+                    # We have a percentile but cannot see whether this bucket has already
+                    # been cut at it. Fail CLOSED: no cap.
+                    historical_p95 = None
+                    logger.warning(
+                        "[%s] G11: max_tokens left unset — the sticky floor for this "
+                        "bucket could not be read, and the percentile alone has already "
+                        "been proven to truncate it", ctx.request_id,
                     )
-                    changed = True
+                if historical_p95:
+                    tighten_mult = cfg.get("tighten_multiplier", _DEFAULT_TIGHTEN_MULTIPLIER)
+                    cap = int(historical_p95 * tighten_mult)
+                    # A truncation this bucket already suffered is harder evidence than any
+                    # percentile over it: the floor may raise the cap, never lower it.
+                    if sticky_floor:
+                        cap = max(cap, sticky_floor)
+                    cap = min(cap, model_limit)
+                    if cap < _MIN_SANE_CAP:
+                        # Declining beats clamping up to the floor: a cap that only the floor
+                        # justifies is the floor deciding the answer length, not the evidence.
+                        logger.debug(
+                            "[%s] G11: max_tokens left unset (estimate %d below the %d-token "
+                            "sanity floor — degenerate evidence, not a short workload)",
+                            ctx.request_id, cap, _MIN_SANE_CAP,
+                        )
+                    else:
+                        ctx.params["max_tokens"] = cap
+                        ctx.params["_g11_max_tokens_set"] = True
+                        floor_note = f", floor={sticky_floor}" if sticky_floor else ""
+                        notes.append(
+                            f"max_tokens tightened to {cap} "
+                            f"(completion p95×{tighten_mult}, cap={model_limit}{floor_note})"
+                        )
+                        changed = True
                 else:
                     # No completion-size evidence for this workload. Output length is
                     # not derivable from input length (a one-line question can need a
@@ -472,6 +740,16 @@ class G11OutputFormat:
                             and fallback_cap > 0:
                         ctx.params["max_tokens"] = min(fallback_cap, model_limit)
                         ctx.params["_g11_max_tokens_set"] = True
+                        # Marked so `process_response` can WARN by name when THIS cap cut
+                        # an answer. The fallback is the one cap with no escalation path:
+                        # it is static, it applies to catch-all traffic too, and a
+                        # truncation it causes raises no floor. Deliberately NOT gated on
+                        # `max_tokens_auto_tighten` — it is an operator's explicit spend
+                        # ceiling, and making a hard ceiling require the learning switch
+                        # would force the riskier feature on to get the simpler one. It is
+                        # instead made OBSERVABLE, and the portal no longer offers a value
+                        # in the degenerate range.
+                        ctx.params["_g11_fallback_cap"] = True
                         notes.append(
                             f"max_tokens set to {ctx.params['max_tokens']} "
                             f"(configured fallback_max_tokens, cap={model_limit})"
@@ -584,12 +862,43 @@ class G11OutputFormat:
         if cfg.get("output_holdout", {}).get("enabled", False) and completion_tokens:
             _record_holdout_metric(ctx, completion_tokens)
 
-        if not cfg.get("max_tokens_feedback_loop", False):
-            return ctx, response
-
         max_tokens = ctx.params.get("max_tokens")
         choices = response.get("choices") or []
         finish_reason = (choices[0] or {}).get("finish_reason") if choices else None
+        truncated_by_us = (
+            finish_reason == "length"
+            and bool(max_tokens)
+            and bool(ctx.params.get("_g11_max_tokens_set"))
+        )
+
+        # ── An answer WE cut must never enter the response cache ──────────────
+        # Runs before every enable flag below, because the fallback cap can truncate with
+        # the feedback loop off. G05 refuses only EMPTY answers, and its key carries
+        # neither `max_tokens` nor the workflow bucket — so a 300-token cut answer stored
+        # under prompt P is served, for the L2 TTL (24h default), to a later request with
+        # the same prompt and NO workflow_id, which by design is never capped. That
+        # request's user sees a mid-sentence answer the provider was never asked for, and
+        # G11 cannot correct it: the cache short-circuit returns without running the
+        # response pipeline, so no truncation is recorded and no floor is raised. The
+        # capped and never-capped populations share one cache namespace; this is the
+        # divergence the bucket fix created, and `verbosity_cache_tag` in g05_cache.py
+        # exists for exactly this class of bug. Ordering is sound: pipeline.py runs this
+        # stage before `G05-store-response`, which honours `ctx.no_cache`. Precedent: G32.
+        if truncated_by_us:
+            ctx.no_cache = True
+            if ctx.params.get("_g11_fallback_cap"):
+                # The one cap with no escalation path: static, applied to catch-all
+                # traffic too, and its truncations raise no floor — so the same request is
+                # cut identically forever. Nothing else would ever say so.
+                logger.warning(
+                    "[%s] G11 fallback_max_tokens=%s cut this answer off mid-stream, and "
+                    "a fallback cap never learns: every matching request will be cut the "
+                    "same way until the value is raised",
+                    ctx.request_id, max_tokens,
+                )
+
+        if not cfg.get("max_tokens_feedback_loop", False):
+            return ctx, response
 
         if max_tokens and completion_tokens:
             utilization = completion_tokens / max_tokens
@@ -609,21 +918,43 @@ class G11OutputFormat:
         # climbs out of a bad cap instead of re-learning it. Anything else that
         # is not `stop` (caller-capped truncation, tool_calls, content_filter,
         # missing finish_reason) is no evidence at all.
-        if completion_tokens:
-            truncated_by_us = (
-                finish_reason == "length"
-                and bool(max_tokens)
-                and bool(ctx.params.get("_g11_max_tokens_set"))
-            )
-            if finish_reason == "stop" or truncated_by_us:
+        # Gated on the AUTO-TIGHTEN switch, not on `max_tokens_feedback_loop`. With the
+        # loop off — the shipped default — nothing ever reads this history, and the ids
+        # are caller-supplied: a client stamping a unique workflow id per request (a
+        # request id, a session id) would make one ZSET + EXPIRE + ZREMRANGEBYRANK per
+        # request on shared Memorystore, each held for 7 days, none of them read. That is
+        # pure cost to the customer for no benefit. Pre-warming was considered and
+        # rejected: with the switch off there is nothing to warm FOR, and when an operator
+        # does opt in, an empty bucket makes G11 decline to cap until 5 completed answers
+        # exist — declining is the quality-safe cold start, not a penalty. Charter 2.1.
+        if completion_tokens and cfg.get("max_tokens_auto_tighten", False):
+            key = _history_key(ctx)   # None → catch-all; nothing reads it, so nothing writes it
+            if key is not None and (finish_reason == "stop" or truncated_by_us):
                 try:
                     redis = _get_redis()
-                    key = _history_key(ctx)
                     ttl_days = cfg.get("max_tokens_history_ttl_days", 7)
+                    ttl_seconds = ttl_days * 86400
                     await _record_max_tokens_pair(
                         redis, key, int(max_tokens or 0), completion_tokens,
-                        ttl_days * 86400, truncated=truncated_by_us,
+                        ttl_seconds, truncated=truncated_by_us,
+                        max_entries=cfg.get("history_max_entries", _DEFAULT_HISTORY_MAX_ENTRIES),
                     )
+                    if truncated_by_us:
+                        # We cut this answer. Raise the bucket's floor so no later percentile
+                        # can put the cap back where it was — the escalated history entry
+                        # alone is one sample among many and ages out (DS1: the same request
+                        # was cut, escalated, and cut again three requests later).
+                        backoff = cfg.get(
+                            "truncation_backoff_multiplier", _DEFAULT_TRUNCATION_BACKOFF
+                        )
+                        raised = int(int(max_tokens) * max(1.0, backoff))
+                        await _raise_sticky_floor(
+                            redis, _floor_key(key), raised, ttl_seconds,
+                        )
+                        logger.info(
+                            "[%s] G11 cut an answer at max_tokens=%s — raising the cap floor "
+                            "for %s to %d", ctx.request_id, max_tokens, key, raised,
+                        )
                 except Exception as exc:
                     logger.warning("[%s] G11 failed to record max_tokens pair: %s", ctx.request_id, exc)
 

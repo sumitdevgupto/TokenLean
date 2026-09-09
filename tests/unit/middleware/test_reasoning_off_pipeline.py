@@ -105,9 +105,18 @@ class TestG25ReusesG06sDecision:
     async def test_a_hard_question_is_untouched_even_when_g06_said_simple(
             self, make_ctx, minimal_config):
         """G06 classified the ROUTE; if it says simple we trust it. This pins that the
-        mapping is what decides, so a future reader can see the coupling is deliberate."""
+        mapping is what decides, so a future reader can see the coupling is deliberate.
+
+        The subject is the EMPTY MAP falling through to the keyword classifier, not the
+        effort value. D-060 (2026-09-08) made the shipped `effort_ceiling` `medium`, so
+        the ceiling is raised here to keep the fall-through observable; that the ceiling
+        clamps is pinned by its own tests in test_g25_adaptive_reasoning.py. D-076
+        (2026-09-08) added a SECOND ceiling — the routed provider's own default effort,
+        `medium` on the o-series — so reaching `high` now also needs
+        `escalate_above_provider_default`. Same reasoning: the subject is the map."""
         ctx = _ctx(make_ctx, minimal_config, _HARD, "o4-mini", OpenAIAdapter(), "simple",
-                   g25={"routing_complexity_map": {}})
+                   g25={"routing_complexity_map": {}, "effort_ceiling": "high",
+                        "escalate_above_provider_default": True})
         out = await G25AdaptiveReasoning().process_request(ctx)
         assert out.params["reasoning_effort"] == "high"
 

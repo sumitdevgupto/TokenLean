@@ -205,6 +205,41 @@ class ProviderAdapter(ABC):
         """
         return True
 
+    def default_reasoning_effort(self, model: str, config: Optional[Dict] = None) -> str:
+        """The effort tier this provider already serves when the request names none.
+
+        This is the answer to "what would the caller have been served WITHOUT us?", and
+        it is the ceiling above which the proxy must not push a request on its own
+        initiative. It is NOT the same question as ``supports_reasoning`` (can this model
+        reason at all) or ``can_disable_reasoning`` (does omitting the param stop it).
+
+        The number is per PROVIDER, which is exactly what the pre-2026-09-08 claim missed:
+        "medium is the provider default" is true of the OpenAI o-series and false
+        everywhere reasoning is opt-in. On Anthropic, extended thinking is off unless the
+        request asks for it, so a proxy that selects ``medium`` there does not lower a
+        bill — it turns thinking ON and raises one, while the docs say the group is
+        non-increasing. Hence the base default is ``off``: a provider whose reasoning is a
+        request parameter does not reason until something asks it to.
+
+        Adapters override for their own family (see ``OpenAIAdapter`` — the o-series
+        reasons intrinsically at medium — and ``GeminiAdapter``). An operator can state it
+        per provider entry with ``default_reasoning_effort: <tier>`` when a provider
+        changes its own default, so this never needs a code change to stay honest.
+        """
+        override = self._configured_default_reasoning_effort(config)
+        return override if override is not None else REASONING_OFF
+
+    def _configured_default_reasoning_effort(self, config: Optional[Dict]) -> Optional[str]:
+        """``providers[].default_reasoning_effort`` when set to a recognised tier, else None.
+
+        An unrecognised value reads as absent rather than raising or disabling the clamp:
+        the adapter's own answer is the safe fallback, and this is read on every request.
+        """
+        value = self._provider_entry(config).get("default_reasoning_effort")
+        if isinstance(value, str) and value.lower() in REASONING_TIERS:
+            return value.lower()
+        return None
+
     def _provider_entry(self, config: Optional[Dict]) -> Dict:
         """This adapter's entry from the ``providers`` config block, or {}.
 
@@ -460,6 +495,58 @@ class ProviderAdapter(ABC):
         """
         return params
 
+    def reserve_reasoning_headroom(
+        self, params: Dict, model: str, config: Dict,
+        requested_effort: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Make room in the OUTPUT budget for a reasoning model's hidden thinking.
+
+        Default no-op (returns None). Adapters whose provider counts reasoning tokens
+        INSIDE the caller's output budget override this: there, a budget sized for the
+        answer alone is spent entirely on thinking and the caller is billed in full for
+        an empty reply (``finish_reason: "length"``, ``content: ""``). Measured on
+        2026-09-07: 18 of 54 o4-mini requests at ``max_completion_tokens: 1024`` came
+        back empty, 44.8% of that arm's spend for zero characters.
+
+        Implementations MUTATE ``params`` in place and return a disclosure dict
+        ``{"param", "from", "to", "effort", "reason"}``, or None when nothing changed.
+        The raise is disclosed to the caller because it RAISES what they can be billed
+        for output — the alternative is paying almost the same for nothing.
+
+        ``requested_effort`` is the tier the CALLER asked for, captured before this
+        module strips the internal ``off`` sentinel — without it an ``off`` request would
+        be provisioned as if it had asked for the default tier, inflating the budget of
+        the one request that explicitly asked for as little reasoning as possible.
+
+        ``cap_reasoning_params`` is the sibling for the opposite direction (shrink a
+        NATIVE thinking budget to fit under ``max_tokens``); this one grows the output
+        budget to fit the thinking. They are not interchangeable.
+        """
+        return None
+
+    def reasoning_headroom_needed(
+        self, model: str, config: Optional[Dict] = None,
+        effort: Optional[str] = None,
+    ) -> Optional[int]:
+        """The smallest output budget under which ``model`` can think AND still answer,
+        or None when the question does not apply (the model does not reason on this
+        provider, or the operator disabled the reservation).
+
+        This is the ONE place the answer is derived. ``reserve_reasoning_headroom``
+        raises a caller's budget to it, and G06 refuses to *route* into a model whose
+        need the caller's budget cannot meet — before this existed, the middleware
+        re-derived the number from config alone and the adapter merged config over its
+        own defaults, so on a deployment with no ``reasoning_headroom`` block the two
+        disagreed (G06 computed 4608 for ``off`` while the adapter computed 1536) and
+        G06 refused routes the adapter would never have touched. Asking the adapter also
+        keeps every provider name and model name out of the middleware, which is a
+        standing rule of this repo.
+
+        Default None — a provider that bills reasoning OUTSIDE the caller's output
+        budget has no such floor.
+        """
+        return None
+
     def extract_usage(self, response: Dict) -> Dict:
         """Normalise provider usage into cached/reasoning/cache-write counts.
 
@@ -709,6 +796,10 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
         k: v for k, v in ctx.params.items()
         if not k.startswith("_") and not k.startswith("x_") and k not in INTERNAL_PARAM_KEYS
     }
+    # The tier the CALLER asked for, captured before the strips below remove it. A
+    # request that asked for `off` still reasons on a model that cannot disable it, so it
+    # still needs output headroom — but at the SMALLEST tier, not the default one.
+    requested_effort = outgoing.get("reasoning_effort")
     if not adapter.supports_reasoning(model):
         for rk in adapter.reasoning_param_keys():
             if outgoing.pop(rk, None) is not None and request_id:
@@ -735,6 +826,33 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
         if outgoing.pop(_uk, None) is not None and request_id:
             logger.debug("[%s] Stripped unsupported param '%s' for %s", request_id, _uk, model)
     outgoing = adapter.cap_reasoning_params(outgoing, outgoing.get("max_tokens"))
+    # Grow the OUTPUT budget so a reasoning model has room to think AND answer. This is
+    # the one seam every call path shares (primary, failover, cascade tier), which is
+    # why it lives here and not in a middleware: `cap_reasoning_params` above was the
+    # only budget reconciliation and it is a no-op on providers that express reasoning
+    # as an effort STRING, and it is handed `max_tokens`, which is absent on exactly the
+    # requests that need it. Recorded on ctx for disclosure — never silent.
+    try:
+        _raised = adapter.reserve_reasoning_headroom(
+            outgoing, model, eff_cfg, requested_effort
+        )
+    except Exception as exc:  # never fail a request over a budget hint
+        _raised = None
+        if request_id:
+            logger.warning("[%s] reasoning-headroom reservation failed: %s", request_id, exc)
+    if _raised:
+        try:
+            ctx.output_budget_raised = _raised
+        except Exception:
+            pass
+        if request_id:
+            logger.info(
+                "[%s] Raised %s %s → %s for %s (effort=%s) — a reasoning model's hidden "
+                "thinking is billed inside the output budget, and the caller's budget "
+                "could not hold thinking plus an answer.",
+                request_id, _raised.get("param"), _raised.get("from"),
+                _raised.get("to"), model, _raised.get("effort"),
+            )
     outgoing = apply_context_management(outgoing, adapter, eff_cfg, ctx.tenant_id)
     return outgoing
 

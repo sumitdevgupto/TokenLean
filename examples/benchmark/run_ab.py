@@ -395,9 +395,34 @@ def _assistant_msg(content: str, tcs: list) -> dict:
     return m
 
 
+# Reasoning models bill their hidden thinking INSIDE the output budget, so a budget
+# sized for the answer is spent entirely on thinking and the call returns EMPTY at full
+# price. The proxy reserves headroom for this (groups.G12_reasoning.reasoning_headroom).
+# The DIRECT arm must apply the SAME policy or the two arms stop being budget-matched
+# and the A/B numbers would measure the reservation instead of the optimisations —
+# mirrors the shipped defaults; keep the two in step if either changes.
+_REASONING_MODEL_FRAGMENTS = ("o1", "o3", "o4")
+_REASONING_ANSWER_FLOOR = 512
+_REASONING_ALLOWANCE = 4096          # the `medium` tier, which is these models' default
+
+
+def reasoning_headroom_budget(model: str, max_tokens: int) -> int:
+    """The output budget to send for `model`, matching the proxy's own reservation.
+
+    Identical policy on both arms, so the comparison stays honest: a raise applied to
+    only one side would show up as a savings difference that is really a budget
+    difference. Non-reasoning models and already-sufficient budgets are unchanged.
+    """
+    low = (model or "").lower().rsplit("/", 1)[-1]
+    if not any(low.startswith(f) for f in _REASONING_MODEL_FRAGMENTS):
+        return max_tokens
+    return max(max_tokens, _REASONING_ANSWER_FLOOR + _REASONING_ALLOWANCE)
+
+
 def call_direct(litellm_model: str, messages: list, max_tokens: int, tools: list = None,
                 api_base: str = None, api_key: str = None) -> dict:
     import litellm
+    max_tokens = reasoning_headroom_budget(litellm_model, max_tokens)
     kw = {"model": litellm_model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
     if tools:
         kw["tools"] = tools

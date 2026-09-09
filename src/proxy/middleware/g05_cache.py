@@ -398,6 +398,26 @@ def _hash_args(args: tuple, kwargs: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def _is_empty_answer(response: Dict[str, Any]) -> bool:
+    """True when the response carries no content and no tool calls.
+
+    Deliberately NOT keyed on ``finish_reason``: a truncated-to-nothing answer
+    (``length``), a model that returned an empty string, and a malformed choice are
+    all equally useless to serve from cache later. A guardrail refusal is excluded --
+    it carries its refusal text as content, so it never reaches the empty test.
+    """
+    choices = response.get("choices") or []
+    if not choices:
+        return False   # no choices at all is a malformed/streamed shape, not our case
+    message = (choices[0] or {}).get("message") or {}
+    if message.get("tool_calls") or message.get("function_call"):
+        return False
+    content = message.get("content")
+    if isinstance(content, list):
+        return not content
+    return content is None or not str(content).strip()
+
+
 class G05Cache:
     """G05 cache with L1 (Redis exact), L2 (pgvector semantic), and auto-TTL."""
     
@@ -587,6 +607,21 @@ class G05Cache:
         if ctx.cache_hit or ctx.bypassed or getattr(ctx, "no_cache", False) \
                 or getattr(ctx, "agent_dispatched", False):
             return
+        # An answer that carries NOTHING must never enter the cache. G18 sets
+        # ctx.no_cache on detection one stage earlier, so this is belt AND braces:
+        # ordering alone was exactly what failed for G32/G15, and the blast radius
+        # here is a tenant being served an empty answer for every look-alike question
+        # until the L2 TTL expires (default 24h), with the provider never called again
+        # and so nothing left to notice it. Independent of any enable flag.
+        if _is_empty_answer(response):
+            logger.warning(
+                "[%s] G05 refusing to cache an EMPTY answer (finish_reason=%s) — "
+                "caching it would replay the emptiness to every similar question",
+                getattr(ctx, "request_id", "?"),
+                ((response.get("choices") or [{}])[0] or {}).get("finish_reason") or "(none)",
+            )
+            return
+
 
         cfg = ctx.config.get("groups", {}).get("G5_cache", {})
         if not cfg.get("enabled", False):

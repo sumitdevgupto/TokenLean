@@ -14,6 +14,7 @@ import os
 import re
 import time
 from collections import Counter
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from middleware import RequestContext, resolve_group_config
@@ -653,7 +654,7 @@ async def _flush_batch_loop(
         import litellm
         from auth.api_key_manager import get_llm_provider_key
         from config_loader import get_provider_model_prefixes, get_providers
-        from providers import build_litellm_call
+        from providers import build_litellm_call, get_adapter, outgoing_params_for
 
         provider_map = get_provider_model_prefixes()
 
@@ -698,14 +699,33 @@ async def _flush_batch_loop(
 
             try:
                 _call_model, _call_kwargs = build_litellm_call(model, get_providers(), provider_key)
+                # Tracker 23.44: route through the SAME provider param-hygiene +
+                # reasoning-headroom-reservation seam every other call site uses
+                # (main.py primary + failover, G06 cascade tiers) — see
+                # providers.outgoing_params_for / reserve_reasoning_headroom. Without
+                # this, a batched request to a reasoning model reached the provider
+                # with a budget sized for the answer alone and could come back empty,
+                # billed in full, with nothing able to detect it afterwards: the
+                # result-serve endpoint (`/v1/batch/results`) has no RequestContext at
+                # poll time. This background flush loop has no RequestContext either
+                # (items are plain dicts read off a Redis Stream), so a minimal
+                # duck-typed stand-in supplies exactly the two attributes the seam
+                # reads (`params`, `tenant_id`) plus the `output_budget_raised` slot it
+                # writes for disclosure (best-effort; the seam itself wraps that write
+                # in try/except, so a plain object is sufficient) — it carries no
+                # reservation logic of its own, all of which stays in the seam/adapter.
+                _routed_adapter = get_adapter(model, get_providers())
+                _batch_ctx = SimpleNamespace(
+                    params=params, tenant_id=tenant_id, output_budget_raised=None
+                )
+                outgoing_params = outgoing_params_for(
+                    _batch_ctx, _routed_adapter, model, cfg, request_id
+                )
                 response = await litellm.acompletion(
                     model=_call_model,
                     messages=messages,
                     **_call_kwargs,
-                    **{
-                        k: v for k, v in params.items()
-                        if not k.startswith("_") and not k.startswith("x_") and k != "model"
-                    },
+                    **outgoing_params,
                 )
                 response_dict = (
                     response.model_dump()

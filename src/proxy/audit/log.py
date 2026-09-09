@@ -243,6 +243,26 @@ class AuditLogger:
                 "tool_dispatch.blocked",
                 {"tools": dispatch_blocked, "count": len(dispatch_blocked)},
             ))
+        # A billed response that delivered NOTHING — no content, no tool calls (typically
+        # a reasoning model that spent the caller's whole output budget thinking). Not a
+        # security event, but it belongs on the same PII-free ledger: it is the one
+        # outcome a customer is entitled to see evidenced rather than inferred from a
+        # bill, and until 2026-09-08 it left no trace anywhere at all. The details carry
+        # only the provider's stop reason and two token COUNTS — never the prompt, never
+        # the (absent) answer — so the row is PII-free on the same basis as the rows
+        # above, and stays so through the GDPR export.
+        empty = getattr(ctx, "empty_completion", None)
+        if isinstance(empty, dict) and empty:
+            events.append((
+                "completion.empty",
+                {
+                    "finish_reason": str(empty.get("finish_reason") or ""),
+                    "reason": str(empty.get("reason") or ""),
+                    "completion_tokens": int(empty.get("completion_tokens") or 0),
+                    "reasoning_tokens": int(empty.get("reasoning_tokens") or 0),
+                    "model": str(getattr(ctx, "routed_model", "") or ""),
+                },
+            ))
         if not events:
             return
         tenant_id = getattr(ctx, "tenant_id", "default")

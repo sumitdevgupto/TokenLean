@@ -14,6 +14,7 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from middleware import RequestContext
 from middleware import langfuse_tracing
+from middleware.g06_routing import record_routing_step
 from savings.calculator import (
     effective_token_cost,
     estimate_cost,
@@ -25,6 +26,87 @@ from cache.redis_pool import get_redis as _get_redis
 
 logger = logging.getLogger(__name__)
 GROUP = "G18"
+
+
+def detect_empty_completion(ctx: RequestContext, response: Dict[str, Any]) -> None:
+    """Flag a billed response that delivered NOTHING, and forbid caching it.
+
+    The worst outcome this proxy can produce is a request the customer pays for in full
+    that carries no answer. It happens for real: on 2026-09-07, 18 of 54 o4-mini requests
+    sent with the caller's own ``max_completion_tokens: 1024`` returned
+    ``finish_reason: "length"`` with empty content, each billing 1,024 reasoning tokens —
+    44.8% of that arm's spend for zero characters. Nothing in the proxy noticed: it was
+    billed as a normal 200, and the savings ledger even recorded a small POSITIVE saving.
+
+    Deliberately NOT configurable and deliberately not inside the ``enabled`` gate below:
+    like the G29/G30 safety scans, an honesty signal a deployment can switch off is not a
+    signal. Sets ``ctx.empty_completion`` (its own field — never another group's state)
+    and ``ctx.no_cache``, so the empty answer is not stored and then replayed from cache
+    to every look-alike question for the next 24 hours.
+
+    Never raises: a diagnostic must not be able to break the response it describes.
+    """
+    try:
+        choices = response.get("choices") or []
+        if not choices:
+            return
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        if message.get("tool_calls") or message.get("function_call"):
+            return
+        content = message.get("content")
+        # A list content part (multimodal) with any entry is an answer; only a missing or
+        # whitespace-only string is nothing at all.
+        if isinstance(content, list):
+            if content:
+                return
+        elif content is not None and str(content).strip():
+            return
+
+        finish_reason = choice.get("finish_reason") or ""
+        # A guardrail refusal is a DELIBERATE empty-ish response that G29/G30 already
+        # disclose on their own surfaces; counting it here would double-report a working
+        # safety feature as a defect.
+        if finish_reason == "content_filter":
+            return
+
+        usage = response.get("usage") or {}
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        reasoning_tokens = int(
+            (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        )
+        reason = finish_reason if finish_reason == "length" else (
+            "stop_empty" if finish_reason else "empty"
+        )
+        ctx.empty_completion = {
+            "finish_reason": finish_reason,
+            "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "reason": reason,
+        }
+        # An empty answer must never be cached: G05 would serve it to every later
+        # identical OR semantically similar question from this tenant, billed, without
+        # ever reaching the provider again. G05's store_response carries an independent
+        # guard as well — ordering alone is not a guarantee (the G32/G15 lesson).
+        ctx.no_cache = True
+        try:
+            EMPTY_COMPLETIONS.labels(
+                reason=reason,
+                model=getattr(ctx, "routed_model", "") or "",
+                tenant_id=getattr(ctx, "tenant_id", "") or "",
+            ).inc()
+        except Exception as exc:  # pragma: no cover - metric backend only
+            logger.debug("G18 empty-completion metric failed: %s", exc)
+        logger.warning(
+            "[%s] EMPTY completion billed: model=%s finish_reason=%s completion_tokens=%d "
+            "reasoning_tokens=%d — the customer paid for output that contains nothing. "
+            "Raise the output budget (groups.G12_reasoning.reasoning_headroom) or lower "
+            "the reasoning effort for this workload.",
+            getattr(ctx, "request_id", "?"), getattr(ctx, "routed_model", "?"),
+            finish_reason or "(none)", completion_tokens, reasoning_tokens,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("G18 empty-completion detection failed: %s", exc)
 
 
 async def _emit_trace(ctx: RequestContext, response: Dict[str, Any]) -> None:
@@ -54,6 +136,18 @@ REASONING_MODE = Counter(
     "`off_unsupported` means `off` was selected but the model reasons intrinsically "
     "(OpenAI o-series), so no reasoning saving may be claimed for it.",
     ["mode", "model", "tenant_id"],
+)
+EMPTY_COMPLETIONS = Counter(
+    "token_opt_empty_completion_total",
+    "Responses billed in full that carried NO content and NO tool calls. `length` means "
+    "the output budget ran out before the model produced anything — on a reasoning model "
+    "the hidden thinking is billed inside that budget, so the customer pays the whole "
+    "allowance for an empty reply. This is a customer-harm signal, not an optimisation "
+    "metric: it has no enable knob and G24 cannot skip it. NON-STREAMING ONLY — a "
+    "streamed response never enters the response pipeline, so it is not counted here "
+    "(the output-budget reservation at the provider seam still applies to it, so the "
+    "harm is prevented; only the observation is missing).",
+    ["reason", "model", "tenant_id"],
 )
 CACHE_READ_TOKENS = Counter(
     "token_opt_cache_read_tokens_total",
@@ -344,6 +438,16 @@ class G18Observability:
         self._audit_logger = audit_logger
 
     async def record(self, ctx: RequestContext, response: Dict[str, Any]) -> None:
+        # BEFORE the enable gate, and before G05 stores the response one stage later:
+        # an empty billed answer is a customer-harm signal, and a deployment that turns
+        # observability off must not thereby turn off the thing that refuses to cache it.
+        detect_empty_completion(ctx, response)
+        # Also before the gate, and for the same reason: G06's savings step is written
+        # here from the model that actually answered (record_routing_step's docstring has
+        # the why). A deployment that turns observability off must not thereby turn the
+        # routing ledger back into the plan-time claim this replaced. Idempotent.
+        record_routing_step(ctx)
+
         cfg = ctx.config.get("groups", {}).get("G18_observability", {})
         if not cfg.get("enabled", False):
             return
@@ -412,6 +516,27 @@ class G18Observability:
             reasoning_rate_multiplier=reasoning_rate_multiplier,
             **_cache_cost_kwargs,
         )
+        # Every OTHER provider call this request paid for. A cascade that escalates sends
+        # the prompt two or three times and only the last response reaches this method, so
+        # pricing that one alone under-stated what the request cost — in the direction
+        # that flattered the savings figure. The final entry is the served call already
+        # priced above (with its cache/reasoning/batch adjustments); the ones before it are
+        # the tier probes and llm_judge calls, added at plain list price. Empty list →
+        # nothing added, so the ordinary single-call path is byte-identical.
+        _calls = list(getattr(ctx, "provider_calls", None) or [])
+        if len(_calls) > 1:
+            for _c in _calls[:-1]:
+                ctx.savings.cost_actual_usd += estimate_cost(
+                    int(_c.get("prompt_tokens") or 0),
+                    int(_c.get("completion_tokens") or 0),
+                    _c.get("model") or model,
+                )
+            # y (final_tokens_sent) deliberately stays the FINAL call's prompt so it stays
+            # comparable with every past measurement; this is the total actually sent.
+            ctx.savings.provider_call_count = len(_calls)
+            ctx.savings.provider_call_prompt_tokens = sum(
+                int(_c.get("prompt_tokens") or 0) for _c in _calls
+            )
         # Decompose the same total so a cost line can answer "how much of this was cache?".
         # Only recorded when the provider actually reported a count — an unreported half
         # stays None so it reads as unknown rather than as a genuine zero.

@@ -153,7 +153,7 @@ def _minimal_config() -> Dict[str, Any]:
                 "max_tokens_feedback_loop": True,
                 "max_tokens_auto_tighten": True,
                 "tighten_quantile": 0.95,
-                "tighten_multiplier": 1.2,
+                "tighten_multiplier": 2.0,
                 "max_tokens_history_ttl_days": 7,
             },
             "G12_reasoning": {

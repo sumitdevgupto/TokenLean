@@ -87,6 +87,27 @@ class RequestContext:
     # empty on cache hit / bypass / non-resilient paths. Used by G18 (failover
     # metric) and the SLA surface. List[Any] to avoid importing providers here.
     provider_attempts: List[Any] = field(default_factory=list)
+    # EVERY provider call this request paid for, in the order they were made. One entry
+    # per completed call: {"model", "prompt_tokens", "completion_tokens",
+    # "reasoning_tokens", "cached_tokens"}. Populated by the primary/failover call site
+    # in main.py AND by G06's cascade tier probes + judge calls (_timed_llm), which
+    # previously recorded only their wall-clock time — so an escalating cascade billed
+    # two or three calls while G18 priced one. cost_actual_usd sums this list; y
+    # (final_tokens_sent) deliberately stays the FINAL call's prompt for comparability
+    # with every past measurement, with provider_call_prompt_tokens disclosed beside it.
+    provider_calls: List[Dict[str, Any]] = field(default_factory=list)
+    # Set when the proxy served a DIFFERENT model than the caller asked for without the
+    # caller choosing it (the routing-disabled / no-tiers substitution of an unconfigured
+    # model). Disclosure only — the substitution itself is unchanged. "" when the served
+    # model is the requested one.
+    model_substituted: str = ""
+    # G06's plan-time reasoning ("classifier=cascade, complexity=simple", "rule=x",
+    # "user_override", ...), carried to the response so the savings step can name WHY the
+    # route was chosen while still reporting the model that actually answered.
+    routing_detail: str = ""
+    # Idempotence latch for record_routing_step: the step is written once per request,
+    # by whichever of G06.process_response / G18 reaches it first.
+    routing_step_recorded: bool = False
 
     # ── Trust & Safety (#2 PII redaction G29 / #3 guardrails G30) ────────────
     # Short-circuit pair (mirrors bypassed/cache_response): set by G30 on a hard
@@ -184,6 +205,23 @@ class RequestContext:
     # The two `off_*` values must stay distinct: collapsing them would let the proxy
     # report a reasoning saving on a provider that could not deliver one (backlog #42).
     reasoning_mode: Optional[str] = None
+    # Set by `providers.outgoing_params_for` when the proxy RAISED the caller's output
+    # budget to make room for a reasoning model's hidden reasoning tokens (FIX-1). On a
+    # reasoning model the caller's `max_completion_tokens` covers reasoning AND the
+    # answer, so a budget sized for the answer alone is spent entirely on thinking and
+    # the customer is billed in full for an EMPTY reply. Shape:
+    # {"param", "from", "to", "effort", "reason"}. Disclosed in `_token_opt` and in the
+    # `x-tokenlean-output-budget-raised` header because it RAISES what the customer can
+    # be billed for output — never a silent change.
+    output_budget_raised: Optional[Dict[str, Any]] = None
+    # Set on the response path when the provider returned NO content and NO tool calls
+    # (typically `finish_reason: "length"` on a reasoning model that spent the whole
+    # budget thinking). Shape: {"finish_reason", "completion_tokens", "reasoning_tokens"}.
+    # This is a trust/honesty signal, not an optimisation: it has no enable knob, it
+    # forces `no_cache` (an empty answer must never be served again from cache), and it
+    # is disclosed via metric, header, `_token_opt` and an audit row. Its OWN field —
+    # never another group's state.
+    empty_completion: Optional[Dict[str, Any]] = None
     # Ingress protocol the client used (default = the OpenAI identity protocol;
     # "anthropic" for /v1/messages, "gemini" for …:generateContent). The pipeline is
     # protocol-agnostic (OpenAI-shaped internally) — this only flows into
@@ -389,3 +427,38 @@ def coerce_mode(raw: Any, valid: Sequence[str], default: str) -> str:
         return default
     mode = str(default if raw is None else raw).strip().lower()
     return mode if mode in valid else default
+
+
+def record_provider_call(ctx, model: str, response: Any) -> None:
+    """Append one COMPLETED provider call to ``ctx.provider_calls``.
+
+    Called from every site that pays a provider: main.py's primary/failover call and
+    G06's cascade tier probes + judge calls. Before this existed, a cascade that
+    escalated made two or three billed calls and G18 priced only the last one — the
+    proxy under-reported what the request actually cost, in the direction that
+    flattered the savings figure.
+
+    Never raises and never blocks a response: a call it cannot parse is simply not
+    recorded (cost then falls back to the response G18 already has), because a
+    bookkeeping miss must not become a 500 on a request the provider already served.
+    """
+    try:
+        usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+        if usage is not None and not isinstance(usage, dict):
+            usage = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
+        usage = usage or {}
+        ctd = usage.get("completion_tokens_details") or {}
+        ptd = usage.get("prompt_tokens_details") or {}
+        if not isinstance(ctd, dict):
+            ctd = ctd.model_dump() if hasattr(ctd, "model_dump") else {}
+        if not isinstance(ptd, dict):
+            ptd = ptd.model_dump() if hasattr(ptd, "model_dump") else {}
+        ctx.provider_calls.append({
+            "model": model or "",
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "reasoning_tokens": int(ctd.get("reasoning_tokens") or 0),
+            "cached_tokens": int(ptd.get("cached_tokens") or 0),
+        })
+    except Exception:  # noqa: BLE001 — bookkeeping never fails a served request
+        pass

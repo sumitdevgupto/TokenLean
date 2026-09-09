@@ -126,6 +126,101 @@ class TestBatchBaselineTokensAttribution:
         assert stored["baseline_tokens"] == 0
 
 
+@pytest.mark.asyncio
+class TestBatchRoutesThroughReservationSeam:
+    """Tracker 23.44 — the batch flush must go through the SAME provider param-hygiene
+    + reasoning-headroom seam every other call site uses (providers.outgoing_params_for).
+    Before this fix the loop called litellm.acompletion with the raw item params, so a
+    batched request to a reasoning model reached the provider with a budget sized for
+    the answer alone — and the result-serve endpoint has no RequestContext to detect the
+    resulting empty answer either."""
+
+    async def test_flush_loop_reserves_reasoning_headroom_for_a_reasoning_model(self):
+        from middleware import g13_batch
+        items = [{
+            "request_id": "r0", "messages": [{"role": "user", "content": "hi"}],
+            "params": {"max_completion_tokens": 1024, "reasoning_effort": "medium"},
+            "model": "o4-mini", "tenant_id": "acme",
+        }]
+        cfg = {
+            "groups": {"G12_reasoning": {"reasoning_headroom": {
+                "enabled": True,
+                "answer_floor_tokens": 512,
+                "allowance_tokens": {"low": 1024, "medium": 4096, "high": 16384},
+            }}},
+            "providers": [],
+        }
+        fake_resp = MagicMock()
+        fake_resp.model_dump.return_value = {"id": "c0", "usage": {"prompt_tokens": 10}}
+        with patch("config_loader.get_provider_model_prefixes", return_value={"o4-mini": "openai"}), \
+             patch("config_loader.get_providers", return_value=[]), \
+             patch("config_loader.get_default_provider", return_value="openai"), \
+             patch("providers.build_litellm_call", return_value=("o4-mini", {})), \
+             patch("providers.key_resolver.resolve_provider_key",
+                   new=AsyncMock(return_value="sk-test")), \
+             patch("litellm.acompletion", new=AsyncMock(return_value=fake_resp)) as mock_call, \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()):
+            await g13_batch._flush_batch_loop("topic1", items, cfg)
+        sent = mock_call.await_args.kwargs
+        # 4096 (medium allowance) + 512 (answer floor) — the reservation the seam
+        # applies for a reasoning model whose caller-sized budget can't hold thinking
+        # plus an answer. Unrouted, this stays 1024 and the provider gets billed for
+        # thinking alone.
+        assert sent["max_completion_tokens"] == 4096 + 512
+
+    async def test_flush_loop_strips_the_off_reasoning_sentinel(self):
+        """`off` is our internal tier vocabulary, never a value any provider accepts —
+        the seam strips it (providers.outgoing_params_for). A side effect of routing
+        through the seam for tracker 23.44: previously the raw sentinel reached
+        litellm.acompletion unfiltered on this path."""
+        from middleware import g13_batch
+        items = [{
+            "request_id": "r0", "messages": [{"role": "user", "content": "hi"}],
+            "params": {"reasoning_effort": "off", "max_tokens": 64},
+            "model": "gpt-4o-mini", "tenant_id": "acme",
+        }]
+        fake_resp = MagicMock()
+        fake_resp.model_dump.return_value = {"id": "c0"}
+        with patch("config_loader.get_provider_model_prefixes", return_value={"gpt-4o-mini": "openai"}), \
+             patch("config_loader.get_providers", return_value=[]), \
+             patch("config_loader.get_default_provider", return_value="openai"), \
+             patch("providers.build_litellm_call", return_value=("gpt-4o-mini", {})), \
+             patch("providers.key_resolver.resolve_provider_key",
+                   new=AsyncMock(return_value="sk-test")), \
+             patch("litellm.acompletion", new=AsyncMock(return_value=fake_resp)) as mock_call, \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()):
+            await g13_batch._flush_batch_loop("topic1", items, {})
+        sent = mock_call.await_args.kwargs
+        assert "reasoning_effort" not in sent
+        assert sent["max_tokens"] == 64
+
+    async def test_flush_loop_strips_internal_only_param_keys(self):
+        """INTERNAL_PARAM_KEYS (template_id/workflow_id/rag_query/batch_id/burst_block)
+        are middleware-internal and must never reach litellm — the seam strips them.
+        The pre-fix loop only stripped `_`/`x_`-prefixed keys and `model`, so any of
+        these leaking into a batched item's params would have reached the provider."""
+        from middleware import g13_batch
+        items = [{
+            "request_id": "r0", "messages": [{"role": "user", "content": "hi"}],
+            "params": {"template_id": "tpl-1", "max_tokens": 64},
+            "model": "gpt-4o-mini", "tenant_id": "acme",
+        }]
+        fake_resp = MagicMock()
+        fake_resp.model_dump.return_value = {"id": "c0"}
+        with patch("config_loader.get_provider_model_prefixes", return_value={"gpt-4o-mini": "openai"}), \
+             patch("config_loader.get_providers", return_value=[]), \
+             patch("config_loader.get_default_provider", return_value="openai"), \
+             patch("providers.build_litellm_call", return_value=("gpt-4o-mini", {})), \
+             patch("providers.key_resolver.resolve_provider_key",
+                   new=AsyncMock(return_value="sk-test")), \
+             patch("litellm.acompletion", new=AsyncMock(return_value=fake_resp)) as mock_call, \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()):
+            await g13_batch._flush_batch_loop("topic1", items, {})
+        sent = mock_call.await_args.kwargs
+        assert "template_id" not in sent
+        assert sent["max_tokens"] == 64
+
+
 class TestCompactJsonToToon:
     """Boundary tests for the lowered TOON array-length trigger threshold
     (now >= 2 identical-key items, previously >= 3)."""

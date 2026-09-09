@@ -36,18 +36,28 @@ class TestG11FeedbackLoop:
 
     @pytest.fixture
     def ctx_with_config(self):
-        """Create a request context with G11 config."""
+        """A request context with G11 config and an IDENTIFIED workload bucket.
+
+        Two parts of this fixture encode the 2026-09-08/09 contract rather than the old
+        one. `workflow_id` is present because a request that identifies no workload has no
+        history bucket at all (`_history_key` returns None) — the catch-all was deleted
+        after it capped long-form answers from short-form evidence. And
+        `max_tokens_auto_tighten` is on because recording is gated on the switch that
+        READS the history: with the cap off, writing a per-request ZSET that nothing
+        consults is pure cost on shared Memorystore.
+        """
         ctx = MagicMock(spec=RequestContext)
         ctx.config = {
             "groups": {
                 "G11_output": {
                     "enabled": True,
                     "max_tokens_feedback_loop": True,
+                    "max_tokens_auto_tighten": True,
                     "max_tokens_history_ttl_days": 7,
                 }
             }
         }
-        ctx.params = {"max_tokens": 500}
+        ctx.params = {"max_tokens": 500, "workflow_id": "wf-support"}
         ctx.model = "gpt-4o-mini"
         ctx.request_id = "test-req-001"
         ctx.user_id = "user-001"
@@ -244,18 +254,27 @@ class TestG11FeedbackLoop:
 
         assert key == "t:NOVA-STG-01:tok_opt:max_tokens_history:wf-123:tpl-456"
 
-    def test_history_key_defaults(self):
-        """Test history key uses defaults when IDs not provided."""
+    def test_history_key_is_none_when_the_request_identifies_no_workload(self):
+        """The catch-all bucket is GONE, deliberately.
+
+        This test used to assert `tok_opt:max_tokens_history:default:default`. That key
+        was the 2026-09-07 truncation defect: neither id is set by ordinary traffic, by
+        any readiness probe or by any pitch dataset, so every workload a tenant ran pooled
+        into one bucket and long-form requests were capped from short-form answers (one
+        readiness sweep produced caps of 64 and 367 from that single bucket, and 6 of 27
+        probes came back `finish_reason=length` on billed 200s). A cap must come from
+        answers to work of the same shape, so with no way to tell shapes apart G11 now
+        declines: `_history_key` returns None and nothing is read or written.
+        """
         ctx = MagicMock(spec=RequestContext)
         ctx.redis_prefix = ""
         ctx.params = {}
 
-        key = _history_key(ctx)
+        assert _history_key(ctx) is None
 
-        assert key == "tok_opt:max_tokens_history:default:default"
-
-    def test_history_key_differs_across_tenants(self):
-        """Two tenants sending the same workload must never share a history bucket."""
+    def test_history_key_is_none_for_every_tenant_without_a_workload_id(self):
+        """Tenant scoping cannot rescue an unidentified request: a per-tenant catch-all is
+        still a pool of unrelated workloads. Both tenants get None, not two buckets."""
         a = MagicMock(spec=RequestContext)
         a.redis_prefix = "t:NOVA-STG-01:"
         a.params = {}
@@ -263,7 +282,44 @@ class TestG11FeedbackLoop:
         b.redis_prefix = "t:SHOP-STG-01:"
         b.params = {}
 
+        assert _history_key(a) is None
+        assert _history_key(b) is None
+
+    def test_history_key_differs_across_tenants(self):
+        """Two tenants running the SAME identified workload must never share a bucket —
+        one tenant's answer lengths may not shape another's caps."""
+        a = MagicMock(spec=RequestContext)
+        a.redis_prefix = "t:NOVA-STG-01:"
+        a.params = {"workflow_id": "wf-support"}
+        b = MagicMock(spec=RequestContext)
+        b.redis_prefix = "t:SHOP-STG-01:"
+        b.params = {"workflow_id": "wf-support"}
+
+        assert _history_key(a) is not None
         assert _history_key(a) != _history_key(b)
+
+    def test_only_one_of_the_two_ids_is_enough_to_form_a_bucket(self):
+        """A caller naming a template but no workflow (or the reverse) HAS identified its
+        workload — the refusal is for a request that identifies neither."""
+        ctx = MagicMock(spec=RequestContext)
+        ctx.redis_prefix = ""
+        ctx.params = {"template_id": "tpl-456"}
+
+        assert _history_key(ctx) == "tok_opt:max_tokens_history:default:tpl-456"
+
+    def test_a_caller_cannot_choose_the_redis_key_length(self):
+        """The ids come off the wire. They used to be interpolated verbatim — no length
+        bound, no charset limit — so a caller picked both the size and the shape of a key
+        on shared Memorystore. Long or odd values are hashed, as G05 hashes its scope tag."""
+        ctx = MagicMock(spec=RequestContext)
+        ctx.redis_prefix = ""
+        ctx.params = {"workflow_id": "w" * 4000, "template_id": "has spaces:and:colons"}
+
+        key = _history_key(ctx)
+
+        assert len(key) < 100
+        assert "w" * 100 not in key
+        assert " " not in key
 
 
 class TestG11AutoTighten:
@@ -282,13 +338,18 @@ class TestG11AutoTighten:
                 "G11_output": {
                     "enabled": True,
                     "enforce_max_tokens": True,
+                    # Explicitly ON. The shipped default is OFF since 2026-09-08 — capping
+                    # from evidence a request cannot be matched to is what cut answers
+                    # mid-sentence on billed 200s — so a test of the cap must opt in.
                     "max_tokens_auto_tighten": True,
                     "tighten_quantile": 0.95,
                     "tighten_multiplier": 1.2,
                 }
             }
         }
-        ctx.params = {}  # No max_tokens set - should trigger auto-tighten
+        # No max_tokens, but a named workload: a cap is only ever derived from a bucket
+        # the caller identified.
+        ctx.params = {"workflow_id": "wf-support"}
         ctx.model = "gpt-4o-mini"
         ctx.current_token_count = 1000
         ctx.request_id = "test-auto-001"

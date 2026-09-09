@@ -21,6 +21,130 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-09
+
+### G02's system-prompt truncation removed — it rewrote answers; G26 owns budget compaction — Bug fix
+
+The template registry had an opt-in `budget.truncate_enabled` path that cut the tail off the caller's
+system prompt until the request fit a registered template's token budget, with no faithfulness check.
+Measured on a real enterprise-support workload it deleted 691 characters of policy text per request and
+changed billed answers: a refund reply stopped naming the disputed amount, an SLA reply stopped naming
+the breach. The path is deleted, not guarded: G02 looks the template up, tracks token history, blocks
+sunset templates and WARNS when a request exceeds its budget, then forwards the request unchanged.
+Runtime protection for a prompt that outgrows the window is G26's job; template budgets are enforced at
+build time. Default installs were unaffected (`truncate_enabled` shipped `false`); the knobs are removed.
+Direction: this LOWERS the published headline twice — G02's ablation dataset now saves ~0% and, no longer
+failing its quality gate, enters the PASS-only blend at ~0%. G02 is no longer a scoreable savings group.
+
+### The savings harness sampled the cache datasets down to almost no repeats — Bug fix
+
+The 2026-09-07 fix that made every ablation arm gradeable reserved every request carrying curated facts.
+On the cache datasets those are the requests that are NOT repeated, so reserving them all crowded the
+repeats out: one dataset's sampled repeat rate fell from 83% to 33%, and the measured cache workload
+fell from 55.9% to 11.9% with the proxy byte-identical. The reservation is now capped at what the
+dataset's own repeat rate leaves, repeated requests are reserved together with their repeats, and the
+sample is enlarged when both cannot fit, so every arm is still graded (never fewer than three checked
+answers) and the sample still looks like the dataset it came from. The quality gate now fills its graded
+window with fact-covered answers first. Direction: this RAISES the published cache figure back to its
+workload's shape and grades more answers, which can only lower a verdict; served behaviour is unchanged.
+The cache figure is the hit share of a repeated-question workload, not a general traffic figure.
+
+### G25 no longer raises reasoning effort above the provider default — Bug fix
+- Adaptive Reasoning shipped with `effort_ceiling: high`, so a request its keyword classifier
+  judged complex was sent to a reasoning model at **high** effort — above the effort the caller
+  would otherwise have been served. Measured on a reasoning benchmark: identical prompts,
+  **2.7x the reasoning tokens** and **+37.8% output tokens**, while the arm's own answer-quality
+  gate passed 30/30. The escalation cost money and bought no checked fact.
+- The ceiling now defaults to `medium`, the provider's own default, making G25 non-increasing:
+  it can lower reasoning effort but never raise it. Operators who want escalation set
+  `effort_ceiling: high` deliberately. Changed in the shipped config **and** the code default,
+  so a deployment with an older config file does not keep escalating.
+- The ceiling is now enforced **per provider**, not just per config: G25 asks the routed provider what
+  effort it serves by default and never selects above it. Where extended thinking is opt-in, the previous
+  default did not lower a bill - it turned thinking on and raised one. Those customers pay less; OpenAI
+  behaviour is unchanged. Escalation is now an explicit `escalate_above_provider_default: true`.
+- A malformed `effort_ceiling` (a typo, a null, or a bare `off`, which YAML reads as false) used to fail
+  OPEN to `high`, the most expensive setting the group can select. It now falls back to `medium` and warns.
+- No change to the published savings headline FROM THE LAST MINT, where the group had no effect
+  in any `all-on` arm because the reasoning models were unreachable (see the `o4` prefix item
+  above). Once they are reachable the ceiling is what stops effort being escalated. Customers on
+  defaults pay less on reasoning-model traffic.
+
+### G12's budget prompt no longer tells the model to skip steps — Bug fix
+- The reasoning-budget instruction injected at `medium` said "Keep reasoning minimal. One brief
+  step max, then final answer." On a graded reasoning benchmark it dropped the named subject of
+  the question in **4 of 30** checks — one request in all three repeats — while saving 49% of
+  reasoning tokens. A budget that costs a required fact is not a saving.
+- The `low` and `medium` texts now bound how much the model NARRATES, never what the answer
+  must contain ("Do not skip any step a correct answer requires").
+- Direction: this **lowers** G12's measured reasoning saving. That is the intended trade.
+
+### Reasoning models no longer silently downgraded when their prefix is unlisted — Bug fix
+- A model name matching no `providers[].model_prefixes` is treated as unknown, and G06's
+  disabled/no-ladder path replaces it with `default_model`. The `o4` prefix was missing, so an
+  `o4-mini` request was served by `gpt-4o-mini` with the reasoning parameters stripped — a
+  different, cheaper model than the caller asked for, with no error anywhere.
+- `o4` added to the OpenAI provider's `model_prefixes` and `tiktoken_prefixes`; a new unit test
+  fails if any config advertises or routes to a model its own prefixes cannot match.
+- Direction: this makes reasoning models REACHABLE where they were being swapped away, so a
+  deployment that routes complex traffic to one now pays that model's reasoning cost and gets
+  that model's answer. Reasoning-group measurements that had silently never run will run.
+
+### G11's automatic max_tokens tightening cut answers mid-sentence - Bug fix
+G11 capped each answer's length from the observed sizes of past answers, but every workload a
+tenant runs shared one bucket of evidence (`workflow_id`/`template_id` both default to
+`default`, and ordinary traffic sets neither), read as a 10-entry sliding window with only 20%
+headroom - so a long-form answer was capped from short-form ones. Measured on billed 200s: 4 of
+54 answers cut on the DS1 ablation and 6 of 27 probes cut on a live readiness sweep that still
+reported READY. The escalation meant to recover from a bad cap aged out of that window, so the
+same request was cut, raised, and cut again. Tightening now ships OFF; when enabled it caps only
+from a bucket the caller identified, reads the whole retained history, allows headroom sized to
+observed variance, and keeps a floor any truncation raises that no later estimate may undercut.
+Readiness now blocks on any probe served a cut answer it did not ask for.
+- Token savings are unchanged: the loop reduced input tokens by 0.00%; its only measurable
+  effect was the missing end of the answer.
+
+### Reasoning models could return an empty answer and bill for it in full - Bug fix
+On OpenAI's o-series the model's hidden reasoning is paid for out of the SAME allowance as the
+answer, so a caller who sized `max_completion_tokens` for the answer alone could have the whole
+budget spent on thinking and receive an empty reply - HTTP 200, billed in full, no error anywhere.
+Measured on a reasoning benchmark: 18 of 54 requests came back empty, and it was the real cause of
+that dataset failing its answer-quality gate. The proxy now reserves room for the model's reasoning
+at the one seam every call passes through (primary, failover and each cascade tier), refuses to
+route a request onto a reasoning model whose thinking cannot fit the budget the caller set, never
+stores an empty answer in the cache, and discloses when it raised the budget. An empty completion
+is now counted, written to the audit log, and blocks a deployment-readiness verdict instead of
+passing silently.
+- Direction: this RAISES the output allowance on reasoning-model traffic, so a request that was
+  returning nothing now costs slightly more and returns an answer. It lowers no published savings
+  figure in our favour.
+- The asynchronous batch lane was reaching the provider without going through that seam at all,
+  so a batched request to a reasoning model had no headroom reserved and nothing downstream could
+  detect the empty answer either. It now uses the same seam as every other call.
+- **This narrows the window; it does not close it.** Where a model reasons intrinsically, asking for
+  no reasoning cannot switch it off, so the smallest allowance we will provision is still finite and
+  a very small budget can still be consumed before the answer starts. That is why the empty-completion
+  counter, the audit row and the readiness gate ship with the fix: the remaining cases are now visible
+  and blocked at deploy time instead of being billed silently. Expect the counter to be non-zero.
+
+### G06 credited savings to a route it did not take - Bug fix
+The routing group recorded its savings step from the model it PLANNED to use, so a cascade that
+escalated, or a route reverted by the cost floor, left a step crediting a model that never answered
+the request. A cascade also priced only its final call, so a request that paid two or three providers
+reported the cost of one. The step is now written from the model that actually served, every provider
+call the proxy made is priced, and a request served by a different model than the caller asked for says
+so in the response and a header instead of being substituted silently.
+- Direction: reported cost savings on cascade deployments go DOWN, because they were understated by
+  counting one call out of several. Nothing a customer receives changes.
+
+### The quality gate passed a dataset in which neither answer existed - Bug fix
+The answer-quality gate compares an optimised answer against an unoptimised one. When the optimised
+answer was empty it was scored as having dropped no facts, provided the comparison answer was empty
+too - so a request that neither side answered counted as a pass and entered the published savings
+average. An empty answer is now treated as a failure to answer whatever the comparison did, and the
+case where both are empty is reported as un-measurable rather than credited.
+- Direction: this can only LOWER a published figure, by removing from it requests that measured nothing.
+
 ## 2026-09-07
 
 ### Quality-gate console print now agrees with the gate's own verdict — Bug fix

@@ -168,6 +168,11 @@ class TestG11OutputFormat:
         ctx = make_ctx()
         ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
         ctx.config["groups"]["G11_output"]["truncation_backoff_multiplier"] = 2.0
+        # Pinned explicitly (2026-09-08): the shipped `tighten_multiplier` default moved
+        # 1.2 → 2.0, and this case is about the BACKOFF, not the multiplier. Setting it
+        # here keeps the assertion testing exactly what it always tested; the new default
+        # is pinned separately by test_default_tighten_multiplier_is_two.
+        ctx.config["groups"]["G11_output"]["tighten_multiplier"] = 1.2
         ctx.params["workflow_id"] = "wf-test"
         ctx.params["template_id"] = "tmpl-test"
 
@@ -195,11 +200,177 @@ class TestG11OutputFormat:
 
         assert "max_tokens" not in ctx.params
 
+    # ── 2026-09-08 truncation defect (tracker 23.12) ──────────────────────────
+    # G11 capped answers from a bucket shared by every workload a tenant runs, read as a
+    # 10-entry sliding window with 20% headroom. Live: 4 of 54 DS1 answers and 6 of 27
+    # readiness probes came back finish_reason=length on billed 200s, and the arm sent
+    # byte-identical INPUT tokens — the whole observable effect was missing answer content.
+
+    @staticmethod
+    def _history(mock_redis, completions):
+        mock_redis.zrevrange = AsyncMock(return_value=[
+            json.dumps({"max_tokens": 0, "completion_tokens": c}) for c in completions
+        ])
+        mock_redis.get = AsyncMock(return_value=None)
+        return mock_redis
+
+    async def test_catch_all_bucket_is_never_capped(self, make_ctx):
+        """A request that identifies NO workload must not be capped. Both ids default to
+        "default"; ordinary traffic, every readiness probe and every pitch dataset set
+        neither, so the only evidence available is other workloads' answers — which is
+        exactly how a long-form answer got a short-form cap."""
+        mock_redis = self._history(AsyncMock(), [200] * 10)
+        ctx = make_ctx()  # no workflow_id, no template_id
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert "max_tokens" not in ctx.params
+        mock_redis.zrevrange.assert_not_called()  # the bucket is not even consulted
+
+    async def test_one_id_is_enough_to_discriminate_a_bucket(self, make_ctx):
+        """Only the both-absent case is the catch-all; a caller who sets either id has
+        told us which work this is."""
+        mock_redis = self._history(AsyncMock(), [100] * 10)
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.params["template_id"] = "tmpl-only"
+        # tests/conftest.py's minimal_config still pins tighten_multiplier 1.2 (the
+        # pre-2026-09-08 value) and is outside this change's scope, so the three cases
+        # below that are NOT about the default set it explicitly.
+        ctx.config["groups"]["G11_output"]["tighten_multiplier"] = 2.0
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 200  # 100 × the 2.0 default multiplier
+
+    async def test_whole_retained_history_is_read_not_a_sliding_window(self, make_ctx):
+        """`zrevrange(key, 0, -1)`. Reading `0, min_entries*2-1` was the amplifier: over 10
+        samples int((10-1)*0.95) is index 8 — the second largest — and any long answer aged
+        out after ten requests, which is also what discarded the truncation escalation."""
+        mock_redis = self._history(AsyncMock(), [100] * 6 + [900])
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            await G11OutputFormat().process_request(ctx)
+
+        args, _ = mock_redis.zrevrange.call_args
+        assert args[1] == 0 and args[2] == -1, f"read a window, not the history: {args}"
+
+    async def test_default_tighten_multiplier_is_two(self, make_ctx):
+        """1.2 was BELOW the model's own same-prompt spread: on DS1 at temperature 0 the
+        same prompt exceeded 1.2× another repeat's length in 15 of 108 ordered pairs, with
+        a per-request spread up to 2.03×. A margin under the observed variance truncates
+        answers the model has already been seen to produce."""
+        mock_redis = self._history(AsyncMock(), [150] * 10)
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.config["groups"]["G11_output"].pop("tighten_multiplier", None)
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 300
+
+    async def test_sticky_floor_raises_a_cap_the_percentile_would_undercut(self, make_ctx):
+        """The floor is what makes the loop converge. On DS1 ds1-08 was cut at 232, the
+        escalated entry pushed the cap to 256, then aged out and the cap fell to 224 and cut
+        the same request again. A floor is monotone within its TTL, so that cannot recur."""
+        mock_redis = self._history(AsyncMock(), [100] * 10)
+        mock_redis.get = AsyncMock(return_value=b"512")
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 512  # not the 200 the percentile wanted
+
+    async def test_sticky_floor_never_lowers_a_cap(self, make_ctx):
+        """It is a floor, not an override: evidence above it still wins."""
+        mock_redis = self._history(AsyncMock(), [400] * 10)
+        mock_redis.get = AsyncMock(return_value=b"100")
+        ctx = make_ctx()
+        # tests/conftest.py's minimal_config still pins tighten_multiplier 1.2 (the
+        # pre-2026-09-08 value) and is outside this change's scope, so the cases here
+        # that are NOT about the default set it explicitly.
+        ctx.config["groups"]["G11_output"]["tighten_multiplier"] = 2.0
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 800
+
+    async def test_floor_still_bounded_by_the_model_limit(self, make_ctx):
+        mock_redis = self._history(AsyncMock(), [100] * 10)
+        mock_redis.get = AsyncMock(return_value=b"999999")
+        ctx = make_ctx(model="gpt-4o-mini")
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.config["groups"]["G11_output"]["model_max_tokens"] = {"gpt-4o-mini": 16384}
+        ctx.params["model"] = "gpt-4o-mini"
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 16384
+
+    async def test_sanity_floor_is_never_the_applied_cap(self, make_ctx):
+        """Degenerate evidence must DECLINE, not clamp up to 64. The old `max(64, ...)` made
+        the floor the answer length whenever the estimate collapsed — three readiness probes
+        were served capped at 64/74 on 2026-09-07 for exactly this reason."""
+        mock_redis = self._history(AsyncMock(), [1] * 10)
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert "max_tokens" not in ctx.params
+
+    async def test_history_min_entries_is_configurable(self, make_ctx):
+        mock_redis = self._history(AsyncMock(), [100, 100, 100])
+        ctx = make_ctx()
+        ctx.config["groups"]["G11_output"]["max_tokens_auto_tighten"] = True
+        ctx.config["groups"]["G11_output"]["history_min_entries"] = 3
+        # tests/conftest.py's minimal_config still pins tighten_multiplier 1.2 (the
+        # pre-2026-09-08 value) and is outside this change's scope, so the three cases
+        # below that are NOT about the default set it explicitly.
+        ctx.config["groups"]["G11_output"]["tighten_multiplier"] = 2.0
+        ctx.params["workflow_id"] = "wf-test"
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            ctx = await G11OutputFormat().process_request(ctx)
+
+        assert ctx.params["max_tokens"] == 200  # 3 entries would be too few at the default 5
+
     async def test_process_response_records_completed_answers(self, make_ctx):
         """process_response records (max_tokens, completion_tokens) for a COMPLETED
         (finish_reason=stop) answer."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
+        # 2026-09-08: the catch-all bucket (no workflow_id/template_id) is no longer
+        # recorded, because nothing may be capped from it. This test is about the
+        # recording rule, not the bucket rule, so it names a workload.
+        ctx.params["workflow_id"] = "wf-test"
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
         ctx.params["max_tokens"] = 256
         ctx.params["workflow_id"] = "wf-test"
@@ -234,6 +405,10 @@ class TestG11OutputFormat:
         history that lets capping activate."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
+        # 2026-09-08: the catch-all bucket (no workflow_id/template_id) is no longer
+        # recorded, because nothing may be capped from it. This test is about the
+        # recording rule, not the bucket rule, so it names a workload.
+        ctx.params["workflow_id"] = "wf-test"
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
         assert "max_tokens" not in ctx.params
 
@@ -258,6 +433,10 @@ class TestG11OutputFormat:
         mistake — it must contribute no evidence at all."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
+        # 2026-09-08: the catch-all bucket (no workflow_id/template_id) is no longer
+        # recorded, because nothing may be capped from it. This test is about the
+        # recording rule, not the bucket rule, so it names a workload.
+        ctx.params["workflow_id"] = "wf-test"
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
         ctx.params["max_tokens"] = 100  # caller-set: no _g11_max_tokens_set marker
 
@@ -279,6 +458,10 @@ class TestG11OutputFormat:
         climbs after a bad guess instead of the truncated size re-teaching it."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
+        # 2026-09-08: the catch-all bucket (no workflow_id/template_id) is no longer
+        # recorded, because nothing may be capped from it. This test is about the
+        # recording rule, not the bucket rule, so it names a workload.
+        ctx.params["workflow_id"] = "wf-test"
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
         ctx.params["max_tokens"] = 128
         ctx.params["_g11_max_tokens_set"] = True
@@ -305,6 +488,10 @@ class TestG11OutputFormat:
         cap would drag the p95 down for mixed workloads."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
+        # 2026-09-08: the catch-all bucket (no workflow_id/template_id) is no longer
+        # recorded, because nothing may be capped from it. This test is about the
+        # recording rule, not the bucket rule, so it names a workload.
+        ctx.params["workflow_id"] = "wf-test"
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
         ctx.params["max_tokens"] = 256
 
@@ -325,6 +512,10 @@ class TestG11OutputFormat:
         """When max_tokens_feedback_loop is false, process_response should skip recording."""
         mock_redis = AsyncMock()
         ctx = make_ctx()
+        # 2026-09-08: the catch-all bucket (no workflow_id/template_id) is no longer
+        # recorded, because nothing may be capped from it. This test is about the
+        # recording rule, not the bucket rule, so it names a workload.
+        ctx.params["workflow_id"] = "wf-test"
         ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = False
         ctx.params["max_tokens"] = 256
 
@@ -339,6 +530,146 @@ class TestG11OutputFormat:
             ctx, resp = await G11OutputFormat().process_response(ctx, response)
 
         mock_redis.zadd.assert_not_called()
+
+    async def test_catch_all_bucket_is_not_recorded(self, make_ctx):
+        """Nothing may be capped from the catch-all bucket, so nothing writes to it —
+        a Redis write on every request into a set no read path consults is pure cost."""
+        mock_redis = AsyncMock()
+        ctx = make_ctx()  # no workflow_id, no template_id
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "done"}}],
+            "usage": {"completion_tokens": 128},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            await G11OutputFormat().process_response(ctx, response)
+
+        mock_redis.zadd.assert_not_called()
+
+    async def test_truncation_raises_the_sticky_floor(self, make_ctx):
+        """When G11's own cap cuts an answer, the bucket's floor rises to cap × backoff so
+        no later percentile can put the cap back where it was. Without this the escalated
+        history entry is one sample among many and ages out — which is how DS1's ds1-08 was
+        cut at 232, raised, and cut again at 224 two repeats later."""
+        mock_redis = AsyncMock()
+        mock_redis.get = AsyncMock(return_value=None)
+        ctx = make_ctx()
+        ctx.params["workflow_id"] = "wf-test"
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        ctx.config["groups"]["G11_output"]["truncation_backoff_multiplier"] = 2.0
+        ctx.params["max_tokens"] = 232
+        ctx.params["_g11_max_tokens_set"] = True
+        response = {
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "cut off mi"}}],
+            "usage": {"completion_tokens": 232},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            await G11OutputFormat().process_response(ctx, response)
+
+        # The raise is a server-side compare-and-set (EVAL), not GET-then-SET: two workers
+        # racing on a read-modify-write could LOWER the floor. Subject unchanged — the
+        # floor still lands at cap × backoff — only the mechanism is atomic now.
+        mock_redis.eval.assert_called_once()
+        args = mock_redis.eval.call_args.args
+        assert args[1] == 1, "EVAL must declare exactly one KEY"
+        key, value = args[2], args[3]
+        assert "max_tokens_floor" in key and "max_tokens_history" not in key
+        assert value == 464
+        mock_redis.set.assert_not_called()
+
+    async def test_a_completed_answer_does_not_raise_the_floor(self, make_ctx):
+        """Only a truncation is evidence that the cap was too low."""
+        mock_redis = AsyncMock()
+        mock_redis.get = AsyncMock(return_value=None)
+        ctx = make_ctx()
+        ctx.params["workflow_id"] = "wf-test"
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        ctx.params["max_tokens"] = 232
+        ctx.params["_g11_max_tokens_set"] = True
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "complete"}}],
+            "usage": {"completion_tokens": 100},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            await G11OutputFormat().process_response(ctx, response)
+
+        mock_redis.set.assert_not_called()
+
+    async def test_history_is_trimmed_to_history_max_entries(self, make_ctx):
+        """The read takes the whole set, so the bound has to live at write time."""
+        mock_redis = AsyncMock()
+        ctx = make_ctx()
+        ctx.params["workflow_id"] = "wf-test"
+        ctx.config["groups"]["G11_output"]["max_tokens_feedback_loop"] = True
+        ctx.config["groups"]["G11_output"]["history_max_entries"] = 50
+        response = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "done"}}],
+            "usage": {"completion_tokens": 128},
+        }
+
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", return_value=mock_redis):
+            await G11OutputFormat().process_response(ctx, response)
+
+        mock_redis.zremrangebyrank.assert_called_once()
+        assert mock_redis.zremrangebyrank.call_args.args[1:] == (0, -51)
+
+
+class TestG11ShippedDefaults:
+    """The template is what a fresh install runs, so the defence against the 2026-09-08
+    truncation defect has to be pinned there and not only in the code."""
+
+    @staticmethod
+    def _shipped_g11():
+        import pathlib
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[3]
+        cfg = yaml.safe_load((root / "config" / "config.yaml.template").read_text(encoding="utf-8"))
+        return cfg["groups"]["G11_output"]
+
+    def test_template_ships_auto_tighten_off(self):
+        """It shipped ON and cut 4 of 54 DS1 answers and 6 of 27 readiness probes
+        mid-sentence, for +0.00% input-token savings."""
+        assert self._shipped_g11()["max_tokens_auto_tighten"] is False
+
+    def test_template_multiplier_covers_observed_variance(self):
+        """1.2 was under the model's own same-prompt spread (up to 2.03× measured)."""
+        assert self._shipped_g11()["tighten_multiplier"] >= 2.0
+
+    def test_template_and_code_defaults_agree(self):
+        from middleware import g11_output_format as g11
+        shipped = self._shipped_g11()
+        assert shipped["tighten_multiplier"] == g11._DEFAULT_TIGHTEN_MULTIPLIER
+        assert shipped["history_min_entries"] == g11._DEFAULT_HISTORY_MIN_ENTRIES
+        assert shipped["history_max_entries"] == g11._DEFAULT_HISTORY_MAX_ENTRIES
+        assert shipped["truncation_backoff_multiplier"] == g11._DEFAULT_TRUNCATION_BACKOFF
+
+    def test_the_dead_knobs_stay_dead(self):
+        """`absolute_default_max_tokens` and `default_max_tokens_multiplier` have no reader
+        anywhere in the proxy. They survived in the portal catalog as two response-length
+        dials a truncated tenant could turn with no effect; nothing may reintroduce them."""
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[3]
+        dead = ("absolute_default_max_tokens", "default_max_tokens_multiplier")
+        offenders = []
+        for path in (root / "src" / "proxy").rglob("*.py"):
+            code = chr(10).join(
+                line.split("#", 1)[0]
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            )
+            if any(name in code for name in dead):
+                offenders.append(str(path))
+        assert not offenders, f"dead max_tokens knob referenced in: {offenders}"
 
 
 @pytest.mark.asyncio

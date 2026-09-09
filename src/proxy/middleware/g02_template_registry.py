@@ -1,25 +1,30 @@
 """
 G02 · Prompt Template Registry
 Stage: Before the Request
-Saving: Structural — prevents fleet-wide token budget overruns.
+Saving: NONE — G02 is a read-only budget OBSERVER. It reports, it never rewrites.
 Technique: At runtime, check that the current request does not exceed the registered
-           token budget for a named template (passed via X-Template-ID header / param).
-           Budget enforcement in CI/CD is handled by scripts/ci/validate-templates.sh.
-           
+           token budget for a named template (passed via X-Template-ID header / param)
+           and WARN when it does. The request is always forwarded unchanged.
+           Budget enforcement in CI/CD is handled by scripts/ci/validate-templates.sh;
+           runtime protection against an over-budget prompt is G26's job (budget-aware
+           context management), which never touches `system` messages.
+
 Features:
   - 30-day deprecation auto-flag for templates approaching EOL
   - Per-version token count history tracking
   - Template metadata registry with versioning
 """
-import hashlib
 import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
 from middleware import RequestContext
-from middleware import cache_floor
-from savings.calculator import count_messages_tokens
+# NOTE: G02 deliberately imports NEITHER `cache_floor` NOR a token counter. It is a
+# read-only budget observer: it never edits ctx.messages, so there is no rewrite for the
+# prefix-cache floor to re-snapshot and nothing to re-count. Re-adding either import is a
+# signal that a content-mutating path is creeping back in — see the note in
+# process_request and tests/unit/middleware/test_g02_template_registry.py.
 
 logger = logging.getLogger(__name__)
 GROUP = "G02"
@@ -237,67 +242,58 @@ class G02TemplateRegistry:
         status, days_remaining, message = meta.get_deprecation_status()
         if status == "SUNSET":
             logger.error("[%s] G02 %s", ctx.request_id, message)
+            # Surfaced to the caller through `_token_opt.metadata.warnings`
+            # (g18_observability.py) — that is the whole mechanism. A sunset template is
+            # REPORTED, never blocked: the request is served normally.
+            #
+            # This branch used to say "# Block sunset templates", record the step as
+            # "BLOCKED (sunset)" and set `ctx.params["_template_sunset"] = True` "that can be
+            # checked by main.py". Nothing anywhere read that flag (W17-R-G02 F4), so the
+            # only thing the code blocked was an operator's understanding of it. A claim with
+            # no reader is removed, not implemented — blocking a request on a registry state
+            # is a product decision nobody has taken.
             ctx.params.setdefault("_token_opt_warnings", []).append(message)
-            # Block sunset templates
             ctx.savings.add_step(
                 GROUP,
-                f"Template '{template_id}' BLOCKED (sunset)",
+                f"Template '{template_id}' SUNSET (reported; request served unchanged)",
                 current_tokens,
                 current_tokens,
             )
-            # Set flag that can be checked by main.py
-            ctx.params["_template_sunset"] = True
         elif status == "DEPRECATION_WARNING":
             logger.warning("[%s] G02 %s", ctx.request_id, message)
             ctx.params.setdefault("_token_opt_warnings", []).append(message)
         elif status == "DEPRECATED":
             logger.warning("[%s] G02 %s", ctx.request_id, message)
         
-        # Budget enforcement with optional truncation (Phase 2 implementation)
+        # Budget enforcement is REPORT-ONLY. G02 never edits ctx.messages.
+        #
+        # Until 2026-09-08 an opt-in `budget.truncate_enabled` path cut the tail off the
+        # caller's system prompt until the request fit `total_input_max`, with no
+        # faithfulness contract of any kind. Measured on the DS1 enterprise-support
+        # workload it removed 691 characters of policy text per request and CHANGED THE
+        # ANSWERS on a billed 200: a refund reply stopped naming the disputed amount, an
+        # SLA reply stopped naming the breach — while the source text for both facts was
+        # still in the prompt it sent. It was deleted rather than guarded, because any
+        # faithfulness guard strong enough to prevent that refuses essentially every
+        # truncation of a real policy prompt, leaving a lossy path alive for no benefit.
+        #
+        # Runtime protection against an over-budget prompt belongs to G26 (budget-aware
+        # context management), which never touches `system` messages and snaps every cut
+        # to a tool-safe boundary. Template budgets are enforced at BUILD time by
+        # scripts/ci/validate-templates.sh — you fix an over-budget template, you do not
+        # mutilate the request.
         if max_input and current_tokens > max_input:
-            budget_cfg = ctx.config.get("groups", {}).get("G2_template_registry", {}).get("budget", {})
-            truncate_enabled = budget_cfg.get("truncate_enabled", False)
-            
-            if truncate_enabled:
-                # Perform actual truncation to meet budget
-                tokens_before = current_tokens
-                strategy = budget_cfg.get("truncate_strategy", "tail_system")
-                min_keep_user = budget_cfg.get("min_keep_user_turns", 1)
-                
-                _pre_truncate_messages = ctx.messages
-                ctx.messages = self._truncate_messages(
-                    ctx.messages, max_input, strategy, min_keep_user, ctx.model
-                )
-                # Keep the prefix-cache floor reservation describing the messages that now
-                # exist. It identifies its span by CONTENT, so a rewrite it does not know
-                # about makes the span read as empty downstream — which the floor
-                # arithmetic would take as "nothing to protect". `_truncate_messages`
-                # rewrites in place (it empties a message's content rather than removing
-                # the message, deliberately), so the lists stay index-aligned.
-                cache_floor.resnapshot(ctx, _pre_truncate_messages, ctx.messages)
-                tokens_after = count_messages_tokens(ctx.messages, ctx.model)
-                
-                logger.warning(
-                    "[%s] G02 template '%s' truncated: %d -> %d tokens (strategy=%s)",
-                    ctx.request_id, template_id, tokens_before, tokens_after, strategy
-                )
-                ctx.savings.add_step(
-                    GROUP,
-                    f"Template '{template_id}' truncated to budget ({strategy})",
-                    tokens_before,
-                    tokens_after,
-                )
-            else:
-                logger.warning(
-                    "[%s] G02 template '%s' budget exceeded: %d > %d tokens",
-                    ctx.request_id, template_id, current_tokens, max_input,
-                )
-                ctx.savings.add_step(
-                    GROUP,
-                    f"Template '{template_id}' budget check (OVER by {current_tokens - max_input}t)",
-                    current_tokens,
-                    current_tokens,
-                )
+            logger.warning(
+                "[%s] G02 template '%s' budget exceeded: %d > %d tokens "
+                "(reported only — the request is sent unchanged)",
+                ctx.request_id, template_id, current_tokens, max_input,
+            )
+            ctx.savings.add_step(
+                GROUP,
+                f"Template '{template_id}' budget check (OVER by {current_tokens - max_input}t)",
+                current_tokens,
+                current_tokens,
+            )
         else:
             # Get token history stats for insights
             history = await self._get_token_history(template_id, meta.version, prefix=_rp)
@@ -318,67 +314,3 @@ class G02TemplateRegistry:
                 )
 
         return ctx
-
-    def _truncate_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        max_tokens: int,
-        strategy: str,
-        min_keep_user: int,
-        model: str,
-    ) -> List[Dict[str, Any]]:
-        """Truncate messages to fit within max_tokens budget.
-        
-        Strategy 'tail_system': Trim from the end of system prompts first,
-        preserving the last N user turns.
-        """
-        import copy
-        result = copy.deepcopy(messages)
-        
-        # Count current tokens
-        current = count_messages_tokens(result, model)
-        if current <= max_tokens:
-            return result
-        
-        if strategy == "tail_system":
-            # Strategy: trim system prompts from the tail, keep last N user turns
-            user_turns = sum(1 for m in result if m.get("role") == "user")
-            
-            # First pass: try to trim system message content from the end
-            for i in range(len(result) - 1, -1, -1):
-                if current <= max_tokens:
-                    break
-                msg = result[i]
-                if msg.get("role") != "system":
-                    continue
-                    
-                content = msg.get("content", "")
-                if not isinstance(content, str) or len(content) < 100:
-                    continue
-                    
-                # Gradually trim from the end (remove last sentences/paragraphs)
-                while len(content) > 200 and current > max_tokens:
-                    # Find last paragraph break or sentence break
-                    last_para = content.rfind("\n\n")
-                    last_sent = content.rfind(". ")
-                    cut = max(last_para, last_sent)
-                    if cut < len(content) // 2:
-                        cut = len(content) - max(100, (current - max_tokens) * 4)
-                    if cut < 50:
-                        break
-                    content = content[:cut].rstrip() + "."
-                    msg["content"] = content
-                    current = count_messages_tokens(result, model)
-            
-            # Second pass: if still over budget, drop non-essential system messages entirely
-            # but preserve at least one system message and min_keep_user user turns
-            for i in range(len(result) - 1, -1, -1):
-                if current <= max_tokens:
-                    break
-                msg = result[i]
-                if msg.get("role") == "system" and len([m for m in result if m.get("role") == "system"]) > 1:
-                    removed_content = msg.get("content", "")
-                    msg["content"] = ""  # Empty but keep the message structure
-                    current = count_messages_tokens(result, model)
-        
-        return result

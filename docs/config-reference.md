@@ -140,7 +140,7 @@ configured; add more here. See [extensibility.md](extensibility.md) for the full
 | Key | Description |
 |---|---|
 | `name` | Provider name; selects the adapter and the key var (`LLM_KEY_<NAME>` / `llm-key-<name>`) |
-| `model_prefixes` | List of model-name prefixes routed to this provider (first match wins) |
+| `model_prefixes` | List of model-name prefixes routed to this provider (first match wins). **A model matching no prefix is UNKNOWN**, and G06's disabled/no-ladder path then serves `proxy.default_model` instead — silently swapping the model the caller asked for. Keep every family you send listed here; `o4` was missing until 2026-09-08 and o4-mini requests were served by gpt-4o-mini with the reasoning params stripped. |
 | `api_base` | Endpoint override (required for Azure and for `openai_compatible` providers) |
 | `adapter: generic` | Use the config-only `GenericLiteLLMAdapter` (no dedicated adapter class) |
 | `litellm_prefix` | Generic mode A: route the model as `<prefix>/<model>` via LiteLLM |
@@ -297,14 +297,24 @@ instances. If Redis is unavailable the reuse is unknown and the feature stays in
 unknown reuse must never buy a cache write.
 
 ### G2_template_registry
-Versioned prompt templates with per-template token budgets.
+Versioned prompt templates with per-template token budgets. **Read-only: G02 reports, it never
+rewrites the request.** A request whose `template_id` (or `X-Template-ID` header) matches a
+registered template is looked up, its token count recorded against that template version, and a
+warning logged if it exceeds `total_input_max` — then it is forwarded **unchanged**.
+
+> **Removed 2026-09-08 — `budget.truncate_enabled` / `budget.truncate_strategy` /
+> `budget.min_keep_user_turns`.** That opt-in path cut the tail off the caller's system prompt until
+> the request fit the budget, with no faithfulness contract; measured on a real support workload it
+> deleted policy text and changed the answers on billed responses. Enforce template budgets at build
+> time with `scripts/ci/validate-templates.sh`. For runtime protection against a prompt that outgrows
+> the model window, enable **G26** (`G26_context_budget`) — it never touches `system` messages and
+> snaps every cut to a tool-safe boundary. `budgets.<id>.output_max` went with them: nothing read it.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Enable template registry |
-| `budgets.<id>.system_prompt_max` | *(per template)* | ⚠ Max system-prompt tokens for this template |
-| `budgets.<id>.total_input_max` | *(per template)* | ⚠ Max total input tokens (budget enforcement) |
-| `budgets.<id>.output_max` | *(per template)* | ⚠ Max output tokens |
+| `enabled` | `true` | Enable template registry (lookup + budget reporting; never edits messages) |
+| `budgets.<id>.total_input_max` | *(per template)* | Max total input tokens — **exceeding it logs a warning, nothing is trimmed** |
+| `budgets.<id>.system_prompt_max` | *(per template)* | **Build-time only** — `scripts/ci/validate-templates.sh` and `scripts/ci/pr-diff-token-check.py` block a template whose system prompt outgrew it. The proxy never reads it. Removing the key does not raise the limit: `validate-templates.sh` skips the check entirely, and `pr-diff-token-check.py` falls back to its own hard default of 500 |
 | `budgets.<id>.{version, author, description}` | *(per template)* | Metadata for tracking/stale detection |
 | `deprecation_warn_days` / `template_history_ttl_days` / `max_history_per_version` | `30` / `90` / `1000` | Registry housekeeping — **config-first, `TEMPLATE_*` env fallback**; see [appendix](#appendix--knob-coverage-caveats) |
 
@@ -361,9 +371,9 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `cascade_cap_to_classified_tier` | `true` | Cap the execution cascade at the tier the request itself classifies as — a plain "medium" query is never pushed to the expensive complex tier. An `x_complexity` request override bypasses the cascade (and this cap) entirely. Set `false` for unbounded confidence-driven escalation |
 | `allow_escalation_above_requested` | `false` | When `false`, the cascade never routes to a model costlier than the one the caller requested — escalation only ever saves cost. Set `true` to allow escalating above the requested model |
 | `response_confidence.ok` / `.truncated` / `.refusal` / `.empty` | `0.85` / `0.30` / `0.40` / `0.0` | No-judge response-adequacy scores (used when `judge_model` is empty), compared against `cascade_confidence_threshold`: `ok` = clean stop, `truncated` = hit `max_tokens`, `refusal` = content-filter / "I can't help" opening, `empty` = blank content |
-| `cascade_tier1_max_tokens` | `512` | Output cap injected on the tier-1 probe call **only when the caller sent no `max_tokens`** (a caller-supplied value always wins). Bounds the probe's cost. `0` = never inject; the provider default applies |
+| `cascade_tier1_max_tokens` | `512` | Output cap injected on the tier-1 probe call **only when the caller set no output budget under either `max_tokens` or `max_completion_tokens`** (a caller-supplied value always wins). Injected under whichever key the call already speaks, never both — sending both is a provider 400. Bounds the probe's cost. `0` = never inject; the provider default applies |
 | `cascade_retry_uncapped_on_truncation` | `true` | If the cascade settles on the tier-1 probe as the final answer but that answer was truncated by the injected cap (`finish_reason: length`), retry tier-1 once without the cap before serving — a self-inflicted truncation is never the customer's answer. No-op when the caller set `max_tokens` |
-| `expected_output_tokens_estimate` | `512` | Expected output tokens used **only for cost estimates** (escalation guards + cost-floor) when the request carries no `max_tokens` |
+| `expected_output_tokens_estimate` | `512` | Expected output tokens used **only for cost estimates** (escalation guards + cost-floor) when the request carries no output budget under `max_tokens` or `max_completion_tokens` |
 | `routellm.enabled` | `true` | Enable RouteLLM sidecar (when classifier=routellm) |
 | `routellm.sidecar_url` | `http://routellm-svc` | RouteLLM Cloud Run internal URL |
 | `routellm.router` | `mf` | RouteLLM router: `mf` (recommended), `sw_ranking`, or `random` |
@@ -544,8 +554,10 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | `enabled` | `true` | Enable output format control |
 | `enforce_max_tokens` | `true` | Auto-set max_tokens if not provided — from completion-size evidence only |
 | `fallback_max_tokens` | `null` | Optional static cap used ONLY while no completion-size evidence exists; `null` = leave uncapped until evidence (output length is not derivable from input length) |
-| `truncation_backoff_multiplier` | `2.0` | An answer cut off by a G11-set cap re-enters the evidence at cap×this, so caps climb out of a bad guess instead of re-learning it |
-| `tighten_quantile` / `tighten_multiplier` | `0.95` / `1.2` | ⚠ Auto-tightening from the p95 of observed **completed** answer sizes (tenant-scoped history; truncated/tool-call answers are never evidence) |
+| `max_tokens_auto_tighten` | `false` | **Ships OFF (2026-09-08).** On, G11 derives a `max_tokens` cap from the observed sizes of past **completed** answers in this request's `(tenant, workflow_id, template_id)` bucket. A request that sets **neither** `workflow_id` nor `template_id` is **never** capped: with no way to tell workloads apart, the only evidence available is other workloads' answers, and capping a long-form answer from short-form ones cut 4 of 54 answers on the DS1 ablation and 6 of 27 probes on a live readiness sweep, on billed 200s. Enable it only for traffic that identifies its workload. |
+| `truncation_backoff_multiplier` | `2.0` | An answer cut off by a G11-set cap re-enters the evidence at cap×this **and raises a sticky per-bucket floor** (Redis, tenant-prefixed, same TTL as the history) that no later percentile may undercut. The floor is what makes the loop converge: the escalated history entry alone is one sample among many and ages out, so the cap fell back and re-cut the same request. |
+| `tighten_quantile` / `tighten_multiplier` | `0.95` / `2.0` | ⚠ Auto-tightening from the p95 of observed **completed** answer sizes (tenant + workload-scoped history; truncated/tool-call answers are never evidence). `tighten_multiplier` was `1.2` until 2026-09-08 — below the model's own same-prompt spread (measured up to 2.03× at temperature 0), so it truncated answers the model had already been observed to produce. |
+| `history_min_entries` / `history_max_entries` | `5` / `200` | Completions required in a bucket before any cap is derived from it, and the newest-N retained. The percentile is taken over **all** retained entries; until 2026-09-08 it read only the 10 most recent, which is not a percentile and let a long answer age out after ten requests. |
 | `verbosity_steering.enabled` | `false` | Append a terseness suffix to steer shorter output (biggest uncovered savings axis; folded into the G05 cache key so terse/verbose answers never mix) |
 | `verbosity_steering.level` | `''` | Bundled preset: `lite` \| `full` \| `ultra` (adapted from caveman-shrink, MIT). Safety carve-outs keep security/destructive-action text in normal prose. ⚠ SAVINGS feature — prove with a pitch-test-plan quality-gate run before enabling by default |
 | `verbosity_steering.default_suffix` / `per_tenant_suffix` | `''` / `{}` | Explicit suffix overrides (per-tenant wins > default_suffix > preset) |
@@ -581,10 +593,51 @@ request itself, and exports it as `token_opt_reasoning_mode_total{mode}`: `off_h
 | `enabled` | `true` | Enable reasoning budget injection |
 | `default_effort` | `medium` | `off` \| `low` \| `medium` \| `high` — validate per workload. Only consulted when G25 did not set an effort. |
 | `effort_map.<tier>` | see template | Per-provider budgets. The `off` row is intentionally empty — `off` is the *absence* of a budget. **Quote the key** (`'off'`): bare `off` is the boolean `false` in YAML. |
-| `reasoning_suppression_prompts.<tier>` | low/medium set | Prompt text appended for that tier. No `off` entry: with reasoning already off there is nothing to suppress, so paying input tokens for it would be waste. |
+| `reasoning_suppression_prompts.<tier>` | low/medium set | Prompt text appended for that tier. No `off` entry: with reasoning already off there is nothing to suppress, so paying input tokens for it would be waste. **These bound verbosity, never completeness** — the pre-2026-09-08 medium text ("One brief step max, then final answer") dropped the named subject of the question on 4 of 30 graded DS18 requests while saving 49% of reasoning tokens. If you re-word them, keep "do not skip a step the correct answer requires". |
 
 An **unrecognised** tier now emits no reasoning parameter at all. Previously it fell through
 to a 1024-token Anthropic thinking budget, so a config typo silently turned reasoning **on**.
+
+#### `reasoning_headroom` — room for thinking inside the output budget
+
+On the OpenAI o-series the hidden reasoning tokens are billed **inside** the caller's
+output budget (`max_completion_tokens`). A caller who sizes that budget for the *answer*
+therefore gets the whole allowance spent on thinking and an **empty reply, billed in
+full**. Measured 2026-09-07: 18 of 54 `o4-mini` requests sent with the caller's own
+`max_completion_tokens: 1024` returned `finish_reason: "length"` with no content —
+**44.8% of that run's spend for zero characters**.
+
+When the proxy calls a reasoning-capable model with a budget that cannot hold thinking
+plus an answer, it now raises that budget to `answer_floor_tokens + allowance_tokens[effort]`
+(capped by `max_output_tokens`) and **discloses the raise** in `_token_opt.output_budget_raised`
+and the `x-tokenlean-output-budget-raised` response header. This **increases** what an
+affected request can be billed for output; the alternative is paying nearly the same for
+nothing. Every other request is byte-identical.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `reasoning_headroom.enabled` | `true` | `false` forwards the caller's budget unchanged |
+| `reasoning_headroom.answer_floor_tokens` | `512` | Room reserved for the ANSWER, after thinking |
+| `reasoning_headroom.allowance_tokens.<tier>` | `off`/`low` 1024, `medium` 4096, `high` 16384 | Room reserved for hidden reasoning. **`off` is not zero**: the o-series cannot disable reasoning (see `off_unsupported` above), so an `off` request still needs room — just the smallest amount. Setting it to `0` re-creates the defect for exactly the callers who asked for the cheapest request. **Quote the key** (`'off'`). |
+| `reasoning_headroom.assumed_effort` | `medium` | Tier assumed when the caller sends no `reasoning_effort`. The middle tier, not the cheapest — an absent effort means the *model's* default, and assuming `low` would under-provision exactly the unlabelled requests. |
+| `reasoning_headroom.max_output_tokens` | `32768` | Never raise a budget above this. A ceiling **below** what the tier needs leaves the caller's budget untouched rather than raising it to a number that still cannot work. |
+| `reasoning_headroom.max_output_tokens_by_model` | `{}` | Optional per-model ceiling, e.g. `{o4-mini: 100000}` |
+
+**Operator-only, deliberately not a tenant portal knob:** it governs what a request can be
+billed for output, and a tenant setting an allowance to `0` would silently re-create the
+defect. Two further layers back it up and are **not** configurable at all — G06 refuses to
+*route* into a reasoning model whose thinking cannot fit the caller's budget
+(`routing_mode` gains `+reasoning_budget_floor`), and any response that still comes back
+empty is counted on `token_opt_empty_completion_total{reason}`, disclosed via
+`x-tokenlean-empty-completion` and `_token_opt.empty_completion`, and **never cached** —
+refused both when it would be stored and when an entry stored earlier would be served.
+
+> **Limitation — non-streaming only.** The empty-completion *detector* runs in the
+> response pipeline, and a streamed response (`stream: true`) skips that pipeline
+> entirely, so a streamed empty answer is not counted, not disclosed and produces no
+> audit row. The budget *reservation* above happens at the provider seam and does apply
+> to streams, so the harm is prevented on that path — only the observation is missing.
+> Same shape as the documented G29/G30 response-scan and G32 tool-policy limitations.
 
 ### G13_batch
 Batch accumulation (Redis Streams) plus TOON compact notation — converts JSON arrays of uniform objects into pipe-delimited rows. The `toon_*` knobs gate when TOON fires so it never inflates tokens. All `toon_*` knobs honour per-tenant overrides (`tenants.<id>.groups.G13_batch`).
@@ -799,7 +852,8 @@ disabled extended thinking — a coupling no caller asked for.
 | `default_effort` | `medium` | Effort when no keyword matches. This is a keyword classifier, so "no match" is the **common** case — this value is the behaviour for most traffic, not an edge case. |
 | `scan_roles` | `["user"]` | Which roles are scored. A system prompt is static across a workload, so scoring it pins every request under that prompt to one tier. |
 | `effort_floor` | `'off'` | Lowest effort G25 may select, applied literally. `off` is a rung **below** `low`, so a floor of `low` genuinely blocks it — set `low` to guarantee every request gets at least minimal reasoning. **Upgrade note:** a config predating the `off` rung that says `effort_floor: low` keeps its current behaviour until changed. Quote the value: bare `off` is YAML `false`. |
-| `effort_ceiling` | `high` | Never classify above this effort level |
+| `effort_ceiling` | `medium` | Highest effort G25 may select. The default is the o-series **provider default**, which makes G25 **non-increasing**: it may lower reasoning effort but never raise it above what the caller would have been served anyway. Measured on DS18 (2026-09-07) a `high` ceiling spent **2.7x** the reasoning tokens (+37.8% output tokens) while the arm's own facts gate passed 30/30 — the escalation bought no checked fact. Raise it to `high` deliberately if you have measured a benefit for your workload. An unrecognised value (a typo, a null, or a bare `off`, which YAML reads as the boolean false) falls back to the code default `medium` with a WARNING; before 2026-09-09 it fell back to `high`, so a malformed ceiling failed OPEN to the most expensive tier the group can select. Raising this to `high` also requires `escalate_above_provider_default: true` wherever `high` is above the provider's own default. |
+| `escalate_above_provider_default` | `false` | G25 never selects an effort above the routed **provider's own default**, which is asked of the provider adapter rather than assumed (`medium` on the OpenAI o-series and on Gemini; `off` on a provider where extended thinking is opt-in). `effort_ceiling` alone made the group non-increasing only on OpenAI: where reasoning is opt-in, a `medium` ceiling turned thinking ON for a caller who never asked, raising the bill under a knob documented as lowering it. Set `true` to let the configured ceiling apply on its own. `effort_floor` still wins over both. |
 | `extra_reasoning_prefixes` | `[]` | Additional reasoning-model name prefixes |
 
 ### G26_context_budget
@@ -1027,7 +1081,6 @@ for reference (all now appear in their group's section above):
 | Group | Key | Default | Effect |
 |---|---|---|---|
 | `G1_compression` | `kompress_enabled` / `kompress_model` / `kompress_max_new_tokens` | `true` / `microsoft/Kompress-v2-base` / `256` | Kompress-v2 fallback compression for logs/errors |
-| `G2_template_registry` | `budget.truncate_enabled` / `budget.truncate_strategy` / `budget.min_keep_user_turns` | `false` / `tail_system` / `1` | ⚠ Truncate over-budget prompts (`budget` singular ≠ `budgets` registry) |
 | `G4_bypass` | `db_cache_ttl_seconds` | `60` | DB-rule cache TTL (was a hardcoded constant) |
 | `G10_memory` | `skills_qdrant_enabled` | `true` | `false` → non-Qdrant skill-injection fallback |
 | `G11_output` | `fallback_max_tokens` | `null` | Optional static `max_tokens` cap while no completion-size evidence exists (replaces the removed input-derived heuristic + `absolute_default_max_tokens`) |

@@ -147,10 +147,16 @@ providers:
   - o1
   - o3
   - gpt-4-5
+  # A model whose name matches NO prefix here is treated as unknown, and G06's
+  # disabled/no-tiers path then downgrades it to `default_model` -- silently swapping a
+  # reasoning model for a cheap one. `o4` was missing until 2026-09-08 and an o4-mini
+  # request was served by gpt-4o-mini with the reasoning params stripped. Keep this list
+  # ahead of the model families you actually send.
   model_prefixes:
   - gpt
   - o1
   - o3
+  - o4
   - text-
   - davinci
   - babbage
@@ -160,6 +166,7 @@ providers:
   - gpt
   - o1
   - o3
+  - o4
   - text-
   - davinci
   - babbage
@@ -613,23 +620,30 @@ groups:
     # (keeps the reproducible baseline byte-identical). Protects code/paths/idents.
     deterministic_fallback: false
   G2_template_registry:
+    # Registry + budget OBSERVER. It looks a template up by the caller's `template_id`
+    # (or the X-Template-ID header), tracks per-version token history, blocks sunset
+    # templates, and WARNS when a request exceeds the template's `total_input_max`.
+    # It NEVER edits the request. The former `budget.truncate_*` knobs, which cut the
+    # tail off the caller's system prompt to make it fit, were removed on 2026-09-08:
+    # they changed answers on billed responses. Fix an over-budget template at build
+    # time (scripts/ci/validate-templates.sh); for runtime protection against a prompt
+    # that outgrows the model window, enable G26 (it never touches `system` messages).
     enabled: true
-    # `budget` (singular) — global truncation policy applied when a prompt exceeds a template's
-    # `budgets` (plural, per-template, below). truncate_enabled off = enforce budgets by reporting
-    # only; on = actually shrink over-budget prompts (⚠ quality — drops content).
-    budget:
-      truncate_enabled: false
-      truncate_strategy: tail_system
-      min_keep_user_turns: 1
     deprecation_warn_days: 30
     template_history_ttl_days: 90
     max_history_per_version: 1000
     budgets:
       customer-support-classifier:
         version: '2.1'
+        total_input_max: 800   # tokens; over this G02 logs a warning — nothing is trimmed
+        # BUILD-TIME budget, not a runtime knob: scripts/ci/validate-templates.sh and
+        # scripts/ci/pr-diff-token-check.py read it to block a template whose system prompt
+        # has grown past what was registered for it. The proxy never reads it. Deleting it
+        # does not raise the limit for either script: validate-templates.sh treats a missing
+        # value as "no budget" and SKIPS the check entirely, while pr-diff-token-check.py
+        # falls back to its own hard default of 500 — a different limit from the one
+        # registered here, and for this template a stricter one.
         system_prompt_max: 400
-        total_input_max: 800
-        output_max: 150
         author: platform-team
         description: Classifies customer support tickets
   G3_doc_pipeline:
@@ -977,17 +991,51 @@ groups:
     enforce_max_tokens: true
     skip_max_tokens_for_reasoning: true
     # Cap discovery is EVIDENCE-based: p95 of observed COMPLETED answer sizes ×
-    # tighten_multiplier (needs ≥5 recorded completions per tenant/workflow/template).
-    # With no evidence yet, NO cap is applied — output length is not derivable from
-    # input length, and a guessed cap truncates long-form answers on fresh deploys.
-    fallback_max_tokens: null           # optional static cap (int, e.g. 2048) used ONLY while no evidence exists; null = uncapped until evidence
-    truncation_backoff_multiplier: 2.0  # an answer cut off by a G11-set cap re-enters the evidence at cap×this, so caps climb out of a bad guess
+    # tighten_multiplier, per (tenant, workflow_id, template_id) bucket. With no
+    # evidence yet, NO cap is applied — output length is not derivable from input
+    # length, and a guessed cap truncates long-form answers on fresh deploys.
+    #
+    # SHIPS OFF (2026-09-08). While it shipped on, the evidence bucket was shared by
+    # every workload a tenant runs (both ids default to "default" and ordinary traffic
+    # sets neither), so a long-form answer was capped from short-form ones: 4 of 54
+    # answers cut on the DS1 ablation, 6 of 27 probes cut on a live readiness sweep.
+    # It saved no input tokens. Turn it on only for traffic that sets workflow_id or
+    # template_id — requests that set neither are never capped, by design.
+    #
+    # Recording of completion sizes is gated on the SAME switch. With it off nothing reads the
+    # history, so nothing writes it: the ids are caller-supplied, and a client stamping a unique
+    # workflow id per request would otherwise create a 7-day Redis sorted set per request that no
+    # code path ever consults. Turning it on starts from an empty bucket, and G11 declines to cap
+    # until history_min_entries completed answers exist. Declining is the safe cold start.
+    #
+    # tighten_multiplier REDUCES truncation and, with the sticky floor, RECOVERS from it - it does
+    # not stop it. The measured worst-case same-prompt spread was 2.03x against a 2.0x multiplier,
+    # and history_max_entries 200 at tighten_quantile 0.95 leaves ~10 of 200 retained answers above
+    # the percentile by construction. The first occurrence in a bucket can still be cut.
+    #
+    # Streamed requests are never capped by this path: a streamed response skips the response
+    # pipeline, so a cap applied to it could never be recorded or corrected.
+    #
+    # An estimate below 64 tokens is treated as a degenerate sample and NOT applied. A genuinely
+    # short workload is therefore never capped - the highest-savings case is the one refused. That
+    # is deliberate: not capping costs money, capping wrongly costs the customer their answer.
+    # fallback_max_tokens is a HARD ceiling on every answer, applied whether or not
+    # max_tokens_auto_tighten is on. It is NOT a warm-up value: it does not lift once a cap
+    # has been learned, and it applies to requests carrying no workflow_id/template_id too -
+    # the ones the learned path refuses to cap at all. It has no escalation path either: a
+    # truncation it causes raises no sticky floor, so a request it cuts is cut identically
+    # forever. The proxy logs a WARNING naming this key when that happens. null = no cap, and
+    # null is the default. Set it above your longest expected answer, or leave it alone.
+    fallback_max_tokens: null
+    truncation_backoff_multiplier: 2.0  # an answer WE cut re-enters the evidence at cap×this AND raises a sticky floor the percentile can never undercut
     force_json_for_all: false
     provider_structured_output: true
     max_tokens_feedback_loop: true
-    max_tokens_auto_tighten: true
+    max_tokens_auto_tighten: false      # opt-in; see the note above. true = derive caps from this bucket's observed answer sizes
     tighten_quantile: 0.95
-    tighten_multiplier: 1.2
+    tighten_multiplier: 2.0             # headroom over the quantile; 1.2 was below the model's own same-prompt spread (measured up to 2.03×) and truncated answers it had already produced
+    history_min_entries: 5              # completions required in a bucket before any cap is derived from it
+    history_max_entries: 200            # newest-N retained per bucket; the percentile is taken over all of them, not a sliding window
     max_tokens_history_ttl_days: 7
     default_model_max_tokens: 4096
     model_max_tokens:
@@ -1037,13 +1085,51 @@ groups:
   G12_reasoning:
     enabled: true
     default_effort: medium
+    # Reasoning models bill their hidden thinking INSIDE the caller's output budget, so
+    # a budget sized for the answer alone is spent entirely on thinking and the caller
+    # is billed in full for an EMPTY reply (finish_reason "length", no content).
+    # Measured 2026-09-07: 18 of 54 o4-mini requests sent with the caller's own
+    # max_completion_tokens: 1024 came back empty -- 44.8% of that arm's spend for zero
+    # characters. When the proxy calls a reasoning model it now raises the output budget
+    # to answer_floor_tokens + allowance_tokens[effort], capped by max_output_tokens,
+    # and DISCLOSES the raise (_token_opt.output_budget_raised +
+    # x-tokenlean-output-budget-raised). This RAISES what a request can be billed for
+    # output; the alternative is paying nearly the same for nothing.
+    # Operator-only on purpose: setting an allowance to 0 re-creates the defect, so it
+    # is not a tenant-facing portal knob. Applies ONLY to reasoning-capable models and
+    # ONLY when the caller set a budget too small -- every other request is byte-identical.
+    reasoning_headroom:
+      enabled: true                 # false -> forward the caller's budget unchanged
+      answer_floor_tokens: 512      # room reserved for the ANSWER, after thinking
+      allowance_tokens:             # room reserved for hidden reasoning, per effort tier
+        # `off` is not zero here: this family reasons intrinsically and cannot be turned
+        # off (see G12's off_unsupported), so an `off` request still needs room -- just
+        # the smallest amount. Setting it to 0 re-creates the empty-answer defect for
+        # exactly the callers who asked for the cheapest possible request.
+        'off': 1024
+        low: 1024
+        medium: 4096
+        high: 16384
+      # Effort assumed when the caller sends none. The middle tier, not the cheapest:
+      # an absent reasoning_effort means the model uses its own default, and assuming
+      # `low` would under-provision exactly the unlabelled requests.
+      assumed_effort: medium
+      max_output_tokens: 32768      # never raise a budget above this
+      max_output_tokens_by_model: {}  # optional per-model ceiling, e.g. {o4-mini: 100000}
     # NOTE: a `provider_params` block (model_fragment / param_key / budget_key /
     # is_effort_key) used to live here. NO code ever read it -- the adapters read
     # `effort_map` below and nothing else. Removed 2026-09-04 so an operator cannot
     # spend time tuning a key that has never had any effect.
+    # Injected into the system prompt to bound how much the model NARRATES its
+    # reasoning. These bound VERBOSITY, never COMPLETENESS: measured on DS18
+    # (2026-09-07) the previous medium text ("One brief step max, then final answer")
+    # dropped the named subject of the question on 4 of 30 graded reasoning requests
+    # -- ds18-03 in all three repeats -- while saving 49% of reasoning tokens. A budget
+    # instruction that can cost a required fact is not a saving (quality wins). If you
+    # re-word these, keep "do not skip a step the correct answer requires".
     reasoning_suppression_prompts:
-      low: '[BUDGET] Provide the final answer only - no reasoning steps, no chain-of-thought, no explanation.'
-      medium: '[BUDGET] Keep reasoning minimal. One brief step max, then final answer.'
+      low: '[BUDGET] Give the final answer directly, without narrating your reasoning. The answer itself must still be complete.'
+      medium: '[BUDGET] Reason concisely. Do not skip any step a correct answer requires; give the final answer once.'
       high: null
     effort_map:
       # `off` = do not opt this request into optional reasoning. Realised per provider:
@@ -1315,7 +1401,32 @@ groups:
     # not clamped away -- `off` is a rung BELOW `low`. Quoted: bare off is YAML false.
     # Set to 'low' to guarantee every request gets at least minimal reasoning.
     effort_floor: 'off'
-    effort_ceiling: high
+    # Highest effort G25 may select. `medium` IS the o-series provider default, so the
+    # shipped default makes G25 NON-INCREASING: it can lower reasoning effort but never
+    # raise it above what the caller would have been served anyway. Measured on DS18
+    # (2026-09-07): with a `high` ceiling the isolated G25 arm sent byte-identical
+    # prompts and spent 2.7x the reasoning tokens (+37.8% output tokens) while its own
+    # facts gate passed 30/30 -- the escalation bought no checked fact and the customer
+    # paid for it. Raise this to `high` deliberately if your workload benefits from
+    # escalation and you have measured that it does -- AND set
+    # `escalate_above_provider_default: true` below, or the provider ceiling still holds
+    # the request at the provider's own default (this knob raises the ceiling; it does
+    # not by itself license going above what the provider would have served).
+    # An unrecognised value here (a typo, a null, or a BARE `off` -- which YAML reads as
+    # the boolean false) falls back to the code default `medium` and logs a WARNING. It
+    # used to fall back to `high`, i.e. a malformed ceiling failed open to the most
+    # expensive setting the group can pick, silently, on billed traffic.
+    effort_ceiling: medium
+    # The ceiling above is not the only one: G25 also never selects an effort ABOVE the
+    # routed provider's OWN default, which each provider adapter answers for itself.
+    # `medium is the provider default` is true of the OpenAI o-series and false wherever
+    # reasoning is opt-in -- on Anthropic, extended thinking is OFF unless the request
+    # asks for it, so `effort_ceiling: medium` alone would turn thinking on and RAISE
+    # that bill under a knob documented as non-increasing. Set this true to let the
+    # config ceiling apply on its own (G25 may then escalate above the provider default);
+    # `effort_floor` above still wins either way, since that is an explicit instruction.
+    # A provider entry can also state its own default with `default_reasoning_effort`.
+    escalate_above_provider_default: false
     extra_reasoning_prefixes: []
     # Which message roles are scored for complexity. USER only by default: a system
     # prompt is static across a workload, so scoring it pins every request under that
