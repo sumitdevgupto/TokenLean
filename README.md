@@ -31,6 +31,33 @@
 
 The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12 PASS datasets; methodology in `pitch-test-plan/`, not shipped), measured on **production-scale** payloads. The **independently runnable proof** is [`examples/benchmark/`](examples/benchmark/): a **true A/B** that fires every request once **direct to the provider** and once **through the proxy**, and compares the **provider's own billed usage** (never the proxy's self-report), over **recognized public datasets** used verbatim (**HotpotQA** · MT-Bench · SWE-bench Lite · HumanEval · GSM8K · **BFCL** for the agentic loop — pinned + cited in [`DATA_LICENSES.md`](examples/benchmark/DATA_LICENSES.md)).
 
+> **What the 54.1% is, and what a re-measurement says.** The headline is a **July 2026**
+> quality-gated ablation (temperature-0, 12 PASS datasets) and it is the figure this project has
+> published since. Re-running the same harness on **2026-09-09** gives **26.4% over 15 datasets**
+> that passed their answer-quality gate. The gap is four separate things, and only the second is a
+> change in what customers get:
+>
+> 1. **A measurement artefact, since fixed.** The sampler had begun reserving every request that
+>    carried a checkable fact. On the cache datasets those are exactly the requests that are *not*
+>    repeated, so the repeats were crowded out and the measured cache workload collapsed while the
+>    proxy was byte-identical. Fixing it moved that workload back from 11.9% to 28.9%.
+> 2. **Answer-quality defects we found and removed**, each of which had been *raising* the number by
+>    shortening or dropping part of an answer: a template path that truncated the caller's own system
+>    prompt, an output-length loop that cut answers mid-sentence, a reasoning-budget instruction that
+>    told the model to skip steps, and a reasoning tier that escalated effort above the provider
+>    default. Removing them is most of why prose fell from 50.4% to 31.1% and reasoning from 6.8% to
+>    -2.1%. **This is the trade we want, and it is the honest direction.**
+> 3. **Run-to-run variance.** Borderline datasets flip pass/fail under provider nondeterminism even at
+>    temperature-0; the observed band for the July gate was roughly 50.8-55.8%.
+> 4. **Workload mix.** The blend averages only the datasets that passed their answer-quality gate, so
+>    which datasets pass moves the blend independently of the proxy.
+>
+> Both figures are **self-measured** on our own harness. The independently runnable proof - the one
+> you can reproduce on your own key against public datasets, comparing the **provider's** billed
+> usage - is [`examples/benchmark/`](examples/benchmark/), and its per-workload numbers are the ones
+> to trust for your own planning.
+
+
 **Per-workload is the primary result** — each number is independently reproducible on your own key (calibrated OpenAI, temperature-0; carries the same run-to-run variance as the headline):
 
 > **What "temperature-0" covers.** The headline and every per-workload figure above are

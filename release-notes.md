@@ -127,6 +127,18 @@ passing silently.
   counter, the audit row and the readiness gate ship with the fix: the remaining cases are now visible
   and blocked at deploy time instead of being billed silently. Expect the counter to be non-zero.
 
+### An answer given as a tool call was scored as no answer at all - Bug fix
+Fixing the gate that passed a dataset where neither side answered introduced the opposite error: it
+treated the absence of prose as the absence of an answer, and an agentic turn answers with a tool
+call, which carries no prose by design. On the re-measurement two datasets produced 36 such rows,
+every one of them a tool call and none a truncation, and a dataset that had passed before failed
+every check while its own tool gates passed at 3 of 3. The classification now reads the reason the
+model stopped: a tool call is not an empty answer, a spent output budget still is, and an unknown
+reason with no text still counts as empty so the original defect cannot return.
+- Direction: this RAISES the measured figure by returning a wrongly-failed dataset to the blend. It
+  does not excuse a tool-call answer from the facts check - a fact the baseline gave and the
+  optimised arm dropped still fails, and that case is pinned by its own test.
+
 ### G06 credited savings to a route it did not take - Bug fix
 The routing group recorded its savings step from the model it PLANNED to use, so a cascade that
 escalated, or a route reverted by the cost floor, left a step crediting a model that never answered
