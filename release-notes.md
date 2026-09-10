@@ -21,6 +21,62 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-10
+
+### The A/B benchmark's facts gate scored a rephrasing as a dropped fact — Bug fix
+
+The gate matched an expected fact as a literal substring, so an answer that reordered the same
+words failed it. On the checked-in calibrated run this produced ten recorded quality regressions,
+every one of them the same item: the expected fact was "Donald J. Trump's private jet" and the
+proxy arm wrote "the private jet of Donald J. Trump". It fires hardest on the arm whose phrasing
+an optimisation changed, which is the arm being measured. A multi-word fact now gets one narrow
+second chance: every content word must appear, inside a single sentence, within a bounded window,
+with no negation in that sentence. Single-word facts, including every numeric answer, still
+require an exact match, and forbidden terms are unchanged. Re-grading the shipped artifact turns
+10 regressions into 0. **This raises measured quality, and therefore may raise published savings,
+so the affected figures are marked awaiting re-calibration rather than left in place.**
+
+### One quality verdict counted nine extra times in the warm-cache burst — Bug fix
+
+A warm repeat replays a request byte-identically: the direct arm is memoised and the proxy arm is a
+cache hit, so both arms grade the very same pair of strings. Each replay was counted as an
+independent verdict, multiplying a single item's result by the burst multiplicity — which is how
+one item produced a tally of ten. Verdicts are now counted once per item; paraphrases, which change
+the prompt, are still counted independently, and the per-call evidence list is unchanged so nothing
+becomes harder to diagnose. Token and cost accounting still covers every call.
+
+### The agentic benchmark's tool results were too small to optimise — Enhancement (OSS)
+
+Each mocked tool result was a twelve-token status stub, so the request-side pruning lever had
+nothing to act on and the agentic slice measured tool-catalogue pruning alone. Real agents get back
+API responses and query results, and those re-enter the prompt on every later turn. Results are now
+generated deterministically from each tool's own schema and capped to the size band the internal
+agentic dataset uses for the same job. The tool catalogue, the questions and the turn structure are
+byte-identical, so the catalogue-pruning figure cannot move for an unrelated reason. The upstream
+benchmark ships no result payloads, so these are ours either way; that is stated in the data
+licences file, and the cap is what stops realism becoming inflation.
+- **OSS:** `build_agentic_dataset.py --results-only` regenerates them offline, with no download.
+
+### Prompt compression could not fire anywhere in the public A/B benchmark — Enhancement (OSS)
+
+Compression only touches assistant messages unless the caller opts in, and every benchmark item is
+system plus user, so the lever was inert across all 125 items while the launcher enabled it and the
+documentation counted it among the techniques the benchmark proves. Because the opt-in carries a
+quality risk in production, the fix is not to switch it on: the prose figure is now reported
+two-sided. A default run measures what a stock install gets; `--compress-user` measures what the
+documented opt-in gets, on the prose profiles only. Neither side may be published alone, the result
+file records which side it holds, and the run exits non-zero if compression was requested but never
+fired, so a sidecar outage cannot be mistaken for a measurement.
+- **OSS:** measured offline beforehand, the currently-active lever cuts 0.77% of the prose corpus
+  and the disabled one clears 3.69% with its deterministic fallback alone.
+
+### Two benchmark profiles were silently missing from the published blend — Bug fix
+
+The illustrative blend drew its prose lever from three profiles and its reasoning lever from one,
+which left the code and repository-issue profiles — 35 of 110 items — run, billed, graded and then
+omitted, with nothing in either document saying so. The lever membership and the exclusions now sit
+in one place with a stated reason for each, and a test fails if any profile belongs to neither.
+
 ## 2026-09-09
 
 ### G02's system-prompt truncation removed — it rewrote answers; G26 owns budget compaction — Bug fix

@@ -525,6 +525,9 @@ def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_toke
             # The proxy discloses both halves of provider cache billing in _token_opt.
             "cache_read_tokens": opt.get("cache_read_tokens"),
             "cache_write_tokens": opt.get("cache_write_tokens"),
+            # Which groups actually recorded a step. Used to prove a lever the run ASKED
+            # for really fired, instead of silently measuring its absence (see --compress-user).
+            "groups_fired": tuple(sorted((opt.get("step_savings") or {}).keys())),
             "assistant_msg": _assistant_msg(content, tcs)}
 
 
@@ -591,7 +594,34 @@ def _blank():
             # NOT `a_calls`: the direct arm is memoised, so its cache halves are only known
             # for calls that were really made (see _accumulate).
             "a_cache_read": 0, "a_cache_write": 0, "a_cache_calls": 0,
-            "b_cache_read": 0, "b_cache_write": 0}
+            "b_cache_read": 0, "b_cache_write": 0,
+            # (profile, label) pairs already counted toward facts_checked. Internal to
+            # aggregation; _finalize strips it before anything is serialised.
+            "_graded": set()}
+
+
+def _count_verdict(rec, seen: set) -> bool:
+    """Does this record contribute a NEW quality verdict? Mutates `seen`.
+
+    A warm repeat that HIT the cache is a byte-identical replay: the direct arm is memoised
+    and the proxy arm served from cache, so both arms grade the very same pair of strings.
+    Counting each replay multiplied one verdict by the burst multiplicity - the checked-in
+    calibrated artifact reported 10 regressions that were a single item replayed nine times,
+    which is unreadable as a quality signal.
+
+    Two things it deliberately does NOT dedup:
+      - a repeat that MISSED the cache (eviction, threshold, a Redis restart, --mode replay)
+        - the proxy arm generated afresh, so that verdict is independent;
+      - a paraphrase - `_apply_paraphrase` changes the prompt.
+
+    `collect_regressions` still emits every affected call, so nothing gets harder to
+    diagnose. One rule, one place: the aggregate and the console both call this.
+    """
+    key = (rec.get("profile"), rec.get("label"))
+    if rec.get("kind") == "repeat" and rec["b"].get("cache_hit") and key in seen:
+        return False
+    seen.add(key)
+    return True
 
 
 def _accumulate(bucket, rec):
@@ -622,13 +652,14 @@ def _accumulate(bucket, rec):
                 bucket[f"{arm}_{half}"] += int(val)
     if rec["b"]["cache_hit"]:
         bucket["cache_hits"] += 1
-    if rec["facts"]["graded"]:
+    if rec["facts"]["graded"] and _count_verdict(rec, bucket["_graded"]):
         bucket["facts_checked"] += 1
         if not rec["facts"]["passed"]:
             bucket["facts_regressed"] += 1
 
 
 def _finalize(bucket):
+    bucket.pop("_graded", None)          # aggregation scratch, never serialised
     ap, bp = bucket["a_prompt"], bucket["b_prompt"]
     ac, bc = bucket["a_cost"], bucket["b_cost"]
     bucket["token_saving_pct"] = round(100.0 * (ap - bp) / ap, 2) if ap else 0.0
@@ -754,6 +785,34 @@ def render(agg: dict, meta: dict) -> None:
 # --weights. The per-workload numbers are the primary artifact; this is transparent
 # arithmetic a reader can recompute or re-weight for their own traffic.
 DEFAULT_WEIGHTS = {"cache": 0.30, "prose": 0.35, "agentic": 0.20, "reasoning": 0.15}
+
+# Profiles --compress-user opts in. These are the prose lanes the lever is designed for;
+# `reason`, `code` and `swe` are deliberately excluded — compressing a maths problem
+# statement or a code prompt risks the answer for a number, which is never the trade.
+_COMPRESS_PROFILES = ("rag", "chat", "ops")
+
+# Which dataset profiles feed which blend lever, and which are deliberately outside it.
+# These were inline lists inside blend(); pulled out because a profile that matches no
+# lever is silently dropped from the blend with nothing anywhere saying so — `code` and
+# `swe` (35 of the 110 items) were being run, billed, graded and then omitted, undisclosed.
+# A profile must now appear in exactly one of these two tables, and a test enforces it, so
+# the choice is stated rather than implied by an omission.
+# `prose`/`reasoning` are built from PROFILES within the cold slice; `cache` and `agentic`
+# are whole SLICES, so their profiles are named here too - otherwise the coverage check
+# reports the agentic profile as unclassified, a false alarm that would train readers to
+# ignore it.
+_BLEND_LEVER_PROFILES = {
+    "prose": ("rag", "chat", "ops"),
+    "reasoning": ("reason",),
+    "agentic": ("agentic",),
+}
+_BLEND_EXCLUDED_PROFILES = {
+    "code": "HumanEval completions are graded by execution/judge, not token-savings — the "
+            "lever set that acts on them is not one of the four traffic levers.",
+    "swe": "SWE-bench Lite items are single large repo contexts; they exercise structured "
+           "pruning but map to no traffic lever, and folding them into `prose` would let "
+           "the largest payloads in the corpus set the prose figure.",
+}
 WEIGHT_CITATIONS = [
     "cache-eligible ~30%: ~31% of LLM queries are semantically similar to a prior request; "
     "production cache-hit rates 30-70% (FAQ/agent 40-65%, creative/multi-turn ~0).",
@@ -817,8 +876,8 @@ def blend(agg: dict, weights: dict) -> dict:
         if base:
             # prose = stateless first-ask savings across recognized Q&A (rag/chat) + the
             # production-shaped structured 'ops' payloads (G19 pruning / G22 dedup fire there).
-            levers["prose"] = _combined_saving(base, ["rag", "chat", "ops"])
-            levers["reasoning"] = _combined_saving(base, ["reason"])
+            levers["prose"] = _combined_saving(base, list(_BLEND_LEVER_PROFILES["prose"]))
+            levers["reasoning"] = _combined_saving(base, list(_BLEND_LEVER_PROFILES["reasoning"]))
         present = {k: weights[k] for k in levers if weights.get(k, 0) > 0}
         wsum = sum(present.values()) or 1.0
         tok = sum(present[k] * levers[k][0] for k in present) / wsum
@@ -826,6 +885,19 @@ def blend(agg: dict, weights: dict) -> dict:
         out[prov] = {"token_saving_pct": round(tok, 2), "cost_saving_pct": round(cost, 2),
                      "weights": present, "levers": {k: round(v[0], 1) for k, v in levers.items()}}
     return out
+
+
+def blend_profile_coverage(profiles) -> dict:
+    """Which of `profiles` are in a lever, excluded by name, or unclassified.
+
+    `unclassified` must always be empty: a profile nobody assigned is a profile silently
+    missing from the blend, which is how `code`/`swe` went unmentioned for so long.
+    """
+    in_lever = {p for ps in _BLEND_LEVER_PROFILES.values() for p in ps}
+    profiles = set(profiles)
+    return {"in_lever": sorted(profiles & in_lever),
+            "excluded": sorted(profiles & set(_BLEND_EXCLUDED_PROFILES)),
+            "unclassified": sorted(profiles - in_lever - set(_BLEND_EXCLUDED_PROFILES))}
 
 
 def render_blend(bl: dict) -> None:
@@ -876,6 +948,12 @@ def main() -> int:
                          "DIAGNOSTIC AID for re-running just the profiles that regressed — a "
                          "filtered run is NOT a calibrated headline number.")
     ap.add_argument("--judge", action="store_true", help="LLM-judge both arms (extra cost)")
+    ap.add_argument("--compress-user", action="store_true",
+                    help="Send x_compress_user on the PROSE profiles (rag/chat/ops) so G01 "
+                         "selective compression of the user message actually runs. It is "
+                         "opt-in in production, so a default run measures WITHOUT it and this "
+                         "flag measures WITH it — publish both sides, never one. Needs the "
+                         "LLMLingua sidecar; the run exits 4 if the lever never fires.")
     ap.add_argument("--exec-humaneval", action="store_true",
                     help="run HumanEval canonical tests (executes model code in a subprocess)")
     ap.add_argument("--require-direct", action="store_true",
@@ -1020,6 +1098,12 @@ def main() -> int:
                 mt = int(item.get("max_tokens", 256))
                 x_controls = {k: v for k, v in item.items() if k.startswith("x_")}
                 x_controls.update(x_extra)
+                # G01 compresses only `assistant` messages unless the caller opts in, and
+                # these items are system+user — so without this the lever is inert and the
+                # prose figure silently excludes it. Prose profiles only: compressing a
+                # GSM8K problem statement or a code prompt is not what the lever is for.
+                if args.compress_user and item.get("_profile") in _COMPRESS_PROFILES:
+                    x_controls["x_compress_user"] = True
                 try:
                     if slice_name == "agentic":
                         # Multi-turn tool-loop episode on BOTH arms; provider-billed tokens are
@@ -1105,6 +1189,10 @@ def main() -> int:
         "stopped_at_cap": stopped_at_cap,
         "workload": args.workload,
         "mode": args.mode,
+        # Which SIDE of the two-sided prose figure this artifact is. Neither side is
+        # quotable alone, so the file has to say which one it holds.
+        "compress_user": bool(args.compress_user),
+        "compress_user_profiles": list(_COMPRESS_PROFILES) if args.compress_user else [],
         "cache_burst": meta_ds.get("cache_burst") if args.workload in ("cache", "full") else None,
     }
     blended = blend(agg, weights) if args.workload == "full" else None
@@ -1125,8 +1213,17 @@ def main() -> int:
 
     # Non-zero exit if a cap tripped or a real quality regression occurred.
     def _reg(sl):
-        return sum(1 for r in records if r.get("slice") == sl
-                   and r["facts"]["graded"] and not r["facts"]["passed"])
+        """Distinct regressed ITEMS in a slice, counted by the SAME rule `_accumulate` uses,
+        so the console line and `facts_regressed` in the artifact cannot disagree."""
+        seen, regressed = set(), 0
+        for r in records:
+            if r.get("slice") != sl or not r["facts"]["graded"]:
+                continue
+            if not _count_verdict(r, seen):
+                continue
+            if not r["facts"]["passed"]:
+                regressed += 1
+        return regressed
     present = [s for s in SLICE_ORDER if any(r.get("slice") == s for r in records)]
     per_slice = {s: _reg(s) for s in present}
     regressed = sum(per_slice.values())
@@ -1144,6 +1241,29 @@ def main() -> int:
             print(f"    ... +{len(regressions) - 12} more (full detail in {RESULTS.name})")
     if stopped_at_cap:
         return 3
+    # A run that ASKED for a lever and silently measured its absence is worse than a run
+    # that failed: it produces a number that looks like the lever's and is not. The proxy
+    # tells us which groups recorded a step, so check rather than assume.
+    if args.compress_user:
+        eligible = [r for r in records if r.get("profile") in _COMPRESS_PROFILES]
+        fired = sum(1 for r in eligible if "G01" in (r["b"].get("groups_fired") or ()))
+        if not eligible:
+            # e.g. --workload agentic --compress-user, or --profiles reason. The artifact
+            # would otherwise claim to hold the compressed side of the two-sided figure
+            # while no compressible record ran at all.
+            print("\n  LEVER NOT EXERCISED: --compress-user was requested but this workload "
+                  "contains no prose record (rag/chat/ops).\n"
+                  "  This artifact is NOT the compressed side of the prose figure.")
+            return 4
+        if not fired:
+            print(f"\n  LEVER NOT FIRED: --compress-user was requested and G01 recorded no "
+                  f"step on any of the {len(eligible)} prose records.\n"
+                  f"  This run measured the DEFAULT side, not the compressed side — do not "
+                  f"publish it as the latter.\n"
+                  f"  Most likely the LLMLingua sidecar is unreachable from the proxy "
+                  f"(check groups.G1_compression.sidecar_url).")
+            return 4
+        print(f"\n  compress-user: G01 fired on {fired}/{len(eligible)} prose records")
     return 2 if regressed else 0
 
 

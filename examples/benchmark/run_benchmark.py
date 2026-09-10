@@ -102,6 +102,145 @@ def normalise_for_match(s):
     return _WHITESPACE.sub(" ", _MD_EMPHASIS.sub(" ", s or "")).strip().lower()
 
 
+# Dotted identifiers stay WHOLE. Splitting "base.py" into ("base", "py") makes the
+# extension match any other path in the sentence - and `swe` facts ARE file paths, so a
+# split tokeniser let "the base class defined in utils.py" satisfy an expected "base.py".
+# Kept whole, such a fact is a single token and therefore stays on the strict path.
+_TOKEN = re.compile(r"[a-z0-9]+(?:\.[a-z0-9]+)*")
+
+# Words allowed to sit BETWEEN the gold span's content words. Anything else intervening
+# means the answer is making a different statement that merely reuses the words.
+# "and"/"or" are deliberately absent: they join separate items rather than glue one claim.
+_FILLER = frozenset({
+    "a", "an", "the", "of", "s", "in", "on", "at", "to", "for", "by", "with", "from",
+    "as", "is", "was", "are", "were", "be", "been", "that", "which", "this", "these",
+    "those", "it", "its", "his", "her", "their", "our", "your",
+})
+
+# Dropped from a gold span before comparing: they carry no fact, and the possessive "s"
+# is the exact thing that makes "Trump's private jet" and "the private jet of Trump"
+# different strings while being the same claim.
+_FACT_STOPWORDS = frozenset({"a", "an", "the", "of", "s"})
+
+# A negation inside the matched window flips the claim, so the window must not be credited.
+# Apostrophes are stripped by _TOKEN, so "isn't" arrives as ("isn", "t") - match the stems.
+_NEGATIONS = frozenset({
+    "not", "no", "never", "without", "nor", "none", "neither", "cannot", "cant", "dont",
+    "isn", "wasn", "aren", "weren", "doesn", "didn", "don", "won", "hasn", "haven",
+    "couldn", "shouldn", "wouldn",
+})
+
+# How far the gold span's tokens may spread WITHIN one sentence before they stop being
+# one claim. Generous enough for reordering and an inserted article, tight enough that
+# two loosely related mentions never combine.
+_WINDOW_SLACK = 3
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+# Never treat the period after these as a sentence end. A naive split cuts
+# "Donald J. Trump" in half at the initial - i.e. exactly through the kind of span
+# these facts are made of - and would defeat the whole guard.
+_ABBREV = frozenset({"mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "vs",
+                     "etc", "inc", "ltd", "fig", "eg", "ie", "approx", "no"})
+
+
+def _sentences(text):
+    """Sentence-split normalised text, keeping initials and abbreviations intact."""
+    out = []
+    for part in _SENT_SPLIT.split(text):
+        if out:
+            prev = out[-1]
+            tail = _TOKEN.findall(prev)
+            last = tail[-1] if tail else ""
+            if prev.endswith(".") and (len(last) == 1 or last in _ABBREV):
+                out[-1] = prev + " " + part
+                continue
+        out.append(part)
+    return out
+
+
+def _min_window(hay, needles):
+    """Smallest (start, end) slice of `hay` containing every token in `needles`, or None.
+
+    Standard linear min-window scan. Distinct tokens only - repetition in the gold span
+    carries no extra meaning for a containment check.
+    """
+    need = set(needles)
+    if not need:
+        return None
+    have, covered, best, left = {}, 0, None, 0
+    for right, tok in enumerate(hay):
+        if tok in need:
+            have[tok] = have.get(tok, 0) + 1
+            if have[tok] == 1:
+                covered += 1
+        while covered == len(need):
+            if best is None or (right - left) < (best[1] - best[0]):
+                best = (left, right)
+            lt = hay[left]
+            if lt in need:
+                have[lt] -= 1
+                if have[lt] == 0:
+                    covered -= 1
+            left += 1
+    return best
+
+
+def _fact_present(fact, text, sentence_tokens):
+    """Is `fact` asserted by the answer? Substring first, then ONE narrow second chance.
+
+    WHY THE SECOND CHANCE EXISTS
+        A raw substring gate scores a REPHRASING as a dropped fact. Measured on the
+        checked-in calibrated A/B artifact: gold "Donald J. Trump's private jet", direct
+        arm wrote it verbatim, proxy arm wrote "the private jet of Donald J. Trump" - the
+        same claim, graded as a regression, and (via the cache repeats) counted ten times.
+        That manufactures regressions on precisely the arm whose phrasing an optimisation
+        changed, which is the same failure family as the Markdown-blind gate fixed earlier.
+
+    WHY IT IS NARROW, AND CANNOT MANUFACTURE A PASS
+        - Multi-token gold spans ONLY. A single token (a GSM8K numeric, "Illinois", or a
+          dotted path like "base.py") keeps exact substring semantics.
+        - EVERY content token must be present - this is containment, not similarity.
+        - They must fall inside ONE SENTENCE, and be CONTIGUOUS THERE apart from filler
+          words. This is the load-bearing guard. An earlier version allowed any gap up to
+          a token budget, which passed "the base class defined in utils.py" for an expected
+          "base.py", "42 oranges and 7 apples" for "42 apples", and "Gary played opposite
+          Oldman Smith" for "Gary Oldman" - manufactured passes that would hide real
+          regressions in the arm being measured.
+        - A negation anywhere in that sentence (and not in the gold span) rejects it.
+
+    The bias is deliberately conservative: every ambiguous case resolves to "missing",
+    which makes the proxy arm look WORSE, never better. That is the only safe direction
+    for a gate whose output feeds a published savings number.
+    """
+    needle = normalise_for_match(str(fact))
+    if not needle:
+        return True
+    if needle in text:
+        return True
+
+    content = [t for t in _TOKEN.findall(needle) if t not in _FACT_STOPWORDS]
+    if len(content) < 2:          # single-token facts stay strict - see docstring
+        return False
+
+    gold = set(content)
+    cap = 2 * len(content) + _WINDOW_SLACK          # backstop; contiguity is the real gate
+    for toks in sentence_tokens:
+        win = _min_window(toks, content)
+        if win is None:
+            continue
+        start, end = win
+        if (end - start + 1) > cap:
+            continue
+        # Everything inside the span that is not part of the fact must be filler.
+        if any(t not in gold and t not in _FILLER for t in toks[start:end + 1]):
+            continue
+        if any(t in _NEGATIONS and t not in gold for t in toks):
+            continue
+        return True
+    return False
+
+
 def check_facts(answer, expected_facts=None, forbidden=None):
     """Deterministic ground-truth check of a single answer — no LLM call.
 
@@ -116,13 +255,17 @@ def check_facts(answer, expected_facts=None, forbidden=None):
     facts trivially passes.
     """
     text = normalise_for_match(answer)
+    sentence_tokens = [_TOKEN.findall(s) for s in _sentences(text)]
     missing = []
     for item in (expected_facts or []):
         if isinstance(item, (list, tuple)):
-            if not any(normalise_for_match(str(opt)) in text for opt in item):
+            if not any(_fact_present(opt, text, sentence_tokens) for opt in item):
                 missing.append(list(item))
-        elif normalise_for_match(str(item)) not in text:
+        elif not _fact_present(item, text, sentence_tokens):
             missing.append(item)
+    # `forbidden` stays EXACT-substring on purpose. Relaxing it would let coincidental
+    # co-occurrence of a banned phrase's words trip the gate on an answer that never
+    # said it - a manufactured failure, the mirror of the manufactured pass guarded above.
     present_forbidden = [f for f in (forbidden or []) if normalise_for_match(str(f)) in text]
     return {
         "passed": not missing and not present_forbidden,

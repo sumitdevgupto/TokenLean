@@ -261,13 +261,24 @@ warm burst — every original precedes its repeats):
   ~43% and lift the combined prose lever to ~8%. We report whatever `ops` yields — it is never tuned.
 - **cache** (`--workload cache`) — a **disclosed** warm-repeat burst (verbatim repeats, L1 exact-match
   via `x_cache_semantic:false`) that reproduces the caching lever at **0 quality loss**.
-- **agentic** (`--workload agentic`) — a multi-turn BFCL tool loop run on both arms. Reproduces the
-  **tool-catalogue-pruning** lever (G08/G16) only; the larger tool-output-projection lever (G14/G15)
-  **structurally cannot fire in a live single-loop A/B** (it acts on `role:"tool"` results a live
-  model never inlines), so this reads ~12% (run-variable 7–22% over 7 runs under model nondeterminism) vs the
-  internal 46% — disclosed, not hidden.
+- **agentic** (`--workload agentic`) — a multi-turn BFCL tool loop run on both arms. It reproduces
+  the **tool-catalogue-pruning** lever (G08/G16) and, since 2026-09-10, the **request-side pruning
+  of tool results** as well: the mocked results were a twelve-token status stub, so there was
+  nothing for that lever to act on and the slice measured catalogue pruning alone. They are now
+  generated from each tool's own schema and capped to the internal dataset's size band (see
+  `DATA_LICENSES.md`). The response-side tool-output-projection lever (G14/G15) still
+  **structurally cannot fire in a live single-loop A/B** — it reads a `function.result` field a
+  live model never emits — so this slice remains below the internal 46%, disclosed, not hidden.
+  **The previously published ~12% predates the result-sizing change and is awaiting re-run.**
 
 ### Calibrated expected results (OpenAI, temperature-0)
+
+> **⚠ AWAITING RE-CALIBRATION (2026-09-10).** The figures below predate three changes and do
+> **not** describe the current harness: the facts gate no longer scores a rephrasing as a dropped
+> fact, a warm repeat no longer counts its original's verdict again, and the agentic tool results
+> are now realistically sized instead of twelve-token stubs. They also predate the deletion of
+> four optimisation levers in the proxy itself (2026-09-09). **Do not quote this table until the
+> re-run lands.** The direction of each change is stated in `release-notes.md`.
 
 Reproduce each part; the numbers carry the same run-to-run variance as the headline (borderline
 items flip under model nondeterminism even at temperature-0), so treat them as bands, not exact:
@@ -280,6 +291,22 @@ items flip under model nondeterminism even at temperature-0), so treat them as b
 | ops (cold, production-shaped) | **~43%** | G19/G22 structured-pruning on verbose DevOps payloads; disclosed **non**-benchmark |
 | reasoning (cold) | **~0%** | reasoning traffic barely compresses — honest |
 | **illustrative blend** | **~32%** (31–34%) | disclosed weighted average (`--weights` tunable), **not** a headline; the spread is the agentic lever's, carried at weight 0.20 |
+
+**The prose lever is TWO-SIDED (2026-09-10).** Prompt compression only touches `assistant`
+messages unless the caller opts in, and these items are system+user — so a default run measures
+the prose lever *without* compression at all. `run_ab.py --compress-user` sends `x_compress_user`
+on the prose profiles (`rag`/`chat`/`ops` only; never `reason`/`code`/`swe`, where compressing the
+question risks the answer) so the lever actually runs. **Publish both sides or neither** — the
+default side is what a stock install gets, the compressed side is what the documented opt-in gets,
+and `ab_results.json` records which side it holds in `meta.compress_user`. The run exits `4` if
+compression was requested and no compression step ever fired, so a sidecar outage cannot be
+mistaken for a measurement.
+
+**Two profiles are outside the blend, by name.** `code` and `swe` (35 of the 110 items) are run,
+billed and graded, but map to none of the four traffic levers, so they do not enter the blend.
+They were previously omitted silently; the exclusions and their reasons now live in
+`_BLEND_EXCLUDED_PROFILES` in `run_ab.py`, and a test fails if any profile belongs to neither a
+lever nor that list.
 
 The **illustrative blend** (`--workload full`) is `Σ wᵢ·savingᵢ` over the reproducible parts, with
 default balanced weights `cache=0.30 prose=0.35 agentic=0.20 reasoning=0.15` echoed (with citations)

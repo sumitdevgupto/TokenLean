@@ -367,3 +367,4 @@ See also [`../../docs/client-onboarding.md`](../../docs/client-onboarding.md).
 | non-OpenAI results look wrong / came back from `gpt-4o-mini` | G06 rerouted the request. Let the launcher **pin** (don't pass `--no-pin-config`) so it sets that provider's routing tiers, or set the live stack's `G6_routing` tiers to the target provider. |
 | azure/bedrock skipped | Missing extras — set `AZURE_API_BASE`, or `AWS_SECRET_ACCESS_KEY` + `AWS_REGION_NAME`. |
 | exit 3 | A spend cap tripped — raise `--max-spend-per-provider` / `--max-spend` or lower `--limit`. |
+| exit 4 | `--compress-user` was requested but the compression group recorded no step on any prose record. The run measured the DEFAULT side; do not publish it as the compressed side. Usually the LLMLingua sidecar is unreachable from the proxy (`groups.G1_compression.sidecar_url`). |

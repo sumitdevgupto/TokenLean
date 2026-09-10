@@ -19,7 +19,7 @@ publishing any headline number).
 | `swe` | SWE-bench Lite | `princeton-nlp/SWE-bench_Lite` | `main` (*pin a sha before publish*) | permissive research use | gold-patch paths/symbols facts |
 | `code` | HumanEval | `openai/openai_humaneval` | `main` (*pin a sha before publish*) | MIT | judge / opt-in exec pass@1 |
 | `reason` | GSM8K | `openai/gsm8k` (`main` config) | `main` (*pin a sha before publish*) | MIT | final-numeric-answer facts |
-| `agentic` | BFCL v3 multi_turn | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` | `main` (*pin a sha before publish*) | Apache-2.0 | relative tool-trajectory (proxy vs direct arm) |
+| `agentic` | BFCL v3 multi_turn (schemas + first user turn); **`tool_results` are ours** | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` | `main` (*pin a sha before publish*) | Apache-2.0 | relative tool-trajectory (proxy vs direct arm) |
 | `ops` | **production-shaped (NOT a recognized benchmark)** — `ops_seed.jsonl`, this repo | n/a | Apache-2.0 (this repo) | relative gold-fact substrings |
 
 > Replace *"pin before publish"* with the actual commit sha printed by `datasets` at
@@ -47,9 +47,18 @@ publishing any headline number).
 - **BFCL v3 multi_turn (Apache-2.0):** Berkeley Function Calling Leaderboard, Gorilla team
   (Patil, Mao et al.), UC Berkeley. Only the **tool schemas** (`multi_turn_func_doc`) and the
   **first user turn** of each task are bundled, verbatim, in `agentic_dataset.jsonl`
-  (`build_agentic_dataset.py`). The system prompt is disclosed harness scaffolding and the
-  `tool_results` are mocks — the live A/B reproduces only the tool-catalogue-pruning lever
-  (G08/G16); it does not attempt tool-output projection (G14/G15), which is not live-reproducible.
+  (`build_agentic_dataset.py`). The system prompt is disclosed harness scaffolding, and the
+  **`tool_results` are OURS, not BFCL's** — BFCL ships tool schemas and user turns but no result
+  payloads, so whatever the loop hands back is authored here either way. They are generated
+  deterministically from each tool's own schema and **size-capped to the band the internal
+  agentic dataset uses for the same job** (median ≈243 chars, ceiling 1,794). Until 2026-09-10
+  they were a twelve-token `{"status": "success", "detail": "<name> completed"}`, which left the
+  request-side structured-pruning lever nothing to act on and reduced this slice to catalogue
+  pruning alone; a tool result re-enters the prompt on every later turn, which is where much of
+  a real agent's context sits. The cap is the honesty control — larger mocks would raise the
+  measured percentage without representing anything real. Regenerate them offline with
+  `build_agentic_dataset.py --results-only`. The live A/B still does **not** attempt tool-output
+  projection (G14/G15), which is response-side and not live-reproducible.
   Each task's catalogue is its own BFCL `involved_classes` toolset (verbatim, 18–39 tools),
   from which G08/G16 prune the tools irrelevant to the turn; every tool the direct arm actually
   calls is protected by the relative tool-trajectory gate, so pruning can never mask a dropped

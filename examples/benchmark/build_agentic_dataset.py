@@ -4,17 +4,27 @@ Build agentic_dataset.jsonl for the A/B benchmark's --workload agentic path.
 
 LIGHTER-HYBRID design (see run_ab.md): each item bundles REAL BFCL v3 multi_turn tool
 schemas + the first user turn VERBATIM (Apache-2.0, gorilla-llm/Berkeley-Function-Calling-
-Leaderboard), plus a disclosed long agent system prompt and simple mock tool_results (loop
-continuation only). This reproduces the LIVE agentic lever = G08/G16 tool-catalogue pruning +
-system-prompt cap. It deliberately does NOT try to reproduce G14/G15 tool-OUTPUT projection:
-those are response-side and only fire on pre-baked embedded `function.result` values that a
-real live model never emits, so a live A/B cannot trigger them (measured internally instead).
+Leaderboard), plus a disclosed long agent system prompt and mock tool_results.
+
+BFCL ships no result payloads, so the loop's returned values are ours either way. They are
+shaped from each tool's own schema and sized to the band the internal agentic dataset uses
+(DS13: median ~243 chars), because a tool result re-enters the prompt on every later turn and
+that is where much of an agent's context actually sits. The first version returned a
+twelve-token "<name> completed", which left the request-side pruning lever nothing to act on
+and reduced the slice to catalogue pruning alone. Sizes are CAPPED at the internal band's
+ceiling: larger mocks would raise the measured percentage without representing anything real.
+
+This still does NOT reproduce G14/G15 tool-OUTPUT projection: those are response-side and fire
+only on pre-baked embedded `function.result` values a live model never emits, so a live A/B
+cannot trigger them (measured internally instead, and tracked as backlog #49).
 
 Quality is graded RELATIVELY by the harness (proxy vs direct arm tool trajectory), so no BFCL
 ground-truth answer files are bundled.
 
 Requires network (downloads BFCL raw files). Run once to regenerate the checked-in artifact:
     python examples/benchmark/build_agentic_dataset.py
+Regenerate ONLY the mock results, offline, from the checked-in schemas:
+    python examples/benchmark/build_agentic_dataset.py --results-only
 Runtime of the benchmark itself needs only the checked-in agentic_dataset.jsonl (+ httpx/litellm).
 """
 import argparse
@@ -122,11 +132,147 @@ def _to_openai_tool(fd):
         "parameters": _norm_schema(params)}}
 
 
+# --------------------------------------------------------------------------- #
+# Mock tool RESULTS
+#
+# BFCL ships tool SCHEMAS and user turns; it ships no result payloads, so whatever the
+# loop feeds back is ours either way. The first version returned
+# {"status": "success", "detail": "<name> completed"} - 47-69 characters, about twelve
+# tokens. Real agents receive API responses, file listings and query results, and those
+# re-enter the prompt on every subsequent turn, which is where a large share of agentic
+# context actually lives. At twelve tokens there was nothing for the request-side
+# structured-pruning lever to act on, so the agentic slice measured catalogue pruning
+# ALONE and no other lever could ever show up in it.
+#
+# These payloads are therefore sized to the band the internal agentic dataset uses for
+# the same job (DS13 tool_results: median ~243 chars, max ~1794) and CAPPED there. The
+# cap is the honesty control: bigger mocks would raise the measured percentage without
+# representing anything real, which is the one thing this harness must never do.
+#
+# Shape is derived from each tool's OWN parameter schema, so a payload looks like it
+# belongs to its tool, and every value is a pure function of (tool name, index) - no RNG,
+# so rebuilds are byte-identical on any machine.
+# --------------------------------------------------------------------------- #
+_RESULT_MAX_CHARS = 1794          # the internal band's ceiling; never exceed it
+# Matched against the FIRST underscore-delimited segment, so multi-word entries would be
+# unreachable - the `get_all` family is caught by the substring test below instead.
+_LIST_VERBS = ("list", "search", "find", "ls", "browse", "query")
+_READ_VERBS = ("get", "read", "cat", "view", "show", "describe", "display", "retrieve",
+               "fetch", "info", "detail", "stat", "lookup")
+_WORDS = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+          "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa")
+
+
+def _stable(mod: int, *parts) -> int:
+    """Deterministic small integer from the parts - hashlib, not PRNG, so it cannot drift
+    with a Python version or a platform."""
+    h = hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % mod
+
+
+def _scalar(kind: str, key: str, salt: str):
+    if kind in ("integer", "number"):
+        return _stable(9000, key, salt) + 100
+    if kind == "boolean":
+        return _stable(2, key, salt) == 1
+    if kind == "array":
+        return [_WORDS[_stable(len(_WORDS), key, salt, i)] for i in range(3)]
+    return f"{key}_{_WORDS[_stable(len(_WORDS), key, salt)]}_{_stable(900, key, salt) + 100}"
+
+
+def synth_tool_result(tool: dict) -> dict:
+    """A plausible, deterministic, size-capped return payload for one tool schema."""
+    fn = tool["function"]
+    name = fn["name"]
+    low = name.lower()
+    props = ((fn.get("parameters") or {}).get("properties") or {})
+    keys = sorted(props)[:5] or ["id", "name", "status"]
+
+    def record(i: int) -> dict:
+        r = {k: _scalar((props.get(k) or {}).get("type", "string"), k, f"{name}:{i}")
+             for k in keys}
+        r["id"] = f"{low[:14]}-{_stable(9000, name, i) + 1000}"
+        return r
+
+    # A response is not the shape of its own arguments. A read returns CONTENT it was
+    # never passed, a list returns rows with fields the caller never supplied, and every
+    # real API response carries a small envelope. Deriving fields from the input schema
+    # alone systematically under-describes what an agent actually gets handed back.
+    envelope = {"status": "success",
+                "ts": f"2026-09-0{1 + _stable(9, name)}T0{_stable(9, name, 'h')}:"
+                      f"{_stable(6, name, 'm')}{_stable(9, name, 'm2')}:00Z",
+                "source": low}
+
+    verb = low.split("_", 1)[0]
+    if verb in _LIST_VERBS or any(v in low for v in ("list", "search", "find", "_all")):
+        n = 2 + _stable(4, name)
+        payload = {**envelope, "count": n, "results": [record(i) for i in range(n)]}
+    elif verb in _READ_VERBS:
+        body = " ".join(_WORDS[_stable(len(_WORDS), name, "body", i)] for i in range(12))
+        payload = {**envelope, "result": record(0), "content": body}
+    else:
+        payload = {**envelope, "action": name, "applied": record(0),
+                   "message": f"{name} completed; state updated"}
+
+    # Cap by dropping whole records, never by truncating into invalid JSON.
+    while len(json.dumps(payload, sort_keys=True)) > _RESULT_MAX_CHARS:
+        rows = payload.get("results")
+        if rows and len(rows) > 1:
+            rows.pop()
+            payload["count"] = len(rows)
+        else:
+            payload = {"status": "success", "action": name}
+            break
+    return payload
+
+
+def _results_for(tools: list) -> dict:
+    return {t["function"]["name"]: synth_tool_result(t) for t in tools}
+
+
+_RESULTS_NOTE = ("tool schemas + first user turn verbatim; system prompt is disclosed "
+                 "harness scaffolding; tool_results are OUR mocks - BFCL ships no result "
+                 "payloads - shaped from each tool's own schema and size-capped to the "
+                 "internal agentic band. Live lever = G08/G16 tool pruning plus request-side "
+                 "pruning of the tool results; G14/G15 response-side projection is not "
+                 "live-reproducible.")
+
+
+def rebuild_results_only(path: Path) -> int:
+    """OFFLINE path: regenerate tool_results in place from the checked-in schemas.
+
+    Touches `tool_results` and the provenance note ONLY - messages, tools and n_tools are
+    rewritten byte-identically, so the catalogue-pruning figure cannot move for an
+    unrelated reason. Needs no network.
+    """
+    items = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    for it in items:
+        it["tool_results"] = _results_for(it["tools"])
+        if isinstance(it.get("_source"), dict):
+            it["_source"]["note"] = _RESULTS_NOTE
+    text = "\n".join(json.dumps(it, ensure_ascii=True, sort_keys=True) for it in items) + "\n"
+    path.write_bytes(text.encode("utf-8"))
+    sizes = sorted(len(json.dumps(v, sort_keys=True))
+                   for it in items for v in it["tool_results"].values())
+    mid = sizes[len(sizes) // 2] if sizes else 0
+    print(f"rebuilt tool_results for {len(items)} items -> {path.name}")
+    print(f"  result sizes (chars): min={sizes[0]} median={mid} max={sizes[-1]} "
+          f"(cap {_RESULT_MAX_CHARS})")
+    print(f"  sha256={hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the BFCL-derived agentic A/B dataset.")
     ap.add_argument("--count", type=int, default=15, help="number of agentic items to bundle")
     ap.add_argument("--out", default=str(HERE / "agentic_dataset.jsonl"))
+    ap.add_argument("--results-only", action="store_true",
+                    help="regenerate tool_results in the checked-in file from its own tool "
+                         "schemas and exit. Offline - no network, no re-download.")
     args = ap.parse_args()
+
+    if args.results_only:
+        return rebuild_results_only(Path(args.out))
 
     class_tools = {}
     for cls, stem in CLASS_DOC.items():
@@ -157,20 +303,16 @@ def main() -> int:
         tools = [t for c in e["involved_classes"] for t in class_tools[c]]
         first_user = next((m["content"] for turn in e["question"] for m in turn
                            if m.get("role") == "user"), "")
-        names = [t["function"]["name"] for t in tools]
         items.append({
             "request_id": f"agentic-{i:04d}", "_profile": "agentic", "_label": e["id"],
             "_source": {"corpus": "BFCL v3 multi_turn (base)", "record_id": e["id"],
                         "involved_classes": e["involved_classes"], "license": "Apache-2.0",
                         "origin": "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
-                        "note": "tool schemas + first user turn verbatim; system prompt is "
-                                "disclosed harness scaffolding; tool_results are mocks (loop "
-                                "continuation). Live lever = G08/G16 tool pruning; G14/G15 not "
-                                "live-reproducible."},
+                        "note": _RESULTS_NOTE},
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": first_user}],
             "tools": tools,
-            "tool_results": {n: {"status": "success", "detail": f"{n} completed"} for n in names},
+            "tool_results": _results_for(tools),
             "expected_facts": None, "n_tools": len(tools), "max_tokens": 512,
         })
 

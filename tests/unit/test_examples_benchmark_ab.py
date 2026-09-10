@@ -1007,3 +1007,338 @@ class TestCacheTokenReporting:
             "b": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0, "cache_hit": False},
             "facts": {"graded": False, "passed": True}})
         assert bucket["a_cache_read"] == 7 and bucket["a_cache_calls"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# 2026-09-10: the grading + dataset repairs (tracker AB-1/2/4/7/10/11)
+# --------------------------------------------------------------------------- #
+run_benchmark = _load("run_benchmark")
+agentic_builder = _load("build_agentic_dataset")
+
+
+class TestRephrasedFactIsNotADroppedFact:
+    """AB-1. A substring gate scores a REPHRASING as a lost fact.
+
+    Taken from the checked-in calibrated artifact: gold "Donald J. Trump's private jet",
+    the direct arm wrote it verbatim, the proxy arm wrote "the private jet of Donald J.
+    Trump". Same claim, graded a regression - and via the cache repeats, counted ten times.
+    It fires hardest on the arm whose phrasing an optimisation changed, which is precisely
+    the arm we are measuring.
+    """
+
+    GOLD = ["Donald J. Trump's private jet"]
+
+    def test_the_real_recorded_case_now_passes(self):
+        proxy = "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+        assert run_benchmark.check_facts(proxy, self.GOLD)["passed"]
+
+    def test_the_verbatim_direct_answer_still_passes(self):
+        direct = "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757."
+        assert run_benchmark.check_facts(direct, self.GOLD)["passed"]
+
+    def test_every_recorded_regression_in_the_artifact_clears(self):
+        """End-to-end on real data: re-grade the shipped artifact's own regressions."""
+        results = json.loads((BENCH / "ab_results.json").read_text(encoding="utf-8"))
+        items = {json.loads(l)["_label"]: json.loads(l)
+                 for l in (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+                 if l.strip()}
+        assert results["regressions"], "fixture must contain the recorded regressions"
+        for g in results["regressions"]:
+            facts = items[g["label"]]["expected_facts"]
+            a = run_benchmark.check_facts(g["direct_answer"], facts)
+            b = run_benchmark.check_facts(g["proxy_answer"], facts)
+            missing_a = {json.dumps(x) for x in a["missing"]}
+            missing_b = {json.dumps(x) for x in b["missing"]}
+            assert not (missing_b - missing_a), f"{g['label']} still reads as a regression"
+
+    # ---- the second chance must never manufacture a PASS ---- #
+
+    def test_a_genuinely_missing_fact_still_fails(self):
+        assert not run_benchmark.check_facts("Trump Force One is a Boeing 757.",
+                                             self.GOLD)["passed"]
+
+    def test_tokens_drawn_from_separate_sentences_do_not_combine(self):
+        scattered = "Donald J. Trump spoke today. Separately, a private jet landed in Ohio."
+        assert not run_benchmark.check_facts(scattered, self.GOLD)["passed"]
+
+    def test_a_negation_in_the_sentence_rejects_the_match(self):
+        assert not run_benchmark.check_facts("That is not Donald J. Trump private jet.",
+                                             self.GOLD)["passed"]
+
+    def test_single_token_facts_stay_exact_substring(self):
+        """The numeric/entity answers (GSM8K, HotpotQA spans) must not relax AT ALL."""
+        assert not run_benchmark.check_facts("the answer is 24", ["42"])["passed"]
+        assert not run_benchmark.check_facts("the state is Ohio", ["Illinois"])["passed"]
+
+    def test_emphasis_stripping_still_cannot_create_an_adjacency(self):
+        """`2*4` must never satisfy an expected `24` - the pre-existing guard survives."""
+        assert not run_benchmark.check_facts("the product is 2*4", ["24"])["passed"]
+
+    def test_initials_do_not_split_the_sentence(self):
+        """A naive sentence split cuts "Donald J. Trump" at the initial, defeating the guard."""
+        assert run_benchmark._sentences("donald j. trump owns the private jet.") == \
+            ["donald j. trump owns the private jet."]
+
+    def test_forbidden_terms_stay_exact_substring(self):
+        res = run_benchmark.check_facts("we cannot process a refund", [], ["refund"])
+        assert res["present_forbidden"] == ["refund"]
+
+    def test_or_groups_still_work(self):
+        assert run_benchmark.check_facts("the region is EU", [["EU", "Europe"]])["passed"]
+
+
+class TestARepeatIsNotAnIndependentVerdict:
+    """AB-2. A warm repeat replays byte-identical strings on both arms."""
+
+    @staticmethod
+    def _rec(kind, label, passed):
+        arm = {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.001,
+               "cache_hit": kind == "repeat", "_billed": kind != "repeat"}
+        return {"provider": "openai", "slice": "cache", "kind": kind, "profile": "rag",
+                "label": label, "a": dict(arm), "b": dict(arm),
+                "facts": {"graded": True, "passed": passed}}
+
+    def test_one_failing_item_replayed_nine_times_counts_once(self):
+        recs = [self._rec("original", "rag-0023", False)]
+        recs += [self._rec("repeat", "rag-0023", False) for _ in range(9)]
+        total = run_ab.aggregate(recs)["openai"]["cache"]["total"]
+        assert total["facts_checked"] == 1
+        assert total["facts_regressed"] == 1, "the artifact reported 10 for this one item"
+
+    def test_token_and_cost_accounting_still_covers_every_replay(self):
+        recs = [self._rec("original", "rag-0023", True)]
+        recs += [self._rec("repeat", "rag-0023", True) for _ in range(9)]
+        total = run_ab.aggregate(recs)["openai"]["cache"]["total"]
+        assert total["b_calls"] == 10, "dedup is for the VERDICT, never for the tokens"
+
+    def test_paraphrases_are_not_deduped(self):
+        """_apply_paraphrase changes the prompt, so each verdict is genuinely independent."""
+        recs = [self._rec("original", "rag-0005", False)]
+        recs += [self._rec("paraphrase", "rag-0005", False) for _ in range(3)]
+        total = run_ab.aggregate(recs)["openai"]["cache"]["total"]
+        assert total["facts_checked"] == 4 and total["facts_regressed"] == 4
+
+    def test_scratch_key_never_reaches_the_artifact(self):
+        agg = run_ab.aggregate([self._rec("original", "rag-0001", True)])
+        assert "_graded" not in agg["openai"]["cache"]["total"]
+        json.dumps(agg)          # must stay serialisable
+
+
+class TestAgenticToolResultsAreRealisticallySized:
+    """AB-4. Twelve-token mocks left the request-side pruning lever nothing to act on."""
+
+    ITEMS = [json.loads(l) for l in
+             (BENCH / "agentic_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+             if l.strip()]
+
+    # The band the internal agentic dataset (DS13) uses for the same job.
+    INTERNAL_MEDIAN, INTERNAL_MAX = 243, 1794
+
+    def _sizes(self):
+        return sorted(len(json.dumps(v, sort_keys=True))
+                      for it in self.ITEMS for v in it["tool_results"].values())
+
+    def test_results_sit_in_the_internal_band_and_never_above_it(self):
+        sizes = self._sizes()
+        median = sizes[len(sizes) // 2]
+        assert median > 100, "a status stub is not a tool result"
+        assert median <= self.INTERNAL_MEDIAN * 1.2, "no inflation beyond the internal band"
+        assert sizes[-1] <= agentic_builder._RESULT_MAX_CHARS <= self.INTERNAL_MAX
+
+    def test_every_tool_has_a_result(self):
+        for it in self.ITEMS:
+            names = {t["function"]["name"] for t in it["tools"]}
+            assert names == set(it["tool_results"]), it["_label"]
+
+    def test_results_are_valid_json_objects(self):
+        for it in self.ITEMS:
+            for name, val in it["tool_results"].items():
+                assert isinstance(val, dict) and val.get("status"), f"{it['_label']}/{name}"
+
+    def test_synthesis_is_deterministic(self):
+        """Pure function of the schema - a rebuild must be byte-identical anywhere."""
+        for it in self.ITEMS:
+            assert agentic_builder._results_for(it["tools"]) == it["tool_results"], it["_label"]
+
+    def test_the_catalogue_is_untouched(self):
+        """The tool catalogue drives the G08/G16 figure; it must not move for this change."""
+        for it in self.ITEMS:
+            assert it["n_tools"] == len(it["tools"])
+            assert [m["role"] for m in it["messages"]] == ["system", "user"]
+
+    def test_provenance_says_the_payloads_are_ours(self):
+        """BFCL ships no result payloads - the artifact must not imply otherwise."""
+        for it in self.ITEMS:
+            note = (it.get("_source") or {}).get("note", "")
+            assert "our mocks" in note.lower() and "verbatim" in note.lower(), it["_label"]
+
+
+class TestBlendProfileCoverage:
+    """AB-7/AB-11. A profile in no lever is silently dropped from the blend."""
+
+    DATASET_PROFILES = {json.loads(l)["_profile"] for l in
+                        (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+                        if l.strip()}
+
+    def test_every_dataset_profile_is_classified(self):
+        cover = run_ab.blend_profile_coverage(self.DATASET_PROFILES)
+        assert cover["unclassified"] == [], (
+            "a profile in neither a lever nor the named exclusions vanishes from the blend "
+            "with nothing saying so - which is how code/swe went unmentioned")
+
+    def test_the_excluded_profiles_carry_a_stated_reason(self):
+        for prof, reason in run_ab._BLEND_EXCLUDED_PROFILES.items():
+            assert len(reason) > 40, f"{prof} needs a real reason, not a label"
+
+    def test_a_new_profile_is_caught_rather_than_silently_dropped(self):
+        cover = run_ab.blend_profile_coverage(self.DATASET_PROFILES | {"longconv"})
+        assert cover["unclassified"] == ["longconv"]
+
+
+class TestCompressUserIsTwoSided:
+    """AB-10. G01 compresses only `assistant` messages unless the caller opts in."""
+
+    def test_only_prose_profiles_are_opted_in(self):
+        """Compressing a maths problem or a code prompt risks the answer for a number."""
+        assert set(run_ab._COMPRESS_PROFILES) == {"rag", "chat", "ops"}
+        for excluded in ("reason", "code", "swe"):
+            assert excluded not in run_ab._COMPRESS_PROFILES
+
+    def test_the_corpus_itself_never_hardcodes_the_opt_in(self):
+        """It must stay a RUN-TIME side, so both sides read the same bytes."""
+        raw = (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8")
+        assert "x_compress_user" not in raw
+
+    def test_the_flag_exists_and_defaults_off(self):
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert '"--compress-user"' in src
+        assert 'action="store_true"' in src
+
+    def test_proxy_results_expose_which_groups_fired(self):
+        """The lever-fired guard reads this; without it the run cannot self-check."""
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert '"groups_fired"' in src and "step_savings" in src
+
+    def test_the_run_refuses_to_pass_off_a_default_run_as_the_compressed_side(self):
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert "LEVER NOT FIRED" in src and "return 4" in src
+
+
+class TestTheSecondChanceCannotManufactureAPass:
+    """Code review, 2026-09-10 (HIGH). The first version of the fix DID manufacture passes.
+
+    It allowed any gap up to a token budget, so unrelated words between the gold span's
+    tokens still counted. Every case below was executed against the shipped function and
+    passed when it must not have. The `swe` profile is the sharp end: its facts are file
+    paths, and a tokeniser that split "base.py" let the extension match any other path in
+    the sentence. Fixed two ways - dotted identifiers stay whole (so a path is a SINGLE
+    token and stays on the strict path), and everything between the gold words must be
+    filler.
+    """
+
+    def test_a_different_file_in_the_same_sentence_is_not_the_expected_file(self):
+        assert not run_benchmark.check_facts(
+            "the base class defined in utils.py", ["base.py"])["passed"]
+
+    def test_a_different_module_is_not_the_expected_module(self):
+        assert not run_benchmark.check_facts(
+            "the latex renderer inside the mathtext.py module", ["latex.py"])["passed"]
+
+    def test_a_quantity_is_not_satisfied_by_a_different_quantity_nearby(self):
+        assert not run_benchmark.check_facts(
+            "42 oranges and 7 apples", ["42 apples"])["passed"]
+
+    def test_two_names_in_one_sentence_are_not_one_person(self):
+        assert not run_benchmark.check_facts(
+            "Gary played opposite Oldman Smith", ["Gary Oldman"])["passed"]
+
+    def test_the_expected_path_present_verbatim_still_passes(self):
+        assert run_benchmark.check_facts("the fix is in base.py today", ["base.py"])["passed"]
+
+    def test_dotted_identifiers_are_one_token(self):
+        assert run_benchmark._TOKEN.findall("base.py and utils.py") == \
+            ["base.py", "and", "utils.py"]
+
+    def test_only_filler_may_sit_between_the_gold_words(self):
+        """"of" is filler, so the genitive inversion survives; a content word is not."""
+        gold = ["Donald J. Trump's private jet"]
+        assert run_benchmark.check_facts(
+            "it is the private jet of Donald J. Trump", gold)["passed"]
+        assert not run_benchmark.check_facts(
+            "the private jet belonging to pilot Donald J. Trump", gold)["passed"]
+
+
+class TestARepeatThatMissedTheCacheIsStillAVerdict:
+    """Code review, 2026-09-10 (MEDIUM). Dedup keyed on `kind` alone.
+
+    The justification - both arms grade the same pair of strings - only holds when the
+    proxy arm actually served from cache. On a miss (eviction, threshold, a Redis restart,
+    --mode replay) arm B generated afresh, so the verdict is independent and dropping it
+    would hide a real regression.
+    """
+
+    @staticmethod
+    def _rec(kind, label, passed, cache_hit):
+        arm_a = {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.001,
+                 "cache_hit": False, "_billed": kind != "repeat"}
+        arm_b = dict(arm_a, cache_hit=cache_hit)
+        return {"provider": "openai", "slice": "cache", "kind": kind, "profile": "rag",
+                "label": label, "a": arm_a, "b": arm_b,
+                "facts": {"graded": True, "passed": passed}}
+
+    def test_repeats_that_missed_the_cache_each_count(self):
+        recs = [self._rec("original", "rag-0023", True, False)]
+        recs += [self._rec("repeat", "rag-0023", False, False) for _ in range(3)]
+        total = run_ab.aggregate(recs)["openai"]["cache"]["total"]
+        assert total["facts_checked"] == 4
+        assert total["facts_regressed"] == 3, "a cache MISS is a fresh generation"
+
+    def test_repeats_that_hit_the_cache_still_collapse(self):
+        recs = [self._rec("original", "rag-0023", False, False)]
+        recs += [self._rec("repeat", "rag-0023", False, True) for _ in range(9)]
+        total = run_ab.aggregate(recs)["openai"]["cache"]["total"]
+        assert total["facts_checked"] == 1 and total["facts_regressed"] == 1
+
+    def test_one_rule_serves_both_the_aggregate_and_the_console(self):
+        """`_reg` and `_accumulate` must not be able to disagree - same helper."""
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert src.count("_count_verdict(") >= 3, "helper defined and used by both callers"
+
+
+class TestCompressUserCannotMislabelAnArtifact:
+    """Code review, 2026-09-10 (MEDIUM). The guard was skipped when nothing was eligible."""
+
+    def test_a_workload_with_no_prose_record_is_refused(self):
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert "LEVER NOT EXERCISED" in src
+        # The empty-eligible branch must return before the "fired" check, not fall through.
+        i_empty = src.index("LEVER NOT EXERCISED")
+        i_fired = src.index("LEVER NOT FIRED")
+        assert i_empty < i_fired
+
+
+class TestBlendCoverageDoesNotCryWolf:
+    """Code review, 2026-09-10 (LOW). `agentic` was reported unclassified - a false alarm."""
+
+    def test_the_agentic_profile_is_classified(self):
+        cover = run_ab.blend_profile_coverage({"agentic"})
+        assert cover["unclassified"] == [] and cover["in_lever"] == ["agentic"]
+
+    def test_the_agentic_dataset_profiles_are_covered_too(self):
+        profs = {json.loads(l)["_profile"] for l in
+                 (BENCH / "agentic_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+                 if l.strip()}
+        assert run_ab.blend_profile_coverage(profs)["unclassified"] == []
+
+
+class TestListVerbMatchingIsReachable:
+    """Code review, 2026-09-10 (LOW). Multi-word verbs could never match a first segment."""
+
+    def test_no_list_verb_contains_an_underscore(self):
+        assert not [v for v in agentic_builder._LIST_VERBS if "_" in v]
+
+    def test_a_get_all_style_tool_still_gets_a_collection_payload(self):
+        tool = {"type": "function", "function": {
+            "name": "get_all_tickets", "description": "",
+            "parameters": {"type": "object", "properties": {"status": {"type": "string"}}}}}
+        assert "results" in agentic_builder.synth_tool_result(tool)
