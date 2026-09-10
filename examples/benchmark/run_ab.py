@@ -1245,7 +1245,11 @@ def main() -> int:
     # that failed: it produces a number that looks like the lever's and is not. The proxy
     # tells us which groups recorded a step, so check rather than assume.
     if args.compress_user:
-        eligible = [r for r in records if r.get("profile") in _COMPRESS_PROFILES]
+        # A cache HIT returns before the optimisation pipeline runs, so G01 cannot fire on
+        # it by construction. Counting those in the denominator made the first calibration
+        # print "9/560" for what is really 9 of the records that reached the pipeline at all.
+        eligible = [r for r in records if r.get("profile") in _COMPRESS_PROFILES
+                    and not r["b"].get("cache_hit")]
         fired = sum(1 for r in eligible if "G01" in (r["b"].get("groups_fired") or ()))
         if not eligible:
             # e.g. --workload agentic --compress-user, or --profiles reason. The artifact
@@ -1263,7 +1267,8 @@ def main() -> int:
                   f"  Most likely the LLMLingua sidecar is unreachable from the proxy "
                   f"(check groups.G1_compression.sidecar_url).")
             return 4
-        print(f"\n  compress-user: G01 fired on {fired}/{len(eligible)} prose records")
+        print(f"\n  compress-user: G01 fired on {fired}/{len(eligible)} prose records that "
+              f"reached the pipeline (cache hits excluded - G01 cannot run on them)")
     return 2 if regressed else 0
 
 

@@ -67,8 +67,11 @@ two-sided. A default run measures what a stock install gets; `--compress-user` m
 documented opt-in gets, on the prose profiles only. Neither side may be published alone, the result
 file records which side it holds, and the run exits non-zero if compression was requested but never
 fired, so a sidecar outage cannot be mistaken for a measurement.
-- **OSS:** measured offline beforehand, the currently-active lever cuts 0.77% of the prose corpus
-  and the disabled one clears 3.69% with its deterministic fallback alone.
+- **OSS:** measured live on 2026-09-10, the opt-in moved the combined prose lever from 8% to 9%
+  and **dropped two facts the default side kept** (a retry count and an out-of-memory cause). It
+  also made the structured-payload profile slightly worse, 44.0% to 42.8%. On this corpus the
+  opt-in is a bad trade, which is consistent with it shipping off — and is exactly why both sides
+  are published rather than the flattering one.
 
 ### Two benchmark profiles were silently missing from the published blend — Bug fix
 

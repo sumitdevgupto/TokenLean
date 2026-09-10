@@ -273,40 +273,33 @@ warm burst — every original precedes its repeats):
 
 ### Calibrated expected results (OpenAI, temperature-0)
 
-> **⚠ AWAITING RE-CALIBRATION (2026-09-10).** The figures below predate three changes and do
-> **not** describe the current harness: the facts gate no longer scores a rephrasing as a dropped
-> fact, a warm repeat no longer counts its original's verdict again, and the agentic tool results
-> are now realistically sized instead of twelve-token stubs. They also predate the deletion of
-> four optimisation levers in the proxy itself (2026-09-09). **Do not quote this table until the
-> re-run lands.** The direction of each change is stated in `release-notes.md`.
-
 Reproduce each part; the numbers carry the same run-to-run variance as the headline (borderline
 items flip under model nondeterminism even at temperature-0), so treat them as bands, not exact:
 
 | Workload | Token savings | Notes |
 |---|---|---|
-| cache | **~90%** | warm repeats served locally; 0 fact drops |
-| agentic | **~12%** (7–22%, n=7) | G08/G16 tool-catalogue pruning at the **shipped** config; 2–3 of 15 episodes drop a tool the direct arm called (`multi_turn_base_52` and `_55` every run, a third intermittently) |
-| prose (cold, recognized Q&A) | **~2–4%** | stateless floor on small public items |
-| ops (cold, production-shaped) | **~43%** | G19/G22 structured-pruning on verbose DevOps payloads; disclosed **non**-benchmark |
-| reasoning (cold) | **~0%** | reasoning traffic barely compresses — honest |
-| **illustrative blend** | **~32%** (31–34%) | disclosed weighted average (`--weights` tunable), **not** a headline; the spread is the agentic lever's, carried at weight 0.20 |
+| cache | **90–93%** | warm repeats served locally; 0 fact drops on both runs |
+| agentic | **21–27%** (n=2) | tool-catalogue pruning (G08/G16) **plus** request-side pruning of the tool results, which only became measurable once the mocked results were realistically sized (2026-09-10). The previously published ~12% was measured against twelve-token stubs. 2–4 of 15 episodes drop a tool the direct arm called (`multi_turn_base_52` and `_55` every run, others intermittently) |
+| prose (cold, recognized Q&A) | **~2.5%** default · **~3.6%** with `--compress-user` | stateless floor on public items; see the two-sided note below |
+| ops (cold, production-shaped) | **44.0%** default · **42.8%** with `--compress-user` | G19/G22 structured-pruning on verbose DevOps payloads; disclosed **non**-benchmark |
+| reasoning (cold) | **0.3%** | reasoning traffic barely compresses — honest |
+| combined prose lever | **8%** default · **9%** with `--compress-user` | `rag`+`chat`+`ops` cold, the figure the blend consumes |
+| **illustrative blend** | **34.4–36.0%** | disclosed weighted average (`--weights` tunable), **not** a headline |
 
-**The prose lever is TWO-SIDED (2026-09-10).** Prompt compression only touches `assistant`
-messages unless the caller opts in, and these items are system+user — so a default run measures
-the prose lever *without* compression at all. `run_ab.py --compress-user` sends `x_compress_user`
-on the prose profiles (`rag`/`chat`/`ops` only; never `reason`/`code`/`swe`, where compressing the
-question risks the answer) so the lever actually runs. **Publish both sides or neither** — the
-default side is what a stock install gets, the compressed side is what the documented opt-in gets,
-and `ab_results.json` records which side it holds in `meta.compress_user`. The run exits `4` if
-compression was requested and no compression step ever fired, so a sidecar outage cannot be
-mistaken for a measurement.
+Measured 2026-09-10 on `gpt-4o-mini` at temperature-0, one run per side, $0.19 total. Both sides
+ran the identical corpus; they differ by one request field.
 
-**Two profiles are outside the blend, by name.** `code` and `swe` (35 of the 110 items) are run,
-billed and graded, but map to none of the four traffic levers, so they do not enter the blend.
-They were previously omitted silently; the exclusions and their reasons now live in
-`_BLEND_EXCLUDED_PROFILES` in `run_ab.py`, and a test fails if any profile belongs to neither a
-lever nor that list.
+**What the opt-in actually bought, and cost.** Turning compression on moved the combined prose
+lever from 8% to 9% — about one point — and **dropped two checked facts that the default side kept**
+(`ops-0001` lost the retry count `5`; `ops-0007` lost `insufficient memory`). It also made the `ops`
+profile slightly *worse* on tokens, 44.0% down to 42.8%. On this corpus the opt-in is a bad trade,
+which is consistent with it shipping off. That is the whole point of publishing both sides: the
+compressed number is not the better number.
+
+**Run-to-run variance is real and larger than that gap.** The two runs differ on slices
+`--compress-user` does not touch at all — agentic read 26.9% then 21.4%, cache 93.2% then 90.3%.
+Treat every figure above as a band, and never compare a one-point difference across two runs.
+
 
 The **illustrative blend** (`--workload full`) is `Σ wᵢ·savingᵢ` over the reproducible parts, with
 default balanced weights `cache=0.30 prose=0.35 agentic=0.20 reasoning=0.15` echoed (with citations)
