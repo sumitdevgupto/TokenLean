@@ -6,6 +6,7 @@ guard, cold/replay trace loading, the relative facts gate, per-provider spend
 caps, and per-provider×mode aggregation."""
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent.parent
 BENCH = REPO / "examples" / "benchmark"
 FIXTURE = REPO / "tests" / "data" / "ab_corpus_fixture.json"
+RECORDED_REGRESSIONS = REPO / "tests" / "data" / "ab_recorded_regressions.json"
 
 
 def _load(name):
@@ -1036,20 +1038,31 @@ class TestRephrasedFactIsNotADroppedFact:
         direct = "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757."
         assert run_benchmark.check_facts(direct, self.GOLD)["passed"]
 
-    def test_every_recorded_regression_in_the_artifact_clears(self):
-        """End-to-end on real data: re-grade the shipped artifact's own regressions."""
-        results = json.loads((BENCH / "ab_results.json").read_text(encoding="utf-8"))
-        items = {json.loads(l)["_label"]: json.loads(l)
-                 for l in (BENCH / "public_dataset.jsonl").read_text(encoding="utf-8").splitlines()
-                 if l.strip()}
-        assert results["regressions"], "fixture must contain the recorded regressions"
-        for g in results["regressions"]:
-            facts = items[g["label"]]["expected_facts"]
+    def test_every_recorded_regression_clears(self):
+        """End-to-end on the REAL recorded data, frozen as a fixture.
+
+        `examples/benchmark/ab_results.json` is a gitignored run OUTPUT, so reading it
+        directly passed locally and failed in CI and in the OSS clean checkout. The
+        evidence lives in `tests/data/` instead, where every checkout has it.
+        """
+        frozen = json.loads(RECORDED_REGRESSIONS.read_text(encoding="utf-8"))
+        rows = frozen["regressions"]
+        assert rows, "fixture must contain the recorded regressions"
+        for g in rows:
+            facts = g["expected_facts"]
             a = run_benchmark.check_facts(g["direct_answer"], facts)
             b = run_benchmark.check_facts(g["proxy_answer"], facts)
             missing_a = {json.dumps(x) for x in a["missing"]}
             missing_b = {json.dumps(x) for x in b["missing"]}
             assert not (missing_b - missing_a), f"{g['label']} still reads as a regression"
+
+    def test_the_frozen_evidence_is_what_the_run_actually_recorded(self):
+        """Ten records, ONE item - the multiplication AB-2 fixes, preserved as evidence."""
+        frozen = json.loads(RECORDED_REGRESSIONS.read_text(encoding="utf-8"))
+        rows = frozen["regressions"]
+        assert len(rows) == 10
+        assert len({r["label"] for r in rows}) == 1
+        assert sum(1 for r in rows if r["kind"] == "repeat") == 9
 
     # ---- the second chance must never manufacture a PASS ---- #
 
@@ -1342,3 +1355,50 @@ class TestListVerbMatchingIsReachable:
             "name": "get_all_tickets", "description": "",
             "parameters": {"type": "object", "properties": {"status": {"type": "string"}}}}}
         assert "results" in agentic_builder.synth_tool_result(tool)
+
+
+class TestTestsOnlyDependOnTrackedFiles:
+    """CI, 2026-09-10. A test read `ab_results.json` - a gitignored RUN OUTPUT.
+
+    It passed locally, where the file exists from a real run, and failed in CI and in the
+    OSS clean checkout, where it does not. The OSS gate could not catch it either: the gate
+    builds from `git archive HEAD`, so it validates the PREVIOUS commit, never the one being
+    made. This test closes the gap from the other side - if a benchmark test starts
+    depending on an untracked path, it fails here rather than after a push.
+    """
+
+    @staticmethod
+    def _referenced_paths(module_path):
+        """Every `BENCH / "x"` / `REPO / "a" / "b"` literal a test module reads."""
+        text = module_path.read_text(encoding="utf-8")
+        out = set()
+        for m in re.finditer(r'\b(BENCH|REPO)\b((?:\s*/\s*"[^"]+")+)', text):
+            parts = re.findall(r'"([^"]+)"', m.group(2))
+            base = "examples/benchmark" if m.group(1) == "BENCH" else ""
+            rel = "/".join([p for p in ([base] if base else []) + parts if p])
+            if "." in parts[-1]:          # a file, not a directory
+                out.add(rel)
+        return out
+
+    def test_every_referenced_path_is_tracked_by_git(self):
+        here = Path(__file__).resolve()
+        modules = [here, here.parent / "test_examples_benchmark.py"]
+        referenced = set()
+        for m in modules:
+            if m.exists():
+                referenced |= self._referenced_paths(m)
+        assert referenced, "path scan found nothing - the regex has drifted"
+
+        # The real question is "will this file be in a clean checkout?", which is
+        # `exists and is not ignored` - NOT "is it staged right now", which would fail for
+        # any legitimately-new fixture before its first commit.
+        missing = sorted(p for p in referenced if not (REPO / p).exists())
+        assert not missing, f"benchmark tests reference file(s) that do not exist: {missing}"
+
+        ignored = subprocess.run(
+            ["git", "check-ignore", *sorted(referenced)],
+            cwd=REPO, capture_output=True, text=True)
+        offenders = sorted(x for x in ignored.stdout.replace("\\", "/").splitlines() if x)
+        assert not offenders, (
+            "benchmark tests depend on GITIGNORED file(s), so they pass locally and fail in "
+            f"CI / a clean OSS checkout: {offenders}")

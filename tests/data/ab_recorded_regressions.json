@@ -1,0 +1,111 @@
+{
+  "_comment": "Frozen evidence for the 2026-09-10 facts-gate fix (tracker AB-1). These are the regressions the checked-in calibrated A/B run actually recorded: one item, plus its nine warm repeats, where the proxy arm rephrased the gold span rather than dropping it. The live artifact (examples/benchmark/ab_results.json) is a gitignored run output, so the evidence is frozen here to keep the test meaningful in a clean checkout and in CI.",
+  "source_run": {
+    "workload": "cache",
+    "mode": "both",
+    "dataset_sha256": "e55040150e344497a0ad2e22583cea195c7fba8b611dee17b4984402a7054469",
+    "prices_as_of": "2026-07-27"
+  },
+  "regressions": [
+    {
+      "label": "rag-0023",
+      "kind": "original",
+      "cache_hit": false,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    },
+    {
+      "label": "rag-0023",
+      "kind": "repeat",
+      "cache_hit": true,
+      "expected_facts": [
+        "Donald J. Trump's private jet"
+      ],
+      "direct_answer": "Trump Force One is Donald J. Trump's private jet, which is a Boeing 757.",
+      "proxy_answer": "Trump Force One is the private jet of Donald J. Trump, which is a Boeing 757."
+    }
+  ]
+}
