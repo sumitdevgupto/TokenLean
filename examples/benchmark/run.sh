@@ -31,16 +31,47 @@ die()  { printf '\033[31m[benchmark] ERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 # from the runner's pass-through args.
 #   --ab  run the true A/B harness (run_ab.py: proxy vs direct-to-provider on
 #         provider-billed tokens) instead of the single-arm counterfactual.
-REBUILD=0; KEEP_CACHE=0; PIN_CONFIG=1; RUN_AB=0; ARGS=()
+#   --restore  put back a config left pinned by a run that was killed, then exit.
+REBUILD=0; KEEP_CACHE=0; PIN_CONFIG=1; RUN_AB=0; RESTORE_ONLY=0; ARGS=()
 for a in "$@"; do
   case "$a" in
     --rebuild)        REBUILD=1 ;;
     --keep-cache)     KEEP_CACHE=1 ;;
     --no-pin-config)  PIN_CONFIG=0 ;;
     --ab)             RUN_AB=1 ;;
+    --restore)        RESTORE_ONLY=1 ;;
     *)                ARGS+=("$a") ;;
   esac
 done
+
+# The backup lives at a STABLE path, not a mktemp one. A run that is KILLED never fires
+# the EXIT trap, so the pinned config stays in place — and with a mktemp backup the next
+# run would then back THAT up as "the original" and faithfully restore it, laundering the
+# pinned config into the operator's real config and silently losing their settings. That
+# happened on 2026-09-10 and ate a local `langfuse_enabled: true`. With a known path, a
+# stranded pin is visible and self-heals on the next run (see restore_stranded below).
+ORIG_BACKUP="config/.config.yaml.prepin"
+
+# Self-heal: a leftover backup means a previous run died before restoring. Put the
+# operator's config back BEFORE taking a new backup, so the pinned config is never
+# mistaken for the original.
+restore_stranded() {
+  if [ -f "$ORIG_BACKUP" ]; then
+    info "found $ORIG_BACKUP — a previous run did not restore; recovering your config first"
+    mv -f "$ORIG_BACKUP" config/config.yaml || die "could not restore $ORIG_BACKUP — move it back to config/config.yaml by hand"
+  fi
+}
+
+if [ "$RESTORE_ONLY" = 1 ]; then
+  if [ -f "$ORIG_BACKUP" ]; then
+    restore_stranded
+    docker compose restart proxy >/dev/null 2>&1 || true
+    info "config restored."
+  else
+    info "nothing to restore — no $ORIG_BACKUP present."
+  fi
+  exit 0
+fi
 
 # Extract the A/B target provider(s) so the config pin below can route them
 # correctly. G06's default tiers are OpenAI-only, so without this a non-OpenAI
@@ -122,14 +153,13 @@ info "proxy healthy"
 # The original config is restored and the proxy reloaded on exit, even on failure or
 # Ctrl-C. Opt out with --no-pin-config to measure the live config as-is.
 PINNED=0
-ORIG_BACKUP=""
 restore_config() {
   local rc=$?
   if [ "$PINNED" = 1 ]; then
     PINNED=0
     info "restoring original proxy config + reloading proxy..."
-    if [ -n "$ORIG_BACKUP" ] && [ -f "$ORIG_BACKUP" ]; then
-      mv -f "$ORIG_BACKUP" config/config.yaml || info "config restore failed (pinned config left in place)"
+    if [ -f "$ORIG_BACKUP" ]; then
+      mv -f "$ORIG_BACKUP" config/config.yaml || info "config restore failed (pinned config left in place; rerun to self-heal from $ORIG_BACKUP)"
     else
       info "no pre-existing config.yaml — leaving benchmark config in place (matches first-run)"
     fi
@@ -138,13 +168,16 @@ restore_config() {
   fi
   exit "$rc"
 }
-trap restore_config EXIT
+# INT/TERM as well as EXIT: a bare `trap ... EXIT` does not fire for every kill, and the
+# whole point of the stable backup is that the paths we cannot trap still recover.
+trap restore_config EXIT INT TERM
+
 
 if [ "$PIN_CONFIG" = 1 ]; then
   [ -f config/config.yaml.template ] || die "config/config.yaml.template missing — cannot pin benchmark config (use --no-pin-config to skip)."
+  restore_stranded
   if [ -f config/config.yaml ]; then
-    ORIG_BACKUP="$(mktemp)"
-    cp config/config.yaml "$ORIG_BACKUP"
+    cp config/config.yaml "$ORIG_BACKUP" || die "could not write $ORIG_BACKUP — refusing to pin without a recoverable backup."
   fi
   info "pinning benchmark config (enabling G01/G05/G06/G08/G19/G22; disabling G28 CCR)..."
   python - <<'PY' || die "failed to generate pinned benchmark config."

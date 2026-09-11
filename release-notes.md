@@ -21,6 +21,44 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-11
+
+### The internal harness scored a rephrasing as a dropped fact, like the public one did — Bug fix
+
+The quality gate that decides which datasets enter the published savings figure matched each
+expected fact as a literal substring, so an answer that reordered the same words failed it. The
+gate is relative to an unoptimised baseline, which is where this does the most damage: the
+baseline writes the phrase one way, an optimisation changes the wording rather than the content,
+and a fact plainly present is recorded as lost. The public benchmark measured the same defect in
+its own copy of the gate yesterday, where it produced every one of that run's ten recorded
+regressions. A multi-word fact now gets one narrow second chance, requiring every content word
+inside a single sentence, contiguous apart from filler, with no negation. Single-word facts and
+file paths still require an exact match, and forbidden terms are untouched. A new test runs the
+same cases through both harnesses and fails if their verdicts ever disagree. **The published
+figure was minted before this fix and is therefore a floor; it is marked pending re-measurement
+rather than restated.**
+
+### A killed benchmark run could silently eat your proxy configuration — Bug fix
+
+The benchmark launcher backs up the configuration, pins its own, and restores on exit. A run that
+is killed never reaches the restore, so the pinned configuration stayed in place — and because the
+backup went to a temporary file, the next run then backed that pinned configuration up as though
+it were the original and faithfully restored it. One interrupted run was enough to lose a local
+setting permanently, with nothing reporting it. The backup now goes to a fixed path, a leftover
+backup is recovered before anything else happens, interrupt and terminate signals are handled as
+well as normal exit, and `--restore` puts a stranded configuration back without needing the stack
+to be running. The Windows launcher has no pin step and was never affected.
+
+### A drift guard was comparing against a local file instead of what ships — Bug fix
+
+The check that stops the measurement harness from being tuned differently to the product read its
+reference from an untracked configuration file that every machine and continuous integration
+runner creates differently. It could fail for reasons unconnected to the harness, which is how it
+behaved when the bug above clobbered a local value, and it would equally have passed in silence on
+any machine whose local file happened to agree. It now reads the tracked template an operator
+actually deploys from. The one genuine difference this surfaced, tracing being on for the harness
+stack and off by default, is recorded as a declared exception with its reason.
+
 ## 2026-09-10
 
 ### The A/B benchmark's facts gate scored a rephrasing as a dropped fact — Bug fix
