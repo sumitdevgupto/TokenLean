@@ -475,8 +475,17 @@ def test_blend_renormalises_on_missing_lever():
 
 
 def test_workload_full_wiring():
+    """Updated 2026-09-16 for the #71 `provider-cache` workload.
+
+    The literal choices string this used to assert broke the moment a workload was added,
+    which says nothing about whether the wiring is right. It now asserts the property that
+    actually matters: every workload the runner claims to offer is a real argparse choice.
+    """
     src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
-    assert '"standard", "cache", "agentic", "full"' in src
+    choices = re.search(r'choices=\[([^\]]*)\],\s*\n\s*default="standard"', src)
+    assert choices, "the --workload choices list moved; this guard needs updating"
+    offered = set(re.findall(r'"([^"]+)"', choices.group(1)))
+    assert offered == {"standard", "cache", "agentic", "provider-cache", "full"}
     assert 'args.workload == "full"' in src and "render_blend(" in src
     assert "ILLUSTRATIVE" in src and "--weights" in src
 
@@ -1402,3 +1411,240 @@ class TestTestsOnlyDependOnTrackedFiles:
         assert not offenders, (
             "benchmark tests depend on GITIGNORED file(s), so they pass locally and fail in "
             f"CI / a clean OSS checkout: {offenders}")
+
+
+# --------------------------------------------------------------------------- #
+# #71 — the provider prompt-cache probe
+# --------------------------------------------------------------------------- #
+pcache_builder = _load("build_provider_cache_dataset")
+PCACHE_DATASET = BENCH / "provider_cache_dataset.jsonl"
+
+
+def _pcache_rows():
+    rows = [json.loads(ln) for ln in
+            PCACHE_DATASET.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return rows[0], rows[1:]
+
+
+class TestTheSharedPrefixIsActuallyShared:
+    """The whole probe rests on one claim: every request starts with the SAME bytes.
+
+    If the prefix varies by even one character the provider cannot match it, every call
+    bills a fresh write, and the run reports a confident zero for cache reads that means
+    nothing at all. That failure is invisible in the output, so it is pinned here.
+    """
+
+    def test_every_item_carries_a_byte_identical_system_prefix(self):
+        _, items = _pcache_rows()
+        prefixes = {it["messages"][0]["content"] for it in items}
+        assert len(prefixes) == 1, f"{len(prefixes)} distinct prefixes - nothing can cache"
+
+    def test_the_prefix_clears_the_provider_minimum(self):
+        meta, _ = _pcache_rows()
+        assert meta["shared_prefix_approx_tokens"] >= pcache_builder.MIN_CACHEABLE_TOKENS
+
+    def test_the_prefix_is_the_first_message(self):
+        """A shared block that is not a PREFIX is not cacheable - position is the feature."""
+        _, items = _pcache_rows()
+        for it in items:
+            assert it["messages"][0]["role"] == "system"
+
+    def test_the_recorded_sha_matches_the_prefix_it_describes(self):
+        import hashlib
+        meta, items = _pcache_rows()
+        actual = hashlib.sha256(items[0]["messages"][0]["content"].encode("utf-8")).hexdigest()
+        assert actual == meta["shared_prefix_sha256"]
+
+
+class TestTheQuestionsAreDistinctAndGradeable:
+    """Distinct questions are what force real provider calls; gradeable ones are what stop
+    the probe being a cost measurement with no quality check behind it."""
+
+    def test_every_question_is_distinct(self):
+        _, items = _pcache_rows()
+        qs = [it["messages"][1]["content"] for it in items]
+        assert len(set(qs)) == len(qs), "a repeated question would be served from a memo/cache"
+
+    def test_every_item_is_facts_graded_with_a_gold_answer(self):
+        _, items = _pcache_rows()
+        for it in items:
+            assert it["grade"] == "facts"
+            assert it["expected_facts"], f"{it['_label']} has no gold fact"
+
+    def test_every_gold_fact_is_present_in_the_shared_dossier(self):
+        """Otherwise both arms fail, the relative gate excuses it, and the probe silently
+        grades nothing while still printing a facts tally."""
+        _, items = _pcache_rows()
+        dossier = items[0]["messages"][0]["content"].lower()
+        for it in items:
+            for fact in it["expected_facts"]:
+                alts = [fact] if isinstance(fact, str) else list(fact)
+                assert any(a.lower() in dossier for a in alts), \
+                    f"{it['_label']}: {fact!r} is not answerable from the dossier"
+
+
+class TestTheProbeBuilderIsDeterministicAndOffline:
+
+    def test_rebuilding_reproduces_the_checked_in_file_byte_for_byte(self):
+        assert pcache_builder.build() == PCACHE_DATASET.read_text(encoding="utf-8")
+
+    def test_the_builder_makes_no_network_calls(self):
+        """The corpus is already checked in; a download here would break the charter and
+        make the artifact non-reproducible offline."""
+        src = (BENCH / "build_provider_cache_dataset.py").read_text(encoding="utf-8")
+        for banned in ("requests", "urllib", "load_dataset", "hf_hub", "huggingface"):
+            assert f"import {banned}" not in src, f"builder imports {banned}"
+
+    def test_a_prefix_under_the_provider_minimum_is_refused(self):
+        """Silently measuring nothing is the failure mode worth a hard stop."""
+        original = pcache_builder.MIN_CACHEABLE_TOKENS
+        try:
+            pcache_builder.MIN_CACHEABLE_TOKENS = 10 ** 9
+            with pytest.raises(SystemExit):
+                pcache_builder.build()
+        finally:
+            pcache_builder.MIN_CACHEABLE_TOKENS = original
+
+
+class TestTheProbeStaysOutOfTheHeadline:
+    """Gate 8.8. Its prefix size is a knob WE chose; if that fed the blend, choosing a
+    bigger dossier would 'improve' the published number."""
+
+    def test_the_profile_is_explicitly_excluded_from_the_blend(self):
+        assert "provider_cache" in run_ab._BLEND_EXCLUDED_PROFILES
+        assert "provider_cache" not in {
+            p for ps in run_ab._BLEND_LEVER_PROFILES.values() for p in ps}
+
+    def test_the_coverage_check_does_not_report_it_as_unclassified(self):
+        cov = run_ab.blend_profile_coverage({"rag", "chat", "ops", "reason", "provider_cache"})
+        assert cov["unclassified"] == []
+        assert "provider_cache" in cov["excluded"]
+
+    def test_blend_ignores_a_provider_cache_slice_entirely(self):
+        agg = {
+            "openai": {
+                "cold": {"by_profile": {
+                    "rag": {"a_prompt": 1000, "b_prompt": 900, "a_cost": 1.0, "b_cost": 0.9},
+                    "reason": {"a_prompt": 500, "b_prompt": 490, "a_cost": 0.5, "b_cost": 0.49}},
+                    "total": {}},
+                "provider_cache": {"by_profile": {}, "total": {
+                    "token_saving_pct": 99.0, "cost_saving_pct": 99.0}},
+            }
+        }
+        out = run_ab.blend(agg, dict(run_ab.DEFAULT_WEIGHTS))
+        assert "provider_cache" not in out["openai"]["levers"]
+
+    def test_the_slice_is_registered_last_in_display_order(self):
+        assert run_ab.SLICE_ORDER[-1] == "provider_cache"
+
+    def test_the_workload_is_selectable_and_is_not_part_of_full(self):
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert '"provider-cache"' in src
+        assert "passes.append(_provider_cache_pass())" in src
+        block = src.split('if args.workload == "full":')[1].split("elif")[0]
+        assert "_provider_cache_pass" not in block
+
+
+class TestCacheEconomicsIsReportedTwoSided:
+    """Gate 8.3. A write is what a later read saves, so one half alone is advocacy."""
+
+    AGG = {"openai": {"provider_cache": {"by_profile": {}, "total": {
+        "a_prompt": 160000, "b_prompt": 150000, "a_calls": 12, "b_calls": 12,
+        "a_cache_calls": 12, "a_cache_read": 120000, "a_cache_write": 13000,
+        "b_cache_read": 100000, "b_cache_write": 12000}}}}
+
+    def test_both_arms_report_read_and_write_as_absolute_tokens(self):
+        econ = run_ab.cache_economics(self.AGG)["openai"]
+        for arm in ("direct", "proxy"):
+            assert econ[arm]["cache_read_tokens"] > 0
+            assert econ[arm]["cache_write_tokens"] > 0
+            assert econ[arm]["prompt_tokens"] > 0
+
+    def test_read_share_is_measured_against_each_arms_own_prompt(self):
+        """The arms send different token counts, so a shared denominator would misreport."""
+        econ = run_ab.cache_economics(self.AGG)["openai"]
+        assert econ["direct"]["read_pct_of_prompt"] == pytest.approx(75.0, abs=0.1)
+        assert econ["proxy"]["read_pct_of_prompt"] == pytest.approx(66.7, abs=0.1)
+
+    def test_no_savings_percentage_is_emitted_for_this_slice(self):
+        econ = run_ab.cache_economics(self.AGG)["openai"]
+        assert "saving" not in json.dumps(econ)
+
+    def test_a_silent_provider_is_reported_as_unreported_not_as_zero(self):
+        """'Declined to cache' and 'does not disclose' are different facts."""
+        agg = {"openai": {"provider_cache": {"by_profile": {}, "total": {
+            "a_prompt": 1000, "b_prompt": 1000, "a_calls": 2, "b_calls": 2,
+            "a_cache_calls": 2, "a_cache_read": 0, "a_cache_write": 0,
+            "b_cache_read": 0, "b_cache_write": 0}}}}
+        assert run_ab.cache_economics(agg)["openai"]["reported"] is False
+
+    def test_a_run_without_the_slice_reports_nothing_at_all(self):
+        assert run_ab.cache_economics({"openai": {"cold": {"total": {}, "by_profile": {}}}}) == {}
+
+
+class TestTheProxyCacheIsBypassedForThisProbe:
+    """A G05 hit means the provider was never called, and a call that never happens can
+    report no provider cache read. This is the one control the measurement depends on."""
+
+    def test_the_pass_sets_x_no_cache(self):
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        block = src.split("def _provider_cache_pass():")[1].split("passes = []")[0]
+        assert '"x_no_cache": True' in block
+        assert '"provider_cache"' in block
+
+
+class TestZeroIsNotTheSameAsUnreported:
+    """Found by the FIRST #71 run (2026-09-16), not by a test.
+
+    The run printed `write 0` for OpenAI, which reads as "the provider wrote nothing to its
+    cache". The truth is that OpenAI publishes no cache-write counter at all - it reports
+    `prompt_tokens_details.cached_tokens` (read) and nothing for write, while Anthropic
+    reports `cache_creation_input_tokens`. `_cache_tokens` already returned None for the
+    missing half, and `_accumulate` already declined to add it, but by the time it reached
+    the report a missing half and a genuine zero were indistinguishable.
+
+    A confident zero about someone else's billing is worse than saying "not reported".
+    """
+
+    @staticmethod
+    def _rec(read, write):
+        """One A/B record whose BOTH arms report `read`/`write` (either may be None)."""
+        arm = {"prompt_tokens": 1000, "completion_tokens": 10, "cost": 0.001,
+               "cache_read_tokens": read, "cache_write_tokens": write,
+               "cache_hit": False, "_billed": True}
+        return {"provider": "openai", "slice": "provider_cache", "profile": "provider_cache",
+                "label": "pcache-0001", "kind": "original",
+                "a": dict(arm), "b": dict(arm),
+                "facts": {"graded": False, "passed": True}}
+
+    def _econ(self, read, write):
+        agg = run_ab.aggregate([self._rec(read, write)])
+        return run_ab.cache_economics(agg)["openai"]
+
+    def test_a_provider_that_omits_the_write_counter_is_marked_unreported(self):
+        econ = self._econ(900, None)
+        assert econ["direct"]["read_reported"] is True
+        assert econ["direct"]["write_reported"] is False
+        assert econ["proxy"]["write_reported"] is False
+
+    def test_a_provider_that_genuinely_reports_zero_is_marked_reported(self):
+        """0 from the provider is a FACT about its billing; None is an absence of one."""
+        econ = self._econ(900, 0)
+        assert econ["direct"]["write_reported"] is True
+        assert econ["direct"]["cache_write_tokens"] == 0
+
+    def test_a_provider_reporting_nothing_at_all_sets_reported_false(self):
+        econ = self._econ(None, None)
+        assert econ["reported"] is False
+        assert econ["direct"]["read_reported"] is False
+
+    def test_the_console_never_prints_a_bare_zero_for_an_unreported_half(self, capsys):
+        run_ab.render_cache_economics({"openai": self._econ(900, None)}, 13500)
+        out = capsys.readouterr().out
+        assert "n/r" in out
+        assert "publishes no cache-WRITE counter" in out
+
+    def test_the_console_does_print_a_real_reported_zero(self, capsys):
+        run_ab.render_cache_economics({"openai": self._econ(900, 0)}, 13500)
+        out = capsys.readouterr().out
+        assert "publishes no cache-WRITE counter" not in out

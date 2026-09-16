@@ -21,6 +21,7 @@ publishing any headline number).
 | `reason` | GSM8K | `openai/gsm8k` (`main` config) | `main` (*pin a sha before publish*) | MIT | final-numeric-answer facts |
 | `agentic` | BFCL v3 multi_turn (schemas + first user turn); **`tool_results` are ours** | `gorilla-llm/Berkeley-Function-Calling-Leaderboard` | `main` (*pin a sha before publish*) | Apache-2.0 | relative tool-trajectory (proxy vs direct arm) |
 | `ops` | **production-shaped (NOT a recognized benchmark)** — `ops_seed.jsonl`, this repo | n/a | Apache-2.0 (this repo) | relative gold-fact substrings |
+| `provider_cache` | HotpotQA (distractor) paragraphs + questions, **re-assembled** into one shared dossier by `build_provider_cache_dataset.py`; **the instruction header above the dossier is ours** | *(none — derived offline from the checked-in `rag` items, no download)* | CC BY-SA 4.0 (HotpotQA) | gold-answer facts (inherited unchanged from the source item) |
 
 > Replace *"pin before publish"* with the actual commit sha printed by `datasets` at
 > build time, and mirror it into `build_public_dataset.py:PINNED` + `public_dataset.meta.json`.

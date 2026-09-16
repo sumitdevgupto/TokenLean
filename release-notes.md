@@ -21,6 +21,33 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-16
+
+### The public benchmark can now measure the provider's prompt cache — Enhancement (OSS)
+
+`ab_results.json` reported provider cache read/write as `0` on every run, and that was
+structural rather than a reporting bug: on a warm repeat neither arm reaches the provider, and
+the distinct items share only a ~15-token prefix — far under the ~1,024 tokens a provider needs
+before it caches anything. So the benchmark could say nothing about cache cost, which is the half
+of the bill token counts do not show. A new `--workload provider-cache` runs many *distinct*
+questions over one long shared prefix with the proxy cache bypassed, so the calls genuinely reach
+the provider. The corpus is re-assembled offline from HotpotQA paragraphs already in the repo — no
+download — and each question keeps its own gold answer, so the existing facts gate applies
+unchanged. Read and write are always reported together as absolute tokens per arm; the slice
+carries **no savings percentage** and is excluded from the illustrative blend, because its prefix
+size is a parameter we chose. A provider that discloses no cache counters is recorded as
+*unreported*, never as zero.
+- **OSS:** `--workload provider-cache` in `examples/benchmark/run_ab.py`, plus
+  `build_provider_cache_dataset.py` and the checked-in `provider_cache_dataset.jsonl`.
+
+**First run (2026-09-16, `gpt-4o-mini`, $0.046):** OpenAI served **91.0%** of the direct arm's
+prompt from its cache and **90.6%** of the proxy arm's — so the proxy does not break the
+provider's prefix cache, while also sending 2.5% fewer tokens. The write half is a different
+story: OpenAI publishes a read counter and **no write counter**, so that column now reports
+`n/r` rather than `0` — a confident zero about a provider's billing is a claim we cannot
+support. Anthropic does publish it, so the write half becomes measurable when this workload is
+run against that provider.
+
 ## 2026-09-11
 
 ### The internal harness scored a rephrasing as a dropped fact, like the public one did — Bug fix

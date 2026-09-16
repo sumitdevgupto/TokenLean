@@ -50,6 +50,7 @@ DATASET = HERE / "public_dataset.jsonl"
 SCHEDULE = HERE / "replay_schedule.json"
 CACHE_SCHEDULE = HERE / "cache_schedule.json"
 AGENTIC_DATASET = HERE / "agentic_dataset.jsonl"
+PROVIDER_CACHE_DATASET = HERE / "provider_cache_dataset.jsonl"
 PRICES = HERE / "prices.json"
 RESULTS = HERE / "ab_results.json"
 COST_LOG = HERE / "ab_cost_log.jsonl"
@@ -595,6 +596,12 @@ def _blank():
             # for calls that were really made (see _accumulate).
             "a_cache_read": 0, "a_cache_write": 0, "a_cache_calls": 0,
             "b_cache_read": 0, "b_cache_write": 0,
+            # How many records the provider actually REPORTED each half on. A sum of 0 is
+            # ambiguous without this: OpenAI discloses `cached_tokens` (read) and has no
+            # write counter at all, so its write column is *unreported*, not zero — and the
+            # first #71 run printed a bare "write 0", which reads as "it wrote nothing".
+            "a_cache_read_n": 0, "a_cache_write_n": 0,
+            "b_cache_read_n": 0, "b_cache_write_n": 0,
             # (profile, label) pairs already counted toward facts_checked. Internal to
             # aggregation; _finalize strips it before anything is serialised.
             "_graded": set()}
@@ -646,8 +653,12 @@ def _accumulate(bucket, rec):
                 continue
             bucket["a_cache_calls"] += 1
         for half in ("cache_read", "cache_write"):
-            # None (provider reported nothing) contributes nothing rather than a zero.
+            # None (provider reported nothing) contributes nothing rather than a zero, and
+            # is counted separately so the report can say "unreported" instead of "0".
             val = rec[arm].get(half + "_tokens")
+            if val is None:
+                continue
+            bucket[f"{arm}_{half}_n"] += 1
             if val:
                 bucket[f"{arm}_{half}"] += int(val)
     if rec["b"]["cache_hit"]:
@@ -704,8 +715,10 @@ def collect_regressions(records: list, max_chars: int = 1500) -> list:
     return out
 
 
-# Stable display/registry order for slices across workloads (standard + cache + future agentic).
-SLICE_ORDER = ["cold", "replay", "cache", "agentic"]
+# Stable display/registry order for slices across workloads (standard + cache + agentic +
+# provider_cache). `provider_cache` is last because it is not a savings slice at all — it is
+# the cache-economics probe (backlog #71) and is deliberately outside the blend.
+SLICE_ORDER = ["cold", "replay", "cache", "agentic", "provider_cache"]
 
 
 def aggregate(records: list, mode: str = None) -> dict:
@@ -812,6 +825,10 @@ _BLEND_EXCLUDED_PROFILES = {
     "swe": "SWE-bench Lite items are single large repo contexts; they exercise structured "
            "pruning but map to no traffic lever, and folding them into `prose` would let "
            "the largest payloads in the corpus set the prose figure.",
+    "provider_cache": "The cache-economics probe (backlog #71) measures provider prompt-cache "
+                      "READ/WRITE tokens, not token savings. Its one deliberately huge shared "
+                      "prefix is a measurement instrument, not a traffic mix — blending its "
+                      "savings percentage would let a chosen prefix size move the headline.",
 }
 WEIGHT_CITATIONS = [
     "cache-eligible ~30%: ~31% of LLM queries are semantically similar to a prior request; "
@@ -887,6 +904,87 @@ def blend(agg: dict, weights: dict) -> dict:
     return out
 
 
+def cache_economics(agg: dict, slice_name: str = "provider_cache") -> dict:
+    """Per-provider provider-prompt-cache report for the #71 probe.
+
+    Reported as ABSOLUTE token counts on BOTH arms plus the share of the prompt that was
+    served from the provider's cache — never as a single savings percentage. Three reasons,
+    all Gate 8:
+      * cache cost moves without token counts moving, so a "% saved" here would mean
+        something different from every other percentage in this artifact;
+      * the shared prefix size is a parameter WE chose, so any ratio built from it is a
+        statement about the instrument as much as the proxy;
+      * read and write are opposite-signed (a write is what a read later saves), so one
+        without the other is advocacy.
+
+    `read_pct_of_prompt` uses the arm's own prompt tokens as denominator, so the two arms
+    stay comparable even though the proxy arm may send a different number of tokens.
+
+    A provider that reported nothing leaves `reported: False` — which is NOT zero, and is
+    said so explicitly, because "the provider declined to cache" and "the provider does not
+    tell us" are different facts with different consequences.
+    """
+    out = {}
+    for prov, slices in agg.items():
+        if slice_name not in slices:
+            continue
+        t = slices[slice_name]["total"]
+        a_read, a_write = t.get("a_cache_read", 0), t.get("a_cache_write", 0)
+        b_read, b_write = t.get("b_cache_read", 0), t.get("b_cache_write", 0)
+        a_prompt, b_prompt = t.get("a_prompt", 0), t.get("b_prompt", 0)
+        out[prov] = {
+            "direct": {"calls": t.get("a_cache_calls", 0), "prompt_tokens": a_prompt,
+                       "cache_read_tokens": a_read, "cache_write_tokens": a_write,
+                       "read_reported": bool(t.get("a_cache_read_n", 0)),
+                       "write_reported": bool(t.get("a_cache_write_n", 0)),
+                       "read_pct_of_prompt": round(100.0 * a_read / a_prompt, 1) if a_prompt else 0.0},
+            "proxy": {"calls": t.get("b_calls", 0), "prompt_tokens": b_prompt,
+                      "cache_read_tokens": b_read, "cache_write_tokens": b_write,
+                      "read_reported": bool(t.get("b_cache_read_n", 0)),
+                      "write_reported": bool(t.get("b_cache_write_n", 0)),
+                      "read_pct_of_prompt": round(100.0 * b_read / b_prompt, 1) if b_prompt else 0.0},
+            "reported": bool(t.get("a_cache_read_n", 0) or t.get("a_cache_write_n", 0)
+                             or t.get("b_cache_read_n", 0) or t.get("b_cache_write_n", 0)),
+        }
+    return out
+
+
+def render_cache_economics(econ: dict, prefix_tokens: int | None) -> None:
+    line = "=" * 68
+    print("\n" + line)
+    print("  PROVIDER PROMPT-CACHE ECONOMICS  (backlog #71 — NOT a savings figure)")
+    print(line)
+    if prefix_tokens:
+        print(f"  Shared prefix: ~{prefix_tokens} tokens, byte-identical across every question.")
+    print("  Many DISTINCT questions, proxy cache bypassed, so every call reaches the provider.")
+    for prov, e in econ.items():
+        print("\n  " + "-" * 64)
+        print(f"  PROVIDER: {prov}")
+        for arm in ("direct", "proxy"):
+            a = e[arm]
+            # "n/r" (not reported) is deliberately NOT rendered as 0 — OpenAI publishes a
+            # read counter and no write counter, so a bare 0 would read as "wrote nothing".
+            rd = f"{a['cache_read_tokens']:>8,}" if a["read_reported"] else "     n/r"
+            wr = f"{a['cache_write_tokens']:>8,}" if a["write_reported"] else "     n/r"
+            pct = (f"({a['read_pct_of_prompt']:.1f}% of prompt read from cache)"
+                   if a["read_reported"] else "(read not reported by this provider)")
+            print(f"    {arm:<7} {a['calls']:>3} calls   prompt {a['prompt_tokens']:>8,}   "
+                  f"cache read {rd}  write {wr}   {pct}")
+        if not any(e[arm]["write_reported"] for arm in ("direct", "proxy")):
+            print("    NOTE: this provider publishes no cache-WRITE counter, so that half is")
+            print("          n/r rather than 0. OpenAI reports `cached_tokens` (read) only;")
+            print("          Anthropic reports `cache_creation_input_tokens` (write) as well.")
+        if not e["reported"]:
+            print("    NOTE: this provider reported no cache figures at all on this run.")
+            print("          That is NOT the same as 'it cached nothing' — it may simply not")
+            print("          disclose the counters. Recorded as unreported, not as zero.")
+    print("\n" + line)
+    print("  Read and write are reported TOGETHER and as absolute tokens: a write is what a")
+    print("  later read saves, so either number alone overstates or understates the economics.")
+    print("  This slice carries no savings percentage and is excluded from the blend.")
+    print(line)
+
+
 def blend_profile_coverage(profiles) -> dict:
     """Which of `profiles` are in a lever, excluded by name, or unclassified.
 
@@ -928,9 +1026,15 @@ def main() -> int:
     ap.add_argument("--providers", default="openai",
                     help="'openai' (default), 'all', or a comma list (e.g. openai,anthropic)")
     ap.add_argument("--mode", choices=["cold", "replay", "both"], default="both")
-    ap.add_argument("--workload", choices=["standard", "cache", "agentic", "full"], default="standard",
+    ap.add_argument("--workload",
+                    choices=["standard", "cache", "agentic", "provider-cache", "full"],
+                    default="standard",
                     help="'standard' = cold+replay on the neutral mix (<$1); 'cache' = disclosed "
                          "warm-cache burst (~90%%); 'agentic' = multi-turn tool-loop episodes; "
+                         "'provider-cache' = many distinct questions over ONE long shared prefix "
+                         "with the proxy cache OFF, to measure the PROVIDER's prompt-cache "
+                         "read/write (backlog #71) — reports no savings figure and is excluded "
+                         "from the blend; "
                          "'full' = ALL levers + the illustrative production-mix blend (costs more)")
     ap.add_argument("--weights", default="",
                     help="override blend weights for --workload full, e.g. "
@@ -1003,6 +1107,11 @@ def main() -> int:
     if args.workload in ("agentic", "full") and not AGENTIC_DATASET.exists():
         return _fail("agentic_dataset.jsonl missing — build the agentic pack first, "
                      "or use --workload standard/cache")
+    # NOT part of `full`: this probe answers a different question (what the PROVIDER charges
+    # to cache) and its deliberately huge shared prefix would dominate any blended figure.
+    if args.workload == "provider-cache" and not PROVIDER_CACHE_DATASET.exists():
+        return _fail("provider_cache_dataset.jsonl missing — run "
+                     "build_provider_cache_dataset.py (offline, no download)")
     try:
         weights = parse_weights(args.weights)
     except ValueError as exc:
@@ -1015,6 +1124,16 @@ def main() -> int:
     agentic_items = ([json.loads(ln) for ln in
                       AGENTIC_DATASET.read_text(encoding="utf-8").splitlines() if ln.strip()]
                      if args.workload in ("agentic", "full") else None)
+    # The first line is the provenance/meta record, not a request — drop it.
+    pcache_items = None
+    pcache_meta = None
+    if args.workload == "provider-cache":
+        _rows = [json.loads(ln) for ln in
+                 PROVIDER_CACHE_DATASET.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        pcache_meta = _rows[0] if _rows and _rows[0].get("_meta") else None
+        pcache_items = [r for r in _rows if not r.get("_meta")]
+        if not pcache_items:
+            return _fail("provider_cache_dataset.jsonl contains no requests")
 
     spend = SpendMeter(args.max_spend_per_provider, args.max_spend)
     records: list = []
@@ -1029,6 +1148,8 @@ def main() -> int:
         available = {it.get("_profile") for it in items.values() if it.get("_profile")}
         if agentic_items:
             available |= {it.get("_profile", "agentic") for it in agentic_items}
+        if pcache_items:
+            available |= {it.get("_profile", "provider_cache") for it in pcache_items}
         bad = unknown_profiles(profile_filter, available)
         if bad:
             return _fail(f"--profiles: unknown profile(s): {', '.join(bad)} — "
@@ -1064,6 +1185,15 @@ def main() -> int:
         def _agentic_pass():
             return ("agentic", [("original", it) for it in agentic_items], {})
 
+        def _provider_cache_pass():
+            # x_no_cache is load-bearing, not hygiene. Every question here is DISTINCT, so
+            # G05 would rarely hit anyway - but a hit on either level would stop the call
+            # reaching the provider, and a call that never reaches the provider can report
+            # no provider cache read. Bypassing G05 read AND write is the only way the
+            # provider's own prefix cache is the thing being measured.
+            return ("provider_cache",
+                    [("original", it) for it in pcache_items], {"x_no_cache": True})
+
         passes = []
         if args.workload == "full":
             passes.append(("cold", load_trace("cold", items, schedule), {"x_no_cache": True}))
@@ -1073,6 +1203,8 @@ def main() -> int:
             passes.append(_cache_pass())
         elif args.workload == "agentic":
             passes.append(_agentic_pass())
+        elif args.workload == "provider-cache":
+            passes.append(_provider_cache_pass())
         else:
             if args.mode in ("cold", "both"):
                 passes.append(("cold", load_trace("cold", items, schedule), {"x_no_cache": True}))
@@ -1087,7 +1219,8 @@ def main() -> int:
                 trace = trace[: args.limit]
             if not trace:
                 continue
-            _tag = {"cold": ", G05 bypassed)", "cache": ", warm-cache burst)"}.get(slice_name, ", caching on)")
+            _tag = {"cold": ", G05 bypassed)", "cache": ", warm-cache burst)",
+                    "provider_cache": ", shared prefix, G05 bypassed)"}.get(slice_name, ", caching on)")
             print(f"\n[{provider}] {slice_name}: {len(trace)} proxy calls (model {spec['model']}{_tag}")
             for i, (kind, item) in enumerate(trace, 1):
                 if spend.overall_tripped() or spend.provider_tripped(provider):
@@ -1195,6 +1328,19 @@ def main() -> int:
         "compress_user_profiles": list(_COMPRESS_PROFILES) if args.compress_user else [],
         "cache_burst": meta_ds.get("cache_burst") if args.workload in ("cache", "full") else None,
     }
+    # #71: the provider-cache probe's own provenance travels with the numbers, so a reader
+    # can see the prefix size and origin that produced them without opening the dataset.
+    econ = cache_economics(agg) if args.workload == "provider-cache" else None
+    if econ is not None:
+        meta["provider_cache"] = {
+            "shared_prefix_approx_tokens": (pcache_meta or {}).get("shared_prefix_approx_tokens"),
+            "shared_prefix_sha256": (pcache_meta or {}).get("shared_prefix_sha256"),
+            "n_items": (pcache_meta or {}).get("n_items"),
+            "provenance": (pcache_meta or {}).get("provenance"),
+            "economics": econ,
+            "note": ("Provider prompt-cache read/write only. Carries NO savings percentage and "
+                     "is excluded from the illustrative blend — see _BLEND_EXCLUDED_PROFILES."),
+        }
     blended = blend(agg, weights) if args.workload == "full" else None
     if blended is not None:
         meta["blend"] = {"weights": weights, "citations": WEIGHT_CITATIONS, "result": blended}
@@ -1204,6 +1350,8 @@ def main() -> int:
     RESULTS.write_text(json.dumps({"meta": meta, "results": agg,
                                    "regressions": regressions}, indent=2), encoding="utf-8")
     render(agg, meta)
+    if econ is not None:
+        render_cache_economics(econ, (pcache_meta or {}).get("shared_prefix_approx_tokens"))
     if blended is not None:
         render_blend(blended)
     if judge and judge.get("ran"):

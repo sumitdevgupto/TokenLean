@@ -243,7 +243,7 @@ are **checked in**, so you need no Hugging Face account. Regenerate them from so
 `build_source` in `public_dataset.meta.json` records the provenance (`"huggingface"` = the real
 verbatim build, `"fixture"` = a structural placeholder that must be regenerated before publishing).
 
-### Four workloads, per-workload transparency (the credibility spine)
+### Four savings workloads + one cache-economics probe (the credibility spine)
 
 No recognized capability benchmark has repeat/traffic structure — they run each item once. So the
 harness reproduces **each production lever as its own workload** and reports every number
@@ -271,6 +271,23 @@ warm burst — every original precedes its repeats):
   live model never emits — so this slice remains below the internal 46%, disclosed, not hidden.
   **The previously published ~12% predates the result-sizing change and is awaiting re-run.**
 
+**And one probe that is deliberately NOT a savings workload:**
+
+- **provider cache read/write** (`--workload provider-cache`) — many **distinct** questions over
+  **one long shared prefix** (~13.5k tokens, byte-identical across every request), with the proxy
+  cache bypassed so every call genuinely reaches the provider. It exists because the four
+  workloads above report `cache_read`/`cache_write` as **0** and always will: on a warm repeat
+  neither arm reaches the provider, and the distinct originals share only a ~15-token system
+  prompt — under the ~1,024 tokens a provider needs before it caches anything. Cache cost is the
+  half of the bill token counts do not show, so the benchmark could say nothing about it at all.
+  The dossier is HotpotQA paragraphs already checked in (no download); each question is that
+  item's own, so the existing facts gate grades it unchanged.
+  **It carries no savings percentage and is excluded from the blend** — its prefix size is a knob
+  we chose, and a number built from it would describe the instrument as much as the proxy. Read
+  and write are always reported together, as absolute tokens, per arm. If the provider reports
+  nothing, that is recorded as *unreported* rather than as zero: "declined to cache" and "does not
+  disclose the counters" are different facts.
+
 ### Calibrated expected results (OpenAI, temperature-0)
 
 Reproduce each part; the numbers carry the same run-to-run variance as the headline (borderline
@@ -285,9 +302,32 @@ items flip under model nondeterminism even at temperature-0), so treat them as b
 | reasoning (cold) | **0.3%** | reasoning traffic barely compresses — honest |
 | combined prose lever | **8%** default · **9%** with `--compress-user` | `rag`+`chat`+`ops` cold, the figure the blend consumes |
 | **illustrative blend** | **34.4–36.0%** | disclosed weighted average (`--weights` tunable), **not** a headline |
+| provider cache read/write | **read 91.0% direct · 90.6% proxy** · write **not reported by OpenAI** | `--workload provider-cache`, measured 2026-09-16 on `gpt-4o-mini`, 12 calls per arm, $0.046. Absolute: direct 140,800 cache-read of 154,650 prompt tokens; proxy 136,576 of 150,786. **Not a savings figure and not in the blend.** See the two findings below |
 
 Measured 2026-09-10 on `gpt-4o-mini` at temperature-0, one run per side, $0.19 total. Both sides
 ran the identical corpus; they differ by one request field.
+
+**Provider prompt cache — what the first run found (2026-09-16).** Two things, and only one of
+them is good news.
+
+1. **The proxy does not break the provider's prefix cache.** OpenAI served **91.0%** of the direct
+   arm's prompt from its cache and **90.6%** of the proxy arm's — a 0.4-point gap, and the proxy
+   arm is the one that also sent 2.5% fewer tokens. So on this shape the two levers compose rather
+   than fight. That is worth knowing precisely because they *can* fight: compressing a prefix below
+   the provider's ~1,024-token minimum stops it caching at all, which is the whole subject of
+   backlog #41/#55.
+2. **The write half cannot be measured on OpenAI at all.** OpenAI publishes `cached_tokens` (read)
+   and **no cache-write counter**. The run therefore reports write as `n/r`, never as `0` — a
+   confident zero about someone else's billing would be a claim we cannot support. Anthropic does
+   publish `cache_creation_input_tokens`, so the write half becomes measurable the day this
+   workload is run against it. **Until then, the "two-sided read AND write" promise is only half
+   deliverable on OpenAI, and the report says so rather than papering over it.**
+
+One caveat on quality: 11 of 12 answers cleared the facts gate. The flagged record (`pcache-0007`)
+is a **synonym, not a dropped fact** — the direct arm said "secondary school study" and the proxy
+said "high school". The gate is deliberately literal, because a matcher loose enough to accept
+synonyms is loose enough to manufacture passes; so it is reported as a regression and explained
+here rather than graded away.
 
 **What the opt-in actually bought, and cost.** Turning compression on moved the combined prose
 lever from 8% to 9% — about one point — and **dropped two checked facts that the default side kept**

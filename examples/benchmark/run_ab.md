@@ -212,9 +212,10 @@ already present, others you add explicitly).
 
 No recognized capability benchmark has repeat/traffic structure — they run each item once. So the
 harness reproduces **each production lever as its own workload** and reports every number
-separately. `--workload` selects which run: `standard` (default), `cache`, `agentic`, or `full`
-(all three in one pass). The **per-workload numbers are the primary artifact**; the blend is
-derived arithmetic (see below).
+separately. `--workload` selects which run: `standard` (default), `cache`, `agentic`, `full`
+(all three in one pass), or `provider-cache` (a cache-economics probe that is NOT a savings
+workload and is NOT part of `full`). The **per-workload numbers are the primary artifact**; the
+blend is derived arithmetic (see below).
 
 - **standard** (cold) — first-occurrence items with **G05 caching fully bypassed** per request
   (`x_no_cache`). Savings come from the **stateless** optimisations only (compression, routing,
@@ -238,6 +239,19 @@ derived arithmetic (see below).
   under model nondeterminism) vs the internal 46% — disclosed, not hidden. Graded by a **relative
   tool-trajectory gate** (the proxy arm's tool calls must cover the direct arm's, minus forbidden)
   alongside the answer facts gate.
+
+- **provider-cache** (`provider_cache_dataset.jsonl`, backlog #71) — **not a savings workload.**
+  Many *distinct* questions over **one** long shared prefix (~13.5k tokens, byte-identical across
+  every request), proxy cache bypassed so every call reaches the provider. It measures the
+  **provider's own prompt cache**: read and write tokens, per arm, as absolute counts. The four
+  workloads above report those columns as `0` and structurally always will — on a warm repeat
+  neither arm reaches the provider, and their distinct originals share only a ~15-token prefix,
+  far under the ~1,024 tokens providers require. The dossier is re-assembled from HotpotQA
+  paragraphs already in `public_dataset.jsonl` (offline, no download) and each question is that
+  item's own, so the existing facts gate applies unchanged. **No savings percentage is emitted and
+  the slice is excluded from the blend** (`_BLEND_EXCLUDED_PROFILES`): the prefix size is a knob we
+  chose, so a ratio built from it would describe the instrument as much as the proxy. A provider
+  that reports no cache counters is recorded as **unreported**, never as zero.
 
 The cold pass writes **nothing** to the cache (`x_no_cache` skips both lookup *and* store), so it
 leaves no residue — which is what lets the same design run against a live remote proxy (`verify.sh`).
@@ -303,7 +317,7 @@ Exit codes: `0` clean · `1` config error (before any spend) · `2` a quality re
 
 ## Output
 
-- **`ab_results.json`** — per provider → per workload slice (`cold`/`cache`/`agentic`) → per dataset
+- **`ab_results.json`** — per provider → per workload slice (`cold`/`cache`/`agentic`/`provider_cache`) → per dataset
   + total (both arms' tokens/cost/calls/cache-hits, `token_saving_pct`, `cost_saving_pct`, facts) + a
   top-level meta block (`prices_as_of`, `seed`, `dataset_sha256`, `workload`, `providers_run`,
   `providers_skipped`, `spend_total_usd`, `stopped_at_cap`, optional `judge`, and — under
@@ -321,7 +335,7 @@ All three are gitignored (the harness + built dataset ship; per-run outputs do n
 | Flag | Default | Meaning |
 |---|---|---|
 | `--providers` | `openai` | `openai` · `all` · comma list |
-| `--workload` | `standard` | `standard` · `cache` · `agentic` · `full` (all + blend) |
+| `--workload` | `standard` | `standard` · `cache` · `agentic` · `full` (all + blend) · `provider-cache` (cache read/write probe, no savings figure, outside the blend) |
 | `--weights` | `""` | override blend weights for `full`, e.g. `cache=.4,agentic=.3,prose=.2,reasoning=.1` |
 | `--mode` | `both` | `cold` · `replay` · `both` (splits the `standard` workload) |
 | `--proxy-url` | `http://localhost:4000` (or `PROXY_URL`) | arm B endpoint |
