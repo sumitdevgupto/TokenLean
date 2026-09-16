@@ -23,6 +23,18 @@ date changes.
 
 ## 2026-09-16
 
+### G06 refused reasoning-model routes the provider seam already fixed for free — Bug fix
+
+A routing guard was meant to stop the proxy sending a request to a reasoning model whose
+thinking cannot fit inside the caller's output budget, which used to bill customers in full
+for an empty reply. It compared the caller's CURRENT budget to what the effort needs — but a
+separate mechanism raises that exact budget on the very next step, for exactly this reason.
+So the guard fired on precisely the cases already handled downstream, and refused legitimate
+cost-saving routes for no reason. It now tests the operator's own ceiling instead — the one
+case the downstream fix genuinely cannot reach — so a caller's merely-low budget is no longer
+mistaken for starvation. No behavior change for any deployment without an explicit output-
+token ceiling configured below what reasoning needs, which is the default.
+
 ### The public benchmark can now measure the provider's prompt cache — Enhancement (OSS)
 
 `ab_results.json` reported provider cache read/write as `0` on every run, and that was

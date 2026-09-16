@@ -197,6 +197,15 @@ def test_g06_routing_floor_agrees_with_the_adapter_on_a_bare_config():
     4,608 tokens for an `off` request, while the adapter would have asked for 1,536 and
     left the budget alone. G06 therefore refused routes the reservation would never have
     needed to touch. It must ASK the adapter instead of re-deriving.
+
+    Updated 2026-09-16 for backlog #58: the last assertion here used to require refusal
+    for ANY budget below `needed`, on the theory that the caller's current budget is what
+    matters. It is not — `reserve_reasoning_headroom` raises that exact budget to `needed`
+    whenever the (also-adapter-derived) ceiling permits, which on a bare config it always
+    does (the ceiling defaults to 32768). So a below-need budget on a bare config is now
+    the UNSTARVED case: it is precisely what the reservation exists to repair, and "ONE
+    derivation" now means G06 and the seam must agree on the CEILING too, not only on
+    `needed` — checked below by asking the adapter for both.
     """
     from middleware.g06_routing import _reasoning_budget_starved
     from providers import get_adapter
@@ -205,7 +214,8 @@ def test_g06_routing_floor_agrees_with_the_adapter_on_a_bare_config():
     ctx = SimpleNamespace(config=bare, params={"reasoning_effort": "off"})
     adapter = get_adapter("o4-mini", [])
     needed = adapter.reasoning_headroom_needed("o4-mini", bare, "off")
-    assert needed is not None
+    cap = adapter.reasoning_headroom_cap("o4-mini", bare)
+    assert needed is not None and cap is not None
 
     # A budget that already clears the adapter's bar must not be refused by G06.
     ok_budget = needed + 1
@@ -215,8 +225,24 @@ def test_g06_routing_floor_agrees_with_the_adapter_on_a_bare_config():
         "G06 refused a route the provider seam would have served unchanged - the two "
         "sides of one policy disagree"
     )
-    # And a budget below it must still be refused, by both.
-    assert _reasoning_budget_starved(ctx, "o4-mini", needed - 1) is True
+    # A budget BELOW `needed` is not starvation on a bare config: the ceiling defaults to
+    # 32768, comfortably above `needed`, so the seam raises it for free on the next step -
+    # which is exactly what it does here, and G06 must agree the route is fine.
+    low_budget = needed - 1
+    raised = dict(max_completion_tokens=low_budget)
+    disclosure = adapter.reserve_reasoning_headroom(raised, "o4-mini", bare, "off")
+    assert disclosure is not None and raised["max_completion_tokens"] == needed
+    assert _reasoning_budget_starved(ctx, "o4-mini", low_budget) is False, (
+        "G06 refused a route the provider seam goes on to fix for free - the two sides "
+        "of one policy disagree about the CEILING, not just about `needed`"
+    )
+    # The one case G06 must still refuse: an explicit ceiling the seam cannot cross.
+    capped = dict(bare)
+    capped["groups"] = {"G12_reasoning": {"reasoning_headroom": {
+        "enabled": True, "max_output_tokens": needed - 1}}}
+    assert _reasoning_budget_starved(
+        SimpleNamespace(config=capped, params={"reasoning_effort": "off"}),
+        "o4-mini", low_budget) is True
 
 
 def test_g06_does_not_re_derive_the_allowance_table():

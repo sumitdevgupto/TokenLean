@@ -1138,7 +1138,13 @@ def main() -> int:
     spend = SpendMeter(args.max_spend_per_provider, args.max_spend)
     records: list = []
     stopped_at_cap = False
-    COST_LOG.write_text("", encoding="utf-8")
+    # Deliberately NOT truncated here (backlog #78). This runs before provider detection
+    # and before any call — a run that dies immediately (bad key, proxy down, typo'd flag)
+    # would otherwise replace the PREVIOUS run's tracked ab_cost_log.jsonl with an empty
+    # file before writing a single record of its own. The log is truncated lazily instead,
+    # at the first successful write below — an aborted run now leaves the prior evidence
+    # exactly as it found it.
+    cost_log_state = {"truncated": False}
 
     profile_filter = {p.strip() for p in args.profiles.split(",") if p.strip()}
     if profile_filter:
@@ -1297,10 +1303,15 @@ def main() -> int:
                     "facts": facts,
                 }
                 records.append(rec)
-                with COST_LOG.open("a", encoding="utf-8") as fh:
+                # First successful record of THIS run truncates the log (see cost_log_state
+                # above); every one after it appends. So a run that never gets here — the
+                # entire failure class #78 is about — leaves the previous run's log untouched.
+                _mode = "w" if not cost_log_state["truncated"] else "a"
+                with COST_LOG.open(_mode, encoding="utf-8") as fh:
                     fh.write(json.dumps({"provider": provider, "slice": slice_name, "kind": kind,
                                          "label": item["_label"], "a_cost": round(a_cost, 6),
                                          "b_cost": round(b_cost, 6), "cache_hit": b["cache_hit"]}) + "\n")
+                cost_log_state["truncated"] = True
                 print(f"  [{i}/{len(trace)}] {item['_label']:<16} "
                       f"A={a['prompt_tokens']:>5}tok/${a_cost:.5f}  "
                       f"B={b['prompt_tokens']:>5}tok/${b_cost:.5f}  "

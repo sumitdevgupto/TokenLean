@@ -245,6 +245,38 @@ class OpenAIAdapter(ProviderAdapter):
             return None
         return allowance + floor
 
+    @staticmethod
+    def _reasoning_headroom_ceiling(model: str, hcfg: Dict) -> int:
+        """The operator's cap — always resolves to an int (default 32768), never None.
+        The ONE derivation, shared by `reserve_reasoning_headroom` (which raises up to it)
+        and `reasoning_headroom_cap` (which G06 asks whether it can reach `needed` at all,
+        backlog #58)."""
+        by_model = hcfg.get("max_output_tokens_by_model") or {}
+        cap_raw = next(
+            (v for m, v in by_model.items() if isinstance(m, str) and m.lower() in model.lower()),
+            hcfg.get("max_output_tokens", 32768),
+        )
+        try:
+            return int(cap_raw)
+        except (TypeError, ValueError):
+            return 32768
+
+    def reasoning_headroom_cap(
+        self, model: str, config: Optional[Dict] = None,
+    ) -> Optional[int]:
+        """See base class. None iff `reasoning_headroom_needed` would also be None for
+        the same (model, config) — both gate on the identical checks below."""
+        if not self.supports_reasoning(model, config):
+            return None
+        hcfg = (
+            (config or {}).get("groups", {})
+            .get("G12_reasoning", {})
+            .get("reasoning_headroom", {})
+        ) or {}
+        if not hcfg.get("enabled", True):
+            return None
+        return self._reasoning_headroom_ceiling(model, hcfg)
+
     def reserve_reasoning_headroom(
         self,
         params: Dict,
@@ -305,15 +337,7 @@ class OpenAIAdapter(ProviderAdapter):
         if budget >= needed:
             return None
 
-        by_model = hcfg.get("max_output_tokens_by_model") or {}
-        cap_raw = next(
-            (v for m, v in by_model.items() if isinstance(m, str) and m.lower() in model.lower()),
-            hcfg.get("max_output_tokens", 32768),
-        )
-        try:
-            cap = int(cap_raw)
-        except (TypeError, ValueError):
-            cap = 32768
+        cap = self._reasoning_headroom_ceiling(model, hcfg)
         new_budget = min(needed, cap)
         if new_budget <= budget:
             # The operator's cap is below what this effort needs. Leave the caller's

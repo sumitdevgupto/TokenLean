@@ -183,7 +183,7 @@ def _reasoning_budget_starved(
     ctx: RequestContext, model: str, budget: Optional[int]
 ) -> bool:
     """True when routing to ``model`` would spend the caller's whole output budget on
-    hidden reasoning and return nothing.
+    hidden reasoning and return nothing, IN A WAY THE PROVIDER SEAM CANNOT FIX.
 
     On providers that bill reasoning INSIDE the output budget, a budget sized for the
     answer alone buys a full-price empty reply — measured at 18 of 54 requests on
@@ -197,9 +197,19 @@ def _reasoning_budget_starved(
     adapter would have asked for 1536, and G06 refused routes the reservation would have
     handled by itself.
 
-    Fails OPEN (returns False) on any error — a routing guard that cannot answer must
-    not block routing; the reservation at the provider seam and the empty-completion
-    detector on the response path are the other two layers.
+    Backlog #58, fixed 2026-09-16: comparing the caller's CURRENT budget to ``needed``
+    was still wrong even with the shared derivation above, because ``reserve_reasoning_
+    headroom`` RAISES that exact budget to ``needed`` on the very next step for exactly
+    this reason — so the guard fired on precisely the cases the reservation already
+    handles, and refused legitimate cost-saving routes for no reason. The one case the
+    seam genuinely cannot fix is the OPERATOR's own ceiling (``reasoning_headroom_cap``)
+    sitting below ``needed`` — that is what this now tests. A caller's LOW current
+    budget is not starvation; it is exactly the shape the reservation exists to repair.
+
+    Fails OPEN (returns False) on any error, and also when the adapter cannot answer
+    the cap question — a routing guard that cannot answer must not block routing; the
+    reservation at the provider seam and the empty-completion detector on the response
+    path are the other two layers.
     """
     if not budget:
         return False   # no caller budget → the provider's own default applies
@@ -210,7 +220,13 @@ def _reasoning_budget_starved(
         )
         if not needed:
             return False   # this model does not reason here, or the operator opted out
-        return budget < int(needed)
+        needed = int(needed)
+        if budget >= needed:
+            return False   # already sufficient — no reservation is even needed
+        cap = adapter.reasoning_headroom_cap(model, ctx.config)
+        if cap is None:
+            return False   # adapter can't confirm a ceiling exists — fail open, not closed
+        return int(cap) < needed
     except Exception as exc:
         logger.debug("G06 reasoning-budget floor check failed for %s: %s", model, exc)
         return False

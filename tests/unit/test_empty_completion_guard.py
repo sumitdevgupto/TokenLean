@@ -8,8 +8,9 @@ on each one. These tests pin the three layers that now stop it:
 
   * detection is unconditional (no enable knob, outside the observability gate);
   * the empty answer is refused by the cache at the store, independently of ordering;
-  * G06 will not route INTO a reasoning model whose thinking cannot fit the caller's
-    budget in the first place.
+  * G06 will not route INTO a reasoning model whose thinking cannot fit even after the
+    provider-seam reservation raises the caller's budget (backlog #58, corrected
+    2026-09-16 — see the tests below for what the ORIGINAL, wrong version pinned).
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -225,16 +226,48 @@ def test_caller_output_budget_reads_the_key_the_caller_actually_used():
     assert _caller_output_budget({"max_tokens": "lots"}) is None
 
 
-def test_reasoning_budget_starved_is_true_only_when_it_cannot_fit():
+def test_a_low_current_budget_alone_is_not_starvation_backlog_58():
+    """THE regression test. The original version of this guard compared the caller's
+    CURRENT budget to `needed` and refused to route whenever budget < needed — but
+    `reserve_reasoning_headroom` (providers/openai_adapter.py) raises that exact budget
+    to `needed` on the very next step, for exactly this reason. So the old guard fired on
+    precisely the cases the reservation already handles, and refused a legitimately
+    cheaper route for no reason. With no operator `max_output_tokens` override (defaults
+    to 32768, comfortably above any `needed` this test config can produce), a budget the
+    caller sized far too small for reasoning must NOT be reported as starved."""
     from middleware.g06_routing import _reasoning_budget_starved
 
     ctx = SimpleNamespace(config=_headroom_config(), params={"reasoning_effort": "medium"})
+    assert _reasoning_budget_starved(ctx, "o4-mini", 1024) is False
+
+
+def test_reasoning_budget_starved_is_true_only_when_the_operators_cap_cannot_fit_it():
+    """The one case the seam genuinely cannot fix: an OPERATOR ceiling below `needed`.
+    `needed` here is 512 (answer_floor) + 4096 (medium allowance) = 4608; a cap of 2000
+    means the seam can raise the caller's budget only as far as 2000, still insufficient."""
+    from middleware.g06_routing import _reasoning_budget_starved
+
+    cfg = _headroom_config()
+    cfg["groups"]["G12_reasoning"]["reasoning_headroom"]["max_output_tokens"] = 2000
+    ctx = SimpleNamespace(config=cfg, params={"reasoning_effort": "medium"})
     assert _reasoning_budget_starved(ctx, "o4-mini", 1024) is True
+    # Already sufficient → never starved, regardless of the cap.
     assert _reasoning_budget_starved(ctx, "o4-mini", 8192) is False
     # Not a reasoning model → not our concern.
     assert _reasoning_budget_starved(ctx, "gpt-4o-mini", 16) is False
     # No caller budget → the provider's own default applies.
     assert _reasoning_budget_starved(ctx, "o4-mini", None) is False
+
+
+def test_a_cap_that_exactly_meets_the_need_is_not_starvation():
+    """Boundary: the seam raises to min(needed, cap); cap == needed means it reaches
+    `needed` exactly, which is sufficient by the same rule as `budget >= needed`."""
+    from middleware.g06_routing import _reasoning_budget_starved
+
+    cfg = _headroom_config()
+    cfg["groups"]["G12_reasoning"]["reasoning_headroom"]["max_output_tokens"] = 4608
+    ctx = SimpleNamespace(config=cfg, params={"reasoning_effort": "medium"})
+    assert _reasoning_budget_starved(ctx, "o4-mini", 1024) is False
 
 
 def test_reasoning_budget_floor_honours_the_operator_switch():

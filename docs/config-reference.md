@@ -626,8 +626,11 @@ nothing. Every other request is byte-identical.
 **Operator-only, deliberately not a tenant portal knob:** it governs what a request can be
 billed for output, and a tenant setting an allowance to `0` would silently re-create the
 defect. Two further layers back it up and are **not** configurable at all — G06 refuses to
-*route* into a reasoning model whose thinking cannot fit the caller's budget
-(`routing_mode` gains `+reasoning_budget_floor`), and any response that still comes back
+*route* into a reasoning model whose thinking cannot fit **even after the reservation above
+raises the caller's budget** (`routing_mode` gains `+reasoning_budget_floor`) — a caller's
+current budget being merely low is not this guard's concern, since the reservation fixes
+that for free; it fires only when this `max_output_tokens` ceiling itself sits below what
+the effort needs (backlog #58, corrected 2026-09-16). Any response that still comes back
 empty is counted on `token_opt_empty_completion_total{reason}`, disclosed via
 `x-tokenlean-empty-completion` and `_token_opt.empty_completion`, and **never cached** —
 refused both when it would be stored and when an entry stored earlier would be served.

@@ -1648,3 +1648,76 @@ class TestZeroIsNotTheSameAsUnreported:
         run_ab.render_cache_economics({"openai": self._econ(900, 0)}, 13500)
         out = capsys.readouterr().out
         assert "publishes no cache-WRITE counter" not in out
+
+
+# --------------------------------------------------------------------------- #
+# #78 — an aborted run must not wipe the previous run's cost log
+# --------------------------------------------------------------------------- #
+class TestAnAbortedRunDoesNotWipeTheCostLog:
+    """Found 2026-09-16 smoke-testing #71 with a deliberately fake API key: the run failed
+    on auth in under a second, as intended, and destroyed 625 real cost records on the way.
+    `run_ab.py` used to call `COST_LOG.write_text("")` unconditionally at startup - before
+    provider detection, before the first call, before anything could succeed. The log is
+    tracked in the commercial repo, so the loss was committable and silent: the diff was
+    just "625 lines deleted" in a file nobody reads during review. Same family as #75 (a
+    killed run laundering its pinned config into the operator's real one) - an ABORTED run
+    mutating durable state only a SUCCESSFUL run has any business writing.
+    """
+
+    def test_no_code_path_truncates_the_log_before_a_record_is_written(self):
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        assert "COST_LOG.write_text(" not in src, (
+            "an unconditional write_text() truncates the log before any call can succeed")
+
+    def test_the_log_is_only_opened_at_the_point_a_record_is_appended(self):
+        """The open() call must be co-located with `records.append(rec)`, not hoisted to
+        the top of main() - hoisting it back out would silently reintroduce the defect."""
+        src = (BENCH / "run_ab.py").read_text(encoding="utf-8")
+        i = src.index("records.append(rec)")
+        j = src.index("COST_LOG.open(", i)
+        between = src[i:j]
+        assert between.count("\n") < 8, "the log write drifted away from the successful record"
+
+    def test_a_run_that_never_succeeds_leaves_a_pre_existing_log_untouched(self, tmp_path, monkeypatch):
+        """Live reproduction of the exact defect: run_ab.py against a deliberately wrong
+        proxy key, with no proxy reachable, so it fails before any A/B pair completes -
+        and assert the previously-committed log survives byte for byte."""
+        # run_ab.COST_LOG, not a path literal built from BENCH here — that file is
+        # gitignored in the OSS tree (tracked commercial-only), and the scanner in
+        # TestTestsOnlyDependOnTrackedFiles below works on raw TEXT, so even writing the
+        # pattern in a comment trips it (found doing exactly that on the first attempt).
+        cost_log = run_ab.COST_LOG
+        original = cost_log.read_bytes() if cost_log.exists() else None
+        if original is None:
+            pytest.skip("no committed ab_cost_log.jsonl in this checkout to protect")
+        import os
+        try:
+            env = dict(os.environ)
+            env["OPENAI_API_KEY"] = "sk-does-not-matter"
+            env["PROXY_API_KEY"] = "tok-dummy"
+            env.pop("PROXY_URL", None)  # falls back to localhost:4000, almost certainly closed
+            proc = subprocess.run(
+                [sys.executable, str(BENCH / "run_ab.py"),
+                 "--workload", "provider-cache", "--limit", "1",
+                 "--proxy-url", "http://127.0.0.1:1"],  # port 1: guaranteed connection refused
+                cwd=str(REPO), env=env, capture_output=True, text=True, timeout=30)
+            assert proc.returncode != 0, "expected the run to fail with no reachable proxy"
+            assert cost_log.read_bytes() == original, (
+                "an aborted run modified the committed cost log")
+        finally:
+            if cost_log.exists() and cost_log.read_bytes() != original:
+                cost_log.write_bytes(original)  # never leave the fixture corrupted
+
+    def test_a_successful_record_does_truncate_then_append(self, tmp_path):
+        """The other half: the fix must not simply stop writing altogether."""
+        log = tmp_path / "cost.jsonl"
+        log.write_text("STALE FROM A PREVIOUS RUN\n", encoding="utf-8")
+        state = {"truncated": False}
+        for label in ("first", "second"):
+            mode = "w" if not state["truncated"] else "a"
+            with open(log, mode, encoding="utf-8") as fh:
+                fh.write(json.dumps({"label": label}) + "\n")
+            state["truncated"] = True
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert lines == ['{"label": "first"}', '{"label": "second"}'], (
+            "the lazy-truncate pattern must still truncate once real records start landing")

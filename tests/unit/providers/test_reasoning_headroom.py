@@ -209,6 +209,64 @@ def test_garbage_budget_does_not_raise():
     assert OpenAIAdapter().reserve_reasoning_headroom(params, REASONING_MODEL, _cfg()) is None
 
 
+# ── reasoning_headroom_cap (backlog #58) ────────────────────────────────────────
+# G06 asks this to test the ONE case reserve_reasoning_headroom truly cannot fix — the
+# operator's own ceiling sitting below what the effort needs — instead of comparing the
+# caller's CURRENT (freely raisable) budget to `needed`, which was the bug.
+
+
+def test_the_cap_matches_what_the_seam_would_actually_raise_to():
+    """Same derivation, same answer — that is the whole point (`_reasoning_headroom_ceiling`
+    is the ONE shared implementation)."""
+    cfg = _cfg(max_output_tokens=9999)
+    assert OpenAIAdapter().reasoning_headroom_cap(REASONING_MODEL, cfg) == 9999
+
+
+def test_the_per_model_ceiling_is_honoured_here_too():
+    cfg = _cfg(max_output_tokens=1_000, max_output_tokens_by_model={"o4-mini": 20_000})
+    assert OpenAIAdapter().reasoning_headroom_cap(REASONING_MODEL, cfg) == 20_000
+
+
+def test_the_default_ceiling_is_32768_when_unconfigured():
+    """The everyday deployment: no `max_output_tokens` block at all. This is the value
+    G06 must see as effectively unlimited relative to any real `needed` — the fix's whole
+    point is that this default must not make the guard fire on a low caller budget."""
+    cfg = {"groups": {"G12_reasoning": {"reasoning_headroom": {"enabled": True}}},
+           "providers": []}
+    assert OpenAIAdapter().reasoning_headroom_cap(REASONING_MODEL, cfg) == 32768
+
+
+def test_the_cap_is_none_exactly_when_needed_is_none():
+    """The two must agree on WHEN they answer, or G06's `cap is None -> fail open` branch
+    could silently diverge from `needed is None -> not our concern`."""
+    adapter = OpenAIAdapter()
+    # Non-reasoning model.
+    assert adapter.reasoning_headroom_cap(PLAIN_MODEL, _cfg()) is None
+    assert adapter.reasoning_headroom_needed(PLAIN_MODEL, _cfg()) is None
+    # Operator disabled the reservation.
+    cfg = _cfg(enabled=False)
+    assert adapter.reasoning_headroom_cap(REASONING_MODEL, cfg) is None
+    assert adapter.reasoning_headroom_needed(REASONING_MODEL, cfg) is None
+
+
+def test_base_adapter_reports_no_cap_either():
+    """Mirrors `reserve_reasoning_headroom`'s no-op on a provider with no such mechanism —
+    an adapter that never overrides the reservation has no ceiling to report."""
+
+    class _Plain(ProviderAdapter):
+        @property
+        def name(self):
+            return "plain"
+
+        def map_reasoning_effort(self, tier, config):
+            return {}
+
+        def map_structured_output(self, format_type, schema=None):
+            return {}
+
+    assert _Plain().reasoning_headroom_cap(REASONING_MODEL, _cfg()) is None
+
+
 def test_base_adapter_is_a_no_op():
     """Providers that bill thinking OUTSIDE the output budget must not be touched."""
 

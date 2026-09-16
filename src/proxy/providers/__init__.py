@@ -547,6 +547,30 @@ class ProviderAdapter(ABC):
         """
         return None
 
+    def reasoning_headroom_cap(
+        self, model: str, config: Optional[Dict] = None,
+    ) -> Optional[int]:
+        """The hard ceiling ``reserve_reasoning_headroom`` will never raise a budget past.
+
+        Backlog #58. G06's reasoning-starvation guard used to refuse a route whenever the
+        CALLER's current budget was under ``reasoning_headroom_needed`` — but that budget
+        is exactly what ``reserve_reasoning_headroom`` raises on the very next step, so the
+        guard was firing on precisely the cases the reservation already handles, and
+        refusing legitimate cost-saving routes for no reason. The one case the reservation
+        genuinely cannot fix is the OPERATOR's own ceiling sitting below what the effort
+        needs — this is that ceiling, so G06 can test the immovable thing instead of the
+        movable one. Both this and ``reserve_reasoning_headroom`` derive it from the same
+        config for the same reason ``reasoning_headroom_needed`` exists: one policy must
+        not have two derivations.
+
+        Default None — a provider with no such reservation mechanism has no ceiling for
+        this question either; None must never be read as "unlimited" by a caller that
+        also got a non-None ``reasoning_headroom_needed`` for the same model, since that
+        combination cannot occur (both gate on the identical ``supports_reasoning`` /
+        ``enabled`` checks).
+        """
+        return None
+
     def extract_usage(self, response: Dict) -> Dict:
         """Normalise provider usage into cached/reasoning/cache-write counts.
 
