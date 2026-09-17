@@ -23,6 +23,46 @@ date changes.
 
 ## 2026-09-17
 
+### An offline re-run of the ablation harness could apply a dataset's config override to the wrong arm — Bug fix
+
+A per-dataset config override is meant to reshape only that dataset's own measurement
+arms. On the harness's offline re-aggregation path (not the one behind any published
+number), it was applied one step too late, after each optimisation's arm had already
+been isolated — so an override touching a DIFFERENT optimisation than the one being
+measured could leak into every other optimisation's arm for that dataset. Reordered to
+match the live path, which was already correct.
+
+### The internal quality gate could call an agentic answer empty when it was not — Bug fix
+
+The check that excuses a tool-call answer from being classified as an empty response
+looked only at one signal (the reported finish reason), when a provider can report a
+tool call under a different signal (an ordinary "stop") while still attaching the
+tool call itself. Such an answer is now recognised either way, matching how the
+proxy's own routing logic already reads the same signal pair.
+
+### A per-optimisation quality check skipped tool-using datasets entirely — Bug fix
+
+Ablation runs grade each individual optimisation's own answers so a technique cannot
+be credited with savings it bought by giving a wrong answer — but a dataset whose
+correctness criteria live entirely in tool calls (rather than prose) was skipped by
+that check altogether, so its per-optimisation figures were never quality-verified.
+Fixed to check both kinds of ground truth, at no added cost (still zero model calls).
+
+### A quality check that verified nothing could print as if it had passed — Bug fix
+
+Where an agentic answer carries no text to check, the internal quality report could
+read as a clean pass even though nothing was actually verified for that request. Such
+requests are now counted and named separately, so a real pass and "nothing to check"
+can never be printed identically.
+
+### A reporting script could silently overwrite the quality-gated results file — Bug fix
+
+Run the documented way, the harness's investor-report script wrote its own summary to
+the exact same filename the quality gate uses for its pass/fail verdict and evidence —
+replacing the one file that says whether a number is publishable with one that cannot
+answer that question. The two reports now use distinct filenames and can never
+collide.
+
 ### A Windows-only defect made the harness run-lock unrecoverable after a crash — Bug fix
 
 The lock that stops two live ablation runs from corrupting each other's config checks
