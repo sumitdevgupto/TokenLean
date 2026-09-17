@@ -21,6 +21,41 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-17
+
+### A zero-choices response body could be cached and replayed forever — Bug fix
+
+The guard that stops an empty answer from being cached checked for no content and no
+tool calls, but treated a response with NO CHOICES AT ALL as "not empty" — the opposite
+of intent. The same function gates both the cache write and the cache read, so a
+malformed provider reply could be written once and served to every look-alike question
+for a full TTL (up to 24 hours) with the provider never called again. It now treats a
+missing or empty choices list as empty, on both the write and read side.
+
+### The same empty-answer check could crash on a malformed response — Bug fix
+
+Found while fixing the item above: the check indexed into the response body without
+checking its shape first, so a response whose `choices` field was present but not a
+list — or whose first entry was not the expected shape — raised an unhandled error that
+propagated into the response pipeline, turning a safety check into a 500 on an otherwise
+successful request. It now treats anything it cannot parse as empty rather than raising.
+
+### A disclosed budget increase could describe a call that failed, not the one served — Bug fix
+
+When a request escalates through multiple models before one of them answers, the proxy
+discloses when it grew the caller's output budget so a reasoning model has room to think.
+That disclosure could end up describing a LATER model that was only evaluated and then
+failed, rather than the model whose answer was actually served — telling a caller their
+budget was raised for reasoning that never happened. It is now committed per attempt and
+restored for whichever model actually answers.
+
+### Routing to a different provider left downstream stages reasoning about the wrong one — Bug fix
+
+On the opt-in routing options that can send a request to a different AI provider than
+the one requested, the internal provider handle used for prompt-caching alignment and
+cache-cost decisions was not updated to match — it kept pointing at the originally
+requested provider. Deployments not using cross-provider routing are unaffected.
+
 ## 2026-09-16
 
 ### G06 refused reasoning-model routes the provider seam already fixed for free — Bug fix

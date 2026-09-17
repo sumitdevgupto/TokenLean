@@ -629,3 +629,105 @@ class TestDispatchSiteDoesNotRelyOnOrdering:
         src = inspect.getsource(mod)
         assert "test_g32_runs_before_every_auto_executing_group" in src
         assert "test_g15_refuses_even_though_g32_never_ran" in src
+
+
+class TestProviderAdapterReResolvedAfterG06:
+    """Backlog #56. `ctx.provider_adapter` is resolved once, before G06 runs, from the
+    model the request NAMED. On the documented opt-in cross-provider routing (rules,
+    a strategy layer, or a cascade plan whose tier1 lands on a different provider),
+    G06 changes ctx.routed_model to a different provider's model — and until this fix,
+    nothing re-pinned the adapter, so every stage after G06 (G21's cache alignment, the
+    G01/G08/G19-shared cache-floor reservation) reasoned about the WRONG provider's
+    cacheable-prefix span and cache multipliers. Only the FAILOVER path re-pinned it.
+    """
+
+    _PROVIDERS_CFG = [
+        {"name": "openai", "model_prefixes": ["gpt", "o1", "o3", "o4"]},
+        {"name": "anthropic", "model_prefixes": ["claude"]},
+    ]
+
+    def _stub_pipeline(self, on_g06):
+        """Every group is a passthrough no-op except G06, which runs `on_g06(ctx)`."""
+        from middleware.pipeline import OptimisationPipeline
+
+        pipeline = OptimisationPipeline.__new__(OptimisationPipeline)
+
+        def _noop(_name):
+            m = AsyncMock()
+            m.process_request.side_effect = lambda ctx: ctx
+            return m
+
+        pipeline._tenant_config_loader = AsyncMock()
+        pipeline._tenant_config_loader.load = AsyncMock()
+        for g in ("g00", "g01", "g02", "g04", "g05", "f2", "g07", "g08", "g09", "g10",
+                  "g11", "g12", "g13", "g16", "g17", "g19", "g20", "g21", "g22", "g25",
+                  "g26", "g27", "g28", "g29", "g30", "g31", "g15"):
+            setattr(pipeline, g, _noop(g))
+        pipeline.g06 = AsyncMock()
+        pipeline.g06.process_request.side_effect = on_g06
+        pipeline.g24 = _noop("g24")
+        pipeline.g24.reevaluate_post_routing = AsyncMock(side_effect=lambda ctx: ctx)
+        pipeline.g18 = MagicMock()
+        return pipeline
+
+    @pytest.mark.asyncio
+    async def test_a_cross_provider_route_repins_the_adapter(self):
+        """G06 routes an OpenAI request onto a Claude model — the adapter every
+        downstream stage sees must switch providers with it."""
+        async def _route_to_anthropic(ctx):
+            ctx.routed_model = "claude-3-5-sonnet-20241022"
+            return ctx
+
+        pipeline = self._stub_pipeline(_route_to_anthropic)
+        ctx = _make_ctx()
+        ctx.config["providers"] = self._PROVIDERS_CFG
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(ctx)
+
+        assert ctx.routed_model == "claude-3-5-sonnet-20241022"
+        assert ctx.provider_adapter.name == "anthropic", (
+            "G21 and the cache-floor reservation would reason about openai's cache "
+            "minimums and multipliers for a request actually going to anthropic"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_same_provider_route_is_unaffected(self):
+        """The overwhelmingly common case: G06 stays on the same provider. Re-resolving
+        must be a no-op, not merely correct for the cross-provider case."""
+        async def _route_within_openai(ctx):
+            ctx.routed_model = "gpt-4o-mini"
+            return ctx
+
+        pipeline = self._stub_pipeline(_route_within_openai)
+        ctx = _make_ctx()
+        ctx.config["providers"] = self._PROVIDERS_CFG
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(ctx)
+
+        assert ctx.provider_adapter.name == "openai"
+
+    @pytest.mark.asyncio
+    async def test_no_routing_at_all_is_unaffected(self):
+        """G06 disabled / no-op — the adapter resolved at pipeline entry must survive."""
+        async def _leave_alone(ctx):
+            return ctx
+
+        pipeline = self._stub_pipeline(_leave_alone)
+        ctx = _make_ctx()
+        ctx.config["providers"] = self._PROVIDERS_CFG
+
+        with patch("middleware.pipeline.langfuse_tracing") as mock_lf, \
+             patch("middleware.pipeline.otel") as mock_otel:
+            mock_otel.start_span.return_value = MagicMock()
+            mock_lf.start_trace.return_value = None
+            await pipeline.process_request(ctx)
+
+        assert ctx.provider_adapter.name == "openai"

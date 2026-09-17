@@ -155,12 +155,47 @@ def test_is_empty_answer(content, expected):
     assert _is_empty_answer(_response(content)) is expected
 
 
-def test_is_empty_answer_ignores_tool_calls_and_malformed_shapes():
+def test_is_empty_answer_ignores_a_real_tool_call():
     assert _is_empty_answer(_response(
         None, tool_calls=[{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]
     )) is False
-    assert _is_empty_answer({}) is False
-    assert _is_empty_answer({"choices": []}) is False
+
+
+def test_a_zero_choices_body_is_empty_backlog_64():
+    """Corrected 2026-09-17. `_is_empty_answer` used to return False - "not empty" -
+    for a body with no choices at all, which was backwards: this function gates BOTH
+    the cache write (`g05_cache.store_response`) and the cache read
+    (`main._refuse_empty_cache_hit`, same function under an alias), and neither call
+    site is ever reached by a streaming response (it returns via `_stream_response`
+    before the response pipeline runs). So a zero-choices body reaching here is always
+    a malformed provider reply, never a legitimate streaming shape - and it is exactly
+    what this guard exists to keep out of the cache: it would otherwise be replayed to
+    every look-alike question for a full TTL (L1 1h, L2 24h).
+
+    NOTE this is the opposite of `test_no_choices_at_all_is_not_our_case` above, which
+    pins `detect_empty_completion` (g18_observability.py) - a DIFFERENT function with a
+    documented reason to treat a no-choices body as out of scope. The two functions
+    serve different purposes (a billing/disclosure counter vs. a cache-poisoning guard)
+    and are not required to agree; only this one is backlog #64's OSS `g05_cache.py`
+    scope."""
+    assert _is_empty_answer({}) is True
+    assert _is_empty_answer({"choices": []}) is True
+    assert _is_empty_answer({"choices": "nope"}) is True
+
+
+def test_is_empty_answer_never_raises_backlog_79():
+    """Found writing the #64 fix: the old code indexed `choices[0]` and called `.get()`
+    on it with no type checking, so 5 of 6 malformed shapes tried here crashed with
+    AttributeError. Nothing between this function and its two call sites
+    (`g05_cache.store_response`, `main._refuse_empty_cache_hit`) catches an exception -
+    `pipeline._run_timed` wraps the call in try/FINALLY, not try/except - so a crash here
+    used to propagate into the response pipeline and 500 an otherwise-successful request.
+    Anything this function cannot parse is treated as empty: too malformed to make sense
+    of is too malformed to trust."""
+    for bad in ({"choices": "nope"}, {"choices": [None]}, {"choices": ["x"]},
+                {"choices": [{"message": "not-a-dict"}]}, {"choices": [{"message": 5}]},
+                "not-a-dict-at-all", None, 42, [], {"choices": None}):
+        assert _is_empty_answer(bad) is True, f"should be treated as empty: {bad!r}"
 
 
 @pytest.mark.asyncio

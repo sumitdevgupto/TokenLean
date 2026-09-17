@@ -758,6 +758,77 @@ class TestG06CascadeExecution:
         assert ctx.savings.routing_mode == "cascade_planned+exec_error"
         assert ctx.routed_model == "gpt-4o"  # requested model, NOT the failed tier-1
 
+    # Distinct pricing including an o-series entry, so tier3's escalation-cost guard
+    # does not block it before `_tier_params` (and the reasoning-headroom raise it
+    # triggers) ever runs.
+    _PRICING_WITH_REASONING = {
+        "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+        "gpt-4o": {"input": 0.005, "output": 0.015},
+        "o1": {"input": 0.015, "output": 0.06},
+        "default": {"input": 0.005, "output": 0.015},
+    }
+
+    async def test_output_budget_raised_describes_the_served_tier_not_a_failed_one_backlog_60(
+        self, make_ctx
+    ):
+        """Backlog #60. Tier3 (a reasoning model) is EVALUATED — which raises the
+        caller's output budget via the real provider seam, a genuine side effect on
+        ctx — and then its call FAILS, so the cascade serves tier2's response instead.
+        Tier2 does not reason, so nothing about its answer was ever raised. Before the
+        fix, ctx.output_budget_raised kept tier3's raise: the disclosure would tell the
+        caller their budget was grown for reasoning that never happened, on an answer
+        from a model that never reasons at all.
+        """
+        ctx = make_ctx(
+            [{"role": "user", "content":
+              "Analyze and architect a strategy for this complex system."}],
+            model="gpt-4o",
+            # A small explicit budget is what makes reserve_reasoning_headroom on the
+            # o-series tier3 candidate actually RAISE something to record.
+            params={"max_completion_tokens": 100},
+        )
+        ctx.config["groups"]["G6_routing"]["classifier"] = "cascade"
+        ctx.config["groups"]["G6_routing"]["cascade_execution"] = True
+        ctx.config["groups"]["G6_routing"]["cascade_confidence_threshold"] = 0.90
+        ctx.config["groups"]["G6_routing"]["judge_model"] = "gpt-4o-mini"
+        ctx.config["groups"]["G6_routing"]["allow_escalation_above_requested"] = True
+        ctx.config["groups"]["G6_routing"]["max_escalation_cost_usd"] = 10.0
+        ctx.config["groups"]["G6_routing"]["tiers"] = {
+            "simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["o1"],
+        }
+
+        call_count = 0
+
+        async def mock_acompletion(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            model = kwargs.get("model", "")
+            if "o1" in model:
+                raise Exception("Tier 3 API error")
+            mock_resp = MagicMock()
+            mock_resp.model_dump.return_value = {
+                "choices": [{"message": {"content": f"Answer from {model}"}}], "model": model,
+            }
+            return mock_resp
+
+        async def mock_judge(*args, **kwargs):
+            return 0.50  # always below threshold -> keep escalating through every tier
+
+        with patch("middleware.g06_routing.litellm.acompletion", mock_acompletion), \
+             patch("middleware.g06_routing._evaluate_response_confidence", mock_judge), \
+             patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"), \
+             patch("config_loader.get_pricing_table", return_value=self._PRICING_WITH_REASONING):
+            from middleware.g06_routing import G06Routing
+            ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
+
+        assert call_count == 3, "expected tier1, tier2, and the failed tier3 attempt"
+        assert ctx.routed_model == "gpt-4o", "rolled back to tier2 after tier3 failed"
+        assert ctx.output_budget_raised is None, (
+            "tier2 (gpt-4o) never reasons and was never raised - the disclosure must "
+            "not describe tier3's failed, discarded evaluation"
+        )
+
 
 @pytest.mark.asyncio
 class TestG06CascadeOverEscalationGuards:

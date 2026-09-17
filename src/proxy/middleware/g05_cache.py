@@ -405,11 +405,37 @@ def _is_empty_answer(response: Dict[str, Any]) -> bool:
     (``length``), a model that returned an empty string, and a malformed choice are
     all equally useless to serve from cache later. A guardrail refusal is excluded --
     it carries its refusal text as content, so it never reaches the empty test.
+
+    Backlog #64, fixed 2026-09-17: a body with NO ``choices`` at all used to return
+    False here — "not empty" — which is backwards. Both call sites (this module's own
+    ``store_response`` write-gate, and ``main._refuse_empty_cache_hit``'s read-gate,
+    imported under an alias) only ever see this function AFTER a non-streaming call
+    completed; a streaming response never reaches either path (it returns via
+    ``_stream_response`` before the response pipeline runs at all), so the old
+    "malformed/streamed shape, not our case" reasoning described a case this function
+    is never actually asked about. A response with zero choices reaching here is a
+    malformed provider body — exactly the shape the whole guard exists to keep out of
+    the cache, and exactly what would otherwise be replayed to every look-alike
+    question for a full TTL (L1 1h, L2 24h) with the provider never called again.
+
+    Backlog #79, fixed the same day: every shape below is now type-checked before use.
+    The old code indexed ``choices[0]`` and called ``.get()`` on it unconditionally, so
+    a ``choices`` value that was present but not a list (or whose first entry was not a
+    dict) raised ``AttributeError`` with nothing between this function and its two call
+    sites to catch it — turning a cache-safety guard into a 500 on the write path, and
+    into a 500 on every future read of an already-cached entry with that shape on the
+    read path. Anything this function cannot make sense of is treated as empty: a
+    provider body too malformed to parse is too malformed to trust, on either side.
     """
-    choices = response.get("choices") or []
-    if not choices:
-        return False   # no choices at all is a malformed/streamed shape, not our case
-    message = (choices[0] or {}).get("message") or {}
+    if not isinstance(response, dict):
+        return True
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+    item = choices[0]
+    message = item.get("message") if isinstance(item, dict) else None
+    if not isinstance(message, dict):
+        return True
     if message.get("tool_calls") or message.get("function_call"):
         return False
     content = message.get("content")

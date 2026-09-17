@@ -293,6 +293,24 @@ class OptimisationPipeline:
 
         ctx = await self._run_timed("G06-routing", ctx, self.g06.process_request(ctx))
 
+        # Backlog #56. `ctx.provider_adapter` was resolved ONCE, above, from the model
+        # the request NAMED — before G06 ran. On the documented opt-in cross-provider
+        # routing (declarative rules, a strategy layer, or a cascade plan whose tier1
+        # lands on a different provider), G06.process_request just changed
+        # ctx.routed_model to a different provider's model, and nothing re-pinned the
+        # adapter. Every stage AFTER this point that reads ctx.provider_adapter — G21's
+        # cache alignment and the G01/G08/G19-shared cache-floor reservation chief among
+        # them — would reason about the WRONG provider's cacheable-prefix span and cache
+        # multipliers, turning a mislabel into a cost decision. Only the FAILOVER path
+        # (`main._make_pin_winner`) re-pinned this before; this is the SAME re-pin,
+        # moved one stage earlier so the rest of Stage 3+ sees it too. A no-op when G06
+        # left the model on its original provider (the overwhelmingly common case) or
+        # is disabled — `get_adapter` is deterministic and idempotent.
+        ctx.provider_adapter = get_adapter(
+            ctx.routed_model,
+            ctx.config.get("providers", []),
+        )
+
         # G24 post-routing re-evaluation — a second, narrower pass now that
         # ctx.routed_model is final. G24's first pass (Stage 1b) runs before G06, so a
         # rule scoped to the post-routing model (e.g. a learned F1 rule keyed on

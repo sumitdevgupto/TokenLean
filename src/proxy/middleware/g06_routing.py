@@ -669,13 +669,29 @@ async def _execute_three_tier_cascade(
         request_tier, _ = _classify_heuristic(ctx.messages, ctx.params)
         max_tier_idx = _TIER_ORDER[request_tier] if cap_enabled else 2
 
+    # Backlog #60. `outgoing_params_for` sets ctx.output_budget_raised as a SIDE EFFECT
+    # (the seam every call path shares), which is correct for a single call but wrong
+    # here: this cascade evaluates params for a tier, may throw before that tier's call
+    # ever completes, and falls back to serving an EARLIER tier's response. Without this
+    # dict, a later tier's speculative raise (or non-raise) silently overwrites — or
+    # fails to clear — what an earlier, actually-served tier recorded, so the disclosure
+    # can describe a call that was never served. Keyed by model rather than tier index
+    # because a tier can retry the same model (the tier1 uncapped-retry in ``_serve``).
+    _budget_raised_by_tier: Dict[str, Optional[Dict[str, Any]]] = {}
+
     def _tier_params(model: str) -> Dict[str, Any]:
         """Provider-hygienic params for a tier call (review S2): the deferred cascade
         runs AFTER G11/G12/G25/G21 mutate ctx.params, so tier calls need the same
         outgoing hygiene as the normal call site — reused, never reimplemented."""
+        # Isolate THIS tier's raise (or lack of one) from whatever an earlier tier left
+        # behind — outgoing_params_for only ever SETS the field, never clears it, so a
+        # non-reasoning tier evaluated after a reasoning one would otherwise inherit its
+        # predecessor's stale disclosure.
+        ctx.output_budget_raised = None
         out = outgoing_params_for(
             ctx, get_adapter(model, get_providers()), model, ctx.config or {}, ctx.request_id
         )
+        _budget_raised_by_tier[model] = ctx.output_budget_raised
         # G21's primary-scoped cache params must not leak onto cascade tiers, and
         # cascade probes are non-streaming by construction (plan-time stream guard).
         out.pop("prompt_cache_key", None)
@@ -760,7 +776,17 @@ async def _execute_three_tier_cascade(
             it once without the cap before serving — a self-inflicted truncation must
             not become the customer's answer (DS18 ds18-02: completion stopped at
             exactly the 512 cap mid-proof). Caller-supplied caps are always respected.
+
+            Backlog #60: also the ONE place the disclosed budget-raise is committed.
+            Every exit from this function funnels through here, so restoring from
+            ``_budget_raised_by_tier`` right before returning is what makes the
+            disclosure describe ``final_model`` — the tier that actually answers —
+            regardless of what a later tier's speculative (and possibly failed)
+            evaluation left in ``ctx.output_budget_raised`` in the meantime. The
+            uncapped retry below reuses ``final_model``'s own params, so it needs no
+            separate entry — the restored value already describes it correctly.
             """
+            ctx.output_budget_raised = _budget_raised_by_tier.get(final_model)
             if (
                 final_model == tier1_model
                 and injected_cap is not None

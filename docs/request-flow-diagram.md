@@ -205,7 +205,10 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 **G06: Routing** (`g06_routing.py`)
 - Classifier modes: `heuristic`, `llm_judge`, `cascade`, `routellm`
 - Optional true 3-tier cascade (cheap → confidence check → escalate) with cost-bounded escalation
-- Sets `ctx.routed_model` (may differ from the requested model)
+- Sets `ctx.routed_model` (may differ from the requested model, including its provider on the
+  opt-in cross-provider routing paths) — `ctx.provider_adapter` is re-resolved immediately after
+  this stage (backlog #56, 2026-09-17) so G21's cache alignment and the cache-floor reservation
+  reason about the provider actually serving the request, not the one originally named
 
 **F2: Intent Orchestration** (`middleware/intent_orchestration.py` — OSS core) — *runs right after G06*
 - Classifies the request's intent (heuristic keyword classifier) against the tenant's registered
