@@ -1915,6 +1915,11 @@ async def _serve_core(
             if ctx.model and ctx.routed_model == _failed_tier1 and ctx.model != _failed_tier1:
                 ctx.routed_model = ctx.model
                 ctx.savings.routed_model = ctx.model
+            # Backlog #60 follow-up: cascade tier calls set output_budget_raised as a
+            # side effect of _tier_params / outgoing_params_for; an error fallback means
+            # we'll call the NORMAL path which will re-set it correctly for the actual
+            # model we're about to call. Clear the stale cascade tier disclosure.
+            ctx.output_budget_raised = None
             ctx.savings.routing_mode = "cascade_planned+exec_error"
             logger.warning(
                 "[%s] G06 deferred cascade errored (%s) — falling back to a normal "

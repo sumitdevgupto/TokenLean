@@ -117,6 +117,7 @@ config/local-keys.json.backup.*
 # crash-recovery sidecar and dated operator backups. Tracked copies weaponize
 # the harness self-heal (stale restore on fresh clones / gsutil push on GCP).
 config/.config.yaml.prerun
+config/.config.yaml.prepin
 config/config.yaml.backup.*
 # Rendered per-feature param files (the *.yaml.template are the source of truth)
 config/params/*.yaml

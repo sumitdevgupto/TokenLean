@@ -44,22 +44,25 @@ for a in "$@"; do
   esac
 done
 
-# The backup lives at a STABLE path, not a mktemp one. A run that is KILLED never fires
-# the EXIT trap, so the pinned config stays in place — and with a mktemp backup the next
-# run would then back THAT up as "the original" and faithfully restore it, laundering the
-# pinned config into the operator's real config and silently losing their settings. That
-# happened on 2026-09-10 and ate a local `langfuse_enabled: true`. With a known path, a
-# stranded pin is visible and self-heals on the next run (see restore_stranded below).
-ORIG_BACKUP="config/.config.yaml.prepin"
+# The backup lives at a PID-based path, not a stable one — if two runs overlap,
+# they'll use different backup files and won't interfere. A run that is KILLED never
+# fires the EXIT trap, so the pinned config stays in place; the next run's
+# restore_stranded() will find ANY leftover backup and recover from it.
+ORIG_BACKUP="config/.config.yaml.prepin.$$"
 
-# Self-heal: a leftover backup means a previous run died before restoring. Put the
-# operator's config back BEFORE taking a new backup, so the pinned config is never
-# mistaken for the original.
+# Self-heal: a leftover backup from ANY previous run (regardless of PID) means that
+# run did not restore. Put the operator's config back BEFORE taking a new backup, so
+# the pinned config is never mistaken for the original. Glob for any *.prepin file so
+# a run on a different PID still recovers a sibling's stranded backup.
 restore_stranded() {
-  if [ -f "$ORIG_BACKUP" ]; then
-    info "found $ORIG_BACKUP — a previous run did not restore; recovering your config first"
-    mv -f "$ORIG_BACKUP" config/config.yaml || die "could not restore $ORIG_BACKUP — move it back to config/config.yaml by hand"
-  fi
+  local backup
+  for backup in config/.config.yaml.prepin config/.config.yaml.prepin.*; do
+    if [ -f "$backup" ]; then
+      info "found $backup — a previous run did not restore; recovering your config first"
+      mv -f "$backup" config/config.yaml || die "could not restore $backup — move it back to config/config.yaml by hand"
+      return 0
+    fi
+  done
 }
 
 if [ "$RESTORE_ONLY" = 1 ]; then
