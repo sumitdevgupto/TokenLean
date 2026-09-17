@@ -23,6 +23,57 @@ date changes.
 
 ## 2026-09-17
 
+### A Windows-only defect made the harness run-lock unrecoverable after a crash — Bug fix
+
+The lock that stops two live ablation runs from corrupting each other's config checks
+whether its recorded owner process is still alive before treating an old lock as stale.
+That check is a single `os.kill(pid, 0)`, whose POSIX contract — raise a specific,
+distinguishable error for a pid that no longer exists — does not hold on Windows: a dead
+pid there raises a plain, generic OS error, indistinguishable by type from "something went
+wrong asking." The liveness check landed in the generic branch, so on the one platform this
+harness ships on, a crashed owner (the exact case this exists to catch) was reported alive.
+After a host crash the lock was stuck until a human deleted the file by hand, and the
+launcher's per-dataset loop was silently reporting every subsequent dataset as errored
+rather than surfacing the real cause. Fixed with a Windows-specific liveness check that asks
+the OS directly rather than relying on an exception-type mapping that doesn't hold here.
+
+### A cold-start timeout during local validation reported an unrelated, unexplained failure — Bug fix
+
+The local deploy's health check sends a proxy request with a 10-second timeout; under the
+script's fail-fast mode, a timeout on that one call killed the whole script before the
+branch that would have named the failure, so a freshly restarted proxy that was merely slow
+on its first request printed a generic failure over four other checks that had already
+passed. It now captures a timeout explicitly, retries once, and only reports failure with
+the real reason if the retry also times out.
+
+### A readiness deploy-gate check sent a real vision request for a feature that ships off — Bug fix
+
+The per-group readiness sweep learns which groups are disabled from the deployment's own
+config, but it fetched that map only after every group's probe request had already been
+sent — including a real vision-model call for the multimodal optimizer, which ships
+disabled by default. Every readiness run was paying for one evidence-free request. The
+enabled/disabled map is now fetched before any request goes out, and a disabled group's
+probe is skipped rather than sent and then ignored.
+
+### An operator narrowing which models may reason could keep leaking a reasoning parameter — Bug fix
+
+A provider can name the specific models it allows to reason. One of the two places that
+question gets asked — the one that decides whether the output budget needs extra headroom
+for hidden thinking — read that list; the other, which decides whether to forward a
+reasoning parameter to the provider at all, did not. An operator who narrowed the list to
+protect against one thing (a model getting no output-budget protection) kept doing the
+other (still telling a now-excluded model to reason) on that exact model. Both checks now
+read the same list.
+
+### A private, cross-module function name papered over a coupling that could silently break — Bug fix
+
+The check that decides whether an answer is empty is deliberately shared between where a
+response is cached and where a cached response is served back, so the two can never drift
+apart — but the shared function crossed a module boundary under a private, underscore-prefixed
+name, so a routine internal rename would have broken the read side at import time with
+nothing pointing at why. Promoted to a public name and pinned by a new test that fails
+loudly, at the coupling, if this ever happens again.
+
 ### A zero-choices response body could be cached and replayed forever — Bug fix
 
 The guard that stops an empty answer from being cached checked for no content and no

@@ -317,3 +317,24 @@ def test_seam_survives_an_adapter_that_raises():
     out = outgoing_params_for(ctx, _Exploding(), REASONING_MODEL, ctx.config, "rq-3")
     assert out["max_completion_tokens"] == 1024
     assert ctx.output_budget_raised is None
+
+
+def test_narrowing_reasoning_models_strips_the_param_here_too_backlog_63():
+    """Backlog #63: this seam used to ask ``supports_reasoning(model)`` with NO config —
+    the widest possible answer — while ``reserve_reasoning_headroom`` /
+    ``reasoning_headroom_needed`` ask WITH config, which an operator can narrow via a
+    provider's ``reasoning_models`` list. An operator who narrows that list to pin a
+    SPECIFIC o-series model got the headroom protection correctly withdrawn for every
+    other o-series model, while this seam kept forwarding ``reasoning_effort`` to it
+    anyway — because it never saw the same list.
+
+    Here the operator pins ``reasoning_models`` to a model OTHER than the one routed,
+    so o4-mini should be treated as non-reasoning end to end: no headroom reservation
+    (already correct pre-fix) AND the reasoning params stripped (the bug)."""
+    cfg = _cfg()
+    cfg["providers"] = [{"name": "openai", "reasoning_models": ["o3-pinned-only"]}]
+    ctx = _Ctx({"max_completion_tokens": 1024, "reasoning_effort": "medium"}, cfg)
+    out = outgoing_params_for(ctx, OpenAIAdapter(), REASONING_MODEL, ctx.config, "rq-4")
+    assert "reasoning_effort" not in out
+    assert ctx.output_budget_raised is None
+    assert out["max_completion_tokens"] == 1024

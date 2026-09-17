@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from middleware.g05_cache import _is_empty_answer
+from middleware.g05_cache import is_empty_answer as _is_empty_answer
 from middleware.g18_observability import G18Observability, detect_empty_completion
 
 
@@ -196,6 +196,20 @@ def test_is_empty_answer_never_raises_backlog_79():
                 {"choices": [{"message": "not-a-dict"}]}, {"choices": [{"message": 5}]},
                 "not-a-dict-at-all", None, 42, [], {"choices": None}):
         assert _is_empty_answer(bad) is True, f"should be treated as empty: {bad!r}"
+
+
+def test_is_empty_answer_import_contract_backlog_59():
+    """`main._refuse_empty_cache_hit` reuses THIS function (aliased on import) so the
+    cache write-gate and read-gate can never drift apart — but that only holds while
+    the import resolves to the exact same object. Before backlog #59 it crossed the
+    module boundary under a private (`_`-prefixed) name with nothing pinning the
+    coupling, so a routine rename inside g05_cache would break main.py at import time
+    with no test naming why. Promoted to a public name; this test is the second half —
+    it fails LOUDLY, at the coupling, if a future rename ever breaks it."""
+    import main as proxy_main
+    from middleware.g05_cache import is_empty_answer
+
+    assert proxy_main._is_empty_cached_answer is is_empty_answer
 
 
 @pytest.mark.asyncio

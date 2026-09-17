@@ -68,7 +68,8 @@ from middleware.g00_rate_limit import RateLimitExceeded
 from middleware.g03_doc_pipeline import trigger_doc_ingestion
 # The SAME predicate G05 uses to refuse STORING an empty answer, reused here to refuse
 # SERVING one that is already stored. One definition, so the two sides cannot drift.
-from middleware.g05_cache import _is_empty_answer as _is_empty_cached_answer
+# Public on purpose (backlog #59) — pinned by test_is_empty_answer_import_contract.
+from middleware.g05_cache import is_empty_answer as _is_empty_cached_answer
 from middleware.g13_batch import start_batch_consumer, start_batch_poller
 from middleware.pipeline import OptimisationPipeline
 from middleware import langfuse_tracing

@@ -398,8 +398,17 @@ def _hash_args(args: tuple, kwargs: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _is_empty_answer(response: Dict[str, Any]) -> bool:
+def is_empty_answer(response: Dict[str, Any]) -> bool:
     """True when the response carries no content and no tool calls.
+
+    Public on purpose (backlog #59): ``main._refuse_empty_cache_hit`` imports this
+    function so the cache write-gate and read-gate share one derivation and cannot
+    drift apart. A leading underscore signalled "internal" while a call site outside
+    this module already depended on it; renaming it here now reads as changing a
+    documented API rather than silently breaking an unstated one. The coupling is
+    also pinned by a test (``test_is_empty_answer_import_contract`` in
+    ``test_empty_completion_guard.py``) so a future rename fails loudly at the
+    import, not at the next empty response served from a stale cache entry.
 
     Deliberately NOT keyed on ``finish_reason``: a truncated-to-nothing answer
     (``length``), a model that returned an empty string, and a malformed choice are
@@ -639,7 +648,7 @@ class G05Cache:
         # here is a tenant being served an empty answer for every look-alike question
         # until the L2 TTL expires (default 24h), with the provider never called again
         # and so nothing left to notice it. Independent of any enable flag.
-        if _is_empty_answer(response):
+        if is_empty_answer(response):
             logger.warning(
                 "[%s] G05 refusing to cache an EMPTY answer (finish_reason=%s) — "
                 "caching it would replay the emptiness to every similar question",

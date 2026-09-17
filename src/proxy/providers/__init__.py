@@ -824,7 +824,14 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
     # request that asked for `off` still reasons on a model that cannot disable it, so it
     # still needs output headroom — but at the SMALLEST tier, not the default one.
     requested_effort = outgoing.get("reasoning_effort")
-    if not adapter.supports_reasoning(model):
+    # Backlog #63: this used to ask supports_reasoning(model) with no config — the
+    # widest possible answer — while reserve_reasoning_headroom/reasoning_headroom_needed
+    # ask WITH eff_cfg (narrowable via a provider's `reasoning_models` list). An operator
+    # who narrows that list got the headroom protection withdrawn for a model but kept
+    # sending it reasoning_effort here, because this call site never saw the same list.
+    # eff_cfg is already this call's ctx.config-shaped argument — the same object every
+    # other seam in this function reads from.
+    if not adapter.supports_reasoning(model, eff_cfg):
         for rk in adapter.reasoning_param_keys():
             if outgoing.pop(rk, None) is not None and request_id:
                 logger.debug(
