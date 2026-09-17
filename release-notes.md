@@ -23,6 +23,61 @@ date changes.
 
 ## 2026-09-17
 
+### A stray local file could carry an operator's live configuration into the public repository — Bug fix
+
+The benchmark launcher backs up an operator's configuration file to a fixed, predictable
+path before temporarily pinning a benchmark-specific config, and restores it afterward.
+That backup path was never added to the list of files excluded from version control, so
+if a run were interrupted before cleanup — or simply left the file behind — a routine
+`git add` of the whole tree would stage it, carrying the operator's actual configuration
+into the next push to the public repository. The path is now excluded.
+
+### Two benchmark runs started at the same time could corrupt each other's configuration backup — Bug fix
+
+The same launcher's config backup used one fixed filename regardless of which process
+created it, so two overlapping runs — say, one kicked off before a prior run had finished
+cleaning up — would each try to back up to and restore from the same file, corrupting
+whichever run restored second. The backup path is now unique per process, and recovery
+after an interrupted run now looks for any leftover backup rather than one exact name.
+
+### A cascade routing error could leave a disclosed budget increase describing a tier that was never called — Bug fix
+
+Cascade routing can escalate a request through progressively larger models, and calling a
+tier's model can itself set the flag that discloses a raised output budget as a side
+effect of preparing that tier's call. If that call then failed and the proxy fell back to
+its normal, non-cascade path, the flag from the failed tier attempt was never cleared —
+so a request that cascade never actually served could still carry a disclosure describing
+a budget raised for a model it was never sent to. The fallback path now clears it before
+the normal call re-sets it correctly for the model that actually answers.
+
+### The new Windows run-lock liveness check could misread a 64-bit process handle — Bug fix
+
+The Windows-specific process-liveness check added earlier today calls three low-level OS
+functions directly, and left their expected argument and return types unspecified. Without
+that declaration, the interface used to make the call can default to assumptions that
+don't hold for every value it passes or receives — including the handle these functions
+use to identify the process being checked — on some platform configurations. The three
+function signatures are now declared explicitly so the call behaves the same everywhere
+this harness runs.
+
+### An internal quality check could grade an answer's facts and its tool calls by different rules — Bug fix
+
+When a request has no recorded ground truth to compare against, the check that verifies
+facts survived an optimisation correctly treats the missing baseline as nothing to check —
+but the equivalent check for tool calls did not, and would fail a request for missing
+tools even when there was no ground truth for tools to be measured against either. Both
+now apply the same rule: no recorded baseline means nothing is checked, consistently,
+for both facts and tool calls on the same request.
+
+### The backlog tracker's rebuild script could be silently run unguarded — Bug fix
+
+The script that regenerates the deferred-work tracker file protects several invariants —
+no duplicate item numbers, no lost content, every item left in a valid state — entirely
+through `assert` statements. Assertions are a language feature that can be turned off
+wholesale for an entire run, which would silently remove every one of those protections
+from a script whose whole job is to rewrite a shared tracking file safely. They are now
+ordinary checks that stop the script with a clear error regardless of how it's invoked.
+
 ### An offline re-run of the ablation harness could apply a dataset's config override to the wrong arm — Bug fix
 
 A per-dataset config override is meant to reshape only that dataset's own measurement
