@@ -52,7 +52,15 @@ class LocalFileStorageBackend(StorageBackend):
         self._base = Path(base_dir or os.environ.get("STORAGE_LOCAL_PATH", "token-usage-logs"))
 
     def write(self, path: str, data: str) -> None:
-        dest = self._base / path
+        # `path` embeds a caller-chosen segment (G18's workflow_id), so a `..` in it could
+        # escape the export root — into another tenant's directory, or over an arbitrary
+        # file when the backend is `local`. Resolve and confirm containment before writing;
+        # a traversal is dropped with a warning, never written (the export is best-effort).
+        base = self._base.resolve()
+        dest = (self._base / path).resolve()
+        if base != dest and base not in dest.parents:
+            logger.warning("LocalFileStorageBackend: refusing path outside the export root: %r", path)
+            return
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(data, encoding="utf-8")
         logger.debug("LocalFileStorageBackend: wrote %s", dest)

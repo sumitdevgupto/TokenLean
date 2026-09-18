@@ -49,6 +49,18 @@ class RequestContext:
     # X-Tenant-ID — carries the impersonating (actor) key's own tenant so G18
     # can write an impersonation audit row (I6). None = no impersonation.
     impersonator_tenant_id: Optional[str] = None
+    # ── Authenticated caller identity (stamped by tenancy.resolver.apply_caller_identity) ──
+    # The identity the proxy KEY carries (tenant id for a dict-metadata key, the user for a
+    # legacy key) — never an X-User-ID override, which the caller chooses within its
+    # allowlist. G00 rate-limits on this; user_id stays the attribution id. "" = not stamped
+    # (a context built outside the pipeline), and G00 then falls back to user_id.
+    key_principal: str = ""
+    # True when the key carries the `gateway` flag (auth.api_key_manager.is_gateway_key).
+    is_gateway_key: bool = False
+    # The trusted team: a gateway key's X-Team header, else "default". G00 buckets/limits and
+    # G18 team labels read THIS, never params["x_team"], which stays a raw, caller-chosen
+    # routing hint (G06 rules still match on it).
+    team: str = "default"
     # OpenTelemetry span for the active pipeline trace (set by tracing layer).
     otel_span: Optional[Any] = None
     # Provider adapter — set by OptimisationPipeline early in process_request.

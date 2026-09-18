@@ -8,7 +8,7 @@ from middleware import RequestContext, apply_operator_overlay
 from middleware import cache_floor
 from middleware.g00_rate_limit import G00RateLimit, RateLimitExceeded
 from providers import get_adapter
-from tenancy.resolver import resolve_tenant
+from tenancy.resolver import apply_caller_identity, resolve_tenant
 from tenancy.config import TenantConfigLoader, deep_merge
 from tracing import otel
 from middleware.g01_compression import G01Compression
@@ -207,6 +207,9 @@ class OptimisationPipeline:
         ctx.qdrant_collection = tenant.qdrant_collection
         ctx.pricing_tier = tenant.pricing_tier
         ctx.is_admin_key = key_is_admin
+        # The key-bound principal + the trusted team (gateway keys only) that G00 limits
+        # and G18 labels read — never a header a caller can choose freely.
+        apply_caller_identity(ctx, headers)
         # I6: record actor→target when an admin key impersonates another tenant
         header_tenant = headers.get("x-tenant-id", "").strip()
         if key_is_admin and header_tenant and header_tenant != (key_tenant_id or ""):

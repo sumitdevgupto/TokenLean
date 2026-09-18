@@ -143,12 +143,14 @@ class TestRealCrossProcessAggregation:
 class TestGaugeModesArePinned:
     """A Gauge without an explicit mode silently defaults — catch it at the source."""
 
-    def test_the_four_known_gauges_declare_max(self):
+    def test_the_known_gauges_declare_max(self):
+        # WORKFLOW_TURNS (a Gauge labelled by the unbounded, caller-chosen workflow_id) was
+        # replaced 2026-09-18 by the WORKFLOW_TURN_COUNT histogram (per tenant); the
+        # remaining severity-ladder gauges still report the most severe worker's value.
         from middleware import g18_observability as g18
         from middleware import quality_metrics as qm
 
         for gauge in (
-            g18.WORKFLOW_TURNS,
             g18.CIRCUIT_BREAKER_STATE,
             g18.MODEL_LOCKOUT_STATE,
             qm.CONTEXT_MAX_AGE_SECONDS,

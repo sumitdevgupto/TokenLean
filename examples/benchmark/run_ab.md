@@ -382,3 +382,5 @@ See also [`../../docs/client-onboarding.md`](../../docs/client-onboarding.md).
 | azure/bedrock skipped | Missing extras — set `AZURE_API_BASE`, or `AWS_SECRET_ACCESS_KEY` + `AWS_REGION_NAME`. |
 | exit 3 | A spend cap tripped — raise `--max-spend-per-provider` / `--max-spend` or lower `--limit`. |
 | exit 4 | `--compress-user` was requested but the compression group recorded no step on any prose record. The run measured the DEFAULT side; do not publish it as the compressed side. Usually the LLMLingua sidecar is unreachable from the proxy (`groups.G1_compression.sidecar_url`). |
+| exit 5 | At least one A/B pair raised (e.g. the proxy restarted mid-run) and was not measured. `ab_results.json` says `"complete": false` and lists them in `errored_pairs`. Not a result — fix the cause and re-run. (Before 2026-09-18 this printed ERROR per pair and exited 0.) |
+| exit 1, "did not serve the warm-up request" | Nothing answered `/health`, or the one unmeasured warm-up request failed. Nothing was measured. Check the stack (`docker compose logs proxy`) and the `--proxy-url`. |

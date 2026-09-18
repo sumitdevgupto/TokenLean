@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -26,6 +26,39 @@ from cache.redis_pool import get_redis as _get_redis
 
 logger = logging.getLogger(__name__)
 GROUP = "G18"
+
+
+_OTHER_LABEL = "other"
+
+
+def _allowed_label_values(ctx: RequestContext, dimension: str) -> Optional[set]:
+    """Operator allowlist for a metric label dimension (team|feature), or None.
+
+    Read from ``groups.G18_observability.label_values.<dimension>`` (a list; per-tenant via
+    the operator overlay). None / absent = no allowlist configured → keep today's behaviour
+    (the raw value passes) so a deployment that never sets it is unchanged. An empty LIST is
+    a real, stricter choice: only "default" survives, everything else folds to "other".
+    """
+    try:
+        cfg = (ctx.config.get("groups", {}) or {}).get("G18_observability", {}) or {}
+        lv = cfg.get("label_values")
+        if not isinstance(lv, dict) or dimension not in lv:
+            return None
+        vals = lv.get(dimension)
+        return {str(v) for v in vals} if isinstance(vals, (list, tuple, set)) else None
+    except Exception:
+        return None
+
+
+def _bounded_label(value: str, allowed: Optional[set]) -> str:
+    """Fold an unbounded label value to a bounded one. ``allowed is None`` → unchanged
+    (no allowlist configured). Otherwise the value must be "default" or listed, else
+    ``"other"`` — so a misconfigured gateway (or any caller) cannot grow label cardinality.
+    """
+    v = str(value) if value is not None else "default"
+    if allowed is None or v == "default" or v in allowed:
+        return v
+    return _OTHER_LABEL
 
 
 def detect_empty_completion(ctx: RequestContext, response: Dict[str, Any]) -> None:
@@ -191,15 +224,15 @@ SAVINGS_PCT = Histogram(
     ["tenant_id"],
     buckets=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
 )
-WORKFLOW_TURNS = Gauge(
-    "token_opt_workflow_turns",
-    "Current turn count per workflow",
-    ["workflow_id", "tenant_id"],
-    # Turn counts only ever grow, so the highest value any worker saw IS the count.
-    # "max" also keeps the series label-identical to single-process mode (only the
-    # "all"/"liveall" modes add a `pid` label, which would break dashboards + the
-    # readiness text parser).
-    multiprocess_mode="max",
+WORKFLOW_TURN_COUNT = Histogram(
+    "token_opt_workflow_turn_count",
+    "Distribution of workflow turn counts, per tenant. Replaces the per-`workflow_id` gauge "
+    "`token_opt_workflow_turns` (removed 2026-09-18): `workflow_id` is caller-chosen (body "
+    "`workflow_id` or `X-Workflow-ID`) and unbounded, so labelling by it minted a "
+    "never-evicted series per conversation. Observed on each request that carries a workflow "
+    "id; per-tenant percentiles show turn efficiency without the unbounded label.",
+    ["tenant_id"],
+    buckets=[1, 2, 3, 5, 8, 13, 21, 34, 55, 89],
 )
 TURN_EFFICIENCY_ALERTS = Counter(
     "token_opt_turn_efficiency_alerts_total",
@@ -467,9 +500,14 @@ class G18Observability:
         reasoning_tokens = _u.get("reasoning_tokens", 0) or 0
         apply_cache_usage_to_savings(ctx, _u)
 
-        # Labels
-        team = ctx.params.get("x_team", "default")
-        feature = ctx.params.get("x_feature", "default")
+        # Labels. `team`/`feature` used to be the raw x_team/x_feature params — any caller
+        # value, so each distinct one minted a new (never-evicted) child series on every
+        # counter below (unbounded cardinality → proxy memory + scrape size grow forever).
+        # Now: team is the TRUSTED team (ctx.team — a gateway key's X-Team, else "default");
+        # feature is bounded to an operator allowlist, everything else folded to "other".
+        team = _bounded_label(getattr(ctx, "team", "") or "default", _allowed_label_values(ctx, "team"))
+        feature = _bounded_label(ctx.params.get("x_feature", "default"),
+                                 _allowed_label_values(ctx, "feature"))
         model = ctx.routed_model
         tenant_id = ctx.tenant_id
 
@@ -594,7 +632,9 @@ class G18Observability:
             workflow_id = ctx.params.get("workflow_id") or ctx.params.get("x_workflow_id")
             if workflow_id:
                 turn_count = ctx.params.get("_token_budget", {}).get("workflow_turn", 0)
-                WORKFLOW_TURNS.labels(workflow_id=workflow_id, tenant_id=tenant_id).set(turn_count)
+                # Observed per tenant, NOT labelled by the caller-chosen workflow_id.
+                if turn_count:
+                    WORKFLOW_TURN_COUNT.labels(tenant_id=tenant_id).observe(turn_count)
 
         # ── Turn Efficiency KPI ──
         if cfg.get("turn_efficiency_enabled", True):

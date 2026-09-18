@@ -327,3 +327,80 @@ class TestTenantOverviewDashboard:
     def test_tenant_overview_uid_present(self):
         d = _load_dashboard("tenant-overview.json")
         assert d.get("uid")
+
+
+# ── Value-coloured stat panels must declare their thresholds (2026-09-18) ─────
+# A stat/gauge panel with no `fieldConfig.defaults.thresholds` does not render neutral: it
+# inherits Grafana's default steps (base green, RED at >= 80). So "Uptime 100%" rendered red on
+# the SLA dashboard, and so did every count or total above 80 on the others - a healthy value
+# painted as an alarm. The guard is generic, not a check on the one panel that was noticed.
+
+_PITCH_DASHBOARD_DIR = DASHBOARD_DIR.parent.parent / "pitch-test-plan" / "dashboard" / "dashboards"
+
+
+def _stat_panels_colouring_by_value(dashboard: dict):
+    def walk(panels):
+        for p in panels or []:
+            yield p
+            yield from walk(p.get("panels"))
+    for p in walk(dashboard.get("panels")):
+        if p.get("type") not in ("stat", "gauge", "bargauge"):
+            continue
+        colour_mode = (p.get("options") or {}).get(
+            "colorMode", "value" if p.get("type") == "stat" else None)
+        field = (p.get("fieldConfig") or {}).get("defaults") or {}
+        if colour_mode == "none" or (field.get("color") or {}).get("mode") in ("fixed", "palette-classic"):
+            continue
+        yield p
+
+
+def _dashboards_with_copies():
+    paths = sorted(DASHBOARD_DIR.glob("*.json"))
+    if _PITCH_DASHBOARD_DIR.exists():      # internal copies; gitignored in the OSS tree
+        paths += sorted(_PITCH_DASHBOARD_DIR.glob("*.json"))
+    return paths
+
+
+class TestStatPanelsDeclareThresholds:
+    @pytest.mark.parametrize("path", _dashboards_with_copies(), ids=lambda p: f"{p.parent.parent.parent.name}/{p.name}")
+    def test_no_value_coloured_panel_falls_back_to_grafanas_red_at_80(self, path):
+        d = json.loads(path.read_text(encoding="utf-8"))
+        missing = []
+        for p in _stat_panels_colouring_by_value(d):
+            fc = p.get("fieldConfig") or {}
+            declared = bool((fc.get("defaults") or {}).get("thresholds", {}).get("steps"))
+            overridden = any(pp.get("id") == "thresholds"
+                             for o in fc.get("overrides", []) for pp in o.get("properties", []))
+            if not (declared or overridden):
+                missing.append(p.get("title"))
+        assert not missing, (
+            f"{path.name}: {missing} colour by value with no thresholds, so Grafana paints any "
+            "value >= 80 red. Declare real steps, or one neutral step if the number has no "
+            "good/bad direction.")
+
+    @staticmethod
+    def _colour_for(steps, value):
+        colour = None
+        for s in steps:
+            if s.get("value") is None or value >= s["value"]:
+                colour = s["color"]
+        return colour
+
+    def test_uptime_is_green_when_healthy_and_red_when_not(self):
+        d = _load_dashboard("sla.json")
+        panel = next(p for p in d["panels"] if p.get("title") == "Uptime %")
+        steps = panel["fieldConfig"]["defaults"]["thresholds"]["steps"]
+        assert self._colour_for(steps, 100) == "green"
+        assert self._colour_for(steps, 99.6) == "green"
+        assert self._colour_for(steps, 99.2) == "yellow"
+        assert self._colour_for(steps, 97.0) == "red"
+
+    def test_uptime_steps_mirror_the_error_rate_panel(self):
+        """Uptime is 100 - error rate over the same 5xx definition, so the two panels must not
+        disagree about the same traffic (error 0.5% -> yellow, 1% -> red)."""
+        d = _load_dashboard("sla.json")
+        uptime = next(p for p in d["panels"] if p.get("title") == "Uptime %")
+        err = next(p for p in d["panels"] if p.get("title") == "Error Rate (%)")
+        u = {s["color"]: s["value"] for s in uptime["fieldConfig"]["defaults"]["thresholds"]["steps"]}
+        e = {s["color"]: s["value"] for s in err["fieldConfig"]["defaults"]["thresholds"]["steps"]}
+        assert 100 - u["green"] == e["yellow"] and 100 - u["yellow"] == e["red"]

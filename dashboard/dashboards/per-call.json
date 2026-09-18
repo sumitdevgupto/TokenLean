@@ -119,6 +119,15 @@
           "unit": "percent",
           "color": {
             "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
           }
         }
       }
@@ -154,7 +163,16 @@
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
-          "decimals": 6
+          "decimals": 6,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         }
       }
     },
@@ -188,7 +206,16 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "string"
+          "unit": "string",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         }
       }
     },
@@ -222,7 +249,16 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "string"
+          "unit": "string",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         }
       }
     },

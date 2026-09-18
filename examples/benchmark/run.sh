@@ -6,10 +6,10 @@
 # starts (and can rebuild) the local stack, then runs the benchmark. Depends only
 # on the repo's docker-compose.yml + config template — not on scripts/.
 #
-#   ./examples/benchmark/run.sh                  # run (starts stack if needed)
-#   ./examples/benchmark/run.sh --rebuild        # rebuild images first (REQUIRED the first
-#                                                #   time after updating proxy code, e.g. the
-#                                                #   G06 routing fix this benchmark relies on)
+#   ./examples/benchmark/run.sh                  # run (starts stack if needed; the proxy image
+#                                                #   is always rebuilt from your checkout - a
+#                                                #   cached no-op when nothing changed)
+#   ./examples/benchmark/run.sh --rebuild        # rebuild EVERY image, not just the proxy
 #   ./examples/benchmark/run.sh --quality-check  # also assert each answer's curated facts
 #                                                #   (proves the savings did not hurt quality)
 #   ./examples/benchmark/run.sh --limit 5        # pass-through args go to run_benchmark.py
@@ -18,6 +18,10 @@
 #                                                #   enables the six groups this benchmark
 #                                                #   measures, so the result never depends on
 #                                                #   whatever groups happen to be toggled on.
+#
+# Exit status is the runner's: 0 = complete (gate passed if asked), 1 = nothing measured,
+# 2 = quality gate failed, 3 = INCOMPLETE (a request failed - not a result).
+# With --ab: 2 = fact regression, 3 = spend cap, 4 = asked-for lever never fired, 5 = incomplete.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,34 +48,45 @@ for a in "$@"; do
   esac
 done
 
-# The backup lives at a PID-based path, not a stable one — if two runs overlap,
-# they'll use different backup files and won't interfere. A run that is KILLED never
-# fires the EXIT trap, so the pinned config stays in place; the next run's
-# restore_stranded() will find ANY leftover backup and recover from it.
-ORIG_BACKUP="config/.config.yaml.prepin.$$"
+# Backups live INSIDE the directory config/.config.yaml.prepin/, one PID-named file per run, so
+# overlapping runs never share one. The DIRECTORY is what .gitignore excludes. The 2026-09-17
+# rename put them at `config/.config.yaml.prepin.<pid>` - a sibling FILE that ignore line does
+# not match - and checkin-push.sh stages the public repo with `git add -A`, so a leftover or
+# in-flight backup of the operator's live config was one routine commit away from the public
+# repo (2026-09-18). A run that is KILLED never fires the EXIT trap, so the pinned config stays
+# in place; the next run's restore_stranded() finds ANY run's leftover backup and recovers it.
+BACKUP_DIR="config/.config.yaml.prepin"
+ORIG_BACKUP="$BACKUP_DIR/$$.yaml"
 
-# Self-heal: a leftover backup from ANY previous run (regardless of PID) means that
-# run did not restore. Put the operator's config back BEFORE taking a new backup, so
-# the pinned config is never mistaken for the original. Glob for any *.prepin file so
-# a run on a different PID still recovers a sibling's stranded backup.
+# The first leftover backup from ANY run, in every layout this launcher has ever written.
+stranded_backup() {
+  local b
+  for b in "$BACKUP_DIR"/*.yaml config/.config.yaml.prepin.* "$BACKUP_DIR"; do
+    if [ -f "$b" ]; then printf '%s\n' "$b"; return 0; fi
+  done
+  return 1
+}
+
+# Self-heal: a leftover backup means that run did not restore. Put the operator's config back
+# BEFORE taking a new backup, so the pinned config is never mistaken for the original.
 restore_stranded() {
   local backup
-  for backup in config/.config.yaml.prepin config/.config.yaml.prepin.*; do
-    if [ -f "$backup" ]; then
-      info "found $backup — a previous run did not restore; recovering your config first"
-      mv -f "$backup" config/config.yaml || die "could not restore $backup — move it back to config/config.yaml by hand"
-      return 0
-    fi
-  done
+  backup="$(stranded_backup)" || return 0
+  info "found $backup — a previous run did not restore; recovering your config first"
+  mv -f "$backup" config/config.yaml || die "could not restore $backup — move it back to config/config.yaml by hand"
+  rmdir "$BACKUP_DIR" 2>/dev/null || true
 }
 
 if [ "$RESTORE_ONLY" = 1 ]; then
-  if [ -f "$ORIG_BACKUP" ]; then
+  # Any run's backup, not this process's: $ORIG_BACKUP carries THIS run's PID, so a killed
+  # run's backup is never at that path and the old `-f "$ORIG_BACKUP"` test made --restore
+  # report "nothing to restore" in exactly the case it exists for (2026-09-18).
+  if stranded_backup >/dev/null; then
     restore_stranded
     docker compose restart proxy >/dev/null 2>&1 || true
     info "config restored."
   else
-    info "nothing to restore — no $ORIG_BACKUP present."
+    info "nothing to restore — no leftover backup under $BACKUP_DIR/."
   fi
   exit 0
 fi
@@ -125,36 +140,23 @@ if [ -z "$key" ] && [ ! -f config/local-keys.json ]; then
 fi
 [ -n "$key" ] || die "No proxy key found and config/local-keys.json already exists (hashes are one-way). Set PROXY_API_KEY, add ROI_PROXY_API_KEY_* to .env, or run: bash scripts/local/deploy-local.sh"
 
-# 5. Ensure the stack is up (build so code changes are picked up) ---------------
+# 5. Pin the config, THEN bring the stack up --------------------------------------
+# Order matters on a cold stack (2026-09-18). The launcher used to start the stack on the
+# operator's config, wait for health, THEN pin and restart the proxy - two cold starts, the
+# first one's warm-up thrown away (and on a fresh volume, its first model download with it).
+# Pinning first means a stack that is not running starts exactly once, on the pinned config.
+# A proxy that was already running still needs one restart to load it; nothing else does.
+#
+# What is pinned and why: examples/benchmark/pin_config.py (shared with run.ps1). The
+# original config is restored and the proxy reloaded on exit, even on failure or Ctrl-C.
+# Opt out with --no-pin-config to measure the live config as-is.
 healthy() { curl -fsS http://localhost:4000/health >/dev/null 2>&1; }
-if [ "$REBUILD" = 1 ]; then
-  info "building + (re)starting stack (docker compose up -d --build)..."
-  docker compose up -d --build || die "docker compose up failed. Try: bash scripts/local/deploy-local.sh"
-elif healthy; then
-  info "proxy already healthy on :4000 (pass --rebuild to pick up code changes)"
-else
-  info "starting stack (docker compose up -d) - builds images only if missing..."
-  docker compose up -d || die "docker compose up failed. Try: bash scripts/local/deploy-local.sh"
-fi
-if ! healthy; then
-  info "waiting for proxy health..."
-  ok=0; for _ in $(seq 1 40); do if healthy; then ok=1; break; fi; sleep 3; done
-  [ "$ok" = 1 ] || die "proxy did not become healthy in ~2min. Check: docker compose logs proxy"
-fi
-info "proxy healthy"
-
-# 5b. Pin a known-good benchmark config ----------------------------------------
-# The benchmark only measures techniques it can credit honestly black-box, and it
-# can only do that if those groups are actually enabled. Rather than trust whatever
-# config happens to be loaded (a config with these groups OFF silently reports a
-# gutted pipeline), we pin a config derived from config.yaml.template (the calibrated
-# baseline) with the six measured groups force-enabled — G01 compression, G05 cache,
-# G06 routing, G08 lazy tools, G19 pruning, G22 dedup. G28 CCR is force-DISABLED: in a
-# pass-through chat completion (no agent loop) it replaces an over-threshold system
-# prompt with a CCR reference token the model can't resolve, shredding the policy facts
-# the answers depend on — and it isn't one of the six measured techniques anyway.
-# The original config is restored and the proxy reloaded on exit, even on failure or
-# Ctrl-C. Opt out with --no-pin-config to measure the live config as-is.
+proxy_started_at() { docker inspect -f '{{.State.StartedAt}}' token-opt-proxy 2>/dev/null || true; }
+wait_healthy() {
+  local tries="$1" ok=0
+  for _ in $(seq 1 "$tries"); do if healthy; then ok=1; break; fi; sleep 3; done
+  [ "$ok" = 1 ]
+}
 PINNED=0
 restore_config() {
   local rc=$?
@@ -163,6 +165,7 @@ restore_config() {
     info "restoring original proxy config + reloading proxy..."
     if [ -f "$ORIG_BACKUP" ]; then
       mv -f "$ORIG_BACKUP" config/config.yaml || info "config restore failed (pinned config left in place; rerun to self-heal from $ORIG_BACKUP)"
+      rmdir "$BACKUP_DIR" 2>/dev/null || true
     else
       info "no pre-existing config.yaml — leaving benchmark config in place (matches first-run)"
     fi
@@ -175,106 +178,44 @@ restore_config() {
 # whole point of the stable backup is that the paths we cannot trap still recover.
 trap restore_config EXIT INT TERM
 
-
 if [ "$PIN_CONFIG" = 1 ]; then
   [ -f config/config.yaml.template ] || die "config/config.yaml.template missing — cannot pin benchmark config (use --no-pin-config to skip)."
   restore_stranded
   if [ -f config/config.yaml ]; then
-    cp config/config.yaml "$ORIG_BACKUP" || die "could not write $ORIG_BACKUP — refusing to pin without a recoverable backup."
+    { mkdir -p "$BACKUP_DIR" && cp config/config.yaml "$ORIG_BACKUP"; } \
+      || die "could not write $ORIG_BACKUP — refusing to pin without a recoverable backup."
   fi
   info "pinning benchmark config (enabling G01/G05/G06/G08/G19/G22; disabling G28 CCR)..."
-  python - <<'PY' || die "failed to generate pinned benchmark config."
-import yaml
-c = yaml.safe_load(open('config/config.yaml.template')) or {}
-groups = c.setdefault('groups', {})
-# The six techniques this benchmark measures black-box.
-enable = ['G1_compression', 'G5_cache', 'G6_routing', 'G8_tools',
-          'G19_headroom', 'g22_deduplication']
-# G28 CCR shreds an over-threshold system prompt into an unresolvable reference
-# token in pass-through mode (no agent loop to retrieve it) — keep it off.
-disable = ['G28_ccr']
-created = []
-def _block(k):
-    blk = groups.get(k)
-    if not isinstance(blk, dict):
-        blk = {}
-        groups[k] = blk
-        created.append(k)
-    return blk
-for k in enable:
-    _block(k)['enabled'] = True
-for k in disable:
-    _block(k)['enabled'] = False
-# Agentic lever (G08/G16 tool-catalogue pruning). Safe to enable globally: the
-# standard/cache workloads carry no tools and <=32-token system prompts, so G16 is a no-op
-# there; it only bites on the --workload agentic tool-heavy episodes.
-_block('G8_tools').update({'enabled': True, 'max_tools_per_agent': 20})
-# The system-prompt cap is deliberately NOT pinned here (2026-09-06). It used to be set to
-# 800 against a shipped default of 4096, and every BFCL episode carries a ~1,046-token system
-# prompt — so the cap fired on all 15 and contributed 7.22 percentage points of agentic savings
-# that nobody running a default install would ever see. This benchmark's whole claim is that a
-# skeptic can reproduce it, so it now runs the shipped default and reports whatever that gives.
-_block('G16_agent_arch').update({'enabled': True, 'max_tools_per_agent': 20})
-# Provider-aware G06 routing. The template's tiers are OpenAI-only
-# (simple->gpt-4o-mini, ...), so a non-OpenAI `--ab --providers <p>` request
-# would be silently rerouted to gpt-4o-mini and the A/B would compare two
-# different models. Set the tiers to the *target* provider's own model ladder so
-# G06 cascades within that provider. The OpenAI (default) path is left untouched
-# so its calibrated numbers stay byte-identical; a mixed/`all` run disables G06
-# (one static tier map can't route each provider within its own family).
-import os as _os
-_provs = _os.environ.get('AB_PROVIDERS', 'openai')
-try:
-    import sys as _sys
-    _sys.path.insert(0, 'examples/benchmark')
-    from run_ab import g06_pin_plan, resolve_providers
-    _action, _tiers = g06_pin_plan(resolve_providers(_provs))
-except Exception as _e:                       # fail safe: keep template tiers
-    _action, _tiers = 'keep', None
-    print(f"  note: G06 provider-aware pin skipped ({_e!r}); keeping template tiers")
-# The benchmark drives its OWN routing via the flat `tiers` map + g06_pin_plan (models
-# guaranteed present in prices.json), so drop the template's per-provider ladders — their
-# declared models aren't necessarily priced in the benchmark's prices.json and would crash
-# arm-B pricing on an escalation. Production keeps tiers_by_provider; the harness doesn't.
-_block('G6_routing').pop('tiers_by_provider', None)
-if _action == 'disable':
-    _block('G6_routing')['enabled'] = False
-    print(f"  G06 routing: DISABLED for mixed providers '{_provs}' (pass-through — no misroute)")
-elif _action == 'tiers':
-    _block('G6_routing')['tiers'] = _tiers
-    print(f"  G06 routing: tiers set to '{_provs}' ladder {_tiers}")
-else:
-    print(f"  G06 routing: template tiers kept (providers='{_provs}')")
-# G00 rate-limiting is a production THROUGHPUT guard, not a token-savings lever. The
-# --workload cache burst fires ~500 requests back-to-back (well over the template's
-# 60/min default), so the un-pinned limit 429s most of arm B and corrupts the
-# measurement. Lift the ceiling for the controlled benchmark burst so every request
-# reaches the pipeline (savings are unaffected — throttled vs served changes nothing
-# about per-request token counts). Only the coarse `default` bucket is widened.
-rl = c.setdefault('rate_limit', {})
-rl['enabled'] = True
-rl.setdefault('default', {}).update({'requests_per_minute': 100000,
-                                     'requests_per_hour': 1000000})
-# G01 LLMLingua sidecar URL: the template defaults to the DEPLOYED service name
-# (`llmlingua-svc`, the GCP/Cloud-Run convention where the 54.1% was measured), but the
-# local docker-compose.yml names the service `llmlingua` (no -svc alias) — so G01's
-# compression calls silently DNS-fail here and the RAG-compression lever never fires.
-# Point it at the compose service so the large multi-doc RAG contexts actually compress.
-_block('G1_compression')['sidecar_url'] = 'http://llmlingua:8080/compress'
-c.setdefault('services', {})['llmlingua_url'] = 'http://llmlingua:8080/compress'
-yaml.safe_dump(c, open('config/config.yaml', 'w'), sort_keys=False)
-if created:
-    print("  note: created missing group blocks:", ", ".join(created))
-print("  pinned config written; six groups + G16 agentic pruning enabled, G28 CCR disabled,")
-print("  G00 burst headroom raised, G01 LLMLingua sidecar pointed at the local compose service")
-PY
-  PINNED=1
-  info "reloading proxy to load pinned config..."
-  docker compose restart proxy >/dev/null 2>&1 || die "proxy restart failed while pinning config."
-  ok=0; for _ in $(seq 1 40); do if healthy; then ok=1; break; fi; sleep 3; done
-  [ "$ok" = 1 ] || die "proxy did not become healthy after pinning config. Check: docker compose logs proxy"
-  info "pinned benchmark config active"
+  PINNED=1   # before the write: a half-written pin must still be restored on exit
+  python examples/benchmark/pin_config.py --operator-config "$ORIG_BACKUP" --providers "$AB_PROVIDERS" \
+    || die "failed to generate pinned benchmark config."
 fi
+
+# The proxy image is rebuilt from the checked-out source on every run. Docker's layer cache
+# makes that a no-op when nothing changed; without it a stack built before a `git pull`
+# keeps measuring the old code with nothing to say so (2026-09-18: the calibration run was
+# four proxy commits behind). A failed build (e.g. offline) warns and uses what exists.
+before="$(proxy_started_at)"
+if [ "$REBUILD" = 1 ]; then
+  info "building + (re)starting stack (docker compose up -d --build)..."
+  docker compose up -d --build || die "docker compose up failed. Try: bash scripts/local/deploy-local.sh"
+else
+  info "building the proxy image from your checkout (cached no-op if unchanged)..."
+  docker compose build --quiet proxy \
+    || info "WARNING: proxy image build failed - measuring the EXISTING image, which may not match your checkout."
+  info "starting stack (docker compose up -d)..."
+  docker compose up -d || die "docker compose up failed. Try: bash scripts/local/deploy-local.sh"
+fi
+info "waiting for proxy health..."
+wait_healthy 40 || die "proxy did not become healthy in ~2min. Check: docker compose logs proxy"
+after="$(proxy_started_at)"
+if [ "$PINNED" = 1 ] && [ -n "$before" ] && [ "$before" = "$after" ]; then
+  # Same process as before the pin: it is still running the operator's config.
+  info "reloading the already-running proxy to load the pinned config..."
+  docker compose restart proxy >/dev/null 2>&1 || die "proxy restart failed while pinning config."
+  wait_healthy 40 || die "proxy did not become healthy after pinning config. Check: docker compose logs proxy"
+fi
+if [ "$PINNED" = 1 ]; then info "proxy healthy (pinned benchmark config active)"; else info "proxy healthy"; fi
 
 # 6. Clear the RUN's tenant prior-run keys (only its own data) -----------------
 # The flush must target the tenant the run ACTUALLY executes under, not the label
@@ -347,8 +288,16 @@ if [ "$RUN_AB" = 1 ]; then
   # Mirror the proxy's LLM_KEY_OPENAI to OPENAI_API_KEY so arm A can authenticate.
   export OPENAI_API_KEY="${OPENAI_API_KEY:-$openai}"
   info "running A/B benchmark (proxy vs direct)..."
-  python examples/benchmark/run_ab.py --api-key "$key" --tenant "$BENCH_TENANT" ${ARGS[@]+"${ARGS[@]}"}
+  RUNNER=(python examples/benchmark/run_ab.py)
 else
   info "running benchmark..."
-  python examples/benchmark/run_benchmark.py --api-key "$key" --tenant "$BENCH_TENANT" ${ARGS[@]+"${ARGS[@]}"}
+  RUNNER=(python examples/benchmark/run_benchmark.py)
 fi
+# The sidecar URL goes BEFORE the pass-through args, so a --sidecar-url of your own wins.
+# The exit status is captured explicitly and handed to the EXIT trap, which restores the
+# config and then exits with it - a failed or incomplete run must never read as success.
+rc=0
+"${RUNNER[@]}" --api-key "$key" --tenant "$BENCH_TENANT" \
+  --sidecar-url "http://localhost:8080/compress" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+[ "$rc" = 0 ] || info "run finished with exit status $rc (see the runner's output above)"
+exit "$rc"

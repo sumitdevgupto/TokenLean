@@ -166,6 +166,20 @@ def is_admin_key(metadata: Optional[dict]) -> bool:
     return bool(isinstance(metadata, dict) and metadata.get("admin"))
 
 
+def is_gateway_key(metadata: Optional[dict]) -> bool:
+    """Return True when a validated key belongs to a customer's API gateway.
+
+    A gateway stamps ``X-Team`` on every request, overwriting whatever the calling app
+    sent, so only such a key's ``X-Team`` may select a G00 bucket, a ``per_team`` limit or
+    a team metric label (``tenancy.resolver.resolve_team``); any other key is team
+    ``"default"``. Set at issuance only (``create_key(gateway=True)`` /
+    ``issue-key.sh --gateway``) — never through ``create_key(extra=…)``. Strictly a JSON
+    ``true``: a trust flag must not be switched on by a stray truthy string. Legacy
+    string-format keys (metadata is None) are never gateway keys.
+    """
+    return bool(isinstance(metadata, dict) and metadata.get("gateway") is True)
+
+
 def is_suspended(metadata: Optional[dict]) -> bool:
     """Return True when a validated key is flagged suspended in its metadata.
 
@@ -326,6 +340,8 @@ def create_key(
     admin: bool = False,
     raw_key: Optional[str] = None,
     extra: Optional[dict] = None,
+    *,
+    gateway: bool = False,
 ) -> Tuple[str, str, dict]:
     """Create a proxy key for a tenant, persist it, refresh the cache.
 
@@ -334,6 +350,8 @@ def create_key(
     Pass ``raw_key`` only for deterministic tests; production always auto-generates.
     ``extra`` merges additional metadata fields (e.g. ``owner_domain`` for the
     per-tenant X-User-ID allowlist — WS25); reserved keys are not overridable.
+    ``gateway`` marks the key as a customer API gateway's (see ``is_gateway_key``); like
+    ``admin`` it is a trust flag, so it is reserved in ``extra`` and set only here.
     """
     tenant_id = (tenant_id or "").strip()
     if not tenant_id:
@@ -344,7 +362,7 @@ def create_key(
     if isinstance(extra, dict):
         metadata.update({k: v for k, v in extra.items()
                          if k not in ("tenant_id", "tier", "created_at", "admin", "suspended",
-                                      "contract_inactive", "ip_allowlist")})
+                                      "contract_inactive", "ip_allowlist", "gateway")})
     metadata.update({
         "tenant_id": tenant_id,
         "tier": (tier or "free").strip().lower(),
@@ -352,6 +370,8 @@ def create_key(
     })
     if admin:
         metadata["admin"] = True
+    if gateway:
+        metadata["gateway"] = True
     with _STORE_WRITE_LOCK:
         store = _load_full_store()
         if key_hash in store:
@@ -483,7 +503,7 @@ def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
 
     Single load-modify-persist under the store lock, so there is never a window with
     zero valid keys nor one where both old and new coexist across a crash. The new key
-    inherits tier/admin from the newest existing key; a suspended tenant stays
+    inherits tier/admin/gateway from the newest existing key; a suspended tenant stays
     suspended (rotation must not be a self-unsuspend loophole).
     Returns ``(raw_key, key_hash, metadata, revoked_count)``. Raises ValueError when
     the tenant has no keys.
@@ -510,10 +530,14 @@ def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
         # Carry over extra metadata (owner_domain etc.) so rotation doesn't drop
         # the per-tenant X-User-ID allowlist or other stamped fields.
         for k, v in newest.items():
-            if k not in metadata and k not in ("admin", "suspended"):
+            if k not in metadata and k not in ("admin", "suspended", "gateway"):
                 metadata[k] = v
         if newest.get("admin"):
             metadata["admin"] = True
+        # Trust flags are carried explicitly, never as a generic extra: a rotated gateway key
+        # stays a gateway key, and only a strict JSON true survives (is_gateway_key).
+        if newest.get("gateway") is True:
+            metadata["gateway"] = True
         if any(e.get("suspended") for e in old.values()):
             metadata["suspended"] = True
         for h in old:

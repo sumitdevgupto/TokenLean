@@ -34,12 +34,38 @@ LLM_KEY_OPENAI=sk-...        # NOTE: LLM_KEY_OPENAI, not OPENAI_API_KEY
 ```
 
 > Want a quick, cheap check first? Append `--limit 5` to run just 5 requests.
-> After changing proxy code, append `--rebuild` to rebuild the image before running.
+> The proxy image is rebuilt from your checkout on every run (a cached no-op when
+> nothing changed), so a `git pull` is picked up automatically; `--rebuild` rebuilds
+> every image, not just the proxy.
 > Add `--quality-check` to assert each answer still contains its required policy
 > facts (no extra cost); add `--judge` for an opt-in LLM faithfulness score.
 
+**Both launchers behave the same** — config pin, restore, exit status. (Until
+2026-09-18 `run.ps1` had no config pin, so a Windows run measured whatever
+`config/config.yaml` held and could not reproduce the figure below.)
+
+**Exit status — a run either completed or it is not a result:**
+
+| Code | Meaning |
+|---|---|
+| `0` | every request answered (and, with `--quality-check`, the facts gate passed) |
+| `1` | nothing measured — bad arguments, or the proxy never served the warm-up request |
+| `2` | complete run, **quality gate failed** |
+| `3` | **INCOMPLETE** — at least one request failed; no savings figure is printed and `last_run.json` says `"complete": false` |
+
+With `--ab`: `2` = a fact regression, `3` = spend cap, `4` = a requested lever never fired,
+`5` = incomplete (an A/B pair errored). If a run is interrupted and leaves your config pinned,
+`run.sh --restore` / `run.ps1 --restore` puts it back.
+
+> **Recording or demoing?** Turn off Docker Desktop's automatic updates first. On
+> 2026-09-18 an auto-update restarted the engine mid-run and killed every container; the
+> launcher now reports that as INCOMPLETE (exit 3) instead of printing a number.
+
 The benchmark runs under a **dedicated tenant** (`bench`, sent via the
 `X-Tenant-ID` header), so every key it creates is namespaced under `t:bench:`.
+(That holds for an **admin** key — the one the launcher generates on a first run. A
+non-admin key runs under its own tenant whatever the header says; the launcher detects
+this, tells you, and flushes that tenant's namespace instead.)
 By default the launcher **clears that tenant's prior-run keys** first (via
 `clear-cache.sh`/`.ps1`, which deletes only `t:bench:*`) so each run measures real
 optimisation instead of replaying a warm cache — otherwise a second run would
@@ -64,17 +90,23 @@ breakdown** (which techniques earned the savings). Full detail is written to
 ### What the launcher checks / does for you
 - **Docker** installed and running.
 - **`.env` has `LLM_KEY_OPENAI`** set (fails fast with a clear message if empty).
-- **Stack health** on `http://localhost:4000/health` — runs `docker compose up -d`
-  and waits (~90s) if the proxy isn't already up; skips if it is.
-- **Pinned config** — before the run it pins a known-good config (derived from
-  `config.yaml.template` with the six measured groups enabled: G01, G05, G06, G08,
-  G19, G22, and **G28 CCR disabled** — in pass-through it replaces an over-threshold
-  system prompt with a reference token the model can't resolve, which would shred
-  answer quality) and reloads the proxy, then **restores your original config and
-  reloads** on exit — even on failure or Ctrl-C. This guarantees the benchmark
-  measures the pipeline it claims to, instead of silently reporting a gutted result
-  when those groups happen to be disabled. Pass `--no-pin-config` to measure the
-  live config as-is.
+- **Pinned config, applied BEFORE the stack starts** — it pins a known-good config
+  (`pin_config.py`, shared by both launchers: derived from `config.yaml.template` with the
+  six measured groups enabled: G01, G05, G06, G08, G19, G22, and **G28 CCR disabled** — in
+  pass-through it replaces an over-threshold system prompt with a reference token the model
+  can't resolve, which would shred answer quality), then **restores your original config
+  and reloads** on exit — even on failure or Ctrl-C. Pinning first means a cold stack
+  starts once, on the pinned config; only a proxy that was already running is restarted.
+  One setting follows *your* config rather than the template: whether Langfuse tracing is
+  on (reporting only — it moves no token count). Pass `--no-pin-config` to measure the live
+  config as-is.
+- **Stack health, then a warm-up that must succeed** — `docker compose up -d`, wait for
+  `http://localhost:4000/health`, then load the LLMLingua sidecar's model directly and send
+  one unmeasured request through the proxy. No timed request is sent until that warm-up has
+  been served (on a first run the model downloads can take a few minutes). A timed request
+  that never reached the proxy (connection refused while it restarts) is sent again once it
+  is healthy; one that reached it and then died is not — it may already have run the
+  pipeline — so it fails the run instead.
 - **Proxy key** — uses `$PROXY_API_KEY`, else a `tok-...` from `ROI_PROXY_API_KEY_*`
   in `.env`. No keys yet? Generate them with `bash scripts/local/deploy-local.sh`.
 
@@ -92,9 +124,10 @@ python examples/benchmark/run_benchmark.py   # --limit N / --model / --proxy-url
 
 A realistic **DevOps/support** workload (`dataset.jsonl`, 36 requests), deliberately
 shaped so that *each* safe, quality-preserving stage of the pipeline actually fires —
-not just the response cache. The **system instruction is always preserved verbatim**
-(`compress_system_prompt` stays off — that's the quality guard); compression is applied
-only to the developer/user-side content that can safely take it:
+not just the response cache. The **system instruction is never compressed**
+(`compress_system_prompt` stays off — that's the quality guard; on the structured-data
+requests G19 collapses its blank lines, never its words); compression is applied only to the
+developer/user-side content that can safely take it:
 
 | Scenario | Requests | Technique exercised |
 |---|---|---|
@@ -116,28 +149,37 @@ report exactly what the quality-preserving pipeline yields.
 
 > **Scope vs the 54.1% headline.** The 54.1% figure is a **quality-gated blend across a
 > broader multi-dataset ablation** — only datasets whose answer quality held (temperature-0,
-> reproducible) are counted toward it. This example is a *single* workload, so its number
-> differs — but it is computed the **same way**, so it's comparable in kind. We report
+> reproducible) are counted toward it — and it carries a caveat and a 2026-09-09 re-measurement
+> in the root README; read it there, not here. This example is a *single* workload, so its
+> number differs — but it is computed the **same way**, so it's comparable in kind. We report
 > whatever this dataset actually yields; we do **not** tune the data to hit a target.
 
 ## Calibrated result
 
-Local calibration run (gpt-4o-mini default, 36 requests). **Deterministic**: two consecutive
-runs landed on **57.1%** to the token (13,149 / 23,014) — the optimisations are deterministic;
-only the LLM's wording (and thus completion tokens / cost) varies run-to-run. This corroborates
-the internal quality-gated headline (**54.1%**) on an independent, single OSS workload.
+Re-calibrated **2026-09-18** on a local stack (gpt-4o-mini, temperature 0, 36 requests, proxy
+image rebuilt from this checkout). **Deterministic**: two consecutive runs landed on **53.5%**
+to the token (11,070 / 20,684), and an image built nine days earlier — four proxy commits
+behind — gave the identical figure. Only the answers' wording (so completion tokens, so the
+cost line) varies run to run.
 
 ```
-TOTAL TOKEN SAVINGS   57.1%   (13,149 / 23,014 tokens)   8 cache hits   ~88s
-Est. cost savings     ~62%    ($0.0077 -> $0.0030)        QUALITY GATE: 36/36 PASS
+TOTAL TOKEN SAVINGS   53.5%   (11,070 / 20,684 tokens)   8 cache hits   ~60s
+Est. cost savings     ~62%    ($0.0077 -> $0.0029)        QUALITY GATE: 31/31 PASS
 
 Per-group contribution (tokens saved)
-  G05 response cache      41.3%
-  G08 lazy tool loading   41.0%
-  G22 dedup                5.0%
-  G19 structured pruning   0.1%
+  G05 response cache      49.1%
+  G08 lazy tool loading   22.0%
+  G19 structured pruning  16.2%
+  G22 dedup                5.9%
+  G01 compression          1.5%
   G06 model routing        0.0%   (saves cost, not tokens — see below)
 ```
+
+> **What happened to 57.1%.** That figure was measured on 2026-07-04 and never refreshed
+> through the changes since — among them the 2026-09-06 decision to stop pinning a
+> system-prompt cap no default install applies, which is why the tool-pruning share fell from
+> 41% to 22%. It is superseded, not reconciled token by token. "36/36" became "31/31" because
+> five tool-call records carry no facts to check and used to be counted as passes.
 
 > **No tuning, no inflation.** The percentage is the proxy's own billed-token metric
 > (`final_tokens_sent` = the provider's `usage.prompt_tokens`, 0 on a cache hit) — not an
@@ -148,17 +190,30 @@ Per-group contribution (tokens saved)
 > smaller tool catalogues will land lower.
 
 **Six techniques, all quality-preserving.** Savings span six groups, and the answers pass
-an automated facts gate: `--quality-check` asserts each answer contains its required facts
-(e.g. GDPR → "eu-west" + "eu-central"; the OOMKilled root cause; for the compressed prose,
-the outage's "09:10"/"23%"/"1.4.2") and no forbidden content, exiting non-zero on a miss.
-So these are *real* savings on *correct* answers — not prompt-shredding.
+an automated facts gate: `--quality-check` asserts that each of the 31 answers with curated
+facts contains them (e.g. GDPR → "eu-west" + "eu-central"; the OOMKilled root cause; for the
+compressed prose, the outage's "09:10"/"23%"/"1.4.2") and no forbidden content, exiting
+non-zero on a miss. So these are *real* savings on *correct* answers — not prompt-shredding.
+
+**Why the quality gate runs at temperature 0.** Until 2026-09-18 the runner sent no
+temperature, so answers were sampled at the provider's default (1.0) and two consecutive runs
+failed on *different* records at an identical token figure. We measured it with the A/B
+harness's own arms and relative gate, 40 paired samples per arm on each record that had failed:
+at the default temperature the **direct** call — no proxy at all — missed those facts about as
+often as the proxy did (37/40 vs 39/40, 39/40 vs 36/40, 39/40 vs 39/40), and at temperature 0
+**neither arm missed once**. The prompts the proxy actually sent still contained every checked
+fact. So the flakiness was the sampler, not the optimisation, and the gate now runs the way the
+project's other quality gates do (`--temperature none` restores the old behaviour). A miss on an
+answer that ran out of `max_tokens` is labelled `[truncated at max_tokens]`.
 
 **G01's share is small but the point is per-request.** It only runs on the 3 verbose-prose
-requests, so it's ~2% of the *total*; but on those requests it cuts **34–38%** of the user
-message while keeping every fact — and that's the only lever that helps a **unique, first-ask**
-request (cache/dedup need repeats; structured pruning needs structured content). The system
-instruction is never touched. (LLMLingua's BERT classifier keeps numbers/entities and drops
-filler like "I'm writing to let you know that, unfortunately…".)
+requests, so it's ~2% of the *total*; on two of them it cuts **34–38%** of the user message
+while keeping every fact, and on the third (the outage report) its faithfulness guard refuses the
+compression every run — it would drop a negation or scope qualifier — so that one is sent as
+written. It's the only lever that helps a **unique, first-ask** request (cache/dedup need
+repeats; structured pruning needs structured content). The system instruction is never
+compressed. (LLMLingua's BERT classifier keeps numbers/entities and drops filler like
+"I'm writing to let you know that, unfortunately…".)
 
 > **Run the gate yourself:** `./examples/benchmark/run.sh --quality-check` (facts, no extra
 > cost) or add `--judge` for an LLM faithfulness score (a few cents). Ground-truth facts are
@@ -167,7 +222,7 @@ filler like "I'm writing to let you know that, unfortunately…".)
 **Two things to read carefully:**
 - **G06 routing shows 0% in the token breakdown but drives the cost line.** Routing swaps
   the model, not the token count: the 5 "simple" questions were sent to gpt-4o and routed
-  *down* to gpt-4o-mini, which is most of the 63.7% cost saving. Token savings and cost
+  *down* to gpt-4o-mini, which is most of the ~62% cost saving. Token savings and cost
   savings are reported separately on purpose.
 - **G07 RAG, G14/G15 tool-output are *not* in this number.** G07 *adds* retrieved context
   (it doesn't reduce a request's own tokens), and G14/G15 only fire inside the agent runtime
@@ -371,7 +426,10 @@ proxy `x_*` controls stripped from the direct arm; arm B tokens = `_token_opt.to
 **separately** (routing changes cost without always cutting input tokens); the facts gate is
 **relative** (a record fails only if the proxy drops a fact the direct arm had). Spend is capped
 per provider (`--max-spend-per-provider`, default $1) with an overall ceiling; a tripped cap
-stops that provider and exits non-zero. Results: `ab_results.json` (per provider → workload slice
+stops that provider and exits non-zero (3). A pair that errors is not a measurement: the run
+exits 5 and `ab_results.json` carries `"complete": false` with the errored pairs listed (it used
+to print ERROR and exit 0). Nothing is measured until one unmeasured warm-up request has been
+served. Results: `ab_results.json` (per provider → workload slice
 (`cold`/`cache`/`agentic`) → per dataset + total, plus the illustrative `blend` block under
 `--workload full`) + `ab_cost_log.jsonl`.
 

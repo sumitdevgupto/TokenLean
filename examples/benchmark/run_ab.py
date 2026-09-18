@@ -40,6 +40,12 @@ from typing import List
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from run_benchmark import check_facts  # noqa: E402 — reuse the deterministic facts gate
+# Cold-stack handling is shared with the single-arm runner so the two cannot drift apart.
+from run_benchmark import (  # noqa: E402
+    _WARMUP_PROSE, never_reached_proxy, wait_for_health, warm_sidecar)
+
+# A pair that errored is not a measurement. Distinct from 3 (spend cap), which is documented.
+EXIT_INCOMPLETE = 5
 
 try:
     import httpx
@@ -498,15 +504,28 @@ def call_proxy(base_url: str, api_key: str, model: str, messages: list, max_toke
     if tools:
         body["tools"] = tools
     body.update(x_controls)
-    # G00 rate-limiting is a throughput guard, not a savings lever. run.sh's pin lifts it
-    # for the burst, but an un-pinned proxy (e.g. run.ps1 --workload cache, no pin step)
-    # will 429 the cache burst. Retry 429s with backoff so a throttled request is served,
-    # not dropped as an ERROR that corrupts the measurement.
-    for attempt in range(6):
-        resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
-        if resp.status_code != 429:
+    # G00 rate-limiting is a throughput guard, not a savings lever. The launchers' pin lifts
+    # it for the burst, but an un-pinned proxy (--no-pin-config) will 429 the cache burst.
+    # Retry 429s with backoff so a throttled request is served, not dropped as an ERROR that
+    # corrupts the measurement. A request that never reached the proxy (connection refused
+    # while it restarts) is resent after it is healthy again; one that reached it and then
+    # died is NOT - it may already have run the pipeline, so it stays a failed pair.
+    health_url = base_url.rstrip("/") + "/health"
+    connect_retries = 2
+    attempt = 0
+    while True:
+        try:
+            resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
+        except httpx.HTTPError as exc:
+            if connect_retries and never_reached_proxy(exc):
+                connect_retries -= 1
+                wait_for_health(health_url, time.time() + 120.0)
+                continue
+            raise
+        if resp.status_code != 429 or attempt >= 5:
             break
-        time.sleep(min(2.0 * (attempt + 1), 10.0))
+        attempt += 1
+        time.sleep(min(2.0 * attempt, 10.0))
     resp.raise_for_status()
     data = resp.json()
     opt = data.get("_token_opt") or {}
@@ -1065,6 +1084,14 @@ def main() -> int:
     ap.add_argument("--no-cache-flush", action="store_true",
                     help="do not attempt a local cache flush (always true for a remote proxy)")
     ap.add_argument("--timeout", type=float, default=180.0)
+    ap.add_argument("--warmup-timeout", type=float, default=600.0,
+                    help="how long the proxy (and sidecar) warm-up may take before the run is "
+                         "abandoned with nothing measured (s)")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip the unmeasured warm-up request (only if the stack is already warm)")
+    ap.add_argument("--sidecar-url", default=os.environ.get("LLMLINGUA_WARM_URL", ""),
+                    help="LLMLingua /compress URL to warm directly first (the launchers pass "
+                         "http://localhost:8080/compress)")
     args = ap.parse_args()
 
     if httpx is None:
@@ -1162,6 +1189,35 @@ def main() -> int:
                          f"available: {', '.join(sorted(available))}")
         print(f"  [diagnostic] profile filter active: {', '.join(sorted(profile_filter))} "
               f"— partial run, NOT a calibrated headline number")
+
+    # Nothing is measured until the stack has served one unmeasured request. On a cold stack
+    # the first measured pair used to be the one that paid for (or died of) the cold start.
+    if not args.no_warmup:
+        if args.sidecar_url:
+            ok, detail = warm_sidecar(args.sidecar_url, args.warmup_timeout)
+            if not ok:
+                print(f"  WARNING: LLMLingua sidecar did not answer ({detail}); G01 may not fire")
+        start = time.time()
+        deadline = start + args.warmup_timeout
+        warm_err = None
+        # A proxy that never answers /health gets 3 minutes, not the whole budget.
+        if not wait_for_health(args.proxy_url.rstrip("/") + "/health",
+                               start + min(args.warmup_timeout, 180.0)):
+            warm_err = "nothing answered /health"
+        else:
+            try:
+                call_proxy(args.proxy_url, args.api_key, PROVIDER_MODELS[run_providers[0]]["model"],
+                           [{"role": "user", "content": _WARMUP_PROSE}], 8,
+                           {"x_jit_retrieval": False, "x_cache_semantic": False,
+                            "x_compress_user": True, "x_no_cache": True},
+                           args.tenant or None, max(10.0, deadline - time.time()))
+            except Exception as exc:  # noqa: BLE001
+                warm_err = f"{type(exc).__name__}: {exc}"
+        if warm_err:
+            return _fail(f"the proxy did not serve the warm-up request ({warm_err}). "
+                         "Nothing was measured and no spend was incurred on the direct arm.")
+
+    errored: list = []   # pairs that raised - any one makes this run INCOMPLETE
 
     for provider in run_providers:
         apply_litellm_env(provider, env)
@@ -1268,8 +1324,11 @@ def main() -> int:
                             direct_memo[memo_key] = a
                         b = call_proxy(args.proxy_url, args.api_key, spec["model"], messages, mt,
                                        x_controls, args.tenant or None, args.timeout)
-                except Exception as exc:  # noqa: BLE001 — report and continue
+                except Exception as exc:  # noqa: BLE001 — recorded; it fails the run at the end
                     print(f"  [{i}/{len(trace)}] {item['_label']:<16} ERROR: {exc}")
+                    errored.append({"provider": provider, "slice": slice_name,
+                                    "label": item.get("_label", ""),
+                                    "error": f"{type(exc).__name__}: {exc}"})
                     continue
 
                 a_cost = price(spec["model"], a["prompt_tokens"], a["completion_tokens"], prices)
@@ -1338,6 +1397,9 @@ def main() -> int:
         "compress_user": bool(args.compress_user),
         "compress_user_profiles": list(_COMPRESS_PROFILES) if args.compress_user else [],
         "cache_burst": meta_ds.get("cache_burst") if args.workload in ("cache", "full") else None,
+        # A non-empty list means this artifact is NOT a result (the run exits 5).
+        "errored_pairs": errored,
+        "complete": not errored,
     }
     # #71: the provider-cache probe's own provenance travels with the numbers, so a reader
     # can see the prefix size and origin that produced them without opening the dataset.
@@ -1398,6 +1460,14 @@ def main() -> int:
                   f"{'CACHE-HIT ' if g['cache_hit'] else ''}dropped: {drop}{trunc}")
         if len(regressions) > 12:
             print(f"    ... +{len(regressions) - 12} more (full detail in {RESULTS.name})")
+    if errored:
+        # Checked first: an errored pair means every figure above covers a different trace than
+        # the one the run claims, so no other verdict about it is meaningful. It used to print
+        # "ERROR" per pair and still exit 0.
+        print(f"\n  INCOMPLETE: {len(errored)} A/B pair(s) raised and were not measured "
+              f"({', '.join(e['label'] for e in errored[:5])}{' ...' if len(errored) > 5 else ''}).")
+        print("  These figures are not a result - fix the cause and re-run.")
+        return EXIT_INCOMPLETE
     if stopped_at_cap:
         return 3
     # A run that ASKED for a lever and silently measured its absence is worse than a run

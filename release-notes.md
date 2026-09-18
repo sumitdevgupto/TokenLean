@@ -21,6 +21,87 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-09-18
+
+### Request-header values could weaken rate limiting and inflate metrics — Bug fix
+
+Rate limiting and the usage metrics trusted team and user values that arrive as request
+headers, which any caller sets. Because each distinct value was treated as a separate
+identity, a caller could stay under the per-minute and per-hour limits by varying a header
+per request, and could grow the number of stored metric series without bound. Rate limits
+now apply per authenticated key (tenant + key-bound principal + team) and the token bucket
+is updated atomically, so limits also hold under bursts of simultaneous requests. A team
+value is honoured only from a key issued as an API-gateway key (a trusted gateway that
+stamps the team per request); for every other key the team is fixed. Team and feature
+metric labels can be bounded to an operator allowlist, with unlisted values grouped as
+`other`. Separately, the per-conversation "workflow turns" metric became a per-tenant
+distribution, and the local usage-log export can no longer be steered outside its folder.
+
+### A backup of the operator's configuration could still be committed to the public repository — Bug fix
+
+Yesterday's fix excluded the benchmark launcher's config-backup path from version control, but
+the same change renamed that backup to a per-process name the exclusion does not match — so a
+leftover backup of an operator's live configuration was again one routine commit away from the
+public repository. Backups now live inside the excluded folder, and a test checks each launcher's
+real backup path against the ignore rules. `--restore`, which only ever looked for its own
+process's backup and so never found a stranded one, now recovers any.
+
+### The benchmark reported success on runs where requests had failed — Bug fix
+
+The benchmark only treated a run as failed when every request failed; with one success it printed
+a savings figure from the survivors and exited 0. Its quality gate left unanswered requests out of
+the count and counted five tool-call records with nothing to check as passes ("36/36" was 31 real
+checks), the Windows launcher exited 0 whatever the run returned, and the A/B harness did the same
+after a failed request pair. A failed request now makes the run INCOMPLETE — exit code 3, no
+headline figure, and the result file says so (the A/B harness exits 5).
+
+### A cold benchmark stack was started twice, and timed before it was warm — Bug fix
+
+The launcher started the stack, then restarted it to load the benchmark configuration, throwing
+away the first warm-up. Its own warm-up could fail without stopping the run, and was too short to
+reach the prompt-compression service, whose ~9 s first load then landed on a timed request. The
+configuration is now applied before the stack starts, nothing is timed until a warm-up succeeds,
+the compression model is loaded up front, and the proxy image is rebuilt from the checkout each
+run so an out-of-date image is never measured silently.
+
+### The Windows benchmark launcher measured whatever configuration happened to be loaded — Bug fix
+
+`run.ps1`, the README's Windows quick start, had no configuration pin. On a fresh clone it
+measured the shipped template, whose compression-service address does not resolve in the local
+stack, so a Windows run could not reproduce the published figure. Both launchers now share one pin
+and restore the operator's configuration on exit or Ctrl+C.
+
+### The benchmark's quality check passed or failed at random — Bug fix
+
+The benchmark sent no sampling temperature, so answers were sampled at the provider's default and
+a few borderline records flipped between runs. Measured against the model called directly, the
+direct model missed those same facts about as often as the proxy did, and at temperature 0
+neither missed once in 40 tries. The prompts the proxy sent still contained every checked fact. The
+benchmark now runs at temperature 0, like the project's other quality gates, and a miss on an
+answer cut off by its length limit is labelled as such.
+
+### Benchmark runs switched Langfuse tracing off — Bug fix
+
+The benchmark's pinned configuration was built from the shipped template, which has tracing off,
+so every benchmark run disabled tracing even where the operator had it on — leaving the
+trace-backed dashboards empty for exactly that traffic. The operator's tracing setting now carries
+over (it changes no measured number). A startup warning about a missing `traceloop` package, which
+appeared on every start for a feature that is off by default, now appears only if it is enabled.
+
+### Local deployments stalled for about 3 seconds on tool-bearing requests — Bug fix
+
+The shipped tool-registry location points at a cloud storage bucket named by an environment
+variable. With the variable unset, as on every local deployment, the proxy still searched for
+cloud credentials — about 3 s, on the request path, once per worker every five minutes. A registry
+location with no bucket now reads the local registry directly.
+
+### Grafana showed healthy values in red — Bug fix
+
+35 single-value dashboard panels declared no colour thresholds, so Grafana applied its default
+(red at 80 and above): "Uptime 100%" rendered red, as did every count and total over 80. Uptime now
+uses the same bands as the error-rate panel (green at 99.5% and above, red below 99%), and totals
+get a neutral colour. A test fails any future panel that colours by value without thresholds.
+
 ## 2026-09-17
 
 ### A stray local file could carry an operator's live configuration into the public repository — Bug fix

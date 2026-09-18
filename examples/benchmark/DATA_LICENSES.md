@@ -67,7 +67,7 @@ publishing any headline number).
 - **`ops` (production-shaped — NOT a recognized public benchmark):** the `ops` profile is the one
   deliberately non-recognized source. It bundles verbose DevOps/support payloads (pasted JSON,
   logs, config) in `ops_seed.jsonl` (Apache-2.0, this repo), adapted from the single-arm harness
-  (`dataset.jsonl`, itself already published in the 57.1% single-arm result). It exists because the
+  (`dataset.jsonl`, itself already published in the single-arm result). It exists because the
   recognized Q&A profiles are too small/stateless to exercise the **structured-pruning (G19)** and
   **dedup (G22)** levers on a first-ask; `ops` is where those fire. It is **facts-gated** (relative)
   and disclosed as production-shaped in `public_dataset.meta.json` (`ops_profile`). We report

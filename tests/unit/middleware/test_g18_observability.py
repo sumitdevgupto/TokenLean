@@ -138,7 +138,10 @@ class TestG18Observability:
 
     async def test_record_emits_prometheus_metrics_with_team_feature_labels(self, make_ctx):
         ctx = make_ctx()
-        ctx.params["x_team"] = "team-a"
+        # team label comes from the TRUSTED team (ctx.team — a gateway key's X-Team), never
+        # the raw params["x_team"] (2026-09-18). feature reads params but is unbounded here
+        # only because no label_values allowlist is configured (default behaviour).
+        ctx.team = "team-a"
         ctx.params["x_feature"] = "feature-x"
         with patch("middleware.langfuse_tracing.finish_trace"):
             from middleware.g18_observability import G18Observability, REQUESTS_TOTAL, COST_USD
@@ -433,7 +436,7 @@ class TestG18AuditLoggerIntegration:
     async def test_prometheus_metrics_still_recorded_with_audit_active(self, make_ctx):
         ctx = make_ctx()
         ctx.config["audit"] = {"enabled": True}
-        ctx.params["x_team"] = "audit-team"
+        ctx.team = "audit-team"                       # trusted team → label (2026-09-18)
         ctx.params["x_feature"] = "audit-feature"
 
         mock_audit = AsyncMock()

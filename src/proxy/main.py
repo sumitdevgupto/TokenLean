@@ -34,7 +34,7 @@ import litellm
 litellm.drop_params = True
 
 from auth.api_key_manager import (
-    get_llm_provider_key, validate_proxy_key, is_admin_key, is_suspended,
+    get_llm_provider_key, validate_proxy_key, is_admin_key, is_gateway_key, is_suspended,
     is_contract_inactive, get_ip_allowlist,
 )
 from net.ip_allowlist import client_ip_from_request, ip_allowed
@@ -226,16 +226,31 @@ _pipeline = OptimisationPipeline()
 
 
 def _init_openllmetry(cfg: Dict[str, Any]) -> None:
+    # The flag is read BEFORE the import. The import used to come first, so every start of
+    # an image without `traceloop-sdk` (i.e. every image we build: it has never been a
+    # dependency) logged "OpenLLMetry init failed: No module named 'traceloop'" while the
+    # feature was switched off in every shipped config. That warning was then read as the
+    # reason Langfuse traces were missing - it is unrelated (OpenLLMetry is OTLP
+    # auto-instrumentation; Langfuse tracing is middleware/langfuse_tracing.py).
+    g18 = ((cfg.get("groups") or {}).get("G18_observability") or {})
+    if not g18.get("openllmetry_enabled", False):
+        return
     try:
         from traceloop.sdk import Traceloop
-        g18 = cfg.get("groups", {}).get("G18_observability", {})
-        if g18.get("openllmetry_enabled", False):
-            endpoint = g18.get("openllmetry_endpoint", "")
-            kwargs = {"app_name": "token-optimisation-proxy"}
-            if endpoint:
-                kwargs["api_endpoint"] = endpoint
-            Traceloop.init(**kwargs)
-            logger.info("OpenLLMetry initialised")
+    except ImportError:
+        logger.warning(
+            "OpenLLMetry is enabled (groups.G18_observability.openllmetry_enabled) but the "
+            "'traceloop-sdk' package is not installed in this image - OTLP auto-instrumentation "
+            "is OFF. Install traceloop-sdk, or set openllmetry_enabled: false. Langfuse "
+            "tracing is separate and unaffected.")
+        return
+    try:
+        endpoint = g18.get("openllmetry_endpoint", "")
+        kwargs = {"app_name": "token-optimisation-proxy"}
+        if endpoint:
+            kwargs["api_endpoint"] = endpoint
+        Traceloop.init(**kwargs)
+        logger.info("OpenLLMetry initialised")
     except Exception as exc:
         logger.warning("OpenLLMetry init failed: %s", exc)
 
@@ -1743,11 +1758,20 @@ async def _serve_core(
     api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     params["_api_key_hash"] = api_key_hash
     # The validated key is the authoritative tenant identity (C1); the pipeline reads
-    # these _auth_* params and only honours X-Tenant-ID for admin keys.
-    if isinstance(tenant_metadata, dict):
-        params["_auth_tenant_id"] = tenant_metadata.get("tenant_id")
-        params["_auth_tier"] = tenant_metadata.get("tier", "free")
-        params["_auth_admin"] = bool(tenant_metadata.get("admin", False))
+    # these _auth_* params and only honours X-Tenant-ID for admin keys. Stamped for EVERY
+    # key: the OpenAI ingress copies every body field into params, so an `_auth_*` field a
+    # client sent must always be overwritten — until 2026-09-18 a legacy (string-format) key
+    # skipped this block, and `_auth_admin` / `_auth_tenant_id` in its body were believed.
+    meta = tenant_metadata if isinstance(tenant_metadata, dict) else {}
+    params["_auth_tenant_id"] = meta.get("tenant_id")
+    params["_auth_tier"] = meta.get("tier", "free")
+    params["_auth_admin"] = bool(meta.get("admin", False))
+    params["_auth_gateway"] = is_gateway_key(tenant_metadata)
+    # G00 rate-limits on the key-bound identity, never an X-User-ID override (which the
+    # caller chooses within its allowlist). _authenticate records it before any override.
+    params["_auth_principal"] = str(
+        getattr(getattr(request, "state", None), "key_principal", None)
+        or meta.get("tenant_id") or user_id or "")
 
     cfg = get_config()
     ctx = RequestContext.create(
@@ -2360,6 +2384,12 @@ async def _authenticate(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid proxy API key. Contact your platform team for a key.",
         )
+    # The key-bound identity, recorded BEFORE any X-User-ID override below: _serve_core
+    # hands it to G00 as the rate-limit principal (an allow-listed override is still the
+    # caller's choice). getattr: some callers pass a bare request object with no .state.
+    _state = getattr(request, "state", None)
+    if _state is not None:
+        _state.key_principal = user_id
 
     # Suspended keys authenticate to a known tenant but are rejected here (403).
     # The suspended flag is set out-of-band by the key-store lifecycle; the proxy

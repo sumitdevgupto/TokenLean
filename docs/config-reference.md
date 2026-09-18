@@ -247,8 +247,10 @@ Request throttling at the gate (token bucket). Lives at the top level, not under
 | `enabled` | `true` | Enable rate limiting |
 | `default.requests_per_minute` | `60` | Per-minute limit applied to all callers without an override |
 | `default.requests_per_hour` | `1000` | Per-hour limit applied to all callers without an override |
-| `per_user.<id>.requests_per_minute` / `.requests_per_hour` | *(per user)* | Override limits for a specific proxy user/key |
-| `per_team.<id>.requests_per_minute` / `.requests_per_hour` | *(per team)* | Override limits for a team |
+| `per_user.<id>.requests_per_minute` / `.requests_per_hour` | *(per user)* | Override limits for a specific proxy key (matched on the key-bound principal, never an `X-User-ID` override) |
+| `per_team.<id>.requests_per_minute` / `.requests_per_hour` | *(per team)* | Override limits for a team. Matches **only a gateway key's team** — `X-Team` is trusted only from a key issued with `gateway: true`; every other key is team `default` |
+
+> **Bucket identity.** A rate-limit bucket is keyed on the authenticated identity — tenant + key-bound principal + team — never on a client-chosen header. Sending a different `X-Team` or `X-User-ID` per request cannot open a fresh bucket, claim another team's limit, or split your own. A customer's API gateway that legitimately stamps a team per request is issued a `gateway` key, which gets one bucket per team.
 
 ## Group parameters
 
@@ -454,7 +456,7 @@ Each rule: `{id, description?, enabled?, priority?, match, action}`.
 | `match.min_prompt_tokens` / `max_prompt_tokens` | Prompt-token bounds; `0`/absent = no bound |
 | `match.models` | Exact any-of vs the **requested** model |
 | `match.has_tools` | `true`/`false` vs whether the request carries tools |
-| `match.params` | `{param: [values]}` — AND across keys, any-of within. `X-*` headers arrive as `x_*` params (e.g. `X-Team` → `x_team`) |
+| `match.params` | `{param: [values]}` — AND across keys, any-of within. `X-*` headers arrive as `x_*` params (e.g. `X-Team` → `x_team`). These are raw, caller-supplied routing hints — a G06 rule may match them, but rate limiting (G00) and metric labels (G18) do **not** trust `x_team`; they use the gateway-verified team instead |
 | `match.user_ids` | Any-of vs `ctx.user_id` (the `X-User-ID` header — **not** a `params` entry; only allow-listed user ids populate it) |
 | `action.tier` | Pin `simple`/`medium`/`complex` — the tier list + `strategy` layer then pick the model |
 | `action.model` | Pin an exact configured model (wins over `tier` if both are set) |
@@ -708,9 +710,10 @@ Agent-architecture enforcement — bounds system-prompt size and tool count.
 |---|---|---|
 | `enabled` | `true` | Enable G18 observability (Prometheus counters + savings metrics) |
 | `langfuse_enabled` | `false` | Emit Langfuse traces. Requires `enabled` **and** Langfuse keys. Gates only trace emission (Prometheus/savings metrics run regardless). OSS default off; the commercial deploy sets it true. |
-| `langfuse_host` | `http://langfuse-svc` | Langfuse internal URL (local: `http://langfuse-svc:3000`) |
+| `langfuse_host` | `http://langfuse-svc` | **Not read by the proxy.** The Langfuse endpoint comes from the `LANGFUSE_HOST` environment variable (the local compose stack sets `http://langfuse:3000`); keys from `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`. Setting this key changes nothing |
 | `prometheus_enabled` | `true` | Expose `/metrics` Prometheus counters |
-| `openllmetry_enabled` | `false` | Enable OTLP auto-instrumentation (set OTLP endpoint first) |
+| `label_values.team` / `label_values.feature` | *(unset)* | Allowlist for the `team` / `feature` metric label values. Unset = keep the value as-is (default). A list bounds cardinality: only `default` and the listed values keep their own label; anything else is folded to `other`. `team` is already the gateway-verified team; this mainly bounds a gateway's team space and the free-form `feature`. |
+| `openllmetry_enabled` | `false` | Enable OTLP auto-instrumentation (set OTLP endpoint first). Needs the `traceloop-sdk` package, which the default image does not include — install it in your image, or the proxy logs a warning and leaves the feature off. Separate from Langfuse tracing (`langfuse_enabled`) |
 | `et_weights.input` | `1.0` | ET metric input weight |
 | `et_weights.cache_read` | `0.1` | ET metric cache-read weight |
 | `et_weights.output` | `4.0` | ET metric output weight (output costs ~4× input) |

@@ -24,7 +24,9 @@ import re
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RUN_SH = ROOT / "examples" / "benchmark" / "run.sh"
+# The pin moved out of run.sh into a module both launchers share (2026-09-18), so run.ps1 pins
+# the same config. The check follows the code, not the file it used to live in.
+PIN_SRC = ROOT / "examples" / "benchmark" / "pin_config.py"
 TEMPLATE = ROOT / "config" / "config.yaml.template"
 
 # Knobs the benchmark may legitimately pin away from the template default.
@@ -56,8 +58,8 @@ def _literal(raw: str):
 
 
 def _pinned() -> dict[tuple[str, str], object]:
-    src = RUN_SH.read_text(encoding="utf-8")
-    # Only the config-pinning heredoc assigns through _block(...); comments are stripped so a
+    src = PIN_SRC.read_text(encoding="utf-8")
+    # Only the config pin assigns through _block(...); comments are stripped so a
     # commented-out example never registers as a live pin.
     src = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
     out: dict[tuple[str, str], object] = {}

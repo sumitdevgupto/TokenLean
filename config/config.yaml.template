@@ -38,6 +38,11 @@ rate_limit:
     user-01:
       requests_per_minute: 2
       requests_per_hour: 120
+  # A rate-limit bucket is keyed on the AUTHENTICATED identity — the tenant + the key-bound
+  # principal + the team. `per_team` matches only a GATEWAY key's team: X-Team is trusted
+  # only from a key issued with `gateway: true` (a customer's API gateway that stamps the
+  # team on every request); every other key is team "default", so a caller cannot pick a
+  # bucket, claim a team's limit, or split its own limit by rotating X-Team / X-User-ID.
   per_team:
     team-alpha:
       requests_per_minute: 20
@@ -929,6 +934,8 @@ groups:
     max_total_context_tokens: 4000
   G8_tools:
     enabled: true
+    # With CONFIG_GCS_BUCKET unset (local / non-GCP) this has no bucket, and the local
+    # TOOL_REGISTRY_PATH (default config/tool-registry.yaml) is read instead - no GCS lookup.
     registry_path: gs://${CONFIG_GCS_BUCKET}/config/tool-registry.yaml
     max_tools_per_agent: 20
     # Compress tool/function DESCRIPTION prose (deterministic regex, zero-LLM via
@@ -1209,15 +1216,28 @@ groups:
     # run regardless — this flag gates only Langfuse traces. The commercial deploy
     # sets it true; Langfuse keys are still required for traces to actually emit.
     langfuse_enabled: false
+    # Not read by the proxy: the Langfuse endpoint is the LANGFUSE_HOST env var (local compose:
+    # http://langfuse:3000). Kept only so existing configs still parse the same.
     langfuse_host: http://langfuse-svc
     prometheus_enabled: true
     capture_trace_content: true
     turn_efficiency_enabled: true
     tool_governance_enabled: true
+    # Needs the traceloop-sdk package, which the default image does not include.
     openllmetry_enabled: false
     openllmetry_endpoint: ''
     turn_efficiency_baseline_multiplier: 2.0
     tool_governance_days: 30
+    # Bound the `team`/`feature` Prometheus label values so a caller (or a misconfigured
+    # gateway) cannot grow label cardinality without limit — each distinct value is a new,
+    # never-evicted series. Omit a dimension (or the whole block) to keep the value as-is
+    # (default); an explicit list means only "default" + the listed values keep their own
+    # label, everything else is folded to "other". `team` is already the TRUSTED team (a
+    # gateway key's X-Team, else "default"), so this mainly bounds a gateway's team space
+    # and the free-form `feature`. Operator-only; per-tenant via the operator overlay.
+    label_values: {}
+    #  team: [checkout, search, billing]
+    #  feature: [ui-copy, ticket-classify]
     jsonl_gcs_bucket: ''
     jsonl_gcs_prefix: token-usage-logs
     et_weights:

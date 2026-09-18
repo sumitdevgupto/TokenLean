@@ -93,14 +93,24 @@ def _load_registry(cfg: Dict) -> List[Dict]:
     if hit and hit[0] and (now - hit[1]) < _registry_cache_ttl():
         return hit[0]
     tools = []
+    # `gs://${CONFIG_GCS_BUCKET}/...` with the bucket unset - every local / non-GCP deploy,
+    # because the template ships that path - arrives here as `gs:///config/...`. There is
+    # nothing to fetch, but constructing the GCS client anyway runs Google's Application
+    # Default Credentials discovery, which outside GCP waits on the metadata server for ~3 s.
+    # That wait was synchronous, on the request path, once per worker per registry-cache TTL:
+    # it was the 3.3-3.5 s G08 stage in the local latency dashboards (2026-09-18).
+    gcs_bucket = registry_path[5:].partition("/")[0] if registry_path.startswith("gs://") else ""
     try:
-        if registry_path.startswith("gs://"):
+        if gcs_bucket:
             from google.cloud import storage
             bucket, blob = registry_path[5:].split("/", 1)
             client = storage.Client()
             data = client.bucket(bucket).blob(blob).download_as_text()
             tools = yaml.safe_load(data).get("tools", [])
         else:
+            if registry_path.startswith("gs://"):
+                logger.debug("G08 registry_path %s names no GCS bucket - using the local registry",
+                             registry_path)
             local = os.getenv("TOOL_REGISTRY_PATH", "config/tool-registry.yaml")
             with open(local) as f:
                 tools = yaml.safe_load(f).get("tools", [])

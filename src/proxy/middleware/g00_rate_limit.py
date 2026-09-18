@@ -9,13 +9,59 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from redis.exceptions import ResponseError
+
 from middleware import RequestContext
 from cache.redis_pool import get_redis as _get_redis
+from tenancy.resolver import DEFAULT_TEAM, team_tag
 from trial import trial_summary
 import events
 
 logger = logging.getLogger(__name__)
 GROUP = "G00"
+
+# An idle bucket expires after this long. It must cover the hour window: an hour bucket
+# untouched for 3600 s has refilled completely, so expiring it then loses nothing.
+_BUCKET_TTL_SECONDS = 3600
+
+# Both windows in ONE atomic step — Redis runs a script without interleaving another
+# client's commands. Until 2026-09-18 each window was an `hgetall` then an `hset`, so
+# requests in flight together (within one instance or across several) all read the same
+# token count and all got through. KEYS[1] = minute bucket, KEYS[2] = hour bucket.
+# ARGV = now, minute capacity, minute refill/s, hour capacity, hour refill/s, ttl.
+# Returns 0 = admitted (one token taken from EACH window), 1 = minute window exhausted,
+# 2 = hour window exhausted; a refused request takes nothing but still records the refill
+# so elapsed time is never counted twice.
+_BUCKET_LUA = """
+local now = tonumber(ARGV[1])
+local function level(key, cap, rate)
+  local b = redis.call('HMGET', key, 'tokens', 'last_refill')
+  local tokens, last = tonumber(b[1]), tonumber(b[2])
+  if tokens == nil or last == nil then return cap end
+  local elapsed = now - last
+  if elapsed < 0 then elapsed = 0 end
+  return math.min(cap, tokens + elapsed * rate)
+end
+local cap_m, rate_m = tonumber(ARGV[2]), tonumber(ARGV[3])
+local cap_h, rate_h = tonumber(ARGV[4]), tonumber(ARGV[5])
+local ttl = tonumber(ARGV[6])
+local tm = level(KEYS[1], cap_m, rate_m)
+local th = level(KEYS[2], cap_h, rate_h)
+local verdict = 0
+if tm < 1 then
+  verdict = 1
+elseif th < 1 then
+  verdict = 2
+else
+  tm = tm - 1
+  th = th - 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tostring(tm), 'last_refill', tostring(now))
+redis.call('HSET', KEYS[2], 'tokens', tostring(th), 'last_refill', tostring(now))
+redis.call('EXPIRE', KEYS[1], ttl)
+redis.call('EXPIRE', KEYS[2], ttl)
+return verdict
+"""
 
 
 class RateLimitExceeded(Exception):
@@ -327,21 +373,23 @@ class G00RateLimit:
         now: float,
     ) -> bool:
         """
-        Token bucket algorithm using Redis.
-        
+        Token bucket algorithm using Redis — a read-modify-write, so it is only the
+        FALLBACK for a Redis that refuses EVAL (see ``_consume``): requests in flight
+        together all read the same count, so concurrent traffic can overdraw it.
+
         Args:
             redis: Redis client
             key: Redis key for this bucket
             capacity: Maximum tokens in bucket
             refill_rate: Tokens refilled per second
             now: Current timestamp
-            
+
         Returns:
             True if request allowed, False otherwise
         """
         # Read current bucket state
         bucket = await redis.hgetall(key)
-        await redis.expire(key, 3600)  # 1 hour TTL
+        await redis.expire(key, _BUCKET_TTL_SECONDS)
 
         if not bucket:
             # Initialize new bucket
@@ -360,12 +408,39 @@ class G00RateLimit:
             # Consume one token
             tokens -= 1
             await redis.hset(key, mapping={"tokens": tokens, "last_refill": now})
-            await redis.expire(key, 3600)
+            await redis.expire(key, _BUCKET_TTL_SECONDS)
             return True
         else:
             await redis.hset(key, mapping={"tokens": tokens, "last_refill": now})
-            await redis.expire(key, 3600)
+            await redis.expire(key, _BUCKET_TTL_SECONDS)
             return False
+
+    async def _consume(self, redis, minute_key: str, hour_key: str,
+                       limits: Dict[str, Any], now: float) -> Optional[str]:
+        """Take one request from BOTH windows atomically (``_BUCKET_LUA``).
+
+        Returns None when admitted, else the exhausted window — ``"minute"`` or ``"hour"``
+        — in which case nothing was taken. A Redis that refuses EVAL (``ResponseError``:
+        scripting disabled, a cluster CROSSSLOT) falls back to the per-window
+        read-modify-write with a WARNING — correct for serial traffic only. Any other error
+        propagates, so the caller fails open exactly as it always has.
+        """
+        cap_m = float(limits["requests_per_minute"])
+        cap_h = float(limits["requests_per_hour"])
+        try:
+            verdict = await redis.eval(
+                _BUCKET_LUA, 2, minute_key, hour_key,
+                now, cap_m, cap_m / 60.0, cap_h, cap_h / 3600.0, _BUCKET_TTL_SECONDS)
+        except ResponseError as exc:
+            logger.warning(
+                "G00 could not update the rate-limit bucket atomically (%s); falling back "
+                "to a read-modify-write that concurrent requests can overdraw", exc)
+            if not await self._check_token_bucket(redis, minute_key, cap_m, cap_m / 60.0, now):
+                return "minute"
+            if not await self._check_token_bucket(redis, hour_key, cap_h, cap_h / 3600.0, now):
+                return "hour"
+            return None
+        return {1: "minute", 2: "hour"}.get(int(verdict))
 
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         """Check rate limits before processing the request."""
@@ -403,66 +478,40 @@ class G00RateLimit:
 
         self._load_config(ctx.config)
 
-        # Extract scope identifiers
-        user_id = ctx.user_id
-        team = ctx.params.get("x_team", "default")
-        feature = ctx.params.get("x_feature", "default")
+        # Scope identifiers — the AUTHENTICATED identity only (2026-09-18). The bucket used to
+        # key on ctx.user_id and params["x_team"], both caller-chosen (an allow-listed
+        # X-User-ID override; any X-Team), so a fresh value per request got a fresh bucket and
+        # these limits never bound. principal = the identity the key carries; team = a gateway
+        # key's X-Team, else "default" (tenancy.resolver.apply_caller_identity). A context
+        # built outside the pipeline carries no stamp and falls back to user_id / "default".
+        principal = getattr(ctx, "key_principal", "") or ctx.user_id
+        team = getattr(ctx, "team", "") or DEFAULT_TEAM
         tenant_id = getattr(ctx, "tenant_id", "default")
 
-        # Get applicable limits (per_user > per_team > per_tenant > tier > default)
+        # Applicable limits (per_user > per_team > per_tenant > tier > default). per_team can
+        # only match a gateway key's team: every other key is team "default".
         limits = self._get_limits_for_scope(
-            user_id, team, tenant_id=tenant_id,
+            principal, team, tenant_id=tenant_id,
             tier=(getattr(ctx, "pricing_tier", "") or "").lower(), rl_cfg=cfg)
 
-        now = time.time()
-        redis = _get_redis()
-
+        # For a caller sending no identity headers this is the exact pre-2026-09-18 key, so
+        # its bucket carries over. team_tag: a gateway's team is never embedded verbatim.
+        scope = f"{tenant_id}:{principal}:{team_tag(team)}"
         try:
-            # Check per-minute limit (60 tokens per minute = 1 token/sec refill rate)
-            minute_key = f"tok_opt:rate_limit:minute:{tenant_id}:{user_id}:{team}"
-            minute_allowed = await self._check_token_bucket(
-                redis,
-                minute_key,
-                capacity=limits["requests_per_minute"],
-                refill_rate=limits["requests_per_minute"] / 60.0,
-                now=now,
-            )
-
-            if not minute_allowed:
-                raise RateLimitExceeded(
-                    retry_after=60,
-                    limit_type="requests_per_minute",
-                    scope=f"user={user_id},team={team}",
-                )
-
-            # Check per-hour limit (refill rate = capacity / 3600 seconds)
-            hour_key = f"tok_opt:rate_limit:hour:{tenant_id}:{user_id}:{team}"
-            hour_allowed = await self._check_token_bucket(
-                redis,
-                hour_key,
-                capacity=limits["requests_per_hour"],
-                refill_rate=limits["requests_per_hour"] / 3600.0,
-                now=now,
-            )
-
-            if not hour_allowed:
-                raise RateLimitExceeded(
-                    retry_after=3600,
-                    limit_type="requests_per_hour",
-                    scope=f"user={user_id},team={team}",
-                )
-
-            logger.debug(
-                "[%s] G00 rate limit check passed for user=%s team=%s",
-                ctx.request_id,
-                user_id,
-                team,
-            )
-            return ctx
-
-        except RateLimitExceeded:
-            raise
+            exhausted = await self._consume(
+                _get_redis(), f"tok_opt:rate_limit:minute:{scope}",
+                f"tok_opt:rate_limit:hour:{scope}", limits, time.time())
         except Exception as exc:
             logger.warning("[%s] G00 rate limit check failed: %s", ctx.request_id, exc)
             # Fail open: allow request if rate limiting fails
             return ctx
+
+        if exhausted:
+            raise RateLimitExceeded(
+                retry_after=60 if exhausted == "minute" else 3600,
+                limit_type=f"requests_per_{exhausted}",
+                scope=f"user={principal},team={team_tag(team)}",
+            )
+        logger.debug("[%s] G00 rate limit check passed for user=%s team=%s",
+                     ctx.request_id, principal, team_tag(team))
+        return ctx

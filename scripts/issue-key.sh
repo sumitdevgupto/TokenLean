@@ -3,13 +3,17 @@
 # issue-key.sh — Issue or revoke proxy API keys stored in Secret Manager
 # =============================================================================
 # Usage:
-#   ./scripts/issue-key.sh issue  --user <user_id>  [--project ID] [--region REGION]
-#   ./scripts/issue-key.sh revoke --user <user_id>  [--project ID]
-#   ./scripts/issue-key.sh list                     [--project ID]
+#   ./scripts/issue-key.sh issue  --tenant <id> [--tier free|enterprise] [--admin] [--gateway] [--project ID]
+#   ./scripts/issue-key.sh revoke --tenant <id>  [--project ID]
+#   ./scripts/issue-key.sh list                  [--project ID]
+#
+#   --admin    key may impersonate another tenant via X-Tenant-ID (operator/benchmark).
+#   --gateway  key is a customer API gateway: its X-Team header is trusted (selects the
+#              rate-limit bucket + team metric label). Every other key's X-Team is ignored.
 #
 # The proxy key secret in Secret Manager is a JSON object mapping the SHA-256 of
 # each raw key to its tenant metadata (new format):
-#   { "<sha256_of_key>": {"tenant_id": "...", "tier": "...", "admin": true|absent}, ... }
+#   { "<sha256_of_key>": {"tenant_id": "...", "tier": "...", "admin"?: true, "gateway"?: true}, ... }
 # Legacy string entries ({ "<hash>": "<user_id>" }) are still accepted by the
 # proxy but resolve to the "default" tenant — always issue new-format keys.
 #
@@ -31,6 +35,7 @@ USER_ID=""
 TENANT_ID=""
 TIER="free"
 ADMIN="false"
+GATEWAY="false"
 PROJECT_ID=""
 SECRET_NAME="${PROXY_KEYS_SECRET_NAME:-token-proxy-api-keys}"
 
@@ -48,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --tenant)  TENANT_ID="$2";  shift 2 ;;
     --tier)    TIER="$2";       shift 2 ;;
     --admin)   ADMIN="true";    shift ;;
+    --gateway) GATEWAY="true";  shift ;;
     --project) PROJECT_ID="$2"; shift 2 ;;
     --secret)  SECRET_NAME="$2"; shift 2 ;;
     --help)
@@ -115,9 +121,9 @@ print(any(owner(v) == t for v in d.values()))" 2>/dev/null | grep -q "True"; the
     warn "Tenant '${tenant}' already has a key. Issuing a new one (old key remains valid until revoked)."
   fi
 
-  # Add new key hash → {tenant_id, tier, admin?} mapping (new format).
+  # Add new key hash → {tenant_id, tier, admin?, gateway?} mapping (new format).
   local updated_json
-  updated_json=$(echo "$existing_json" | KEY_HASH="$key_hash" TENANT="$tenant" TIER="$TIER" ADMIN="$ADMIN" python3 -c "
+  updated_json=$(echo "$existing_json" | KEY_HASH="$key_hash" TENANT="$tenant" TIER="$TIER" ADMIN="$ADMIN" GATEWAY="$GATEWAY" python3 -c "
 import os, sys, json, datetime
 d = json.load(sys.stdin)
 meta = {
@@ -127,12 +133,16 @@ meta = {
 }
 if os.environ.get('ADMIN') == 'true':
     meta['admin'] = True
+# A gateway key may set X-Team (a customer's API gateway that stamps the team per
+# request); every other key's X-Team is ignored. Trust flag — issuance only.
+if os.environ.get('GATEWAY') == 'true':
+    meta['gateway'] = True
 d[os.environ['KEY_HASH']] = meta
 print(json.dumps(d))
 ")
 
   store_keys_json "$updated_json"
-  success "Key issued for tenant: ${tenant} (tier=${TIER}, admin=${ADMIN})"
+  success "Key issued for tenant: ${tenant} (tier=${TIER}, admin=${ADMIN}, gateway=${GATEWAY})"
   echo ""
   echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
   echo -e "${GREEN}║  Proxy API Key — share this with the developer       ║${NC}"

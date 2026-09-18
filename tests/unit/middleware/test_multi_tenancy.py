@@ -354,25 +354,23 @@ class TestG00RateLimitTenantIsolation:
         ctx.config["rate_limit"]["enabled"] = True
         ctx.config["rate_limit"]["default"] = {"requests_per_minute": 60, "requests_per_hour": 1000}
 
+        # The bucket is consumed by one atomic EVAL (2026-09-18): eval(_BUCKET_LUA, 2,
+        # minute_key, hour_key, ...). 0 = admitted; the tenant-scoped keys are args[2:4].
         mock_redis = AsyncMock()
-        mock_redis.hgetall = AsyncMock(return_value={})
-        mock_redis.expire = AsyncMock(return_value=True)
-        mock_redis.hset = AsyncMock(return_value=True)
+        mock_redis.eval = AsyncMock(return_value=0)
 
         from middleware.g00_rate_limit import G00RateLimit
         with patch("middleware.g00_rate_limit._get_redis", return_value=mock_redis):
             await G00RateLimit().process_request(ctx)
 
-        called_keys = [c.args[0] for c in mock_redis.hgetall.await_args_list]
-        assert any("tenant-alpha" in k for k in called_keys)
+        bucket_keys = [k for c in mock_redis.eval.await_args_list for k in c.args[2:4]]
+        assert any("tenant-alpha" in k for k in bucket_keys)
 
     async def test_two_tenants_same_user_team_get_independent_buckets(self, make_ctx):
         """Tenant-alpha saturating its bucket must not affect tenant-beta's
         bucket, even with identical user_id/team — proven by distinct keys."""
         mock_redis = AsyncMock()
-        mock_redis.hgetall = AsyncMock(return_value={})
-        mock_redis.expire = AsyncMock(return_value=True)
-        mock_redis.hset = AsyncMock(return_value=True)
+        mock_redis.eval = AsyncMock(return_value=0)
 
         from middleware.g00_rate_limit import G00RateLimit
 
@@ -384,8 +382,8 @@ class TestG00RateLimitTenantIsolation:
             ctx.config["rate_limit"]["default"] = {"requests_per_minute": 60, "requests_per_hour": 1000}
             with patch("middleware.g00_rate_limit._get_redis", return_value=mock_redis):
                 await G00RateLimit().process_request(ctx)
-            seen_keys.extend(c.args[0] for c in mock_redis.hgetall.await_args_list)
-            mock_redis.hgetall.reset_mock()
+            seen_keys.extend(k for c in mock_redis.eval.await_args_list for k in c.args[2:4])
+            mock_redis.eval.reset_mock()
 
         minute_keys = {k for k in seen_keys if ":minute:" in k}
         assert len(minute_keys) == 2  # one per tenant, never shared

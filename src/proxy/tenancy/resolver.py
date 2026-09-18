@@ -15,7 +15,12 @@ Resolution order:
 
 The resolver is synchronous so it can be called from both async FastAPI request
 handlers and sync test helpers.
+
+The same rule governs the TEAM (``X-Team``): honoured only for keys flagged
+``gateway`` (``resolve_team``), and every identity G00/G18 act on is stamped onto the
+request context once, by ``apply_caller_identity``.
 """
+import hashlib
 import logging
 from typing import Dict, Optional
 
@@ -97,6 +102,69 @@ def resolve_tenant(
             header_tenant,
         )
     return TenantContext.default()
+
+
+# ── Team identity (X-Team) ────────────────────────────────────────────────────
+# Until 2026-09-18 G00 and G18 read the raw X-Team header, which any caller can set: a
+# fresh value per request got a fresh rate-limit bucket (the limits never bound), claimed
+# any team's `per_team` limit, and minted a new Prometheus series. X-Team is honoured only
+# from a key flagged `gateway` — a customer's API gateway that stamps the team on every
+# request, overwriting whatever the app sent. Defined once, here beside the X-Tenant-ID
+# rule, so every consumer applies the same rule.
+DEFAULT_TEAM = "default"
+_MAX_TEAM_TAG_CHARS = 64
+
+
+def resolve_team(header_team: Optional[str], key_is_gateway: bool) -> str:
+    """The request's trusted team: a gateway key's ``X-Team`` value, else ``"default"``.
+
+    Pass the HEADER (the gateway's stamp), never a JSON body field — a body passes
+    through a gateway untouched, so a body ``x_team`` is still the app's choice.
+    """
+    if not key_is_gateway:
+        return DEFAULT_TEAM
+    team = (header_team or "").strip()
+    return team or DEFAULT_TEAM
+
+
+def team_tag(team: str) -> str:
+    """Key-safe form of a team name for a Redis key segment.
+
+    A gateway can send anything, so the value is never embedded verbatim: short, plainly
+    safe names stay legible in ``redis-cli``; anything longer or odder becomes a 16-char
+    digest (the shape ``g11_output_format._bucket_tag`` uses). ``:`` is outside the safe
+    set, so a team can never add a segment to a key that the GDPR purge matches as
+    ``tok_opt:rate_limit:*:<tenant>:*``.
+    """
+    text = str(team)
+    if 0 < len(text) <= _MAX_TEAM_TAG_CHARS and all(
+        (c.isascii() and c.isalnum()) or c in "-_." for c in text
+    ):
+        return text
+    return "h-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def apply_caller_identity(ctx, headers: Dict[str, str]) -> None:
+    """Stamp the authenticated caller's identity onto ``ctx`` — once, at pipeline entry.
+
+    ``main._serve_core`` records the key's facts in ``ctx.params`` as ``_auth_*`` for EVERY
+    key (overwriting any ``_auth_*`` field a client put in the JSON body). This turns them
+    into the three fields G00 and G18 read:
+
+    * ``ctx.is_gateway_key`` — the key's ``gateway`` flag;
+    * ``ctx.key_principal`` — the key-bound identity (the tenant id for a dict-metadata key,
+      the user for a legacy key), captured BEFORE any X-User-ID override: an allow-listed
+      override is still the caller's choice, so it must never select a rate-limit bucket.
+      ``ctx.user_id`` stays the attribution id;
+    * ``ctx.team`` — :func:`resolve_team`.
+
+    ``headers`` must be lower-cased.
+    """
+    params = getattr(ctx, "params", None) or {}
+    ctx.is_gateway_key = bool(params.get("_auth_gateway", False))
+    ctx.key_principal = str(params.get("_auth_principal") or params.get("_auth_tenant_id")
+                            or getattr(ctx, "user_id", "") or "")
+    ctx.team = resolve_team(headers.get("x-team"), ctx.is_gateway_key)
 
 
 def register_tenant(api_key_hash: str, ctx: TenantContext) -> None:

@@ -125,6 +125,47 @@ def test_load_registry_coerces_null_tools_key():
     assert registry == []
 
 
+class TestRegistryPathWithNoBucket:
+    """2026-09-18. The template ships `gs://${CONFIG_GCS_BUCKET}/config/tool-registry.yaml`,
+    so every deploy without that env var loads `gs:///config/tool-registry.yaml`. Building a
+    GCS client for an empty bucket ran Google's credential discovery - a ~3 s metadata-server
+    wait, synchronous on the request path, once per worker per cache TTL - before falling back
+    to the local file. It was the 3.3-3.5 s G08 stage in the local latency dashboards."""
+
+    @staticmethod
+    def _local_registry_file():
+        handle = MagicMock()
+        handle.__enter__ = MagicMock(return_value=handle)
+        handle.__exit__ = MagicMock(return_value=False)
+        return handle
+
+    def test_an_empty_bucket_never_constructs_a_gcs_client(self):
+        from middleware import g08_tool_loading as g08
+        g08._registry_cache = {}
+        with patch("google.cloud.storage.Client") as client, \
+             patch("builtins.open", return_value=self._local_registry_file()), \
+             patch("middleware.g08_tool_loading.yaml.safe_load", return_value={"tools": _MOCK_REGISTRY}), \
+             patch.object(g08.logger, "warning") as warning:
+            registry = g08._load_registry({"registry_path": "gs:///config/tool-registry.yaml"})
+        assert registry == _MOCK_REGISTRY, "the local registry must be served"
+        client.assert_not_called()
+        # Not a failure, so not a WARNING: the old path logged "could not load" every TTL.
+        warning.assert_not_called()
+
+    def test_a_real_bucket_still_reads_gcs(self):
+        """The GCP path must be untouched - only the bucket-less path changed."""
+        from middleware import g08_tool_loading as g08
+        g08._registry_cache = {}
+        with patch("google.cloud.storage.Client") as client, \
+             patch("middleware.g08_tool_loading.yaml.safe_load", return_value={"tools": _MOCK_REGISTRY}):
+            client.return_value.bucket.return_value.blob.return_value.download_as_text.return_value = "x"
+            registry = g08._load_registry({"registry_path": "gs://acme-config/config/tool-registry.yaml"})
+        client.assert_called_once()
+        client.return_value.bucket.assert_called_once_with("acme-config")
+        client.return_value.bucket.return_value.blob.assert_called_once_with("config/tool-registry.yaml")
+        assert registry == _MOCK_REGISTRY
+
+
 class TestClassifyIntent:
     """Direct unit tests for _classify_intent's keyword extraction."""
 

@@ -335,11 +335,12 @@ def test_call_proxy_retries_on_429(monkeypatch):
 
 
 def test_pin_raises_g00_burst_headroom():
-    """The benchmark config pin (run.sh) must lift G00's rate limit so the ~500-request
-    cache burst is not 429'd — otherwise arm B is throttled and the measurement is invalid."""
-    src = (BENCH / "run.sh").read_text(encoding="utf-8")
+    """The benchmark config pin must lift G00's rate limit so the ~500-request cache burst is
+    not 429'd — otherwise arm B is throttled and the measurement is invalid. The pin lives in
+    pin_config.py since 2026-09-18 (shared by run.sh and run.ps1), so this reads it there."""
+    src = (BENCH / "pin_config.py").read_text(encoding="utf-8")
     assert "rate_limit" in src and "requests_per_minute" in src, \
-        "run.sh pin must widen G00 rate-limit headroom for the cache burst"
+        "the pin must widen G00 rate-limit headroom for the cache burst"
 
 
 def test_workload_agentic_wiring():
@@ -406,7 +407,7 @@ def test_agentic_pin_enables_g16_tool_pruning_only():
     The launcher must still pin the tool cap (that IS the live-reproducible agentic lever, and
     it matches the shipped default), and must NOT pin the system-prompt cap.
     """
-    sh = (BENCH / "run.sh").read_text(encoding="utf-8")
+    sh = (BENCH / "pin_config.py").read_text(encoding="utf-8")   # the pin, since 2026-09-18
     assert "G16_agent_arch" in sh and "max_tools_per_agent" in sh
     assert "max_system_prompt_tokens" not in sh, (
         "pinning the system-prompt cap makes the published agentic number depend on a config "
@@ -1699,6 +1700,9 @@ class TestAnAbortedRunDoesNotWipeTheCostLog:
             proc = subprocess.run(
                 [sys.executable, str(BENCH / "run_ab.py"),
                  "--workload", "provider-cache", "--limit", "1",
+                 # Since 2026-09-18 an unreachable proxy fails at the warm-up gate, before any
+                 # pair; a 2 s budget keeps that inside this test's own 30 s timeout.
+                 "--warmup-timeout", "2",
                  "--proxy-url", "http://127.0.0.1:1"],  # port 1: guaranteed connection refused
                 cwd=str(REPO), env=env, capture_output=True, text=True, timeout=30)
             assert proc.returncode != 0, "expected the run to fail with no reachable proxy"

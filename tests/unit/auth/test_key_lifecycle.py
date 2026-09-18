@@ -47,6 +47,37 @@ def test_create_admin_key_flagged(temp_store):
     assert akm.is_admin_key(m) is True
 
 
+def test_create_gateway_key_flagged(temp_store):
+    raw, _h, meta = akm.create_key("edge", tier="enterprise", gateway=True)
+    assert meta.get("gateway") is True
+    _ok, _tid, m = akm.validate_proxy_key(raw)
+    assert akm.is_gateway_key(m) is True
+
+
+def test_gateway_flag_cannot_be_set_via_extra(temp_store):
+    # `gateway` is a trust flag, reserved like `admin` — a client-supplied extra must not
+    # smuggle it in (create_key extra is only ever fed server-side, so this is preventive).
+    _raw, _h, meta = akm.create_key("edge", extra={"gateway": True, "owner_domain": "x.test"})
+    assert "gateway" not in meta
+    assert akm.is_gateway_key(meta) is False
+    assert meta.get("owner_domain") == "x.test"   # non-reserved extra still passes
+
+
+def test_is_gateway_key_requires_strict_true(temp_store):
+    # A truthy non-True (e.g. a stray string) must NOT grant gateway trust.
+    assert akm.is_gateway_key({"gateway": "yes"}) is False
+    assert akm.is_gateway_key({"gateway": 1}) is False
+    assert akm.is_gateway_key(None) is False
+
+
+def test_rotation_preserves_gateway_flag(temp_store):
+    akm.create_key("edge", tier="enterprise", gateway=True)
+    raw2, _h, meta, _revoked = akm.rotate_tenant_keys("edge")
+    assert meta.get("gateway") is True
+    _ok, _tid, m = akm.validate_proxy_key(raw2)
+    assert akm.is_gateway_key(m) is True
+
+
 def test_create_rejects_duplicate_raw_key(temp_store):
     akm.create_key("acme", raw_key="tok-fixed-abc")
     with pytest.raises(ValueError):
