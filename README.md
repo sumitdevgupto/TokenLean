@@ -11,6 +11,8 @@
   <strong>100% free when self-hosted</strong> — every optimisation, never billed, never tier-gated.<br>
   Prefer zero-ops? Get it as a fully-managed <a href="#free-self-host-vs-enterprise-managed">Enterprise SaaS</a> —
   <a href="https://tokenlean.cbeyond.cloud/" target="_blank" rel="noopener"><strong>tokenlean.cbeyond.cloud</strong></a>
+  <br>
+  <a href="https://youtu.be/22on_HzyuuQ" target="_blank" rel="noopener"><strong>Youtube</strong></a>
 </p>
 
 [![CI](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitdevgupto/TokenLean/actions/workflows/ci.yml)
@@ -246,6 +248,12 @@ client = anthropic.Anthropic(
     api_key=os.environ["PROXY_API_KEY"],
     base_url=os.environ["PROXY_ENDPOINT"]     # x-api-key auth handled natively
 )
+```
+
+**Claude Code** (CLI) → two env vars (it appends `/v1/messages` itself, so **no** `/v1` suffix):
+```bash
+export ANTHROPIC_BASE_URL="$PROXY_ENDPOINT"     # e.g. http://localhost:8000 — no /v1
+export ANTHROPIC_AUTH_TOKEN="$PROXY_API_KEY"    # sent as Bearer (or ANTHROPIC_API_KEY → x-api-key)
 ```
 
 **Gemini SDK** → `…/v1beta/models/{model}:generateContent`

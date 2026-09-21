@@ -77,6 +77,23 @@ client = Anthropic(
 )
 ```
 
+#### Claude Code (CLI)
+Claude Code appends `/v1/messages` itself, so configure it with environment variables
+and **no** `/v1` suffix on the base URL (persist them in `~/.claude/settings.json`
+under `"env"`, or export them for a one-off session):
+```bash
+export ANTHROPIC_BASE_URL="$PROXY_ENDPOINT"    # e.g. http://localhost:8000 — no /v1
+export ANTHROPIC_AUTH_TOKEN="$PROXY_API_KEY"   # Bearer; or ANTHROPIC_API_KEY → x-api-key
+claude
+```
+Two operational notes:
+- The proxy serves `/v1/messages` but **not** `/v1/messages/count_tokens`, so Claude
+  Code's optional token-count preflight isn't proxied; the message flow itself is
+  unaffected.
+- Claude Code sends real Anthropic model ids (`claude-…`), so the tenant's config needs
+  an Anthropic provider whose `model_prefixes` cover `claude-` (or pin `ANTHROPIC_MODEL`
+  to a model the proxy routes).
+
 ### Gemini (native `generateContent`)
 Point the Google GenAI SDK's base URL at the proxy; the proxy exposes
 `/v1beta/models/{model}:generateContent` (+ `:streamGenerateContent`) and re-serialises
