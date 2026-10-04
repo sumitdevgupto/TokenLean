@@ -3,15 +3,18 @@ G03 · Document Ingestion Pipeline — Cloud Run Job
 Triggered when a document is uploaded to GCS.
 Steps: download → extract text (Unstructured) → strip boilerplate
        → chunk (256-512 tokens) → embed dense + sparse (SPLADE/BM25)
-       → upsert to Qdrant named vectors.
+       → upsert to Qdrant named vectors → snapshot the collection to QDRANT_SNAPSHOT_BUCKET.
 """
 import logging
 import os
 import re
 import sys
+import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), stream=sys.stdout)
@@ -68,13 +71,120 @@ def download_from_gcs(bucket: str, obj: str) -> bytes:
     return blob.download_as_bytes()
 
 
+def _cloud_run_auth_headers(url: str) -> dict:
+    """``Authorization: Bearer <identity token>`` for an IAM-protected Cloud Run service
+    (tika-svc on GCP), from the metadata server; ``{}`` for any other URL. The audience is
+    the service origin, and only ``https://*.run.app`` hosts get a token. This job image
+    does not ship the proxy's ``ml_models``, whose helper this mirrors."""
+    import urllib.request
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host.endswith(".run.app"):
+        return {}
+    req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/"
+        f"service-accounts/default/identity?audience=https://{host}",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    # The fixed metadata-server URL, never caller input (bandit B310).
+    with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310
+        token = resp.read().decode().strip()
+    return {"Authorization": f"Bearer {token}"}
+
+
+# ─── Qdrant connection: the proxy's settings (ml_models.qdrant_client_kwargs) ────
+# This image does not ship the proxy's ml_models, so this is a copy, and a test holds it to
+# the proxy's. On GCP, Qdrant runs on Cloud Run behind IAM plus its own API key: without the
+# key, an identity token and port 443, every call from this job failed.
+_id_token_cache: Dict[str, Tuple[str, float]] = {}
+_id_token_lock = threading.Lock()
+# Cloud Run names itself in every service's (K_SERVICE) and job's (CLOUD_RUN_JOB)
+# environment. Elsewhere the metadata server is probed; a "no" is kept _GCP_NO_TTL_S only.
+_CLOUD_RUN_ENV = ("K_SERVICE", "CLOUD_RUN_JOB")
+_GCP_NO_TTL_S = 300.0
+_gcp_metadata_available: Optional[bool] = None
+_gcp_checked_at = 0.0
+_clock = time.monotonic
+
+
+def _gcp_identity_token(audience: str) -> str:
+    """A GCP identity token for ``audience`` from the metadata server, cached ~50 min."""
+    import urllib.request
+
+    now = time.time()
+    tok, exp = _id_token_cache.get(audience, ("", 0.0))
+    if tok and now < exp:
+        return tok
+    with _id_token_lock:
+        tok, exp = _id_token_cache.get(audience, ("", 0.0))
+        if tok and now < exp:
+            return tok
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/"
+            f"service-accounts/default/identity?audience={audience}",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        # The fixed metadata-server URL, never caller input (bandit B310).
+        token = urllib.request.urlopen(req, timeout=5).read().decode().strip()  # nosec B310
+        _id_token_cache[audience] = (token, now + 3000)  # refresh 10 min before 1 h expiry
+        return token
+
+
+def _on_gcp() -> bool:
+    """Whether this process runs on GCP: Cloud Run's environment says so, else the metadata
+    server answers. A yes is kept for the process, a no for _GCP_NO_TTL_S only (one slow
+    probe used to turn the identity token off for the whole run)."""
+    global _gcp_metadata_available, _gcp_checked_at
+    if _gcp_metadata_available:
+        return True
+    if any(os.environ.get(name) for name in _CLOUD_RUN_ENV):
+        _gcp_metadata_available = True
+        return True
+    now = _clock()
+    if _gcp_metadata_available is False and now - _gcp_checked_at < _GCP_NO_TTL_S:
+        return False
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/id",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        urllib.request.urlopen(req, timeout=2).read()  # nosec B310 (fixed URL)
+        _gcp_metadata_available = True
+    except Exception:
+        _gcp_metadata_available = False
+        _gcp_checked_at = now
+    return _gcp_metadata_available
+
+
+def _qdrant_client_kwargs(url: str) -> Dict[str, Any]:
+    """QdrantClient kwargs for ``url``: the Qdrant API key (``QDRANT_API_KEY``), port 443 for
+    an https URL without a port (the client defaults to 6333, which Cloud Run does not
+    serve), and on GCP a Cloud Run identity token for the IAM layer."""
+    kwargs: Dict[str, Any] = {"url": url, "api_key": os.getenv("QDRANT_API_KEY") or None}
+    try:
+        import inspect
+        from qdrant_client import QdrantClient
+        if "check_compatibility" in inspect.signature(QdrantClient.__init__).parameters:
+            kwargs["check_compatibility"] = False
+    except Exception as exc:
+        logger.debug("qdrant-client compatibility probe failed: %r", exc)
+    if url.startswith("https://") and ":" not in url.split("//", 1)[1].split("/", 1)[0]:
+        kwargs["port"] = 443
+    if url.startswith("https://") and os.getenv("QDRANT_LOCAL_NOAUTH") != "1" and _on_gcp():
+        kwargs["auth_token_provider"] = lambda: _gcp_identity_token(url)
+    return kwargs
+
+
 def extract_text_with_tika(content: bytes, filename: str) -> str:
     """Use Apache Tika sidecar to extract text from documents."""
     try:
         import httpx
-        
+
         tika_url = os.getenv("TIKA_SIDECAR_URL", "http://tika-svc:9998")
-        
+
         with httpx.Client(timeout=30.0) as client:
             resp = client.put(
                 f"{tika_url}/tika",
@@ -83,6 +193,7 @@ def extract_text_with_tika(content: bytes, filename: str) -> str:
                     "Content-Type": "application/octet-stream",
                     "Accept": "text/plain",
                     "X-Filename": filename,
+                    **_cloud_run_auth_headers(tika_url),
                 },
             )
             resp.raise_for_status()
@@ -92,18 +203,20 @@ def extract_text_with_tika(content: bytes, filename: str) -> str:
         return ""
 
 
-def extract_text(content: bytes, filename: str) -> str:
-    """Use Unstructured or Tika to extract clean text from any document type."""
-    # Try Tika first if enabled
-    use_tika = os.getenv("USE_TIKA", "false").lower() == "true"
-    if use_tika:
-        text = extract_text_with_tika(content, filename)
-        if text:
-            logger.info("Extracted text using Tika sidecar")
-            return text
-        logger.warning("Tika failed — falling back to Unstructured")
-    
-    # Fallback to Unstructured
+# Formats whose bytes may be stored as text when no parser reads them, and only when those
+# bytes really are UTF-8 with no NUL.
+_TEXT_SUFFIXES = frozenset({".txt", ".text", ".md", ".markdown", ".rst", ".csv", ".tsv",
+                            ".json", ".jsonl", ".yaml", ".yml", ".xml", ".html", ".htm",
+                            ".log"})
+
+
+class UnreadableDocumentError(RuntimeError):
+    """Neither Unstructured nor Tika could read the file, and it is not plain UTF-8 text.
+    Storing its bytes as text would put noise into the tenant's RAG context, so the job
+    stores nothing instead."""
+
+
+def _extract_with_unstructured(content: bytes, filename: str) -> str:
     try:
         import tempfile
         from unstructured.partition.auto import partition
@@ -111,17 +224,44 @@ def extract_text(content: bytes, filename: str) -> str:
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1], delete=False) as f:
             f.write(content)
             tmp_path = f.name
-
-        elements = partition(filename=tmp_path)
-        os.unlink(tmp_path)
+        try:
+            elements = partition(filename=tmp_path)
+        finally:
+            os.unlink(tmp_path)
         return "\n\n".join(str(e) for e in elements)
     except Exception as exc:
-        logger.error("Text extraction failed: %s", exc)
-        # Fallback: decode as UTF-8
-        try:
-            return content.decode("utf-8", errors="replace")
-        except Exception:
-            return ""
+        logger.warning("Unstructured could not read %s: %s", filename, exc)
+        return ""
+
+
+def _as_text(content: bytes, filename: str) -> Optional[str]:
+    """``content`` as text when ``filename`` is a plain-text format and the bytes are UTF-8
+    with no NUL; otherwise None."""
+    if os.path.splitext(filename)[1].lower() not in _TEXT_SUFFIXES or b"\x00" in content:
+        return None
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def extract_text(content: bytes, filename: str) -> str:
+    """Text of a document: Unstructured first, so PDF and Word read as before; then the Tika
+    sidecar, when TIKA_SIDECAR_URL is set, for what Unstructured cannot read (Excel,
+    PowerPoint and more); then a plain-text file as UTF-8. Raises UnreadableDocumentError
+    for anything else, rather than storing its bytes as text."""
+    text = _extract_with_unstructured(content, filename)
+    if text.strip():
+        return text
+    if os.getenv("TIKA_SIDECAR_URL"):
+        text = extract_text_with_tika(content, filename)
+        if text.strip():
+            logger.info("Extracted %s with the Tika sidecar", filename)
+            return text
+    text = _as_text(content, filename)
+    if text is not None:
+        return text
+    raise UnreadableDocumentError(f"no reader could extract text from {filename}")
 
 
 def strip_boilerplate(text: str) -> str:
@@ -180,65 +320,58 @@ def table_to_csv(text: str) -> str:
     return "\n".join(out)
 
 
-def summarise_large_chunks(
-    chunks: List[str], max_tokens: int = 4000
-) -> List[str]:
-    """
-    Summarise any chunk exceeding max_tokens with a cheap model.
-    Avoids sending oversized chunks to the vector DB (and later to the LLM).
-    """
-    import tiktoken
+def _token_counter():
     try:
+        import tiktoken
         enc = tiktoken.get_encoding("cl100k_base")
+        return lambda text: len(enc.encode(text))
     except Exception:
-        enc = None
+        return lambda text: len(text) // 4
 
+
+def _cut_to_budget(text: str, max_tokens: int, count) -> List[str]:
+    """Cut ``text`` into consecutive pieces of at most ``max_tokens`` tokens, each ending at a
+    line break, else a space, when one falls in the piece's last three quarters (so no piece
+    is shrunk below a quarter of the budget just to end on a boundary)."""
+    pieces: List[str] = []
+    while text and count(text) > max_tokens:
+        lo, hi = 1, len(text)           # the longest prefix within the budget
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if count(text[:mid]) <= max_tokens:
+                lo = mid
+            else:
+                hi = mid - 1
+        cut = lo
+        for boundary in ("\n", " "):
+            at = text.rfind(boundary, 0, lo + 1)
+            if at > lo // 4:
+                cut = at
+                break
+        pieces.append(text[:cut])
+        text = text[cut:].lstrip()
+    if text:
+        pieces.append(text)
+    return pieces
+
+
+def split_oversized_chunks(chunks: List[str], max_tokens: int = 4000) -> List[str]:
+    """Cut any chunk over ``max_tokens`` into consecutive pieces within it.
+
+    The chunker cuts by characters, about four per token, so a chunk only runs over when its
+    text is token-dense (some non-Latin scripts) or CHUNK_SIZE_TOKENS is raised. Cutting
+    keeps every word and needs no model, no key, and nothing leaves the job."""
+    count = _token_counter()
+    max_tokens = max(1, int(max_tokens))
     result: List[str] = []
     for chunk in chunks:
-        token_count = len(enc.encode(chunk)) if enc else len(chunk) // 4
-        if token_count <= max_tokens:
+        if count(chunk) <= max_tokens:
             result.append(chunk)
-            continue
-
-        # Summarise with cheap LLM
-        try:
-            import litellm
-            summary_model = os.getenv("SUMMARY_MODEL", "gemini-2.0-flash-lite")
-            provider_key = os.getenv("SUMMARY_PROVIDER_KEY", "")
-
-            # Try to resolve from Secret Manager if running on GCP
-            if not provider_key:
-                try:
-                    from google.cloud import secretmanager
-                    sm = secretmanager.SecretManagerServiceClient()
-                    project = os.getenv("GOOGLE_CLOUD_PROJECT", "")
-                    if project:
-                        secret_name = f"projects/{project}/secrets/gemini-api-key/versions/latest"
-                        resp = sm.access_secret_version(name=secret_name)
-                        provider_key = resp.payload.data.decode("utf-8").strip()
-                except Exception:
-                    pass
-
-            response = litellm.completion(
-                model=summary_model,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Summarise the following document section in plain prose. "
-                        "Preserve all key facts, numbers, and named entities. "
-                        f"Be concise (target <{max_tokens // 2} tokens):\n\n{chunk[:12000]}"
-                    ),
-                }],
-                api_key=provider_key or None,
-                max_tokens=max_tokens // 2,
-            )
-            summary = response.choices[0].message.content or chunk
-            result.append(summary)
-            logger.info("Summarised oversized chunk: %d tokens → summary", token_count)
-        except Exception as exc:
-            logger.warning("Chunk summarisation failed: %s — keeping original", exc)
-            result.append(chunk)
-
+        else:
+            pieces = _cut_to_budget(chunk, max_tokens, count)
+            logger.info("Cut an oversized chunk into %d pieces of at most %d tokens",
+                        len(pieces), max_tokens)
+            result.extend(pieces)
     return result
 
 
@@ -284,7 +417,7 @@ def upsert_to_qdrant(
         )
         sys.exit(1)
 
-    client = QdrantClient(url=_QDRANT_URL)
+    client = QdrantClient(**_qdrant_client_kwargs(_QDRANT_URL))
 
     # Collection management: ensure named vectors (dense + sparse)
     collections = [c.name for c in client.get_collections().collections]
@@ -346,6 +479,66 @@ def upsert_to_qdrant(
         len(points),
         source,
     )
+    snapshot_collection(client, _QDRANT_COLLECTION)
+
+
+# ─── Durable collections: a snapshot after every ingest ───────────────────────
+# Qdrant on Cloud Run keeps its collections in the container's own filesystem, so a new
+# revision or a restart starts it empty. The changed collection's snapshot goes to
+# QDRANT_SNAPSHOT_BUCKET, and the service restores the newest snapshot of each collection
+# before it serves (infra/qdrant-restore.sh). The name carries the time the snapshot was asked
+# for: one asked for later holds every upsert an earlier one does, so the newest is the most
+# complete, whichever of two concurrent ingests uploads last.
+_SNAPSHOT_TIME = "%Y%m%dT%H%M%S.%fZ"
+
+
+def snapshot_collection(client, collection: str) -> Optional[str]:
+    """Write *collection*'s snapshot to QDRANT_SNAPSHOT_BUCKET as <collection>.<UTC time>.snapshot
+    and delete its older snapshots there (never a newer one another ingest wrote). Returns the
+    object's name; None when no bucket is set (a Qdrant with storage of its own). Qdrant's own
+    copy is deleted whatever happens: it holds the whole collection in the container's memory.
+    A failure raises, failing the ingest: the document would not survive a restart."""
+    bucket_name = os.getenv("QDRANT_SNAPSHOT_BUCKET", "").strip()
+    if not bucket_name:
+        return None
+    name = f"{collection}.{datetime.now(timezone.utc).strftime(_SNAPSHOT_TIME)}.snapshot"
+    snapshot = client.create_snapshot(collection_name=collection, wait=True)
+    try:
+        from google.cloud import storage
+        bucket = storage.Client().bucket(bucket_name)
+        with tempfile.TemporaryFile() as copy:
+            _download_snapshot(collection, snapshot.name, copy)
+            copy.seek(0)
+            bucket.blob(name).upload_from_file(copy, content_type="application/octet-stream")
+        for blob in bucket.list_blobs(prefix=f"{collection}."):
+            if blob.name.endswith(".snapshot") and blob.name < name:
+                blob.delete()
+    finally:
+        client.delete_snapshot(collection_name=collection, snapshot_name=snapshot.name, wait=True)
+    logger.info("Snapshot of %s written to gs://%s/%s", collection, bucket_name, name)
+    return name
+
+
+def _download_snapshot(collection: str, snapshot_name: str, out) -> None:
+    """Stream a snapshot file from Qdrant's HTTP API into *out*, with the client's credentials:
+    the API key, and on GCP an identity token for Cloud Run's IAM."""
+    import httpx
+
+    headers = {}
+    if os.getenv("QDRANT_API_KEY"):
+        headers["api-key"] = os.environ["QDRANT_API_KEY"]
+    if _QDRANT_URL.startswith("https://") and os.getenv("QDRANT_LOCAL_NOAUTH") != "1" and _on_gcp():
+        headers["Authorization"] = f"Bearer {_gcp_identity_token(_QDRANT_URL)}"
+    url = f"{_QDRANT_URL.rstrip('/')}/collections/{collection}/snapshots/{snapshot_name}"
+    with httpx.stream("GET", url, headers=headers, timeout=600.0) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            out.write(chunk)
+
+
+class IngestPiiError(RuntimeError):
+    """INGEST_PII_MODE asks for something this job cannot do. Storing the text anyway would
+    drop the operator's decision, so the job fails instead."""
 
 
 def redact_ingest_pii(text: str) -> str:
@@ -360,18 +553,24 @@ def redact_ingest_pii(text: str) -> str:
         response to restore at ingest).
       * ``INGEST_PII_PHI``  — ``true`` also scans the PHI entity set.
 
-    Uses the shared OSS ``guardrails`` engine. If it isn't importable in this container
-    the scan safely no-ops with a one-time warning (default mode is off, so this never
-    changes behaviour unless an operator opted in)."""
-    mode = os.getenv("INGEST_PII_MODE", "off").lower()
-    if mode not in ("flag", "mask") or not text:
+    Uses the shared OSS ``guardrails`` engine. If it isn't importable in this container,
+    flag mode warns and goes on (it never changes the text), while mask mode raises
+    IngestPiiError rather than store unmasked text, as does a mode other than off, flag
+    or mask (a mistyped mask must not mean off)."""
+    mode = os.getenv("INGEST_PII_MODE", "").strip().lower() or "off"
+    if mode not in ("off", "flag", "mask"):
+        raise IngestPiiError(f"INGEST_PII_MODE={mode!r} is not off, flag or mask")
+    if mode == "off" or not text:
         return text
     try:
         from guardrails.pii import PiiDetector, mask_matches, DEFAULT_ENTITIES, PHI_ENTITIES
-    except Exception:
+    except Exception as exc:
+        if mode == "mask":
+            raise IngestPiiError("INGEST_PII_MODE=mask but the guardrails engine is not "
+                                 "importable in this container") from exc
         logger.warning(
-            "INGEST_PII_MODE=%s but the guardrails engine is not importable in this "
-            "container — skipping ingest PII scan", mode,
+            "INGEST_PII_MODE=flag but the guardrails engine is not importable in this "
+            "container — skipping the ingest PII scan",
         )
         return text
     phi = os.getenv("INGEST_PII_PHI", "false").lower() == "true"
@@ -395,7 +594,11 @@ def run() -> None:
     logger.info("Processing gs://%s/%s", _GCS_BUCKET, _GCS_OBJECT)
 
     content = download_from_gcs(_GCS_BUCKET, _GCS_OBJECT)
-    text = extract_text(content, _GCS_OBJECT)
+    try:
+        text = extract_text(content, _GCS_OBJECT)
+    except UnreadableDocumentError as exc:
+        logger.error("%s — not ingesting gs://%s/%s", exc, _GCS_BUCKET, _GCS_OBJECT)
+        sys.exit(1)
     text = strip_boilerplate(text)
 
     if len(text) < 50:
@@ -407,15 +610,19 @@ def run() -> None:
 
     # Trust & safety: redact PII/PHI BEFORE chunk/embed/store (no-op unless
     # INGEST_PII_MODE is flag/mask) so the vector store never holds raw personal data.
-    text = redact_ingest_pii(text)
+    try:
+        text = redact_ingest_pii(text)
+    except IngestPiiError as exc:
+        logger.error("%s — not ingesting gs://%s/%s", exc, _GCS_BUCKET, _GCS_OBJECT)
+        sys.exit(1)
 
     chunks = chunk_text(text)
     logger.info("Created %d chunks", len(chunks))
 
-    # Summarise oversized chunks (>4,000 tokens) with cheap model
+    # Cut any chunk over MAX_CHUNK_TOKENS into pieces within it.
     max_chunk_tokens = int(os.getenv("MAX_CHUNK_TOKENS", "4000"))
-    chunks = summarise_large_chunks(chunks, max_tokens=max_chunk_tokens)
-    logger.info("After summarisation: %d chunks", len(chunks))
+    chunks = split_oversized_chunks(chunks, max_tokens=max_chunk_tokens)
+    logger.info("After the size cut: %d chunks", len(chunks))
 
     dense_embeddings = embed_chunks_dense(chunks)
     sparse_embeddings = embed_chunks_sparse(chunks)

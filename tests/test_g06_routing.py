@@ -209,6 +209,64 @@ class TestExecuteThreeTierCascade:
 
         assert call_count["n"] >= 2  # tier1 + tier2 at minimum
 
+    # A tier call sends the conversation to a model the caller did not pick, often at
+    # another provider. Its prompt-cache markers go only to a provider that caches by
+    # marker: anywhere else litellm would turn them into a separately billed Gemini cache,
+    # or hand them to an endpoint that may reject them.
+    _MARK = {"type": "ephemeral"}
+    _PROVIDERS = [{"name": "openai", "model_prefixes": ["gpt-"]},
+                  {"name": "anthropic", "model_prefixes": ["claude"]}]
+    _UNMARKED = [{"role": "system", "content": [{"type": "text", "text": "Rules."}]},
+                 {"role": "user", "content": "Hello"}]
+
+    def _marked_ctx(self):
+        return _make_ctx(messages=[
+            {"role": "system", "content": [
+                {"type": "text", "text": "Rules.", "cache_control": self._MARK}]},
+            {"role": "user", "content": "Hello", "cache_control": self._MARK}])
+
+    async def _tier_calls(self, tiers, responses, tier):
+        sent = []
+
+        async def side_effect(**kwargs):
+            sent.append(kwargs)
+            return responses[min(len(sent), len(responses)) - 1]
+
+        with patch("middleware.g06_routing._resolve_provider_key", new_callable=AsyncMock, return_value="key"), \
+             patch("middleware.g06_routing.get_providers", return_value=self._PROVIDERS), \
+             patch("middleware.g06_routing.litellm.acompletion", side_effect=side_effect), \
+             patch("middleware.g06_routing._classify_heuristic", return_value=(tier, 0.50)), \
+             patch("middleware.g06_routing.estimate_cost", return_value=0.0):
+            await _execute_three_tier_cascade(self._marked_ctx(), tiers, self._cfg(threshold=0.70))
+        return sent
+
+    @pytest.mark.asyncio
+    async def test_a_tier_call_carries_cache_markers_only_to_a_provider_that_caches_by_marker(self):
+        sent = await self._tier_calls(
+            {"simple": ["claude-3-5-haiku"], "medium": ["gpt-4o"], "complex": []},
+            [_fake_response("Tier1", finish_reason="length"), _fake_response("Tier2")],
+            tier="medium")
+        assert len(sent) == 2
+        assert sent[0]["messages"][0]["content"][0]["cache_control"] == self._MARK
+        assert sent[0]["messages"][1]["cache_control"] == self._MARK
+        assert sent[1]["messages"] == self._UNMARKED
+
+    @pytest.mark.asyncio
+    async def test_the_uncapped_tier1_retry_follows_the_same_rule(self):
+        sent = await self._tier_calls(
+            {"simple": ["gpt-4o-mini"], "medium": [], "complex": []},
+            [_fake_response("Tier1", finish_reason="length"), _fake_response("Retried")],
+            tier="simple")
+        assert len(sent) == 2  # the capped probe, then its uncapped retry
+        assert [s["messages"] for s in sent] == [self._UNMARKED, self._UNMARKED]
+
+    def test_every_tier_call_sends_its_messages_through_the_marker_rule(self):
+        import inspect
+        from middleware import g06_routing
+        body = inspect.getsource(g06_routing._execute_three_tier_cascade)
+        assert "messages=ctx.messages" not in body
+        assert body.count("messages=_tier_messages(") == 4  # tier1, its retry, tier2, tier3
+
     @pytest.mark.asyncio
     async def test_cost_rollback_prevents_tier2_escalation(self):
         """Escalation cost above max_escalation_cost → stay with tier1."""

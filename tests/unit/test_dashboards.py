@@ -404,3 +404,25 @@ class TestStatPanelsDeclareThresholds:
         u = {s["color"]: s["value"] for s in uptime["fieldConfig"]["defaults"]["thresholds"]["steps"]}
         e = {s["color"]: s["value"] for s in err["fieldConfig"]["defaults"]["thresholds"]["steps"]}
         assert 100 - u["green"] == e["yellow"] and 100 - u["yellow"] == e["red"]
+
+
+# ── Trust & Safety: G31, with the managed rules' record-only matches (2026-10-02) ──
+
+class TestTrustSafetyContextTrust:
+    def test_the_g31_row_shows_its_events_and_the_record_only_managed_matches(self):
+        queries = _all_panel_queries(_load_dashboard("trust-safety.json"))
+        assert any("token_opt_context_trust_events_total" in q for q in queries)
+        managed = [q for q in queries if "token_opt_context_trust_managed_recorded_total" in q]
+        assert managed
+        assert all('tenant_id=~"$tenant"' in q and "by (rule_id)" in q for q in managed)
+
+    def test_every_metric_the_dashboard_queries_is_one_the_proxy_defines(self):
+        import re
+        src = Path(__file__).parent.parent.parent / "src" / "proxy"
+        defined = set()
+        for path in src.rglob("*.py"):
+            defined |= set(re.findall(r'"(token_opt_[a-z0-9_]+)"',
+                                      path.read_text(encoding="utf-8", errors="replace")))
+        queried = set(re.findall(r"token_opt_[a-z0-9_]+",
+                                 " ".join(_all_panel_queries(_load_dashboard("trust-safety.json")))))
+        assert queried and not queried - defined

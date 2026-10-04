@@ -18,6 +18,16 @@ output "proxy_service_account_email" {
   value       = google_service_account.proxy_sa.email
 }
 
+output "grafana_service_account_email" {
+  description = "Service account grafana-svc runs as (gcp-deploy.sh), not the proxy's"
+  value       = google_service_account.grafana_sa.email
+}
+
+output "langfuse_service_account_email" {
+  description = "Service account langfuse-svc runs as (gcp-deploy.sh), not the proxy's"
+  value       = google_service_account.langfuse_sa.email
+}
+
 output "db_password_secret_name" {
   description = "Secret Manager secret name for DB password"
   value       = google_secret_manager_secret.db_password.secret_id
@@ -34,7 +44,7 @@ output "prometheus_service_url" {
 }
 
 output "redis_host" {
-  description = "Redis host for REDIS_URL=redis://<host>:6379/0 — Memorystore host or the docker-Redis GCE VM internal IP"
+  description = "Redis host — Memorystore host or the docker-Redis GCE VM internal IP (the clients use redis_url)"
   value = (
     var.redis_backend == "memorystore"
     ? google_redis_instance.cache[0].host
@@ -42,7 +52,19 @@ output "redis_host" {
   )
 }
 
+output "redis_url" {
+  description = "REDIS_URL for the clients: rediss:// once redis_tls is on, with Memorystore's port (6378 with TLS); no credentials (the password is the redis-auth secret, the CA the redis-ca secret)"
+  value = format("%s://%s:%d/0", var.redis_tls ? "rediss" : "redis",
+    var.redis_backend == "memorystore" ? google_redis_instance.cache[0].host : google_compute_instance.redis[0].network_interface[0].network_ip,
+  var.redis_backend == "memorystore" ? google_redis_instance.cache[0].port : 6379)
+}
+
 output "qdrant_service_url" {
   description = "Internal Cloud Run URL for the Qdrant service (empty when Qdrant is disabled — use pgvector)"
   value       = var.enable_qdrant ? google_cloud_run_v2_service.qdrant[0].uri : ""
+}
+
+output "qdrant_snapshot_bucket" {
+  description = "Bucket of Qdrant's collection snapshots (QDRANT_SNAPSHOT_BUCKET for the ingest job and token-proxy; empty when Qdrant is disabled)"
+  value       = var.enable_qdrant ? google_storage_bucket.qdrant_snapshots[0].name : ""
 }

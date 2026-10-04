@@ -7,10 +7,16 @@ byte-for-byte. Everything else is best-effort filler removal.
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
+import re
+import time
+
+import pytest
+
 from middleware.prose_compress import (
     compress,
     compress_text,
     compress_descriptions_in_place,
+    protected_segments,
 )
 
 
@@ -171,3 +177,138 @@ class TestDescriptionCompression:
     def test_no_descriptions_returns_zero(self):
         obj = {"name": "x", "value": 3}
         assert compress_descriptions_in_place(obj) == 0
+
+    def test_a_refused_compression_keeps_the_original_and_saves_nothing(self):
+        obj = {"description": "Please just do the thing.",
+               "parameters": {"properties": {"q": {"description": "Really the query."}}}}
+        seen = []
+
+        def refuse(before, after):
+            seen.append((before, after))
+            return False
+
+        assert compress_descriptions_in_place(obj, accept=refuse) == 0
+        assert obj["description"] == "Please just do the thing."
+        assert obj["parameters"]["properties"]["q"]["description"] == "Really the query."
+        assert [b for b, _ in seen] == ["Please just do the thing.", "Really the query."]
+
+    def test_an_accepted_compression_is_kept(self):
+        obj = {"description": "Please just do the thing."}
+        assert compress_descriptions_in_place(obj, accept=lambda b, a: True) > 0
+        assert "just" not in obj["description"]
+
+
+class TestMeaningBearingWordsKept:
+    """Tool descriptions are instructions to the model (G08 compresses them by default), so the
+    compressor drops only words whose loss leaves the instruction as it was."""
+
+    def test_the_reported_description_keeps_its_instructions(self):
+        out = compress_text("Make sure the date is ISO-8601. This might return an empty list. "
+                            "Uses just-in-time lookup.")
+        assert "Make sure" in out and "might return" in out and "just-in-time" in out
+
+    def test_sure_opening_a_reply_is_still_dropped(self):
+        out = compress_text("Sure, here is the list. Sure! Done.")
+        assert "sure" not in out.lower()
+
+    @pytest.mark.parametrize("text, kept", [
+        ("Make sure the date is set.", "Make sure"),
+        ("I am not sure, so check the logs.", "not sure,"),
+        ("Be sure! It deletes data.", "Be sure!"),
+    ])
+    def test_sure_inside_a_sentence_is_kept(self, text, kept):
+        assert kept in compress_text(text)
+
+    @pytest.mark.parametrize("text, kept", [
+        ("This might return an empty list.", "might"),
+        ("The field is maybe empty.", "maybe"),
+        ("The call perhaps times out.", "perhaps"),
+        ("This could potentially delete files.", "could potentially"),
+        ("It appears in results only when published.", "It appears"),
+    ])
+    def test_modal_hedges_are_kept(self, text, kept):
+        assert kept in compress_text(text)
+
+    @pytest.mark.parametrize("compound", [
+        "just-in-time", "very-high-priority", "really-long", "sure-fire", "please-wait",
+        "thank-you", "maybe-null", "the-end", "Class-A", "not-quite", "no-thanks",
+        "in my opinion-piece"])
+    def test_a_hyphenated_compound_is_kept_whole(self, compound):
+        assert compound in compress_text(f"Uses {compound} handling.")
+
+    @pytest.mark.parametrize("text, kept", [
+        ("Returns not just the IDs but the full records.", "not just"),
+        ("You cannot just delete the file.", "cannot just"),
+        ("This isn't really required.", "isn't really"),
+        ("This isn’t simply a cache.", "isn’t simply"),
+        ("It is not quite sorted.", "not quite"),
+        ("Order is never really guaranteed.", "never really"),
+    ])
+    def test_a_degree_word_after_a_negation_is_kept(self, text, kept):
+        assert kept in compress_text(text)
+
+    @pytest.mark.parametrize("text", [
+        "Optional. limit caps the rows.",
+        "The limit parameter caps the rows.",
+        "I'll fix the bug. Please call the cleanup tool.",
+        "Basically, query is the search string.",
+    ])
+    def test_no_surviving_word_changes_case(self, text):
+        words = set(re.findall(r"\w+", text))
+        assert set(re.findall(r"\w+", compress_text(text))) <= words
+
+
+class TestTildeFences:
+    def test_tilde_fenced_code_block_preserved(self):
+        text = "Here is the code:\n~~~python\ndef foo():\n    return the a value\n~~~\nDone."
+        assert "~~~python\ndef foo():\n    return the a value\n~~~" in compress_text(text)
+
+
+class TestProtectedSegments:
+    """What G01 requires every compression to keep unchanged, in order."""
+
+    def test_overlapping_matches_merge_into_one_segment_in_order(self):
+        text = ('call fetch_user(user_id) then requests.get("https://api.acme.io/v2/users") '
+                "and check /etc/app/x.yaml.")
+        assert protected_segments(text) == [
+            "fetch_user(user_id)", 'requests.get("https://api.acme.io/v2/users")',
+            "/etc/app/x.yaml"]
+
+    @pytest.mark.parametrize("text, segment", [
+        ("Set the user_id field.", "user_id"),
+        ("Set MAX_RETRY_COUNT high.", "MAX_RETRY_COUNT"),
+        ("Call fetchUser now.", "fetchUser"),
+        ("Use the UserService class.", "UserService"),
+        ("Run `make deploy` now.", "`make deploy`"),
+        ("See https://acme.io/docs.", "https://acme.io/docs"),
+        ("Upgrade to 1.2.3 soon.", "1.2.3"),
+        ("Read config.database.host now.", "config.database.host"),
+    ])
+    def test_each_kind_is_found(self, text, segment):
+        assert protected_segments(text) == [segment]
+
+    @pytest.mark.parametrize("text", [
+        "The report (see the appendix) covers every region.",
+        "Fix the API and the URL today.",
+        "Call me now, or later this week.",
+    ])
+    def test_plain_prose_has_none(self, text):
+        assert protected_segments(text) == []
+
+
+class TestPatternsAreLinear:
+    """The patterns run on client-supplied text (tool descriptions via G08, chat history via
+    G01), inside the event loop. Unanchored, the path and call patterns took about five
+    seconds on these 30k-character inputs (and grow with the square of the length); each
+    must now start only at the beginning of its run."""
+
+    @pytest.mark.parametrize("text", [
+        "a." * 15_000, "a" * 30_000, "a-" * 15_000, "f(" * 15_000, "a_" * 15_000,
+        "aB" * 15_000, "https://" + "." * 30_000, "`" + "a" * 30_000, "```" + "a" * 30_000,
+        "~~~" + "a" * 30_000, "1." * 15_000, "a/" * 15_000, "a " * 15_000,
+    ], ids=lambda t: repr(t[:8]))
+    def test_a_long_crafted_input_is_quick(self, text):
+        start = time.perf_counter()
+        protected_segments(text)
+        compress_text(text)
+        assert time.perf_counter() - start < 1.0

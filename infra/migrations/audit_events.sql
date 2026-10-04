@@ -14,6 +14,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_id
 CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp
   ON audit_events (timestamp DESC);
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS details JSONB;
+-- An INSERT-only role. Nothing connects as it: the database-level protection is the
+-- restricted runtime role in src/proxy/audit/enforcement.py.
 DO $$ BEGIN
   IF NOT EXISTS (
     SELECT FROM pg_roles WHERE rolname = 'proxy_audit_role'

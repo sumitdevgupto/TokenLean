@@ -233,44 +233,39 @@ if [[ -n "$LANGFUSE_URL" ]]; then
   fi
 fi
 
-# Check LLMLingua sidecar
-LLMLINGUA_URL=$(gcloud run services describe llmlingua-svc \
-  --project="$PROJECT_ID" \
-  --region="$REGION" \
-  --format="value(status.url)" 2>/dev/null || echo "")
-
-if [[ -n "$LLMLINGUA_URL" ]]; then
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${LLMLINGUA_URL}/health" 2>/dev/null || echo "000")
-  if [[ "$HTTP_STATUS" == "200" ]]; then
-    success "llmlingua-svc: HTTP ${HTTP_STATUS}"
+# Check the private sidecars (LLMLingua, Tika, RouteLLM). Each must REFUSE an anonymous call — they
+# require Cloud Run IAM, so a 200 without a token means the service is public (a failure,
+# not a pass) — and answer one that carries your identity token.
+check_private_sidecar() {
+  local svc="$1" path="$2" url anon authed
+  url=$(gcloud run services describe "$svc" --project="$PROJECT_ID" --region="$REGION" \
+    --format="value(status.url)" 2>/dev/null || echo "")
+  [[ -z "$url" ]] && return 0
+  anon=$(curl -s -o /dev/null -w "%{http_code}" "${url}${path}" 2>/dev/null || echo "000")
+  case "$anon" in
+    401|403) ;;
+    2*)
+      error "${svc}: answers anonymous calls (HTTP ${anon}) — it must require IAM; redeploy with gcp-deploy.sh"
+      UNHEALTHY=$((UNHEALTHY+1)); return 0 ;;
+    *)
+      warn "${svc}: anonymous probe returned HTTP ${anon} (expected 401/403)"
+      WARNINGS=$((WARNINGS+1)); return 0 ;;
+  esac
+  authed=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $(gcloud auth print-identity-token 2>/dev/null || true)" \
+    "${url}${path}" 2>/dev/null || echo "000")
+  if [[ "$authed" == "200" ]]; then
+    success "${svc}: private (anonymous HTTP ${anon}) and up (HTTP 200 with an identity token)"
     HEALTHY=$((HEALTHY+1))
   else
-    warn "llmlingua-svc: HTTP ${HTTP_STATUS}"
+    warn "${svc}: private (anonymous HTTP ${anon}), but HTTP ${authed} with your identity token (does your account hold run.invoker?)"
     WARNINGS=$((WARNINGS+1))
   fi
-fi
-
-# Check RouteLLM sidecar
-ROUTELLM_URL=$(gcloud run services describe routellm-svc \
-  --project="$PROJECT_ID" \
-  --region="$REGION" \
-  --format="value(status.url)" 2>/dev/null || echo "")
-
-if [[ -n "$ROUTELLM_URL" ]]; then
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${ROUTELLM_URL}/health" 2>/dev/null || echo "000")
-  # routellm-svc's /health is a POST route (src/routellm-sidecar/app.py), so a GET probe returns
-  # 404/405 even though the service is UP — that's reachable, not a failure. It may also be
-  # deployed --ingress=internal (denial-of-wallet: it holds an OpenAI key) → 403 to an external
-  # curl. So any of 200/403/404/405 means "up"; only 000/5xx is a real problem.
-  case "$HTTP_STATUS" in
-    200|403|404|405)
-      success "routellm-svc: reachable (HTTP ${HTTP_STATUS}; up — /health is POST-only / internal-ingress)"
-      HEALTHY=$((HEALTHY+1)) ;;
-    *)
-      warn "routellm-svc: HTTP ${HTTP_STATUS}"
-      WARNINGS=$((WARNINGS+1)) ;;
-  esac
-fi
+}
+check_private_sidecar llmlingua-svc /health
+check_private_sidecar tika-svc /tika
+# RouteLLM holds an OpenAI key: an anonymous 200 here is someone else's bill.
+check_private_sidecar routellm-svc /health
 
 # Check Qdrant (only when enabled — otherwise G07 uses pgvector fallback)
 if [[ "$ENABLE_QDRANT" == "true" ]]; then

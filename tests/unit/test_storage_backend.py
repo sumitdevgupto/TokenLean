@@ -76,6 +76,16 @@ class TestGCSStorageBackend:
     def test_is_storage_backend_subclass(self):
         assert issubclass(GCSStorageBackend, StorageBackend)
 
+    def test_the_client_is_made_once_for_every_write(self):
+        # storage.Client() runs credential discovery; it ran on every export.
+        mock_gcs_module = MagicMock()
+        with patch.dict("sys.modules", {"google.cloud.storage": mock_gcs_module, "google.cloud": MagicMock(storage=mock_gcs_module), "google": MagicMock()}):
+            backend = GCSStorageBackend("my-bucket")
+            for i in range(3):
+                backend.write(f"prefix/{i}.json", "{}")
+        mock_gcs_module.Client.assert_called_once()
+        assert mock_gcs_module.Client.return_value.bucket.return_value.blob.call_count == 3
+
 
 # ─── get_storage_backend factory ─────────────────────────────────────────────
 

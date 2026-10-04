@@ -15,6 +15,11 @@
 #                      templates/prompts (local transform; non-fatal)
 #   --help             Show this help
 #
+# Environment:
+#   SKIP_PROXY_DEPLOY=true   For a wrapper that deploys token-proxy's image itself: an
+#                            existing token-proxy keeps its image and settings, and only
+#                            this script's env vars and secrets are merged in.
+#
 # PRE-REQUISITE (admin only):
 #   Copy config/keys.yaml.template → config/keys.yaml and fill in real LLM API keys.
 #   This file is gitignored and never committed. The script automatically
@@ -49,6 +54,15 @@ PROJECT_ID=""
 REGION="asia-south1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# The working copy of the live config sits in a directory only this run can write (mktemp
+# makes it 0700), removed on exit. At a fixed /tmp/config.yaml another user of the deploy
+# host could plant the file this script uploads as the live config, and a copy an earlier
+# run left behind was reused.
+WORK_DIR="$(mktemp -d)"
+CONFIG_LOCAL="${WORK_DIR}/config.yaml"
+remove_work_dir() { rm -rf "$WORK_DIR"; }
+trap remove_work_dir EXIT
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -87,6 +101,12 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown option: $1" ;;
   esac
 done
+
+# Redis requires its password and serves only TLS, unless .env.gcp switches either off
+# (REDIS_AUTH_ENFORCE, REDIS_TLS in .env.gcp.template). The Redis VM applies both at boot:
+# reconcile_redis_vm restarts it when it runs anything else.
+export TF_VAR_redis_auth_enforced="${REDIS_AUTH_ENFORCE:-true}"
+export TF_VAR_redis_tls="${REDIS_TLS:-true}"
 
 # ─── Resolve whether Cloud SQL is private-IP-only ─────────────────────────────
 # private_cloud_sql=true means the instance has no public IPv4, so the off-VPC
@@ -159,6 +179,8 @@ check_prereqs() {
     PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
     [[ -z "$PROJECT_ID" ]] && error "No GCP project set. Use --project or: gcloud config set project PROJECT_ID"
   fi
+  [[ "$PROJECT_ID" == "your-gcp-project-id" ]] && \
+    error "GCP_PROJECT_ID is still .env.gcp.template's placeholder: set your project id in .env.gcp, or use --project"
 
   if [[ -z "$REGION" ]]; then
     REGION="${GCP_REGION:-asia-south1}"
@@ -207,11 +229,15 @@ provision_infra() {
   CONFIG_BUCKET=$(terraform output -raw config_bucket_name)
   DB_CONNECTION=$(terraform output -raw db_instance_connection_name)
   PROXY_SA=$(terraform output -raw proxy_service_account_email)
+  GRAFANA_SA=$(terraform output -raw grafana_service_account_email)
+  LANGFUSE_SA=$(terraform output -raw langfuse_service_account_email)
   QDRANT_URL=$(terraform output -raw qdrant_service_url)
+  QDRANT_SNAPSHOT_BUCKET=$(terraform output -raw qdrant_snapshot_bucket 2>/dev/null || echo "")
   REDIS_HOST=$(terraform output -raw redis_host 2>/dev/null || echo "")
   if [[ -n "$REDIS_HOST" ]]; then
-    REDIS_URL="redis://${REDIS_HOST}:6379/0"
-    success "Redis URL constructed from Terraform output: ${REDIS_URL}"
+    # Its scheme and port too: rediss:// on 6378 once Memorystore has TLS.
+    REDIS_URL="$(terraform output -raw redis_url)"
+    success "Redis URL from Terraform output: ${REDIS_URL}"
   fi
 
   success "Infrastructure provisioned"
@@ -295,7 +321,7 @@ provision_llm_keys() {
   # strict BYOK. Provisioned when present in keys.yaml; a warning otherwise. `store_key`
   # tolerates a missing keys_file (parse yields empty → skip), so this is safe under BYOK.
   store_key "routellm-openai-key" "routellm" \
-    || warn "routellm key not set — G06 mf/sw_ranking routers need an OpenAI key for embeddings; G06 routing will degrade. Disable G06 or use the causal_llm router if you don't use OpenAI."
+    || warn "routellm key not set — G06 mf/sw_ranking routers need an OpenAI key for embeddings; without one G06 uses the bert router (the default, no key needed)."
 
   # Langfuse keys — only available after first deploy + manual UI step
   # These live under langfuse_keys: in keys.yaml (not llm_keys:)
@@ -341,12 +367,12 @@ upload_config() {
   # If config.yaml is missing, fall back to generating from template
   if [[ -f "${REPO_ROOT}/config/config.yaml" ]]; then
     gsutil cp "${REPO_ROOT}/config/config.yaml" "gs://${CONFIG_BUCKET}/config/config.yaml"
-    cp "${REPO_ROOT}/config/config.yaml" /tmp/config.yaml
+    cp "${REPO_ROOT}/config/config.yaml" "$CONFIG_LOCAL"
   else
     warn "config/config.yaml not found — generating from template (G1-G24 tuning may be missing)"
     sed "s|\${CONFIG_GCS_BUCKET}|${CONFIG_BUCKET}|g;s|REPLACE_WITH_CONFIG_BUCKET|${CONFIG_BUCKET}|g" \
-      "${REPO_ROOT}/config/config.yaml.template" > /tmp/config.yaml
-    gsutil cp /tmp/config.yaml "gs://${CONFIG_BUCKET}/config/config.yaml"
+      "${REPO_ROOT}/config/config.yaml.template" > "$CONFIG_LOCAL"
+    gsutil cp "$CONFIG_LOCAL" "gs://${CONFIG_BUCKET}/config/config.yaml"
   fi
   gsutil cp "${REPO_ROOT}/config/bypass-rules.yaml"   "gs://${CONFIG_BUCKET}/config/bypass-rules.yaml"
   [[ -f "${REPO_ROOT}/config/tool-registry.yaml" ]] && \
@@ -356,21 +382,21 @@ upload_config() {
     gsutil cp "${REPO_ROOT}/config/adaptive_bypass_rules.yaml" \
       "gs://${CONFIG_BUCKET}/config/adaptive_bypass_rules.yaml" || \
     warn "config/adaptive_bypass_rules.yaml not found — G24 will have no bypass rules in GCP"
-  # /tmp/config.yaml is kept for use by deploy_services; cleaned up after deploy
+  # $CONFIG_LOCAL is kept for use by deploy_services; cleaned up after deploy
 
   success "Config uploaded to gs://${CONFIG_BUCKET}/config/"
 }
 
-# ─── Helper: ensure /tmp/config.yaml is available for deploy_services ───────────
+# ─── Helper: ensure $CONFIG_LOCAL is available for deploy_services ───────────
 prepare_config_yaml() {
-  if [[ ! -f /tmp/config.yaml ]]; then
+  if [[ ! -f "$CONFIG_LOCAL" ]]; then
     if [[ -f "${REPO_ROOT}/config/config.yaml" ]]; then
-      info "Copying config/config.yaml to /tmp/config.yaml (--skip-infra path)..."
-      cp "${REPO_ROOT}/config/config.yaml" /tmp/config.yaml
+      info "Copying config/config.yaml to the working copy (--skip-infra path)..."
+      cp "${REPO_ROOT}/config/config.yaml" "$CONFIG_LOCAL"
     else
-      info "Generating /tmp/config.yaml from template (--skip-infra path)..."
+      info "Generating the working copy of config.yaml from template (--skip-infra path)..."
       sed "s|\${CONFIG_GCS_BUCKET}|${CONFIG_BUCKET}|g;s|REPLACE_WITH_CONFIG_BUCKET|${CONFIG_BUCKET}|g" \
-        "${REPO_ROOT}/config/config.yaml.template" > /tmp/config.yaml
+        "${REPO_ROOT}/config/config.yaml.template" > "$CONFIG_LOCAL"
     fi
   fi
 }
@@ -427,7 +453,12 @@ build_and_push() {
 
   build_service_local "proxy"             "${REPO_ROOT}/src/proxy"
   build_service_local "llmlingua-sidecar" "${REPO_ROOT}/src/llmlingua-sidecar"
+  # The doc-pipeline image copies the proxy's guardrails engine from a gitignored staging
+  # folder: stage it for this build only.
+  bash "${REPO_ROOT}/scripts/ci/stage-doc-pipeline-guardrails.sh" "${REPO_ROOT}" \
+    || error "could not stage the guardrails engine for doc-pipeline"
   build_service_local "doc-pipeline"      "${REPO_ROOT}/src/doc-pipeline"
+  bash "${REPO_ROOT}/scripts/ci/stage-doc-pipeline-guardrails.sh" --clean "${REPO_ROOT}"
   build_service_local "finetune-pipeline" "${REPO_ROOT}/src/finetune-pipeline"
 
   # routellm-sidecar is optional — only build if the directory exists
@@ -446,6 +477,120 @@ build_and_push() {
 }
 
 # ─── Step 5: Deploy Cloud Run services ───────────────────────────────────────
+
+# QDRANT_URL is Terraform's qdrant_service_url, empty when enable_qdrant=false (the pgvector
+# deploy, and the commercial deploy's default): only a Qdrant deploy needs it.
+check_qdrant_url() {
+  if [[ -n "${QDRANT_URL:-}" ]]; then return 0; fi
+  if [[ "${ENABLE_QDRANT:-true}" == "true" ]]; then
+    error "QDRANT_URL is empty — ensure Qdrant service is deployed (or set ENABLE_QDRANT=false to run on pgvector)"
+  fi
+  info "Qdrant disabled (ENABLE_QDRANT=false): no QDRANT_URL; G07 retrieval uses pgvector"
+}
+
+# token-proxy. SKIP_PROXY_DEPLOY=true is for a wrapper that deploys the proxy image itself,
+# such as the commercial deploy: when the service already exists, this keeps its image and
+# every setting the wrapper added, and only merges this script's env vars and secrets in
+# (--update-*, never the replace-all --set-*). A plain deploy here swapped in the OSS image
+# and wiped the wrapper's settings (database URL, key store, BYOK enforcement) until the
+# wrapper's last step restored them, so production ran unbilled with portal keys refused, and
+# stayed that way if a step in between failed. The DB_PASSWORD mount is left out of the
+# merge: the proxy does not read it, and the wrapper manages the database credentials. With
+# no service yet (a first deploy) nothing is serving, so it deploys as below. Without Qdrant
+# (enable_qdrant=false) QDRANT_URL is empty: the proxy gets none, and an update in place
+# removes one an earlier Qdrant deploy left.
+deploy_token_proxy() {
+  local env_vars="GCP_PROJECT_ID=${PROJECT_ID},\
+CONFIG_GCS_BUCKET=${CONFIG_BUCKET},\
+CONFIG_GCS_BLOB=config/config.yaml,\
+REDIS_URL=${REDIS_URL},\
+${QDRANT_URL:+QDRANT_URL=${QDRANT_URL},}\
+${QDRANT_SNAPSHOT_BUCKET:+QDRANT_SNAPSHOT_BUCKET=${QDRANT_SNAPSHOT_BUCKET},}\
+GCP_REGION=${REGION},\
+DOC_PIPELINE_JOB_NAME=doc-pipeline-job,\
+FINETUNE_PIPELINE_JOB_NAME=finetune-pipeline-job,\
+INGEST_REQUIRE_OIDC=true,\
+INGEST_PUSH_SA_EMAIL=token-opt-ingest-push-sa@${PROJECT_ID}.iam.gserviceaccount.com,\
+INGEST_OIDC_AUDIENCE=${PROXY_URL:-}/ingest-doc,\
+DOC_PIPELINE_SA_EMAIL=${PROXY_SA},\
+LANGFUSE_HOST=${LANGFUSE_URL},\
+AWS_REGION_NAME=${AWS_REGION_NAME:-us-east-1},\
+LOG_LEVEL=INFO"
+  if [[ "${SKIP_PROXY_DEPLOY:-false}" == "true" ]] && gcloud run services describe token-proxy \
+       --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+    info "SKIP_PROXY_DEPLOY=true: token-proxy keeps its image and settings; merging this deploy's env vars and secrets"
+    local drop_qdrant=""
+    if [[ -z "${QDRANT_URL:-}" ]]; then drop_qdrant="--remove-env-vars=QDRANT_URL,QDRANT_SNAPSHOT_BUCKET"; fi
+    gcloud run services update token-proxy \
+      --region="$REGION" \
+      --project="$PROJECT_ID" \
+      $(private_network_flags) \
+      --update-env-vars="${env_vars}" \
+      ${drop_qdrant} \
+      ${LANGFUSE_SECRETS_FLAG//--set-secrets=/--update-secrets=} \
+      ${METRICS_SECRET_FLAG//--set-secrets=/--update-secrets=} \
+      ${ALERT_WEBHOOK_SECRET_FLAG//--set-secrets=/--update-secrets=} \
+      ${AWS_SECRETS_FLAG//--set-secrets=/--update-secrets=} \
+      ${QDRANT_KEY_SECRET_FLAG//--set-secrets=/--update-secrets=} \
+      ${REDIS_SECRET_FLAG//--set-secrets=/--update-secrets=} \
+      --quiet
+    return
+  fi
+  gcloud run deploy token-proxy \
+    --image="${REGISTRY_URL}/proxy:latest" \
+    --platform=managed \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --service-account="$PROXY_SA" \
+    --add-cloudsql-instances="${DB_CONNECTION}" \
+    $(private_network_flags) \
+    --allow-unauthenticated \
+    --memory=4Gi --cpu=2 \
+    --cpu-boost \
+    --min-instances=0 --max-instances="${PROXY_MAX_INSTANCES:-1}" \
+    --timeout=120 \
+    --set-env-vars="${env_vars}" \
+    --set-secrets="DB_PASSWORD=token-opt-db-password:latest" \
+    ${LANGFUSE_SECRETS_FLAG} \
+    ${METRICS_SECRET_FLAG} \
+    ${ALERT_WEBHOOK_SECRET_FLAG} \
+    ${AWS_SECRETS_FLAG} \
+    ${QDRANT_KEY_SECRET_FLAG} \
+    ${REDIS_SECRET_FLAG} \
+    --quiet
+}
+
+# The Redis password (Terraform's redis-auth secret) as a mount of REDIS_PASSWORD, and the CA
+# that signs Redis's certificate (redis-ca) as REDIS_CA_CERT, for the Redis Terraform provisioned
+# only: an external REDIS_URL from .env carries its own. The clients send the password as the
+# `default` user's, which a Redis with no password yet accepts too. Each mount only once its
+# secret has a version (Memorystore's password exists only once AUTH is on, the CA only with
+# redis_tls).
+redis_secret_flag() {
+  [[ -n "${REDIS_HOST:-}" ]] || return 0
+  local mounts=""
+  if timeout 30 gcloud secrets versions access latest --secret="redis-auth" --project="$PROJECT_ID" &>/dev/null; then
+    mounts="REDIS_PASSWORD=redis-auth:latest"
+  fi
+  if timeout 30 gcloud secrets versions access latest --secret="redis-ca" --project="$PROJECT_ID" &>/dev/null; then
+    mounts="${mounts:+${mounts},}REDIS_CA_CERT=redis-ca:latest"
+  fi
+  if [[ -n "$mounts" ]]; then
+    echo "--set-secrets=${mounts}"
+  fi
+}
+
+# Direct VPC egress for a Redis client (token-proxy, finetune-pipeline-job). The Redis Terraform
+# provisions (VM or Memorystore) has only a private address, so without it every Redis call
+# fails: G00's limits, the cache and sessions quietly stop working, and the fine-tune job loses
+# its job records. The private Cloud SQL path needs it too (VPC_EGRESS_FLAGS). Private ranges
+# only: other traffic still leaves directly.
+private_network_flags() {
+  if [[ "${PRIVATE_SQL:-false}" == "true" || -n "${REDIS_HOST:-}" ]]; then
+    echo "--network=default --subnet=default --vpc-egress=private-ranges-only"
+  fi
+}
+
 deploy_services() {
   info "Deploying Cloud Run services..."
 
@@ -466,43 +611,89 @@ deploy_services() {
   # token_opt. Pointing Langfuse at token_opt makes Prisma hit P3005 ("schema is not empty")
   # on first boot once the proxy schema migrations have run, and grafana's Langfuse
   # datasource already expects LANGFUSE_DB_NAME=langfuse.
-  DB_URL="postgresql://token_opt_app:${LANGFUSE_SECRET}@localhost/langfuse?host=/cloudsql/${DB_CONNECTION}"
+  # random_password (infra/main.tf) may contain # ? % @ / : — URL-encode it, or Prisma reads
+  # them as URL syntax and Langfuse does not boot.
+  LANGFUSE_DB_PW_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$LANGFUSE_SECRET")
+  DB_URL="postgresql://token_opt_app:${LANGFUSE_DB_PW_ENC}@localhost/langfuse?host=/cloudsql/${DB_CONNECTION}"
 
-  # Deploy LLMLingua-2 sidecar (internal only, allow unauthenticated for proxy SA access)
+  # The LLMLingua and Tika sidecars are private: Cloud Run IAM refuses any caller without
+  # an identity token for a run.invoker principal, at Google's front end, before the
+  # container. The proxy SA holds a project-level run.invoker (infra/main.tf
+  # proxy_run_invoker) and sends that token (ml_models.cloud_run_auth_headers). Ingress
+  # stays ALL, as for Qdrant: from the proxy's egress, an internal-only service is
+  # unreachable (infra/main.tf, token-opt-qdrant). Each sidecar runs as its own service
+  # account with no roles, so a compromise (Tika parses untrusted files) cannot use the
+  # proxy SA's secrets or KMS access.
+  #
+  # Created here, idempotently, not in Terraform, so a --skip-infra redeploy of a project
+  # provisioned before these accounts existed still works.
+  ensure_sidecar_sa() {
+    local name="$1" email="${1}@${PROJECT_ID}.iam.gserviceaccount.com"
+    gcloud iam service-accounts describe "$email" --project="$PROJECT_ID" &>/dev/null && return 0
+    gcloud iam service-accounts create "$name" --project="$PROJECT_ID" \
+      --display-name="TokenLean ${2} (no roles)" --quiet \
+      || error "could not create the ${name} service account"
+    success "Created service account ${email} (no roles)"
+  }
+  # Earlier deploys made both sidecars public (allUsers run.invoker). Remove that grant
+  # whatever --no-allow-unauthenticated did, and stop if the service is still public.
+  require_private_service() {
+    local svc="$1" member members
+    for member in allUsers allAuthenticatedUsers; do
+      gcloud run services remove-iam-policy-binding "$svc" \
+        --region="$REGION" --project="$PROJECT_ID" \
+        --member="$member" --role="roles/run.invoker" --quiet &>/dev/null || true
+    done
+    members=$(gcloud run services get-iam-policy "$svc" --region="$REGION" --project="$PROJECT_ID" \
+      --format="value(bindings.members)" 2>/dev/null) \
+      || error "could not read the IAM policy of ${svc} to confirm it is private"
+    if [[ "$members" == *allUsers* || "$members" == *allAuthenticatedUsers* ]]; then
+      error "${svc} is still public. Remove the grant: gcloud run services remove-iam-policy-binding ${svc} --region=${REGION} --member=allUsers --role=roles/run.invoker (and the same for allAuthenticatedUsers)"
+    fi
+  }
+
+  # Deploy LLMLingua-2 sidecar (private; see above)
+  LLMLINGUA_SA="llmlingua-sidecar-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+  ensure_sidecar_sa llmlingua-sidecar-sa "LLMLingua sidecar"
   gcloud run deploy llmlingua-svc \
     --image="${REGISTRY_URL}/llmlingua-sidecar:latest" \
     --platform=managed \
     --region="$REGION" \
     --project="$PROJECT_ID" \
-    --service-account="$PROXY_SA" \
-    --allow-unauthenticated \
+    --service-account="$LLMLINGUA_SA" \
+    --ingress=all \
+    --no-allow-unauthenticated \
     --memory=2Gi --cpu=2 \
     --cpu-boost \
     --max-instances=1 \
     --timeout=60 \
     --set-env-vars="LOG_LEVEL=INFO" \
     --quiet
+  require_private_service llmlingua-svc
 
   LLMLINGUA_URL=$(gcloud run services describe llmlingua-svc \
     --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
 
-  # Read RouteLLM model names from config.yaml (already in GCS; local copy at /tmp/config.yaml)
+  # Read RouteLLM model names from config.yaml (already in GCS; local copy at $CONFIG_LOCAL)
   ROUTELLM_STRONG=$(python3 -c "
 import yaml, sys
-cfg = yaml.safe_load(open('/tmp/config.yaml'))
+cfg = yaml.safe_load(open(sys.argv[1]))
 print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('strong_model',''))
-" 2>/dev/null || echo "")
+" "$CONFIG_LOCAL" 2>/dev/null || echo "")
   ROUTELLM_WEAK=$(python3 -c "
 import yaml, sys
-cfg = yaml.safe_load(open('/tmp/config.yaml'))
+cfg = yaml.safe_load(open(sys.argv[1]))
 print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_model',''))
-" 2>/dev/null || echo "")
+" "$CONFIG_LOCAL" 2>/dev/null || echo "")
 
   [[ -z "$ROUTELLM_STRONG" ]] && { warn "G6_routing.routellm.strong_model not set — defaulting to gpt-4o"; ROUTELLM_STRONG="gpt-4o"; }
   [[ -z "$ROUTELLM_WEAK"   ]] && { warn "G6_routing.routellm.weak_model not set — defaulting to gpt-4o-mini"; ROUTELLM_WEAK="gpt-4o-mini"; }
   info "RouteLLM models: strong=${ROUTELLM_STRONG} weak=${ROUTELLM_WEAK}"
 
-  # Deploy RouteLLM sidecar if it was built (internal only, allow unauthenticated for proxy SA access)
+  # Deploy RouteLLM sidecar if it was built. Private like the other sidecars: IAM keeps
+  # anonymous callers out (it holds an OpenAI key) and G06 sends the proxy's identity token.
+  # Ingress stays ALL: the proxy's calls to a run.app URL do not travel the VPC, so an
+  # internal-only service refused every one of them.
   ROUTELLM_URL=""
   if gcloud artifacts docker images describe "${REGISTRY_URL}/routellm-sidecar:latest" \
        --project="$PROJECT_ID" &>/dev/null 2>&1; then
@@ -512,7 +703,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
       --region="$REGION" \
       --project="$PROJECT_ID" \
       --service-account="routellm-sidecar-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-      --ingress=internal \
+      --ingress=all \
       --no-allow-unauthenticated \
       --memory=2Gi --cpu=2 \
       --cpu-boost \
@@ -521,13 +712,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
       --set-env-vars="LOG_LEVEL=INFO,ROUTELLM_STRONG_MODEL=${ROUTELLM_STRONG},ROUTELLM_WEAK_MODEL=${ROUTELLM_WEAK}" \
       --set-secrets="OPENAI_API_KEY=routellm-openai-key:latest" \
       --quiet
-
-    # Scrub the legacy allUsers invoker binding left by earlier deploys that used
-    # --allow-unauthenticated. Harmless behind internal ingress today, but a landmine:
-    # if anyone ever flips this service's ingress, allUsers would make it fully public.
-    gcloud run services remove-iam-policy-binding routellm-svc \
-      --region="$REGION" --project="$PROJECT_ID" \
-      --member="allUsers" --role="roles/run.invoker" --quiet &>/dev/null || true
+    require_private_service routellm-svc
 
     ROUTELLM_URL=$(gcloud run services describe routellm-svc \
       --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
@@ -557,21 +742,37 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
   ensure_secret_has_version "langfuse-salt"            "$(openssl rand -hex 32)"
   ensure_secret_has_version "grafana-admin-password"   "$(openssl rand -base64 12)"
 
-  # Under least-privilege secret IAM (TF_VAR_least_privilege_secret_iam=true) the proxy SA
-  # has NO project-wide secretAccessor — only per-secret bindings from Terraform's
-  # proxy_secret_ids list. langfuse-salt is created HERE by this script (not Terraform),
-  # so it cannot be in that list; bind it explicitly or langfuse-svc (which runs as the
-  # proxy SA and mounts SALT=langfuse-salt) fails to deploy with "Permission denied on
-  # secret". Idempotent; must run even when the secret already existed. No-op without
-  # least-priv (the project-wide grant covers it).
-  if [[ "${TF_VAR_least_privilege_secret_iam:-false}" == "true" && -n "${PROXY_SA:-}" ]]; then
-    timeout 30 gcloud secrets add-iam-policy-binding "langfuse-salt" \
-      --member="serviceAccount:${PROXY_SA}" \
+  # The Langfuse DSN carries the database password, so it is a secret mounted as DATABASE_URL:
+  # as a plain env var anyone with roles/run.viewer could read it. A new version only when
+  # the DSN changed.
+  if [[ "$(timeout 30 gcloud secrets versions access latest --secret=langfuse-database-url --project="$PROJECT_ID" 2>/dev/null)" != "$DB_URL" ]]; then
+    if timeout 30 gcloud secrets describe langfuse-database-url --project="$PROJECT_ID" &>/dev/null; then
+      printf '%s' "$DB_URL" | timeout 30 gcloud secrets versions add langfuse-database-url \
+        --data-file=- --project="$PROJECT_ID" >/dev/null || error "could not update langfuse-database-url"
+    else
+      printf '%s' "$DB_URL" | timeout 30 gcloud secrets create langfuse-database-url \
+        --replication-policy=automatic --data-file=- --project="$PROJECT_ID" >/dev/null \
+        || error "could not create langfuse-database-url"
+    fi
+    success "langfuse-database-url holds the Langfuse DSN"
+  fi
+
+  # langfuse-svc runs as its own account (Terraform's langfuse_sa), which has no project-wide
+  # secret access: Terraform binds it on the secrets it declares, but langfuse-salt and
+  # langfuse-database-url are created HERE, so bind them here or langfuse-svc (which mounts
+  # both) fails to deploy with "Permission denied on secret". Idempotent; must run even when
+  # the secret already existed.
+  grant_langfuse_secret() {
+    local secret_name="$1"
+    timeout 30 gcloud secrets add-iam-policy-binding "$secret_name" \
+      --member="serviceAccount:${LANGFUSE_SA}" \
       --role="roles/secretmanager.secretAccessor" \
       --project="$PROJECT_ID" &>/dev/null \
-      && success "least-priv: proxy SA granted accessor on langfuse-salt" \
-      || warn "Could not bind proxy SA on langfuse-salt — langfuse-svc deploy may fail (grant manually: gcloud secrets add-iam-policy-binding langfuse-salt --member=serviceAccount:${PROXY_SA} --role=roles/secretmanager.secretAccessor)"
-  fi
+      && success "langfuse-svc's service account granted accessor on ${secret_name}" \
+      || warn "Could not bind langfuse-svc's service account on ${secret_name} — its deploy may fail (grant manually: gcloud secrets add-iam-policy-binding ${secret_name} --member=serviceAccount:${LANGFUSE_SA} --role=roles/secretmanager.secretAccessor)"
+  }
+  grant_langfuse_secret langfuse-salt
+  grant_langfuse_secret langfuse-database-url
 
   # Issue an initial proxy API key for the 'admin' user if none exists yet.
   # Delegates to issue-key.sh which correctly sha256-hashes the raw key before storing.
@@ -597,7 +798,7 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --platform=managed \
     --region="$REGION" \
     --project="$PROJECT_ID" \
-    --service-account="$PROXY_SA" \
+    --service-account="$LANGFUSE_SA" \
     --add-cloudsql-instances="${DB_CONNECTION}" \
     ${VPC_EGRESS_FLAGS} \
     ${LF_AUTH_FLAG} \
@@ -605,15 +806,14 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
     --cpu-boost \
     --max-instances=1 \
     --port=3000 \
-    --set-env-vars="DATABASE_URL=${DB_URL},NEXTAUTH_URL=https://placeholder.invalid" \
-    --set-secrets="NEXTAUTH_SECRET=langfuse-nextauth-secret:latest,SALT=langfuse-salt:latest,LANGFUSE_DB_PASSWORD=token-opt-db-password:latest" \
+    --set-env-vars="NEXTAUTH_URL=https://placeholder.invalid" \
+    --set-secrets="DATABASE_URL=langfuse-database-url:latest,NEXTAUTH_SECRET=langfuse-nextauth-secret:latest,SALT=langfuse-salt:latest,LANGFUSE_DB_PASSWORD=token-opt-db-password:latest" \
     --quiet
 
   LANGFUSE_URL=$(gcloud run services describe langfuse-svc \
     --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
 
-  # Ensure QDRANT_URL is set
-  [[ -z "$QDRANT_URL" ]] && error "QDRANT_URL is empty — ensure Qdrant service is deployed"
+  check_qdrant_url
 
   # Pre-compute optional Langfuse secrets flag to avoid fragile subshell in gcloud args
   LANGFUSE_SECRETS_FLAG=""
@@ -622,10 +822,19 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
   fi
 
   # H2: inject the /metrics scrape token only if the secret exists (Terraform
-  # creates token-opt-metrics-scrape-token). Without it, /metrics stays open.
+  # creates token-opt-metrics-scrape-token, generating the token unless one is set).
+  # Without it the proxy refuses every scrape, so apply Terraform before deploying.
   METRICS_SECRET_FLAG=""
   if timeout 30 gcloud secrets versions access latest --secret="token-opt-metrics-scrape-token" --project="$PROJECT_ID" &>/dev/null; then
     METRICS_SECRET_FLAG="--set-secrets=METRICS_SCRAPE_TOKEN=token-opt-metrics-scrape-token:latest"
+  fi
+
+  # The token Alertmanager presents to /admin/alert-webhook (Terraform creates
+  # token-opt-alert-webhook-token). Without it the webhook takes only an admin key, which
+  # Alertmanager does not have, so its alerts are refused.
+  ALERT_WEBHOOK_SECRET_FLAG=""
+  if timeout 30 gcloud secrets versions access latest --secret="token-opt-alert-webhook-token" --project="$PROJECT_ID" &>/dev/null; then
+    ALERT_WEBHOOK_SECRET_FLAG="--set-secrets=ALERT_WEBHOOK_TOKEN=token-opt-alert-webhook-token:latest"
   fi
 
   # AWS Bedrock SigV4 creds — mount only if populated (Bedrock is optional). litellm reads
@@ -645,42 +854,13 @@ print(cfg.get('groups',{}).get('G6_routing',{}).get('routellm',{}).get('weak_mod
   if timeout 30 gcloud secrets versions access latest --secret="qdrant-api-key" --project="$PROJECT_ID" &>/dev/null; then
     QDRANT_KEY_SECRET_FLAG="--set-secrets=QDRANT_API_KEY=qdrant-api-key:latest"
   fi
+  REDIS_SECRET_FLAG="$(redis_secret_flag)"
 
+  # Right before the proxy: a VM restarted onto TLS refuses the running proxy until the new
+  # revision, with its rediss:// URL and the CA, replaces it.
+  reconcile_redis_vm
   # Deploy main proxy — LANGFUSE_URL now available
-  gcloud run deploy token-proxy \
-    --image="${REGISTRY_URL}/proxy:latest" \
-    --platform=managed \
-    --region="$REGION" \
-    --project="$PROJECT_ID" \
-    --service-account="$PROXY_SA" \
-    --add-cloudsql-instances="${DB_CONNECTION}" \
-    ${VPC_EGRESS_FLAGS} \
-    --allow-unauthenticated \
-    --memory=4Gi --cpu=2 \
-    --cpu-boost \
-    --min-instances=0 --max-instances="${PROXY_MAX_INSTANCES:-1}" \
-    --timeout=120 \
-    --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},\
-CONFIG_GCS_BUCKET=${CONFIG_BUCKET},\
-CONFIG_GCS_BLOB=config/config.yaml,\
-REDIS_URL=${REDIS_URL},\
-QDRANT_URL=${QDRANT_URL},\
-GCP_REGION=${REGION},\
-DOC_PIPELINE_JOB_NAME=doc-pipeline-job,\
-FINETUNE_PIPELINE_JOB_NAME=finetune-pipeline-job,\
-INGEST_REQUIRE_OIDC=true,\
-INGEST_PUSH_SA_EMAIL=token-opt-ingest-push-sa@${PROJECT_ID}.iam.gserviceaccount.com,\
-INGEST_OIDC_AUDIENCE=${PROXY_URL:-}/ingest-doc,\
-DOC_PIPELINE_SA_EMAIL=${PROXY_SA},\
-LANGFUSE_HOST=${LANGFUSE_URL},\
-AWS_REGION_NAME=${AWS_REGION_NAME:-us-east-1},\
-LOG_LEVEL=INFO" \
-    --set-secrets="DB_PASSWORD=token-opt-db-password:latest" \
-    ${LANGFUSE_SECRETS_FLAG} \
-    ${METRICS_SECRET_FLAG} \
-    ${AWS_SECRETS_FLAG} \
-    ${QDRANT_KEY_SECRET_FLAG} \
-    --quiet
+  deploy_token_proxy
 
   PROXY_URL=$(gcloud run services describe token-proxy \
     --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)" 2>/dev/null || echo "")
@@ -709,7 +889,7 @@ LOG_LEVEL=INFO" \
     --platform=managed \
     --region="$REGION" \
     --project="$PROJECT_ID" \
-    --service-account="$PROXY_SA" \
+    --service-account="$GRAFANA_SA" \
     --add-cloudsql-instances="${DB_CONNECTION}" \
     ${VPC_EGRESS_FLAGS} \
     --allow-unauthenticated \
@@ -734,17 +914,21 @@ LANGFUSE_DB_USER=token_opt_app" \
   # carefully-tuned config/config.yaml on disk while still updating sidecar URLs.
   info "Patching config.yaml in GCS with real sidecar URLs..."
 
-  # Deploy tika-sidecar if it was built (internal-only, used by doc-pipeline G03)
+  # Deploy tika-sidecar if it was built (private, like llmlingua-svc). deploy_jobs hands its
+  # URL to the ingestion job, which uses Tika for files Unstructured cannot read.
   TIKA_URL=""
   if gcloud artifacts docker images describe "${REGISTRY_URL}/tika-sidecar:latest" \
        --project="$PROJECT_ID" &>/dev/null 2>&1; then
+    TIKA_SA="tika-sidecar-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+    ensure_sidecar_sa tika-sidecar-sa "Tika sidecar"
     gcloud run deploy tika-svc \
       --image="${REGISTRY_URL}/tika-sidecar:latest" \
       --platform=managed \
       --region="$REGION" \
       --project="$PROJECT_ID" \
-      --service-account="$PROXY_SA" \
-      --allow-unauthenticated \
+      --service-account="$TIKA_SA" \
+      --ingress=all \
+      --no-allow-unauthenticated \
       --memory=1Gi --cpu=1 \
       --cpu-boost \
       --max-instances=1 \
@@ -752,6 +936,7 @@ LANGFUSE_DB_USER=token_opt_app" \
       --port=9998 \
       --set-env-vars="LOG_LEVEL=INFO" \
       --quiet
+    require_private_service tika-svc
     TIKA_URL=$(gcloud run services describe tika-svc \
       --region="$REGION" --project="$PROJECT_ID" --format="value(status.url)")
     success "tika-svc deployed: ${TIKA_URL}"
@@ -761,7 +946,7 @@ LANGFUSE_DB_USER=token_opt_app" \
   python3 - <<PYEOF
 import yaml, sys, os
 
-path = '/tmp/config.yaml'
+path = '${CONFIG_LOCAL}'
 if not os.path.exists(path):
     sys.exit(0)
 
@@ -771,12 +956,21 @@ with open(path) as f:
 changed = False
 groups = cfg.get('groups', {})
 
-# G01 LLMLingua sidecar URL
-llmlingua_url = '${LLMLINGUA_URL}'
+# G01 LLMLingua sidecar URL. The sidecar serves /compress, not the service root (the bare
+# URL 404'd on every call and G01 fell back silently). LLMLingua on GCP is opt-in
+# (LLMLINGUA_ON_GCP=true) because it changes what tenants' compressed prompts look like;
+# otherwise sidecar_url is emptied, which turns it off. Only this service's own URLs (the
+# template default, an earlier deploy's bare URL, or empty) are touched.
+llmlingua_url = '${LLMLINGUA_URL}'.rstrip('/')
 if llmlingua_url:
     g1 = groups.get('G1_compression') or groups.get('g1_compression', {})
-    if g1 and g1.get('sidecar_url', '').startswith('http://llmlingua-svc'):
-        g1['sidecar_url'] = llmlingua_url
+    current = (g1.get('sidecar_url') or '') if g1 else None
+    ours = current is not None and (
+        current == '' or current.startswith('http://llmlingua-svc')
+        or current.rstrip('/') in (llmlingua_url, llmlingua_url + '/compress'))
+    wanted = llmlingua_url + '/compress' if '${LLMLINGUA_ON_GCP:-false}' == 'true' else ''
+    if ours and current != wanted:
+        g1['sidecar_url'] = wanted
         changed = True
 
 # G06 RouteLLM sidecar URL
@@ -788,34 +982,26 @@ if routellm_url:
         rl['url'] = routellm_url
         changed = True
 
-# G03 Tika sidecar URL
-tika_url = '${TIKA_URL}'
-if tika_url:
-    g3 = groups.get('G3_doc_pipeline') or groups.get('g3_doc_pipeline', {})
-    if g3 and g3.get('tika_url', '').startswith('http://tika-svc'):
-        g3['tika_url'] = tika_url
-        changed = True
-
 if changed:
     with open(path, 'w') as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-    print('Sidecar URLs patched in /tmp/config.yaml')
+    print('Sidecar URLs patched in the working copy of config.yaml')
 else:
     print('No placeholder sidecar URLs found — config.yaml already has real URLs or sidecars not configured')
 PYEOF
 
-  gsutil cp /tmp/config.yaml "gs://${CONFIG_BUCKET}/config/config.yaml" &>/dev/null
+  gsutil cp "$CONFIG_LOCAL" "gs://${CONFIG_BUCKET}/config/config.yaml" &>/dev/null
   success "config.yaml re-uploaded to GCS with sidecar URLs"
 
-  rm -f /tmp/config.yaml
+  rm -f "$CONFIG_LOCAL"
   success "All services deployed"
   echo ""
   echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
   echo -e "${GREEN}║        Token Optimisation Proxy — DEPLOYED           ║${NC}"
   echo -e "${GREEN}╠══════════════════════════════════════════════════════╣${NC}"
   echo -e "${GREEN}║${NC} Proxy endpoint:  ${PROXY_URL}"
-  GRAFANA_PASSWORD=$(gcloud secrets versions access latest --secret="grafana-admin-password" --project="$PROJECT_ID" 2>/dev/null || echo "<retrieval_failed>")
-  echo -e "${GREEN}║${NC} Grafana:         ${GRAFANA_URL}  (admin/${GRAFANA_PASSWORD})"
+  # The password is not printed: this summary ends up in scrollback and CI logs.
+  echo -e "${GREEN}║${NC} Grafana:         ${GRAFANA_URL}  (user admin; password: gcloud secrets versions access latest --secret=grafana-admin-password --project=${PROJECT_ID})"
   echo -e "${GREEN}║${NC} Langfuse:      ${LANGFUSE_URL}"
   if [[ "${LANGFUSE_UI_PUBLIC:-0}" != "1" ]]; then
     echo -e "${GREEN}║${NC}   (private — tunnel via: gcloud run services proxy langfuse-svc --region=${REGION})"
@@ -839,30 +1025,91 @@ PYEOF
 deploy_jobs() {
   info "Deploying G3 Cloud Run Jobs (doc-pipeline, finetune-pipeline)..."
 
+  # Both jobs read and write Qdrant, which on GCP needs its API key as well as the proxy
+  # SA's identity: mount the same secret the proxy gets (QDRANT_KEY_SECRET_FLAG is set in
+  # deploy_services, which runs first; empty when the secret does not exist). Without Qdrant
+  # (enable_qdrant=false) they get no QDRANT_URL. The ingestion job also gets tika-svc's URL
+  # when deploy_services deployed it: Tika reads what Unstructured cannot (the job runs as
+  # the proxy SA, whose project-level run.invoker lets it call the private service). It writes
+  # each changed collection's snapshot to Qdrant's snapshot bucket, which Qdrant restores from
+  # on a restart.
   gcloud run jobs deploy doc-pipeline-job \
     --image="${REGISTRY_URL}/doc-pipeline:latest" \
     --region="$REGION" \
     --project="$PROJECT_ID" \
     --service-account="$PROXY_SA" \
-    --set-env-vars="QDRANT_URL=${QDRANT_URL},GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
+    --set-env-vars="${QDRANT_URL:+QDRANT_URL=${QDRANT_URL},}${QDRANT_SNAPSHOT_BUCKET:+QDRANT_SNAPSHOT_BUCKET=${QDRANT_SNAPSHOT_BUCKET},}${TIKA_URL:+TIKA_SIDECAR_URL=${TIKA_URL},}GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
+    ${QDRANT_KEY_SECRET_FLAG:-} \
     --max-retries=1 \
     --task-timeout=600 \
     --quiet
   success "doc-pipeline-job deployed"
 
   # REDIS_URL + GCS_BUCKET are required for a real finetune run (job-tracking + training
-  # export); per-run TENANT_ID/QDRANT_COLLECTION/DOMAIN/TENANT_PROVIDER_KEY come as container
-  # overrides from the trigger. Job name matches FINETUNE_PIPELINE_JOB_NAME on the proxy.
+  # export); per-run TENANT_ID/QDRANT_COLLECTION/DOMAIN/TENANT_PROVIDER_KEY_VERSION come as
+  # container overrides from the trigger. The last is only the NAME of a finetune-tenant-key
+  # version holding the tenant's key (Terraform creates that secret): an execution keeps its
+  # overrides. Job name matches FINETUNE_PIPELINE_JOB_NAME on the proxy.
   gcloud run jobs deploy finetune-pipeline-job \
     --image="${REGISTRY_URL}/finetune-pipeline:latest" \
     --region="$REGION" \
     --project="$PROJECT_ID" \
     --service-account="$PROXY_SA" \
-    --set-env-vars="QDRANT_URL=${QDRANT_URL},REDIS_URL=${REDIS_URL},GCS_BUCKET=${CONFIG_BUCKET},GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
+    --set-env-vars="${QDRANT_URL:+QDRANT_URL=${QDRANT_URL},}REDIS_URL=${REDIS_URL},GCS_BUCKET=${CONFIG_BUCKET},GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
+    ${QDRANT_KEY_SECRET_FLAG:-} \
+    ${REDIS_SECRET_FLAG:-} \
+    $(private_network_flags) \
     --max-retries=1 \
     --task-timeout=1800 \
     --quiet
   success "finetune-pipeline-job deployed"
+}
+
+# What Redis on the VM runs, as infra/redis-vm-startup.sh reports it at boot: "<auth> <tls>",
+# e.g. "enforced on:7" (the version of the redis-tls-server secret it serves).
+redis_vm_reports() {
+  local zone="${REGION}-a" auth tls
+  auth="$(gcloud compute instances get-guest-attributes token-opt-redis-vm --zone="$zone" \
+    --project="$PROJECT_ID" --query-path=token-opt/redis-auth --format="value(value)" 2>/dev/null || true)"
+  tls="$(gcloud compute instances get-guest-attributes token-opt-redis-vm --zone="$zone" \
+    --project="$PROJECT_ID" --query-path=token-opt/redis-tls --format="value(value)" 2>/dev/null || true)"
+  echo "${auth:-unreported} ${tls:-unreported}"
+}
+
+# The Redis VM applies REDIS_AUTH_ENFORCE and REDIS_TLS only at boot, reading its password and
+# TLS key then. When it runs anything other than what this deploy configures (a first deploy
+# with them on, a switch, a renewed certificate), restart it and wait until it runs that, before
+# the clients get their new URL and secrets: a client on TLS cannot talk to a Redis still
+# serving plaintext. A restart empties Redis, which keeps nothing on disk: the cache, sessions
+# and rate-limit counters start over.
+reconcile_redis_vm() {
+  local zone="${REGION}-a" want version now i
+  gcloud compute instances describe token-opt-redis-vm --zone="$zone" --project="$PROJECT_ID" \
+    &>/dev/null || return 0   # Memorystore (Terraform applies both itself) or an external Redis
+  want="open"
+  [[ "${TF_VAR_redis_auth_enforced:-true}" == "true" ]] && want="enforced"
+  if [[ "${TF_VAR_redis_tls:-true}" == "true" ]]; then
+    version="$(gcloud secrets versions describe latest --secret=redis-tls-server \
+      --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || true)"
+    [[ -n "$version" ]] || error "Redis TLS is on but the redis-tls-server secret has no version: run without --skip-infra (or terraform apply in infra/)"
+    want="${want} on:${version##*/}"
+  else
+    want="${want} off"
+  fi
+  now="$(redis_vm_reports)"
+  [[ "$now" == "$want" ]] && return 0
+  warn "Redis on token-opt-redis-vm runs '${now}', this deploy configures '${want}': restarting the VM (Redis starts empty)"
+  gcloud compute instances reset token-opt-redis-vm --zone="$zone" --project="$PROJECT_ID" --quiet \
+    || error "could not restart token-opt-redis-vm"
+  for ((i = 0; i < ${REDIS_VM_WAIT_TRIES:-30}; i++)); do
+    sleep "${REDIS_VM_WAIT_SECONDS:-10}"
+    now="$(redis_vm_reports)"
+    if [[ "$now" == "$want" ]]; then
+      success "Redis on token-opt-redis-vm runs '${want}'"
+      return 0
+    fi
+  done
+  error "token-opt-redis-vm did not come back running '${want}' (it reports '${now}'): see gcloud compute instances get-serial-port-output token-opt-redis-vm --zone=${zone} --project=${PROJECT_ID}"
 }
 
 # ─── Step 6: Seed Qdrant with demo documents ────────────────────────────────
@@ -875,9 +1122,10 @@ seed_qdrant() {
     return 0
   fi
   # WHY always seed on deploy:
-  # Qdrant runs on Cloud Run with ephemeral (container) storage. Every new revision
-  # (every gcp-deploy.sh run that pushes a new image) wipes the filesystem, so any
-  # previously seeded data is gone. We must re-seed after every deploy.
+  # Qdrant runs on Cloud Run with container storage: one always-on instance keeps it between
+  # requests, and a new revision (any change to the Qdrant service) or a Cloud Run restart
+  # restores only the collections whose snapshots the ingest job wrote (tenant documents).
+  # This demo collection has none, so it is gone then.
   # We check first — if docs are already present (e.g. --skip-infra config-only run
   # with no image change), we skip the expensive open/close ingress cycle.
 
@@ -907,8 +1155,12 @@ seed_qdrant() {
   # NOT internal-only (internal ingress rejected even in-VPC Cloud Run callers using the
   # run.app URL under private-ranges-only egress, silently breaking G07/docs-chat).
   # For this off-VPC seeding window we add a TEMPORARY allUsers invoker (removed below);
-  # during the window the app-layer api-key still gates every request.
+  # during the window the app-layer api-key still gates every request. The trap removes it
+  # however the deploy ends from here, a failed step or a Ctrl-C included (and still removes
+  # the work directory, whose trap it replaces).
   info "Opening Qdrant IAM temporarily for off-VPC seeding..."
+  trap exit_during_seed_window EXIT
+  trap 'exit 130' INT TERM
   gcloud run services add-iam-policy-binding token-opt-qdrant \
     --region="$REGION" --project="$PROJECT_ID" \
     --member=allUsers --role=roles/run.invoker &>/dev/null || true
@@ -944,14 +1196,26 @@ except:
       || warn "Qdrant seeding failed — run manually: QDRANT_API_KEY=<qdrant-api-key secret> ./scripts/seed-data.sh --qdrant-url ${qdrant_public_url}"
   fi
 
-  # Always remove the temporary allUsers grant (ingress stays ALL — the steady state;
-  # IAM + the app-layer key are the two standing gates).
+  close_qdrant_seed_window
+  trap remove_work_dir EXIT
+  trap - INT TERM
+  success "Qdrant IAM restored (invoker-only, ingress stays ALL + api-key)"
+}
+
+# Always remove the temporary allUsers grant (ingress stays ALL — the steady state;
+# IAM + the app-layer key are the two standing gates).
+close_qdrant_seed_window() {
   info "Removing temporary Qdrant allUsers IAM grant..."
   gcloud run services remove-iam-policy-binding token-opt-qdrant \
     --region="$REGION" --project="$PROJECT_ID" \
     --member=allUsers --role=roles/run.invoker &>/dev/null \
     || warn "Could not remove Qdrant allUsers grant — run manually: gcloud run services remove-iam-policy-binding token-opt-qdrant --member=allUsers --role=roles/run.invoker --region=${REGION}"
-  success "Qdrant IAM restored (invoker-only, ingress stays ALL + api-key)"
+}
+
+# The EXIT trap while the window is open: close it, then do what the trap it replaced did.
+exit_during_seed_window() {
+  close_qdrant_seed_window
+  remove_work_dir
 }
 
 # ─── Step 7: Patch Prometheus/Alertmanager with real service URLs ────────────
@@ -1036,11 +1300,23 @@ load_infra_outputs() {
   CONFIG_BUCKET=$(terraform output -raw config_bucket_name)
   DB_CONNECTION=$(terraform output -raw db_instance_connection_name)
   PROXY_SA=$(terraform output -raw proxy_service_account_email)
+  # Grafana and Langfuse run as accounts of their own, which a Terraform state from before
+  # they existed does not have: a full deploy (or terraform apply) creates them.
+  GRAFANA_SA=$(terraform output -raw grafana_service_account_email 2>/dev/null) \
+    && LANGFUSE_SA=$(terraform output -raw langfuse_service_account_email 2>/dev/null) \
+    || error "Grafana's and Langfuse's service accounts are not in the Terraform state yet: run once without --skip-infra (or terraform apply in infra/)"
   QDRANT_URL=$(terraform output -raw qdrant_service_url 2>/dev/null || echo "")
+  QDRANT_SNAPSHOT_BUCKET=$(terraform output -raw qdrant_snapshot_bucket 2>/dev/null || echo "")
+  if [[ -n "$QDRANT_URL" && -z "$QDRANT_SNAPSHOT_BUCKET" ]]; then
+    warn "The Terraform state has no Qdrant snapshot bucket yet: ingested documents will not survive a Qdrant restart until a deploy without --skip-infra creates it"
+  fi
   REDIS_HOST=$(terraform output -raw redis_host 2>/dev/null || echo "")
   if [[ -n "$REDIS_HOST" ]]; then
-    REDIS_URL="redis://${REDIS_HOST}:6379/0"
-    success "Redis URL constructed from Terraform output: ${REDIS_URL}"
+    # A state from before Redis TLS has no redis_url: guessing redis://host:6379 here would
+    # miss a Redis that serves TLS.
+    REDIS_URL="$(terraform output -raw redis_url)" \
+      || error "The Terraform state has no redis_url output yet: run once without --skip-infra (or terraform apply in infra/)"
+    success "Redis URL from Terraform output: ${REDIS_URL}"
   fi
   cd "${REPO_ROOT}"
   success "Infrastructure outputs loaded"

@@ -127,7 +127,11 @@ class TestG00RateLimit:
         _patch(monkeypatch, redis)
         with pytest.raises(RateLimitExceeded):
             await G00RateLimit().process_request(_ctx(make_ctx))
-        assert float(redis.store["tok_opt:rate_limit:hour:default:test_user:default"]["tokens"]) == 500.0
+        # Nothing consumed: the hour bucket must not drop below 500. It may rise a hair: a
+        # refusal still records the refill for the time elapsed, and on a 1 ms Windows timer
+        # that is a clock tick between this test's time.time() and the limiter's.
+        tokens = float(redis.store["tok_opt:rate_limit:hour:default:test_user:default"]["tokens"])
+        assert 500.0 <= tokens < 500.5
 
     async def test_per_user_override_admits_beyond_default(self, make_ctx, monkeypatch):
         _patch(monkeypatch, _FakeRedis())
@@ -138,6 +142,56 @@ class TestG00RateLimit:
         await G00RateLimit().process_request(_ctx(make_ctx, rpm=1,
                                                   per_user={"test_user": {"requests_per_minute": 120,
                                                                           "requests_per_hour": 2000}}))
+
+    async def test_a_partial_per_team_override_keeps_the_default_hour_limit(self, make_ctx, monkeypatch):
+        """Only requests_per_minute set: the hour limit is the default, not a KeyError that
+        the limiter's catch-all turned into "admit" — an unlimited team."""
+        now = time.time()
+        redis = _FakeRedis({
+            "tok_opt:rate_limit:minute:default:acme:team-x": {"tokens": "10", "last_refill": str(now)},
+            "tok_opt:rate_limit:hour:default:acme:team-x": {"tokens": "0", "last_refill": str(now)},
+        })
+        _patch(monkeypatch, redis)
+        ctx = _ctx(make_ctx, principal="acme", team="team-x", is_gateway_key=True,
+                   per_team={"team-x": {"requests_per_minute": 20}})
+        with pytest.raises(RateLimitExceeded) as ei:
+            await G00RateLimit().process_request(ctx)
+        assert ei.value.limit_type == "requests_per_hour"
+
+    async def test_a_partial_per_user_override_keeps_the_default_minute_limit(self, make_ctx, monkeypatch):
+        now = time.time()
+        redis = _FakeRedis({"tok_opt:rate_limit:minute:default:test_user:default":
+                            {"tokens": "0", "last_refill": str(now)}})
+        _patch(monkeypatch, redis)
+        ctx = _ctx(make_ctx, per_user={"test_user": {"requests_per_hour": 5000}})
+        with pytest.raises(RateLimitExceeded) as ei:
+            await G00RateLimit().process_request(ctx)
+        assert ei.value.limit_type == "requests_per_minute"
+
+    async def test_a_null_override_falls_back_to_the_defaults(self, make_ctx, monkeypatch):
+        now = time.time()
+        redis = _FakeRedis({"tok_opt:rate_limit:minute:default:test_user:default":
+                            {"tokens": "0", "last_refill": str(now)}})
+        _patch(monkeypatch, redis)
+        with pytest.raises(RateLimitExceeded):
+            await G00RateLimit().process_request(_ctx(make_ctx, per_user={"test_user": None}))
+
+    async def test_overrides_are_merged_over_the_defaults(self):
+        g = G00RateLimit()
+        g._default_limits = {"requests_per_minute": 60, "requests_per_hour": 1000}
+        g._per_user_limits = {"u": {"requests_per_hour": 5}, "n": None}
+        g._per_team_limits = {"t": {"requests_per_minute": 2}, "m": None}
+        try:
+            got = {who: g._get_limits_for_scope(*who) for who in
+                   (("u", "x"), ("n", "t"), ("n", "x"), ("n", "m"))}
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(f"an override must merge over the defaults, raised {exc!r}")
+        assert got == {
+            ("u", "x"): {"requests_per_minute": 60, "requests_per_hour": 5},
+            ("n", "t"): {"requests_per_minute": 2, "requests_per_hour": 1000},
+            ("n", "x"): {"requests_per_minute": 60, "requests_per_hour": 1000},
+            ("n", "m"): {"requests_per_minute": 60, "requests_per_hour": 1000},
+        }
 
     async def test_per_team_applies_for_gateway_team(self, make_ctx, monkeypatch):
         _patch(monkeypatch, _FakeRedis())

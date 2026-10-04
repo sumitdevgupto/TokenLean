@@ -55,3 +55,24 @@ async def test_pass_survives_table_errors():
 
     out = await run_retention_pass(_Pool(_BoomConn()), {"audit_days": 5})
     assert out == {}  # error swallowed, loop lives on
+
+
+async def test_an_unreadable_config_is_logged_not_ignored(monkeypatch, caplog):
+    """An unreadable config turns retention off for that pass (no `enabled`): data then
+    outlives its retention period, so it must say why."""
+    import asyncio
+    import retention
+
+    async def stop(_seconds):
+        raise asyncio.CancelledError
+
+    def broken():
+        raise RuntimeError("config store down")
+
+    monkeypatch.setattr(retention.asyncio, "sleep", stop)
+    with caplog.at_level("WARNING", logger="retention"):
+        try:
+            await retention.run_retention_loop(lambda: None, broken)
+        except asyncio.CancelledError:
+            pass
+    assert "config store down" in caplog.text

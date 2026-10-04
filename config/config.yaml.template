@@ -20,7 +20,6 @@ services:
   routellm_url: http://routellm-svc:8081
   langfuse_host: http://langfuse-svc:3000
   mem0_url: ''
-  zep_url: ''
 savings:
   chars_per_token: 4
   per_message_overhead: 4
@@ -86,7 +85,8 @@ rate_limit:
   # into ctx.config per request (no redeploy). Expiry (days elapsed OR requests
   # exhausted) → HTTP 402 code=trial_expired until an operator converts or extends;
   # the 402 is not billed and does not consume trial allowance. Counting basis = the
-  # billable unit (every served 2xx, incl. cache hits/bypasses). Trial requests are
+  # billable unit (every served 2xx, incl. cache hits/bypasses; a batched request counts
+  # when it is queued). Trial requests are
   # flagged on usage_events and excluded from invoices. Warn %%s fire a one-shot
   # `trial.threshold` webhook per crossing (per trial generation); exhaustion fires
   # one `trial.expired` (delivery is commercial; no-op without a dispatcher).
@@ -105,17 +105,38 @@ retention:
   audit_days: 0                 # 0 = keep audit_events forever
   usage_days: 0                 # 0 = keep usage_events forever
   cache_l2_expired_cleanup: true
-# App-level source-IP allowlist (CIDR) for the proxy request path. OFF by default —
-# OSS/self-host is open; the managed enterprise deploy turns it on. Enforced in core
-# _authenticate for the /v1/* routes (net/ip_allowlist.py). global_cidrs apply to ALL
-# tenants (e.g. an office / VPN egress that must always work); per-tenant CIDRs are set
-# from the adminconsole and stored in the tenant's key metadata. Empty global + empty
-# per-tenant ⇒ the tenant is unrestricted. A request is allowed iff its source IP is in
-# (global_cidrs ∪ tenant_cidrs).
+# App-level source-IP allowlist (CIDR) for the proxy request path, enforced in core
+# _authenticate for the /v1/* routes (net/ip_allowlist.py). enabled switches on
+# global_cidrs, which apply to ALL tenants (e.g. an office / VPN egress that must always
+# work): OFF by default — OSS/self-host is open — and no deploy script turns it on.
+# A tenant's own CIDRs, set from the admin console and stored in its keys' metadata, are
+# enforced whether enabled is on or off. Empty global + empty per-tenant ⇒ the tenant is
+# unrestricted. A request is allowed iff its source IP is in (global_cidrs ∪ tenant_cidrs).
+# The source IP is resolved as network: below describes.
 ip_allowlist:
   enabled: false
-  trust_x_forwarded_for: true   # first XFF hop is the client (Cloud Run / portal front the proxy)
   global_cidrs: []              # e.g. ["203.0.113.0/24", "198.51.100.7/32"]
+# The caller's address, for the IP allowlist and the portal login limits (net/client_ip.py).
+# X-Forwarded-For is written left to right: a client may put anything in it, and each proxy
+# in front of TokenLean appends the address its connection came from. So the caller is the
+# entry trusted_proxy_hops places from the RIGHT. auto = 1 on Cloud Run (whose front end
+# appends one entry), else 0 (no proxy in front: the socket peer). Behind nginx or a single
+# load balancer that appends the peer, set 1; behind Google's external Application Load
+# Balancer, which appends two entries, set 2. Replaces ip_allowlist.trust_x_forwarded_for.
+network:
+  trusted_proxy_hops: auto
+  # enforce = use that address. observe = keep the old first X-Forwarded-For entry and log
+  # where the new address differs (a rollout step; CLIENT_IP_MODE overrides this).
+  client_ip_mode: enforce
+# OpenAI ingress (/v1/chat/completions) accepts only the documented Chat Completions
+# parameters, TokenLean's own client parameters (every x_* field, plus workflow_id,
+# template_id, rag_query, session_id, ...) and the names listed here. Other body fields
+# are dropped and their NAMES logged, never their values. Fields starting with "_" can
+# never be re-admitted, and litellm call arguments (api_base, extra_headers, ...) are
+# stripped again before the upstream call whatever is listed here. Global config only —
+# a tenant override cannot extend it.
+ingress:
+  extra_allowed_params: []      # e.g. ["metadata"]
 providers:
 - name: openai
   api_base: https://api.openai.com/v1
@@ -351,6 +372,10 @@ resilience:
   failure_threshold: 5        # consecutive 5xx/timeout failures that trip a provider's breaker
   cooldown_seconds: 30        # breaker-open duration AND per-tenant 429-cooldown TTL
   retry_base_delay: 0.2       # exponential backoff base between retries (seconds)
+  # How long a provider call waits for the provider to send anything (the whole answer,
+  # or for a stream each next chunk) before it counts as a timeout: retried, then failed
+  # over. Long reasoning answers can take minutes.
+  request_timeout_seconds: 300
   # Per-model lockout (finer than the provider breaker): quarantine ONE degraded /
   # deprecated model while the provider's OTHER models keep serving. Default off →
   # provider-breaker-only behaviour is unchanged. When on, a model that racks up
@@ -580,10 +605,11 @@ groups:
     # Aiming the span AT the minimum needs a compression engine with a rate dial, which
     # here is the LLMLingua sidecar (`sidecar_url` below). Without it -- sidecar not
     # deployed, unreachable, or unable to land above the minimum -- there is nothing to
-    # aim, and the span is PRESERVED WHOLE instead. That is still correct and still
-    # cheaper on a repeating prefix, but it gives back the whole prefix's compression
-    # rather than only the part that was at stake. Content outside the span stays
-    # compressed either way.
+    # aim, and the choice is between compressing the span anyway and PRESERVING IT WHOLE.
+    # The same arithmetic picks the cheaper: with a small cache discount, keeping the
+    # whole span costs more than compressing it. G08 and G19 can only trim or not, so
+    # they always make that comparison. Content outside the span stays compressed either
+    # way.
     #
     # Still opt-in: at the first sighting of a prefix there is no reuse to bank on, and
     # a provider may evict a cached block before the reuse arrives.
@@ -606,7 +632,11 @@ groups:
     reduction_threshold: 0.95
     compress_user_messages: false
     compress_system_prompt: false
-    layered_composition_enabled: true
+    # Layered composition, opt-in per request: a system message that carries a
+    # `layer_context` object (e.g. {"domain": "billing", "task_description": "..."}) has
+    # its content REPLACED by these layers, filled from that object. Messages without it
+    # are never touched, and the field is removed before the provider call.
+    layered_composition_enabled: false
     layers:
       base: You are a helpful AI assistant.
       role: You specialize in {domain}.
@@ -672,9 +702,8 @@ groups:
       min_docs: 100
       stability_days: 30
       auto_trigger: false
-    tika_sidecar:
-      enabled: false
-      url: http://tika-svc:9998
+    # (tika_sidecar.{enabled,url} removed 2026-10-01: nothing read them. The doc-pipeline
+    #  job reaches Tika through its own TIKA_SIDECAR_URL env var.)
   G4_bypass:
     enabled: true
     database_first: true
@@ -725,6 +754,9 @@ groups:
     # (l3_enabled / l3_similarity_threshold removed 2026-09-07 — the L3 tier never
     #  executed and its library has been dropped. L1 exact-match and L2 semantic are
     #  the shipped cache tiers. A leftover l3_* key in an existing config is ignored.)
+    # Adaptive TTLs: over the last one to two hours of lookups, a hit rate above 80%
+    # stores new entries for 25% longer and one below 20% for 25% shorter, kept within
+    # min/max multiplier x the TTL above. false = the TTLs above, as configured.
     auto_ttl_enabled: true
     auto_ttl_min_multiplier: 0.25
     auto_ttl_max_multiplier: 2.0
@@ -740,6 +772,7 @@ groups:
     #   round_robin    — rotate across the tier's models (per worker)
     #   weighted       — deterministic split by `strategy_weights` (model → weight)
     #   least_latency  — the tier model with the lowest observed served-latency EWMA
+    #                    (one whose call just failed is passed over for 5 minutes)
     #   canary         — `canary_pct`%% of traffic to the SECOND model, rest to the first
     strategy: priority
     strategy_weights: {}       # e.g. {gpt-4o-mini: 9, gpt-4o: 1} for the `weighted` strategy
@@ -772,7 +805,9 @@ groups:
     # declare a real cheap→strong cascade; the single-model providers (groq/bedrock/deepseek/
     # xai, and azure whose deployment names are yours to set) route every tier to one model —
     # still on-provider, no misroute — add a stronger id to simple/medium/complex to turn on a
-    # true cascade for them.
+    # true cascade for them. A tier a TENANT set (portal model preferences, or
+    # tenants.<id>.groups.G6_routing.tiers) replaces that tier of the ladder for every
+    # request from that tenant, even one for another provider's model.
     tiers_by_provider:
       openai:
         simple: [gpt-4o-mini]
@@ -867,8 +902,13 @@ groups:
     expected_output_tokens_estimate: 512
     routellm:
       url: http://routellm-svc:8081
-      router: mf
-      threshold: 0.11593
+      # bert: a local classifier with an Apache-2.0 checkpoint. mf and sw_ranking need an
+      # OpenAI key (they embed the prompt; without one G06 uses bert), mf's checkpoint has no
+      # licence, and causal_llm is a 16 GB Meta Llama 3 derivative.
+      router: bert
+      # ~50% of requests to strong_model. Each router has its own scale (RouteLLM's
+      # calibration): bert 0.4066, mf 0.11593, sw_ranking 0.21647, causal_llm 0.0962.
+      threshold: 0.4066
       timeout_ms: 500
       weak_model: gpt-4o-mini
       strong_model: gpt-4o
@@ -912,6 +952,7 @@ groups:
     enabled: true
     chunk_size_tokens: 256
     top_k: 3
+    max_top_k: 50          # the most a caller's X-Rag-Top-K header may ask for
     top_k_after_rerank: 1
     similarity_threshold: 0.85
     dense_model: all-MiniLM-L6-v2
@@ -953,11 +994,14 @@ groups:
     mcp_http_timeout_seconds: 10.0
     tool_usage_ttl_days: 90
     mcp_servers: null
+    # A daily pass, per tenant, over the registry tools the model has stopped calling (offered
+    # for the whole window, not called in it). dry_run_first: true only reports them (log +
+    # token_opt_tool_pruning_candidates); false drops them from that tenant's requests.
     pruning:
       enabled: true
       inactivity_threshold_days: 30
       dry_run_first: true
-      schedule: 0 2 * * *
+      schedule: 0 2 * * *              # daily, UTC ("M H * * *")
   G9_context_schema:
     enabled: false
     use_instructor: true
@@ -987,12 +1031,11 @@ groups:
     sliding_window_turns: 6
     summary_model: gpt-4o-mini
     skills_enabled: false
-    skills_qdrant_enabled: true      # false → non-Qdrant heuristic skill-injection fallback
+    skills_qdrant_enabled: true      # false → G7's hybrid search + reranker, not a vector search
     skills_qdrant_collection: agent_skills
     skills_top_k: 2
     skills_similarity_threshold: 0.7
-    mem0_enabled: false
-    zep_enabled: false
+    mem0_enabled: false              # needs MEM0_API_URL + MEM0_API_KEY; per authenticated user (see config-reference)
   G11_output:
     enabled: true
     enforce_max_tokens: true
@@ -1092,6 +1135,9 @@ groups:
   G12_reasoning:
     enabled: true
     default_effort: medium
+    # For a request that names no reasoning, capped at the provider's own default (as G25
+    # caps its choice): Anthropic gets no thinking, the o-series stays at medium. Raise a
+    # provider's with providers[].default_reasoning_effort. A tenant's own value is used as is.
     # Reasoning models bill their hidden thinking INSIDE the caller's output budget, so
     # a budget sized for the answer alone is spent entirely on thinking and the caller
     # is billed in full for an EMPTY reply (finish_reason "length", no content).
@@ -1168,9 +1214,14 @@ groups:
     default_model: gpt-4o-mini
     redis_stream_prefix: tok_opt:batch
     consumer_group: proxy-batch-consumers
-    consumer_name: proxy-worker-1
-    max_pending_ack_ms: 30000
-    batch_topics: []
+    # consumer_name: unset (recommended) gives each process its own. Instances sharing one
+    # name are a single consumer to Redis, which then cannot tell whose work an entry is.
+    max_pending_ack_ms: 30000  # a consumer holds what it is flushing; an entry nobody has
+                               # held this long (its process stopped) is retried by another
+    max_attempts: 3            # deliveries of one request before it is marked failed
+    batch_topics: []           # only these topics are batched; a request naming any other
+                               # topic is answered at once (nothing would read it)
+    max_backlog: 10000         # queued requests per tenant per topic before its new ones are answered at once
     provider_native: false
     completion_window: 24h
     poll_interval_seconds: 30
@@ -1206,7 +1257,12 @@ groups:
   G17_loop:
     enabled: true
     max_iterations: 10
+    # Budget per request that carries a workflow_id, measured against that conversation's
+    # own prompt (remaining = budget - prompt tokens), reported in x-token-opt-state.
     starting_budget_tokens: 10000
+    # Opt-in: when remaining < compact_output_below_tokens, append "Keep your answer brief"
+    # to the end of the system prompt.
+    compact_output_enabled: false
     compact_output_below_tokens: 500
     confidence_stop_threshold: 0.95
     wall_clock_timeout_seconds: 300
@@ -1220,7 +1276,10 @@ groups:
     # http://langfuse:3000). Kept only so existing configs still parse the same.
     langfuse_host: http://langfuse-svc
     prometheus_enabled: true
-    capture_trace_content: true
+    # Raw prompt/response text in Langfuse traces. Off: every tenant's traces share one
+    # Langfuse project. A request whose PII G29/G31 found and left in place (flag/block) is
+    # traced without its text even when on; spans keep their counts either way.
+    capture_trace_content: false
     turn_efficiency_enabled: true
     tool_governance_enabled: true
     # Needs the traceloop-sdk package, which the default image does not include.
@@ -1230,11 +1289,11 @@ groups:
     tool_governance_days: 30
     # Bound the `team`/`feature` Prometheus label values so a caller (or a misconfigured
     # gateway) cannot grow label cardinality without limit — each distinct value is a new,
-    # never-evicted series. Omit a dimension (or the whole block) to keep the value as-is
-    # (default); an explicit list means only "default" + the listed values keep their own
-    # label, everything else is folded to "other". `team` is already the TRUSTED team (a
-    # gateway key's X-Team, else "default"), so this mainly bounds a gateway's team space
-    # and the free-form `feature`. Operator-only; per-tenant via the operator overlay.
+    # never-evicted series. A list means only "default" + the listed values keep their own
+    # label, everything else is folded to "other"; "*" keeps every value as-is. Omitted,
+    # `feature` (any caller's X-Feature) keeps only "default", and `team`, already the
+    # TRUSTED team (a gateway key's X-Team, else "default"), keeps its value. Operator-only;
+    # per-tenant via the operator overlay.
     label_values: {}
     #  team: [checkout, search, billing]
     #  feature: [ui-copy, ticket-classify]
@@ -1273,7 +1332,6 @@ groups:
       code:
         strip_comments: true
         strip_whitespace: true
-        compress_imports: true
       logs:
         dedupe_lines: true
         truncate_long_lines: 200
@@ -1335,6 +1393,8 @@ groups:
         # OpenAI does not surcharge cache writes - they bill at the normal input rate.
         cache_write_multiplier: 1.0
       anthropic:
+        # Placed only on a request carrying none of the caller's own cache_control markers:
+        # Anthropic accepts at most four, and the caller chose where its go.
         marker: false
         cache_type: ephemeral
         discount_pct: 90
@@ -1580,7 +1640,12 @@ groups:
     threshold: 0.5             # minimum rule severity to fire
     scan_roles: [system, tool] # roles that retrieval/memory inject into (user is G30's job)
     metrics_enabled: true
-    extra_rules: []            # [[id, category, severity, regex], …] managed-feed additions
+    extra_rules: []            # [[id, category, severity, regex], …] your own additions
+    # Managed rules (the Enterprise feed writes them to managed_extra_rules): record = a
+    # match is counted and audited and the request is left alone; enforce = they act under
+    # `mode` like any other rule. A tenant can opt in (managed_rules_enforce: true) but
+    # cannot turn off an enforce set here.
+    managed_rules: record
     # block_message: "Retrieved context contained a prompt-injection attempt."
     # ── PII pass over retrieved context (opt-in; same engine as G29) ──
     pii_mode: off              # off (default) | flag | mask | block. Scans the SAME
@@ -1661,10 +1726,17 @@ orchestration:
   agents: []                         # [] = disabled. Example entry:
     # - id: billing
     #   description: "Billing, invoices, refunds, charges"   # for the managed ML classifier
-    #   url: http://billing-agent:8000/v1                    # OpenAI-compatible endpoint
+    #   url: http://billing-agent:8000/v1                    # OpenAI-compatible endpoint. An agent
+    #                                  # defined in THIS file may name a host on your own network,
+    #                                  # as here; one saved from the portal must be a public host
+    #                                  # (no single-label or .internal/.local/.svc name, no address
+    #                                  # that is not public, checked again when it is called)
     #   match: [refund, invoice, billing, charge, payment]   # heuristic intent keywords
     #   model: gpt-4o-mini            # optional: model string sent to the agent (default: requested)
-    #   api_key_env: BILLING_AGENT_KEY # optional: env var holding the agent's API key
+    #   api_key_env: BILLING_AGENT_KEY # optional: env var holding the agent's API key. Honoured
+    #                                  # only for agents defined in THIS file (here or under a
+    #                                  # static tenants.<id>.orchestration); agents saved from the
+    #                                  # portal are called without a key.
     #   max_tokens: 1024              # optional: per-agent output budget (governance)
     #   timeout_seconds: 60           # optional: dispatch timeout before fallback
 

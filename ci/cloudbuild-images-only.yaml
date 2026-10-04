@@ -108,6 +108,14 @@ steps:
       - 'src/finetune-pipeline'
     waitFor: [run-tests]
 
+  # Step 8a: Stage the proxy's guardrails engine into the doc-pipeline build context (its
+  # Dockerfile copies it; the same explicit file list as every other build path).
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: stage-doc-pipeline-guardrails
+    entrypoint: 'bash'
+    args: ['scripts/ci/stage-doc-pipeline-guardrails.sh']
+    waitFor: ['-']
+
   # Step 8: Build doc-pipeline image
   - name: 'gcr.io/cloud-builders/docker'
     id: build-doc-pipeline
@@ -119,7 +127,7 @@ steps:
       - '-t'
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/doc-pipeline:latest'
       - 'src/doc-pipeline'
-    waitFor: [run-tests]
+    waitFor: [run-tests, stage-doc-pipeline-guardrails]
 
   # Step 9: Push all images
   - name: 'gcr.io/cloud-builders/docker'

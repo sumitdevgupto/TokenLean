@@ -1,21 +1,26 @@
 # ── OpenTelemetry tracing configuration ───────────────────────────────────────
 # Copy to config/params/tracing.yaml and fill in values.
-# All keys are merged under ctx.config["tracing"] at proxy startup.
+# All keys are merged under ctx.config["tracing"] and read once at proxy startup (a change
+# applies at the next start). Each request is one trace: its pipeline span, with every
+# stage span under it.
 #
 # OSS stack: opentelemetry-sdk (Apache-2) + Jaeger (Apache-2)
 
 tracing:
   # Enable OpenTelemetry pipeline tracing.  When false, all span calls are no-ops.
+  # Without this file (no `enabled`), spans are exported only when the
+  # OTEL_EXPORTER_OTLP_ENDPOINT env var is set, as docker-compose sets it.
   enabled: true
 
-  # OTLP gRPC endpoint for the OTel collector / Jaeger.
-  # Override with OTEL_EXPORTER_OTLP_ENDPOINT env var.
+  # OTLP gRPC endpoint for the OTel collector / Jaeger. The OTEL_EXPORTER_OTLP_ENDPOINT env
+  # var wins over this. TLS is used unless the endpoint starts with http://.
   otlp_endpoint: "http://jaeger:4317"
 
   # Service name reported to Jaeger / Tempo.
   service_name: "token-opt-proxy"
 
-  # Propagate trace ID as X-Trace-ID response header.
+  # Name each request's trace on its response, as an X-Trace-ID header (32 hex chars), while
+  # spans are exported: served, streamed or refused. Absent here, it is on.
   propagate_trace_id_header: true
 
   # Sampling ratio (1.0 = 100%, 0.1 = 10%).  Use 1.0 in dev, lower in prod.

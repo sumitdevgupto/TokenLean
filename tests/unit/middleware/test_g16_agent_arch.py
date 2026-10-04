@@ -37,6 +37,18 @@ class TestG16AgentArch:
         ctx = await G16AgentArch().process_request(ctx)
         assert len(ctx.params["tools"]) == 15  # 15 < 20 fallback → no pruning
 
+    async def test_tools_null_is_no_tools(self, make_ctx):
+        # `"tools": null` in a body used to raise len(None) and fail the request with a 500.
+        from middleware.g16_agent_arch import G16AgentArch
+        ctx = make_ctx(params={"tools": None})
+        assert ctx.config["groups"]["G16_agent_arch"].get("enabled") is True
+        try:
+            ctx = await G16AgentArch().process_request(ctx)
+        except TypeError as exc:
+            pytest.fail(f"G16 failed on tools: null: {exc}")
+        assert ctx.params["tools"] is None
+        assert ctx.params.get("_token_opt_warnings", []) == []
+
     async def test_small_system_prompt_no_warning(self, make_ctx):
         ctx = make_ctx([
             {"role": "system", "content": "Be helpful."},

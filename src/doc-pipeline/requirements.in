@@ -1,0 +1,10 @@
+# What this image needs. scripts/compile-requirements.sh resolves it into requirements.txt with
+# every version pinned.
+unstructured>=0.18.32
+pdfminer.six>=20260107
+python-docx>=1.1.0
+google-cloud-storage>=3.13.0
+qdrant-client>=1.12,<1.13
+langchain-text-splitters>=0.2.0
+fastembed>=0.3.0
+tiktoken>=0.13.0

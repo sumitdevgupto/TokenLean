@@ -1,4 +1,5 @@
 """Unit tests for F2 Intent-Based Multi-Agent Orchestration (OSS-core engine)."""
+import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -14,6 +15,15 @@ from middleware.intent_orchestration import (
 )
 from savings.models import SavingsRecord
 
+
+
+@pytest.fixture(autouse=True)
+def _agent_hosts_resolve_publicly(monkeypatch):
+    """A tenant's agent host is resolved before it is called; here every name resolves to a
+    public address, so no test depends on real DNS."""
+    async def resolve(host):
+        return ["93.184.216.34"]
+    monkeypatch.setattr("middleware.intent_orchestration._host_addresses", resolve)
 
 def _ctx(*, config, tenant_id="default", messages=None, model="gpt-4o-mini", **flags):
     msgs = messages or [{"role": "user", "content": "please process my refund"}]
@@ -34,7 +44,7 @@ def _ctx(*, config, tenant_id="default", messages=None, model="gpt-4o-mini", **f
 def _cfg(*, enabled=True, agents=None, threshold=1, tenants=None):
     c = {"orchestration": {"enabled": enabled, "confidence_threshold": threshold,
                            "agents": agents if agents is not None else [
-                               {"id": "billing", "url": "http://billing/v1",
+                               {"id": "billing", "url": "https://billing.agents.example/v1",
                                 "match": ["refund", "invoice", "billing"]}]}}
     if tenants:
         c["tenants"] = tenants
@@ -104,6 +114,74 @@ def test_tenant_agents_replace_global_never_merge():
     assert [a["id"] for a in _orchestration_cfg(cfg, "OTHER")["agents"]] == ["global"]
 
 
+# ── api_key_env is operator-only ──────────────────────────────────────────────────────
+# `api_key_env` names a SERVER environment variable. An agent that reached ctx.config from
+# a tenant override (the portal) must never make the proxy read one and send it to the
+# tenant's url. An agent defined in the operator's own config still gets its key.
+_PLATFORM_SECRET = "sk-platform-secret-must-not-leave"
+
+
+def _agent(**over):
+    agent = {"id": "billing", "url": "https://tenant-agent.example/v1",
+             "match": ["refund"], "api_key_env": "LLM_KEY_OPENAI"}
+    agent.update(over)
+    return agent
+
+
+async def _dispatched_api_key(ctx, operator_config):
+    with patch("config_loader.get_config", return_value=operator_config), \
+         patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is True
+    return m.call_args.kwargs["api_key"]
+
+
+async def test_tenant_agent_cannot_read_a_server_env_var(monkeypatch):
+    monkeypatch.setenv("LLM_KEY_OPENAI", _PLATFORM_SECRET)
+    ctx = _ctx(config=_cfg(agents=[_agent()]), tenant_id="ACME")
+    assert await _dispatched_api_key(ctx, operator_config=_cfg(agents=[])) == "no-key"
+
+
+async def test_operator_agent_still_gets_its_key(monkeypatch):
+    monkeypatch.setenv("BILLING_AGENT_KEY", "sk-agent-key")
+    agent = _agent(url="https://billing.agents.example/v1", api_key_env="BILLING_AGENT_KEY")
+    ctx = _ctx(config=_cfg(agents=[agent]))
+    assert await _dispatched_api_key(ctx, operator_config=_cfg(agents=[agent])) == "sk-agent-key"
+
+
+async def test_static_per_tenant_operator_agent_gets_its_key(monkeypatch):
+    monkeypatch.setenv("ACME_AGENT_KEY", "sk-acme")
+    agent = _agent(url="http://acme-agent/v1", api_key_env="ACME_AGENT_KEY")
+    operator = _cfg(agents=[], tenants={"ACME": {"orchestration": {"agents": [agent]}}})
+    ctx = _ctx(config=operator, tenant_id="ACME")
+    assert await _dispatched_api_key(ctx, operator_config=operator) == "sk-acme"
+
+
+async def test_tenant_cannot_reuse_an_operator_agent_key_at_its_own_url(monkeypatch):
+    monkeypatch.setenv("BILLING_AGENT_KEY", "sk-agent-key")
+    operator_agent = _agent(url="https://billing.agents.example/v1", api_key_env="BILLING_AGENT_KEY")
+    hijacked = dict(operator_agent, url="https://tenant-agent.example/v1")
+    ctx = _ctx(config=_cfg(agents=[hijacked]), tenant_id="ACME")
+    assert await _dispatched_api_key(ctx, operator_config=_cfg(agents=[operator_agent])) == "no-key"
+
+
+async def test_another_tenants_static_agent_key_is_not_reachable(monkeypatch):
+    monkeypatch.setenv("OTHER_AGENT_KEY", "sk-other")
+    other_agent = _agent(url="https://other-agent.example/v1", api_key_env="OTHER_AGENT_KEY")
+    operator = _cfg(agents=[], tenants={"OTHER": {"orchestration": {"agents": [other_agent]}}})
+    ctx = _ctx(config=_cfg(agents=[other_agent]), tenant_id="ACME")  # ACME copied it verbatim
+    assert await _dispatched_api_key(ctx, operator_config=operator) == "no-key"
+
+
+async def test_refused_key_env_is_logged_by_name_never_by_value(monkeypatch, caplog):
+    monkeypatch.setenv("LLM_KEY_OPENAI", _PLATFORM_SECRET)
+    ctx = _ctx(config=_cfg(agents=[_agent(id="billing-log-check")]), tenant_id="ACME")
+    with caplog.at_level(logging.WARNING, logger="middleware.intent_orchestration"):
+        await _dispatched_api_key(ctx, operator_config=_cfg(agents=[]))
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "LLM_KEY_OPENAI" in text and _PLATFORM_SECRET not in text
+
+
 # ── dispatch behaviour ────────────────────────────────────────────────────────────────
 async def test_dispatch_on_intent_match():
     ctx = _ctx(config=_cfg())
@@ -115,7 +193,7 @@ async def test_dispatch_on_intent_match():
     assert out.llm_elapsed_ms >= 0.0
     # forwarded to the agent's URL via OpenAI-compatible transport
     _, kwargs = m.call_args
-    assert kwargs["base_url"] == "http://billing/v1"
+    assert kwargs["base_url"] == "https://billing.agents.example/v1"
     assert kwargs["custom_llm_provider"] == "openai"
 
 
@@ -158,7 +236,7 @@ async def test_cascade_response_prevents_dispatch():
 
 async def test_tenant_isolation_agent_not_visible_to_other_tenant():
     cfg = _cfg(agents=[], tenants={"ACME": {"orchestration": {
-        "enabled": True, "agents": [{"id": "acme-billing", "url": "http://a/v1", "match": ["refund"]}]}}})
+        "enabled": True, "agents": [{"id": "acme-billing", "url": "https://a.agents.example/v1", "match": ["refund"]}]}}})
     # ACME dispatches to its own agent...
     acme = _ctx(config=cfg, tenant_id="ACME")
     with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))):
@@ -173,7 +251,7 @@ async def test_tenant_isolation_agent_not_visible_to_other_tenant():
 
 
 async def test_per_agent_max_tokens_budget_passed():
-    cfg = _cfg(agents=[{"id": "billing", "url": "http://b/v1", "match": ["refund"], "max_tokens": 256}])
+    cfg = _cfg(agents=[{"id": "billing", "url": "https://b.agents.example/v1", "match": ["refund"], "max_tokens": 256}])
     ctx = _ctx(config=cfg)
     with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
         await IntentOrchestration().process_request(ctx)
@@ -239,7 +317,7 @@ async def test_dispatch_ssrf_url_falls_back_to_llm():
 
 # ── timeout cap ──────────────────────────────────────────────────────────────────────
 async def test_dispatch_timeout_capped():
-    cfg = _cfg(agents=[{"id": "billing", "url": "http://billing/v1", "match": ["refund"],
+    cfg = _cfg(agents=[{"id": "billing", "url": "https://billing.agents.example/v1", "match": ["refund"],
                          "timeout_seconds": 999999}])
     ctx = _ctx(config=cfg)
     with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
@@ -264,7 +342,7 @@ async def test_dispatch_updates_routed_model():
     """Regression: routed_model must reflect the agent's own model, not whatever G06 last
     picked for the now-skipped main LLM call — otherwise billing/cost pricing (G18) and the
     x-tokenlean-routed-model header mislabel the request."""
-    cfg = _cfg(agents=[{"id": "billing", "url": "http://billing/v1", "match": ["refund"],
+    cfg = _cfg(agents=[{"id": "billing", "url": "https://billing.agents.example/v1", "match": ["refund"],
                          "model": "internal-billing-llm-v2"}])
     ctx = _ctx(config=cfg, model="gpt-4o-mini")
     ctx.routed_model = "gpt-4o-mini"  # simulate G06 having already routed
@@ -295,3 +373,129 @@ async def test_openai_only_no_provider_specific_fields():
     blob = str(kwargs)
     for forbidden in ("cache_control", "thinking", "budget_tokens", "response_schema"):
         assert forbidden not in blob
+
+
+async def test_an_agent_call_carries_none_of_the_callers_cache_markers():
+    """An agent is an OpenAI-compatible URL, not a provider that caches by marker, and
+    litellm hands a custom endpoint the markers as they are. The caller's prompt-cache
+    markers are removed before the call."""
+    mark = {"type": "ephemeral"}
+    ctx = _ctx(config=_cfg(), messages=[
+        {"role": "system", "content": [{"type": "text", "text": "Rules.", "cache_control": mark}]},
+        {"role": "user", "content": "please process my refund", "cache_control": mark}])
+    with patch("litellm.acompletion", new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is True
+    assert m.call_args.kwargs["messages"] == [
+        {"role": "system", "content": [{"type": "text", "text": "Rules."}]},
+        {"role": "user", "content": "please process my refund"}]
+
+
+# ── internal targets: names, number spellings, resolution ─────────────────────────────
+@pytest.mark.parametrize("url", [
+    "http://metadata.google.internal./computeMetadata/v1/",    # trailing dot, same name
+    "http://METADATA.GOOGLE.INTERNAL/computeMetadata/v1/",
+    "http://langfuse:3000/api/public/traces",                   # a compose service
+    "http://qdrant:6333/collections",
+    "http://routellm:8080/route",
+    "http://2852039166/latest/meta-data/",                      # 169.254.169.254, decimal
+    "http://0xa9fea9fe/latest/meta-data/",                      # ... hex
+    "http://0251.0376.0251.0376/latest/meta-data/",             # ... octal
+    "http://127.1:8080/",                                       # short form of 127.0.0.1
+    "http://[::ffff:169.254.169.254]/latest/meta-data/",        # IPv4-mapped IPv6
+    "http://[::1]:8080/",
+    "http://vault.internal/v1",
+    "http://printer.local/",
+    "http://api.localhost/",
+    "http://billing.default.svc/v1",
+    "http://100.64.0.1/",                                       # shared address space
+    "http://224.0.0.1/",                                        # multicast
+])
+def test_validate_outbound_url_rejects_internal_targets(url):
+    with pytest.raises(ValueError):
+        validate_outbound_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://agent.example.com./v1",                            # a public name, trailing dot
+    "http://billing.internal.example.com/v1",
+])
+def test_validate_outbound_url_still_allows_public_names(url):
+    validate_outbound_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://billing-agent:8000/v1",                             # the template's own example
+    "http://vault.internal/v1",
+])
+def test_an_operator_agent_may_name_its_own_network(url):
+    validate_outbound_url(url, internal_names_ok=True)
+
+
+@pytest.mark.parametrize("url", [
+    "http://metadata.google.internal./computeMetadata/v1/",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://2852039166/latest/meta-data/",
+    "http://[::ffff:169.254.169.254]/latest/meta-data/",
+    "http://localhost:8000/v1",
+    "http://api.localhost/v1",
+])
+def test_an_operator_agent_still_cannot_reach_metadata_or_loopback(url):
+    with pytest.raises(ValueError):
+        validate_outbound_url(url, internal_names_ok=True)
+
+
+def _resolving_to(monkeypatch, *addresses):
+    looked_up = []
+
+    async def resolve(host):
+        looked_up.append(host)
+        return list(addresses)
+    monkeypatch.setattr("middleware.intent_orchestration._host_addresses", resolve)
+    return looked_up
+
+
+@pytest.mark.parametrize("address", ["10.0.0.7", "169.254.169.254", "127.0.0.1", "fd00::1",
+                                     "fe80::1%eth0"])
+async def test_a_tenant_agent_whose_name_resolves_inside_is_not_called(monkeypatch, address):
+    _resolving_to(monkeypatch, "93.184.216.34", address)
+    ctx = _ctx(config=_cfg(agents=[{"id": "x", "url": "https://agent.attacker.example/v1",
+                                    "match": ["refund"]}]))
+    with patch("litellm.acompletion", new=AsyncMock()) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is False
+    m.assert_not_called()
+
+
+async def test_a_tenant_agent_that_resolves_publicly_is_called(monkeypatch):
+    looked_up = _resolving_to(monkeypatch, "93.184.216.34")
+    ctx = _ctx(config=_cfg(agents=[{"id": "x", "url": "https://agent.example.com/v1",
+                                    "match": ["refund"]}]))
+    with patch("litellm.acompletion",
+               new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is True and m.called
+    assert looked_up == ["agent.example.com"]
+
+
+async def test_an_operator_agent_on_the_operator_network_is_called(monkeypatch):
+    looked_up = _resolving_to(monkeypatch, "10.0.0.7")
+    agent = {"id": "billing", "url": "http://billing-agent:8000/v1", "match": ["refund"]}
+    ctx = _ctx(config=_cfg(agents=[agent]))
+    with patch("config_loader.get_config", return_value=_cfg(agents=[dict(agent)])), \
+            patch("litellm.acompletion",
+                  new=AsyncMock(return_value=_FakeResp(_openai_response()))) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is True and m.called
+    assert looked_up == []                                      # the operator's own: not resolved
+
+
+async def test_a_tenant_agent_borrowing_the_operator_s_internal_url_is_refused(monkeypatch):
+    operator = {"id": "billing", "url": "http://billing-agent:8000/v1", "match": ["refund"]}
+    tenant = {"id": "mine", "url": "http://billing-agent:8000/v1", "match": ["refund"]}
+    ctx = _ctx(config=_cfg(agents=[tenant]))
+    with patch("config_loader.get_config", return_value=_cfg(agents=[operator])), \
+            patch("litellm.acompletion", new=AsyncMock()) as m:
+        out = await IntentOrchestration().process_request(ctx)
+    assert out.agent_dispatched is False
+    m.assert_not_called()

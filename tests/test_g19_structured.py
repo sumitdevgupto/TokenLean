@@ -42,7 +42,7 @@ def _make_config(enabled=True, request_side=True, response_side=True,
         # test_fixture_matches_shipped_template, which now enforces the match.
         strategies = {
             "json": {"remove_empty": True, "dedupe_keys": True},
-            "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
+            "code": {"strip_comments": True, "strip_whitespace": True},
             "logs": {"dedupe_lines": True, "truncate_long_lines": 200,
                      "always_keep_severities": ["ERROR", "FATAL", "CRITICAL", "PANIC"]},
             "text": {"dedupe_sentences": True, "max_sentence_len": 0},
@@ -118,13 +118,20 @@ def test_detect_plain_text_returns_text():
 # ─── JSON compression ────────────────────────────────────────────────────────
 
 def test_json_removes_empty_fields():
-    data = json.dumps({"name": "Alice", "email": "", "address": None, "tags": []})
+    data = json.dumps({"name": "Alice", "email": "", "address": None, "tags": [], "meta": {}})
     result = _compress_json(data, {"remove_empty": True, "dedupe_keys": True})
     parsed = json.loads(result)
-    assert "name" in parsed
-    assert "email" not in parsed
-    assert "address" not in parsed
-    assert "tags" not in parsed
+    assert parsed == {"name": "Alice", "email": "", "address": None}
+
+
+def test_json_keeps_null_and_empty_string_values():
+    """A null or empty field is not the same fact as an absent one, and a null in a list
+    holds a position: dropping either changes the data the question may be about."""
+    data = json.dumps({"deleted_at": None, "middle_name": "", "scores": [1, None, 3],
+                       "nested": {"reason": None}})
+    parsed = json.loads(_compress_json(data, {"remove_empty": True, "dedupe_keys": False}))
+    assert parsed == {"deleted_at": None, "middle_name": "", "scores": [1, None, 3],
+                      "nested": {"reason": None}}
 
 
 def test_json_compact_output():
@@ -171,19 +178,74 @@ def test_dedupe_skips_heterogeneous_keys():
 
 # ─── Code compression ────────────────────────────────────────────────────────
 
-def test_code_strips_comments():
-    code = """# This is a comment
+_CODE_STRATEGY = {"strip_comments": True, "strip_whitespace": True}
+_PY_CODE = """# This is a comment
 import os
 # Another comment
 def main():
     x = 1  # inline comment
-    return x
+    return x // 2
 """
-    result = _compress_code(code, {"strip_comments": True, "strip_whitespace": True, "compress_imports": True})
+
+
+def test_code_strips_comments():
+    result = _compress_code("```python\n" + _PY_CODE + "```", _CODE_STRATEGY)
     assert "# This is a comment" not in result
     assert "# Another comment" not in result
+    assert "inline comment" not in result
     assert "def main():" in result
-    assert "return x" in result
+    assert "return x // 2" in result          # floor division is not a Python comment
+
+
+def test_unlabelled_code_keeps_its_comments():
+    """Without a language the markers are ambiguous (#include, #[derive], a shebang, a CSS
+    colour, `a // b`), so nothing is treated as a comment."""
+    for text in (_PY_CODE, "```\n" + _PY_CODE + "```"):
+        result = _compress_code(text, _CODE_STRATEGY)
+        assert "# This is a comment" in result and "x = 1  # inline comment" in result
+
+
+def test_c_keeps_preprocessor_lines_and_strips_slash_comments():
+    code = ("```c\n#include <stdio.h>\n#define MAX 10\n// helper\n#ifdef DEBUG\n"
+            "int main(void) { return MAX; } // exit code\n#endif\n```")
+    result = _compress_code(code, _CODE_STRATEGY)
+    for kept in ("#include <stdio.h>", "#define MAX 10", "#ifdef DEBUG", "#endif",
+                 "int main(void) { return MAX; }"):
+        assert kept in result
+    assert "helper" not in result and "exit code" not in result
+
+
+def test_rust_keeps_attributes():
+    code = "```rust\n#[derive(Debug)]\n// a point\nstruct Point { x: i32 }\n```"
+    result = _compress_code(code, _CODE_STRATEGY)
+    assert "#[derive(Debug)]" in result and "a point" not in result
+
+
+def test_css_colours_survive():
+    code = "```css\n.a {\n  color: #fff;\n  background: #0a0a0a; /* dark */\n}\n```"
+    result = _compress_code(code, _CODE_STRATEGY)
+    assert "color: #fff;" in result and "background: #0a0a0a;" in result
+
+
+def test_a_shebang_survives_in_a_shell_block():
+    code = "```bash\n#!/usr/bin/env bash\n# install deps\npip install -r req.txt  # quiet\n```"
+    result = _compress_code(code, _CODE_STRATEGY)
+    assert "#!/usr/bin/env bash" in result
+    assert "install deps" not in result and "quiet" not in result
+    assert "pip install -r req.txt" in result
+
+
+def test_the_fence_label_is_case_insensitive():
+    result = _compress_code("```Python\nx = 1  # note\n# gone\n```", _CODE_STRATEGY)
+    assert "note" not in result and "gone" not in result and "x = 1" in result
+
+
+def test_each_fenced_block_uses_its_own_language():
+    text = ("Two files:\n```python\nx = 1  # py comment\n```\n"
+            "```c\n#include <x.h>\n// c comment\n```")
+    result = _compress_code(text, _CODE_STRATEGY)
+    assert "py comment" not in result and "c comment" not in result
+    assert "#include <x.h>" in result
 
 
 def test_code_strips_blank_lines():
@@ -195,8 +257,17 @@ import sys
 def main():
     pass
 """
-    result = _compress_code(code, {"strip_comments": True, "strip_whitespace": True, "compress_imports": True})
+    result = _compress_code(code, {"strip_comments": True, "strip_whitespace": True})
     assert "\n\n" not in result
+
+
+def test_an_import_inside_a_function_keeps_its_indentation():
+    # Import "compression" merged nothing: it only stripped the leading whitespace of
+    # every import line, so a nested import reached the model at top level, an
+    # indentation the user never wrote.
+    code = "```python\ndef f():\n    import os\n    return os.getcwd()\n```"
+    out = _compress_code(code, {"strip_comments": True, "strip_whitespace": True})
+    assert "def f():\n    import os\n    return os.getcwd()" in out
 
 
 def test_code_preserves_logic():
@@ -206,7 +277,7 @@ def test_code_preserves_logic():
     else:
         return b - a
 """
-    result = _compress_code(code, {"strip_comments": True, "strip_whitespace": True, "compress_imports": False})
+    result = _compress_code(code, {"strip_comments": True, "strip_whitespace": True})
     assert "def calculate(a, b):" in result
     assert "return a - b" in result
     assert "return b - a" in result
@@ -354,8 +425,8 @@ async def test_request_side_compresses_json():
 async def test_response_side_compresses_tool_output():
     big_json = json.dumps({
         "results": [{"id": 1, "data": "hello"}, {"id": 2, "data": "world"}],
-        "metadata": None, "empty": "",
-    })
+        "metadata": {}, "warnings": [],
+    }, indent=2)
     msgs = [{"role": "user", "content": "test"}]
     ctx = _make_ctx(msgs, config=_make_config(min_length=10))
     response = {
@@ -373,6 +444,20 @@ async def test_response_side_compresses_tool_output():
     result = await g19.process_response(ctx, response)
     tool_result = result["choices"][0]["message"]["tool_calls"][0]["function"]["result"]
     assert len(tool_result) < len(big_json)
+
+
+@pytest.mark.asyncio
+async def test_a_pasted_c_file_reaches_the_model_with_its_includes():
+    """The finding: with the shipped config every #include/#define line of a pasted C file
+    was deleted before the model saw it, so it answered about code the user never wrote."""
+    code = ("```c\n#include <stdio.h>\n#define GREETING \"hi\"\n\n// entry point\n"
+            "int main(void) {\n    puts(GREETING);\n    return 0;\n}\n```")
+    ctx = _make_ctx([{"role": "user", "content": "Why won't this compile?\n" + code}])
+    result = await G19Headroom().process_request(ctx)
+    sent = result.messages[0]["content"]
+    assert "#include <stdio.h>" in sent and '#define GREETING "hi"' in sent
+    assert "entry point" not in sent                  # a C comment is still removed
+    assert "puts(GREETING);" in sent
 
 
 @pytest.mark.asyncio
@@ -456,14 +541,13 @@ class TestT10CompressorRouting:
     """
 
     def test_json_uses_the_builtin_compactor(self):
-        result = _compress('{"key": 1, "empty": null}', "json", {"remove_empty": True})
+        result = _compress('{"key": 1, "empty": []}', "json", {"remove_empty": True})
         assert result is not None and "empty" not in result
 
     def test_code_uses_the_builtin_compressor(self):
-        code = chr(10).join(["# comment", "def foo():", "    pass"])
+        code = chr(10).join(["```python", "# comment", "def foo():", "    pass", "```"])
         result = _compress(code, "code",
-                           {"strip_comments": True, "strip_whitespace": True,
-                            "compress_imports": True})
+                           {"strip_comments": True, "strip_whitespace": True})
         assert result is not None and "# comment" not in result
 
     def test_logs_use_the_builtin_compressor(self):
@@ -541,7 +625,7 @@ class TestCompressText:
         msgs = [{"role": "system", "content": repeated_text}]
         strategies = {
             "json": {"remove_empty": True, "dedupe_keys": True},
-            "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
+            "code": {"strip_comments": True, "strip_whitespace": True},
             "logs": {"dedupe_lines": True, "truncate_long_lines": 200},
             "text": {"dedupe_sentences": True, "max_sentence_len": 0},
         }
@@ -635,8 +719,7 @@ class TestAnswerFidelity:
             "```\n"
             "Closing prose.\n"
         )
-        out = _compress_code(text, {"strip_comments": True, "strip_whitespace": True,
-                                    "compress_imports": True})
+        out = _compress_code(text, {"strip_comments": True, "strip_whitespace": True})
         assert "# Heading One" in out
         assert "## Heading Two" in out
         assert "Closing prose." in out

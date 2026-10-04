@@ -23,7 +23,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**Cost figures are config-priced estimates - directional, not invoice-grade.** Dollar values = token counts x a static pricing table; they exclude negotiated discounts, provider-side prompt caching, batch/reasoning surcharges, and currency effects. baseline_* is a counterfactual. **Token-count savings are measured; dollar figures are estimates.** Provider-reconciled billing is a separate (non-OSS) concern."
+        "content": "**Cost figures are config-priced estimates - directional, not invoice-grade.** Dollar values = token counts x a static pricing table; they exclude negotiated discounts, batch/reasoning surcharges, and currency effects. Provider prompt-cache discounts are priced from the cached tokens the provider reports, and the baseline gets the same discount when the request would have been cached without the proxy. baseline_* is a counterfactual. **Token-count savings are measured; dollar figures are estimates.** Provider-reconciled billing is a separate (non-OSS) concern."
       },
       "transparent": true
     },

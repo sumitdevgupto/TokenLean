@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -105,6 +106,9 @@ class CircuitBreaker:
       OPEN    --(cooldown_seconds elapse)-->   HALF_OPEN   (allow_request lets ONE probe)
       HALF_OPEN --(probe succeeds)-->          CLOSED
       HALF_OPEN --(probe fails)-->             OPEN        (cooldown restarts)
+    While the probe is in flight HALF_OPEN refuses everyone else. A probe that never
+    reports (a 4xx is no health signal, so nothing records it) frees its slot after
+    ``cooldown_seconds``, and the next caller probes again.
     A success in CLOSED resets the running failure count. ``configure()`` refreshes
     threshold/cooldown from the latest config so hot-reload and per-provider
     overrides apply without a worker restart.
@@ -117,6 +121,7 @@ class CircuitBreaker:
     failures: int = 0
     state: BreakerState = BreakerState.CLOSED
     opened_at: float = 0.0
+    probe_started_at: Optional[float] = None   # HALF_OPEN only: when its probe began
 
     def configure(self, failure_threshold: int, cooldown_seconds: float) -> None:
         """Refresh tunables from the latest resolved config (hot-reload safe)."""
@@ -124,13 +129,20 @@ class CircuitBreaker:
         self.cooldown_seconds = cooldown_seconds
 
     def allow_request(self) -> bool:
-        """Whether a request may proceed now. Advances OPEN→HALF_OPEN when cooldown elapsed."""
+        """Whether a request may proceed now. Advances OPEN→HALF_OPEN when cooldown elapsed,
+        admitting that caller as the one probe."""
+        now = self._clock()
         if self.state is BreakerState.OPEN:
-            if self._clock() - self.opened_at >= self.cooldown_seconds:
-                self.state = BreakerState.HALF_OPEN
-                return True  # single probe
-            return False
-        return True  # CLOSED or HALF_OPEN (probe in flight)
+            if now - self.opened_at < self.cooldown_seconds:
+                return False
+            self.state = BreakerState.HALF_OPEN
+        elif self.state is not BreakerState.HALF_OPEN:
+            return True  # CLOSED
+        elif (self.probe_started_at is not None
+                and now - self.probe_started_at < self.cooldown_seconds):
+            return False  # a probe is in flight
+        self.probe_started_at = now
+        return True
 
     def peek_state(self) -> BreakerState:
         """Current state for display, reflecting elapsed cooldown as HALF_OPEN
@@ -156,6 +168,22 @@ class CircuitBreaker:
             self.opened_at = self._clock()
 
 
+# How long a provider call waits for the provider to send anything: the whole answer, or for
+# a stream each next chunk. Without it litellm waits 10 minutes, long past any client's
+# patience, so a provider that stalls is never failed over. Long reasoning answers can take
+# minutes, hence a generous default.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
+
+
+def _timeout_seconds(value: Any) -> float:
+    """A positive, finite number of seconds, else the default."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_REQUEST_TIMEOUT_SECONDS
+    return seconds if math.isfinite(seconds) and seconds > 0 else DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+
 @dataclass
 class ResilienceConfig:
     """Resolved resilience settings for one request (global defaults + per-provider override)."""
@@ -175,6 +203,16 @@ class ResilienceConfig:
     model_lockout: bool = False
     model_failure_threshold: int = 3   # model-scoped failures that lock one model
     model_lockout_seconds: float = 30.0  # lock duration before a single probe re-tests
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    def call_limits(self) -> Dict[str, Any]:
+        """litellm arguments for one attempt this layer makes: its timeout, and, when this
+        layer is on and so retries and fails over itself, none of the client library's own
+        retries (the OpenAI client retries twice on a 429 or 5xx) stacked underneath."""
+        limits: Dict[str, Any] = {"timeout": self.request_timeout_seconds}
+        if self.enabled:
+            limits["max_retries"] = 0
+        return limits
 
     @classmethod
     def resolve(cls, config: Dict[str, Any], provider: str = "") -> "ResilienceConfig":
@@ -197,7 +235,18 @@ class ResilienceConfig:
             model_failure_threshold=int(base.get("model_failure_threshold", 3)),
             # default the lock duration to the breaker cooldown unless overridden
             model_lockout_seconds=float(base.get("model_lockout_seconds", cooldown)),
+            request_timeout_seconds=_timeout_seconds(
+                base.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
         )
+
+
+def request_timeout_for(config: Optional[Dict[str, Any]], model: str) -> float:
+    """``resilience.request_timeout_seconds`` for the provider serving ``model`` (that
+    provider's own ``resilience:`` override wins). For provider calls made outside this
+    layer, which keep the client library's retries since nothing else retries them."""
+    from providers import get_provider_entry
+    entry = get_provider_entry(model, (config or {}).get("providers", []) or []) or {}
+    return ResilienceConfig.resolve(config or {}, entry.get("name", "")).request_timeout_seconds
 
 
 class ResilienceStore:
@@ -324,8 +373,8 @@ def note_provider_outcome(provider: str, exc: Optional[BaseException],
             store.record_provider_success(provider, cfg)
         elif is_retryable_error(exc) and not is_rate_limit_error(exc):
             store.record_provider_failure(provider, cfg)
-    except Exception:  # pragma: no cover - observability must never break a call
-        pass
+    except Exception as err:  # pragma: no cover - observability must never break a call
+        logger.debug("provider outcome not recorded for %s: %r", provider, err)
 
 
 @dataclass
@@ -357,6 +406,10 @@ class Attempt:
     outcome: str        # "success" | "error" | "failopen_attempt" | "skipped_breaker" |
                         # "skipped_cooldown" | "skipped_no_key" | "skipped_model_lockout"
     error: str = ""
+    # An "error" the provider's side caused (5xx, timeout, connection): the signal the
+    # breakers take. Never a 429 or a request the provider refused, which say nothing
+    # about the model. G06's least_latency passes over such a model for a while.
+    transient: bool = False
 
 
 class AllTargetsFailedError(Exception):
@@ -468,7 +521,10 @@ async def call_with_resilience(
         for attempt_i in range(max_tries):
             try:
                 result = await target.invoke()
-            except BaseException as exc:  # noqa: BLE001 — classified below
+            # Exception, not BaseException: a cancelled request (the client gone, a
+            # shutdown) must end here. Taken as a target's failure, it went on to the next
+            # target and ended in a 502 for a request nobody was waiting for.
+            except Exception as exc:  # noqa: BLE001 — classified below
                 last_error = exc
                 retryable = is_retryable_error(exc)
                 rate_limited = is_rate_limit_error(exc)
@@ -485,7 +541,8 @@ async def call_with_resilience(
                     await sleep(cfg.retry_base_delay * (2 ** attempt_i))
                     continue  # retry the SAME target
                 # Retries exhausted for this target (or error is non-retryable).
-                attempts.append(Attempt(prov, target.model, "error", describe_error(exc)))
+                attempts.append(Attempt(prov, target.model, "error", describe_error(exc),
+                                        transient=retryable and not rate_limited))
                 if cfg.enabled and rate_limited:
                     store.set_cooldown(redis_prefix, prov, cfg.cooldown_seconds)
                 if not retryable and i == 0:

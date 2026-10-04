@@ -351,6 +351,9 @@ class TestG11AutoTighten:
         # the caller identified.
         ctx.params = {"workflow_id": "wf-support"}
         ctx.model = "gpt-4o-mini"
+        ctx.routed_model = "gpt-4o-mini"  # as on every real context: G11 caps for it
+        ctx.provider_adapter = None       # unresolved, as on a real context: not a Mock that
+                                          # answers "reasoning model" to every question
         ctx.current_token_count = 1000
         ctx.request_id = "test-auto-001"
         ctx.redis_prefix = ""

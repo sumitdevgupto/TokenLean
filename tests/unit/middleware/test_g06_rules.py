@@ -13,7 +13,7 @@ import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from middleware.g06_rules import (
     MAX_PATTERN_LEN,
@@ -298,6 +298,8 @@ class TestRoutingRulesIntegration:
         _rules_cfg(ctx, [{"id": "pin-claude", "match": {"keywords": ["pin"]}, "action": {"model": "claude-opus-4"}}])
         from middleware.g06_routing import G06Routing
         with patch("middleware.g06_routing._tier_reachable", side_effect=lambda m: m == "gpt-4o"), \
+             patch("middleware.g06_routing._resolve_provider_key",
+                   new=AsyncMock(return_value=None)), \
              patch("config_loader.get_pricing_table", return_value=_PRICING):
             ctx = await G06Routing().process_request(ctx)
         assert ctx.routed_model == "gpt-4o"  # fell back to the caller's reachable model
@@ -363,3 +365,86 @@ class TestRoutingRulesRegression:
         # the cost-floor to the cheaper caller model), i.e. rules did not perturb it.
         assert absent[0] == "gpt-4o-mini"
         assert absent[1] == "heuristic+cost_floor"
+
+
+# ── Time-limited patterns ─────────────────────────────────────────────────────
+# Rule patterns are tenant-authored and run on the event loop every tenant shares; a
+# runaway one froze the worker (`^(\w+\s?)+$` on ~30 word chars and a '!' ran for
+# ever under `re`). Searches now use the `regex` engine inside one per-request budget.
+
+# Inputs sized so an UNPROTECTED engine takes seconds, not forever: a regression then
+# fails the time assertions quickly instead of hanging the suite.
+_RUNAWAY = "a" * 33   # `(a|aa)+c`: ~4 s with no time limit; the budget stops it at 50 ms
+
+
+def _pattern_rule(rid, *patterns):
+    return {"id": rid, "match": {"patterns": list(patterns)}, "action": {"tier": "simple"}}
+
+
+def _evaluate(rules, text, **kw):
+    return evaluate_rules(rules, text=text, prompt_tokens=0, model="m", has_tools=False,
+                          params={}, user_id="", explain=True, **kw)
+
+
+class TestTimeLimitedPatterns:
+    def test_the_proxy_has_the_time_limited_engine(self):
+        from middleware import g06_rules
+        assert g06_rules._engine is not None   # `regex`, pinned in src/proxy/requirements.txt
+
+    def test_the_findings_pattern_no_longer_freezes_the_worker(self):
+        import time
+        started = time.monotonic()
+        rule, _ = _evaluate([_pattern_rule("r", r"^(\w+\s?)+$")], "a" * 26 + "!")  # ~4 s under `re`
+        assert rule is None and time.monotonic() - started < 1.0
+
+    def test_a_runaway_pattern_stops_at_the_budget_and_counts_as_no_match(self):
+        import time
+        seen = []
+        started = time.monotonic()
+        rule, trace = _evaluate([_pattern_rule("r", r"(a|aa)+c")], _RUNAWAY, on_timeout=seen.append)
+        assert rule is None and trace[0]["failed_on"] == "patterns (timed out)"
+        assert seen == [r"(a|aa)+c"] and time.monotonic() - started < 0.5
+
+    def test_one_budget_covers_all_of_a_requests_rules(self):
+        import time
+        started = time.monotonic()
+        _evaluate([_pattern_rule(f"r{i}", r"(a|aa)+c") for i in range(20)], "a" * 30)
+        assert time.monotonic() - started < 0.5          # one 50 ms budget, not 20 of them
+
+    def test_a_rule_ahead_of_a_runaway_one_still_matches(self):
+        rules = [_pattern_rule("hit", r"aaa"), _pattern_rule("slow", r"(a|aa)+c")]
+        rule, _ = _evaluate(rules, _RUNAWAY)
+        assert rule is not None and rule["id"] == "hit"   # first match wins before it runs
+
+    def test_once_the_budget_is_spent_later_patterns_count_as_no_match(self):
+        rules = [_pattern_rule("slow", r"(a|aa)+c"), _pattern_rule("hit", r"aaa")]
+        rule, trace = _evaluate(rules, _RUNAWAY)
+        assert rule is None and [t["failed_on"] for t in trace] == [
+            "patterns (timed out)", "patterns (timed out)"]
+
+    def test_ordinary_patterns_still_match_case_insensitively(self):
+        rule, _ = _evaluate([_pattern_rule("r", r"refund|chargeback")], "Please process my REFUND")
+        assert rule is not None
+
+    async def test_a_runaway_rule_falls_through_to_the_classifier_and_is_counted(self, make_ctx):
+        from middleware.g06_routing import G06Routing, RULE_PATTERN_TIMEOUTS
+        ctx = make_ctx([{"role": "user", "content": _RUNAWAY}], model="gpt-4o-mini")
+        ctx.tenant_id = "t-redos"
+        _rules_cfg(ctx, [_pattern_rule("slow", r"(a|aa)+c")])
+        before = RULE_PATTERN_TIMEOUTS.labels(tenant_id="t-redos")._value.get()
+        with patch("config_loader.get_pricing_table", return_value=_PRICING):
+            ctx = await G06Routing().process_request(ctx)
+        assert not (ctx.savings.routing_mode or "").startswith("rules:")
+        assert RULE_PATTERN_TIMEOUTS.labels(tenant_id="t-redos")._value.get() == before + 1
+
+
+@pytest.mark.parametrize("pattern,nested", [
+    (r"(a+)+", True), (r"^(\w+\s?)+$", True), (r"(a*)*b", True), (r"((ab)+)+", True),
+    (r"(?:x+y*)+", True), (r"(a+){2,}", True),
+    (r"\d+(\.\d+)?", False), (r"(\w+\s){3}", False), (r"(a\s?)+", False), (r"(ab)+", False),
+    (r"(a|aa)+c", False),            # not this shape; the time budget covers it
+    (r"refund|chargeback", False), (r"(unclosed", False),
+])
+def test_has_nested_quantifier(pattern, nested):
+    from middleware.g06_rules import has_nested_quantifier
+    assert has_nested_quantifier(pattern) is nested

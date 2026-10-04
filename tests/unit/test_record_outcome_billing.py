@@ -193,3 +193,100 @@ async def test_schedule_billing_noop_on_none(monkeypatch):
     main._schedule_billing(_ctx(), None)           # no response
     await asyncio.sleep(0)
     meter.record.assert_not_called()
+
+
+# ─── An admin key acting as another tenant is not that tenant's traffic ─────────
+# An admin key with X-Tenant-ID (operator support, benchmarks) was billed as the tenant
+# it named: a billable usage row, and a bump of its quota, spend and trial counters. Its
+# row now names the impersonator and is never billable, and it counts against none of them.
+def _impersonated_ctx():
+    ctx = _ctx()
+    ctx.impersonator_tenant_id = "ops"
+    return ctx
+
+
+@pytest.fixture
+def counters(monkeypatch):
+    bumped = []
+    for name in ("_bump_quota_counter", "_bump_spend_counter", "_bump_trial_counter"):
+        monkeypatch.setattr(main, name, lambda ctx, name=name: bumped.append(name))
+    return bumped
+
+
+@pytest.mark.asyncio
+async def test_an_impersonated_answer_is_recorded_but_never_billed(monkeypatch, counters):
+    meter = AsyncMock()
+    monkeypatch.setattr(main, "_usage_meter", meter)
+    monkeypatch.setattr(main, "_persist_all_outcomes", lambda: False)   # not an error row
+    main._record_outcome(_impersonated_ctx(), time.time(), "200", {"id": "resp"})
+    await asyncio.sleep(0)
+    meter.record.assert_awaited_once()
+    assert meter.record.await_args.kwargs["billable"] is False
+    assert meter.record.await_args.kwargs["status_code"] == 200
+    assert counters == []
+
+
+@pytest.mark.asyncio
+async def test_the_tenant_s_own_answer_still_counts(monkeypatch, counters):
+    meter = AsyncMock()
+    monkeypatch.setattr(main, "_usage_meter", meter)
+    main._record_outcome(_ctx(), time.time(), "200", {"id": "resp"})
+    await asyncio.sleep(0)
+    assert meter.record.await_args.kwargs["billable"] is True
+    assert counters == ["_bump_quota_counter", "_bump_spend_counter", "_bump_trial_counter"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("impersonated, billable", [(True, False), (False, True)],
+                         ids=["impersonated", "the tenant's own"])
+async def test_a_deferred_batch_request_is_billed_only_when_it_is_the_tenant_s(
+        monkeypatch, impersonated, billable):
+    meter = AsyncMock()
+    monkeypatch.setattr(main, "_usage_meter", meter)
+    ctx = _impersonated_ctx() if impersonated else _ctx()
+    ctx.cache_response = None
+    main._bill_batch_deferred(ctx)
+    await asyncio.sleep(0)
+    meter.record.assert_awaited_once()
+    assert meter.record.await_args.kwargs["billable"] is billable
+    assert meter.record.await_args.kwargs["status_code"] == 202
+
+
+# ─── A batched request counts against the tenant's limits ───────────────────────
+# It was billed when queued but bumped no counter, so a trial or capped tenant could send
+# everything as a batch and never reach a limit. Its cost is known only when its answer
+# arrives; G13 adds that to the spend counter then.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("impersonated, counted", [
+    (True, []), (False, ["_bump_quota_counter", "_bump_trial_counter"])],
+    ids=["impersonated", "the tenant's own"])
+async def test_a_deferred_batch_request_counts_against_the_quota_and_trial(
+        monkeypatch, counters, impersonated, counted):
+    monkeypatch.setattr(main, "_usage_meter", AsyncMock())
+    ctx = _impersonated_ctx() if impersonated else _ctx()
+    ctx.cache_response = None
+    main._bill_batch_deferred(ctx)
+    await asyncio.sleep(0)
+    assert counters == counted
+
+
+@pytest.mark.asyncio
+async def test_a_served_request_s_cost_goes_to_the_spend_counter_g13_adds_to(monkeypatch):
+    from middleware import g00_rate_limit
+    added = []
+
+    class _Redis:
+        async def incrbyfloat(self, key, amount):
+            added.append((key, amount))
+            return amount
+
+        async def expire(self, key, ttl):
+            added.append((key, ttl))
+
+    monkeypatch.setattr(g00_rate_limit, "_get_redis", lambda: _Redis())
+    ctx = _ctx()
+    ctx.savings = SimpleNamespace(cost_actual_usd=0.25)
+    main._bump_spend_counter(ctx)
+    await asyncio.sleep(0)
+    key = g00_rate_limit.G00RateLimit.spend_key("t:t1:")
+    assert added == [(key, 0.25), (key, 40 * 86400)]

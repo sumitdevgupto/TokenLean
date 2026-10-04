@@ -247,9 +247,11 @@ class TestLoadRulesFromDb:
         }
         mock_conn = AsyncMock()
         mock_conn.fetch = AsyncMock(return_value=[mock_row])
-        mock_conn.close = AsyncMock()
+        pool = _FakePool(mock_conn)
 
-        with patch("asyncpg.connect", new_callable=AsyncMock, return_value=mock_conn):
+        with patch("cache.pg_pool.get_pg_pool", new=AsyncMock(return_value=pool)), \
+                patch("asyncpg.connect", new=AsyncMock(side_effect=AssertionError(
+                    "a connection per call: use the shared pool"))):
             from middleware.g04_bypass import _load_rules_from_db
             rules = await _load_rules_from_db()
 
@@ -257,16 +259,70 @@ class TestLoadRulesFromDb:
         assert rules[0]["rule_id"] == "r1"
         assert rules[0]["keywords"] == ["order", "status"]
         assert rules[0]["patterns"] == [r"order\s+#\d+"]
-        mock_conn.close.assert_awaited_once()
+        assert pool.released == 1
 
     async def test_db_connection_error_returns_empty_list(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "postgresql://test/db")
 
-        with patch("asyncpg.connect", new_callable=AsyncMock, side_effect=Exception("connection refused")):
+        with patch("cache.pg_pool.get_pg_pool",
+                   new=AsyncMock(side_effect=Exception("connection refused"))):
             from middleware.g04_bypass import _load_rules_from_db
             rules = await _load_rules_from_db()
 
         assert rules == []
+
+
+class _FakePool:
+    """asyncpg.Pool.acquire() as an async context manager."""
+
+    def __init__(self, conn):
+        self.conn, self.released = conn, 0
+
+    def acquire(self):
+        pool = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                return pool.conn
+
+            async def __aexit__(self, *exc):
+                pool.released += 1
+
+        return _Ctx()
+
+
+class _Pipeline:
+    def __init__(self, log):
+        self.log = log
+
+    def __getattr__(self, name):
+        def _queue(*args, **kwargs):
+            self.log.append(name)
+            return self
+        return _queue
+
+    async def execute(self):
+        self.log.append("EXECUTE")
+        return []
+
+
+@pytest.mark.asyncio
+class TestBypassStats:
+    async def test_the_stats_of_one_check_are_one_round_trip(self, monkeypatch):
+        import middleware.g04_bypass as mod
+        log = []
+
+        class _Redis:
+            def pipeline(self, transaction=True):
+                assert transaction is False
+                return _Pipeline(log)
+
+            def __getattr__(self, name):
+                raise AssertionError(f"direct redis.{name}: pipeline the stats writes")
+
+        monkeypatch.setattr(mod, "_get_redis", lambda: _Redis())
+        await mod._record_bypass_stat("r1", True, 0.83, tenant_id="acme")
+        assert log == ["hincrby", "hincrby", "hset", "zincrby", "expire", "EXECUTE"]
 
 
 @pytest.mark.asyncio
@@ -322,3 +378,45 @@ class TestLoadRulesPrefersDatabase:
             await bypass.process_request(ctx2)
 
         mock_load.assert_awaited_once()
+        # ...and the DB rule still applies: the config rules used to replace it here.
+        assert ctx2.bypassed is True
+        assert ctx2.cache_response["choices"][0]["message"]["content"] == "from-database"
+
+    async def test_an_empty_database_is_not_asked_again_within_the_ttl(self, make_ctx):
+        """No rows (or no bypass_rules table, or an error) is an answer too: asking again on
+        every request cost a Postgres round trip each time."""
+        with patch("middleware.g04_bypass._load_rules_from_db", new_callable=AsyncMock,
+                   return_value=[]) as mock_load:
+            from middleware.g04_bypass import G04Bypass
+            bypass = G04Bypass()
+            for n in (1, 2):
+                ctx = make_ctx([{"role": "user", "content": f"hello {n}"}])
+                ctx.config["groups"]["G4_bypass"]["database_first"] = True
+                await bypass.process_request(ctx)
+                assert ctx.bypassed is True          # the config rule ('hello') applies
+        mock_load.assert_awaited_once()
+
+    async def test_config_rules_return_once_the_database_rules_are_gone(self, make_ctx):
+        import middleware.g04_bypass as mod
+        db_rule = [{"rule_id": "db-1", "name": "db-rule", "keywords": [],
+                    "patterns": [r"order\s+#\d+"], "static_response": "from-database",
+                    "confidence_threshold": 0.5}]
+        clock = [1_700_000_000.0]
+        answers = [db_rule, []]
+
+        async def _load(tenant_id=None):
+            return answers.pop(0)
+
+        with patch.object(mod, "_load_rules_from_db", new=_load), \
+                patch.object(mod.time, "time", side_effect=lambda: clock[0]):
+            bypass = mod.G04Bypass()
+            ctx = make_ctx([{"role": "user", "content": "order #1 please"}])
+            ctx.config["groups"]["G4_bypass"]["database_first"] = True
+            await bypass.process_request(ctx)
+            assert ctx.bypassed is True
+            clock[0] += 120                           # past the 60 s TTL; the rule was deleted
+            ctx = make_ctx([{"role": "user", "content": "hello there"}])
+            ctx.config["groups"]["G4_bypass"]["database_first"] = True
+            await bypass.process_request(ctx)
+        assert ctx.bypassed is True                   # the config rule, not the stale DB one
+        assert ctx.cache_response["choices"][0]["message"]["content"] != "from-database"

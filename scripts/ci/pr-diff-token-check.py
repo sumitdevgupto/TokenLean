@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from typing import Dict, List, Tuple
@@ -22,11 +23,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _git() -> str:
+    """git's absolute path on the caller's own PATH (a CI runner's or an operator's)."""
+    git = shutil.which("git")
+    if git is None:
+        raise FileNotFoundError("git is not on PATH: the changed templates are read from it")
+    return git
+
+
 def get_changed_templates(base_ref: str, head_ref: str) -> List[str]:
     """Get list of changed template files in the PR."""
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", f"{base_ref}...{head_ref}"],
+            [_git(), "diff", "--name-only", f"{base_ref}...{head_ref}"],
             capture_output=True,
             text=True,
             check=True,
@@ -111,7 +120,7 @@ def check_template_budget(file_path: str, base_ref: str, head_ref: str) -> Dict:
     # Try to get previous version
     try:
         result = subprocess.run(
-            ["git", "show", f"{base_ref}:{file_path}"],
+            [_git(), "show", f"{base_ref}:{file_path}"],
             capture_output=True,
             text=True,
         )
@@ -221,7 +230,7 @@ def main():
     
     # Summary
     print(f"\n{'='*60}")
-    print(f"PR Diff Token Check Summary")
+    print("PR Diff Token Check Summary")
     print(f"{'='*60}")
     print(f"Templates checked: {len(results)}")
     print(f"Budget violations: {budget_violations}")

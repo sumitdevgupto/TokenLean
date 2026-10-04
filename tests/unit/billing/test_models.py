@@ -134,6 +134,13 @@ class TestUsageEventsDDL:
             assert f"ADD COLUMN IF NOT EXISTS {col}" in USAGE_EVENTS_DDL, (
                 f"DDL missing idempotent migration for: {col}")
 
+    def test_the_impersonator_column_is_created_and_self_healed(self):
+        table = USAGE_EVENTS_DDL.split(");", 1)[0]
+        assert "impersonated_by TEXT        NOT NULL DEFAULT ''" in table
+        assert ("ADD COLUMN IF NOT EXISTS impersonated_by TEXT NOT NULL DEFAULT ''"
+                in USAGE_EVENTS_DDL)
+        assert UsageEvent.__dataclass_fields__["impersonated_by"].default == ""
+
     def test_ddl_has_create_index(self):
         assert "CREATE INDEX" in USAGE_EVENTS_DDL
 

@@ -130,6 +130,7 @@ async def summarise_turns(
         import litellm
         from providers import get_adapter, get_provider_entry
         from providers.key_resolver import resolve_provider_key, ProviderKeyError
+        from providers.resilience import request_timeout_for
         summary_adapter = get_adapter(summary_model, ctx.config.get("providers", []))
         # BYOK: resolve the summary model's key for THIS tenant (strict denial or no key →
         # skip summarisation gracefully, exactly like the prior missing-key path).
@@ -171,6 +172,7 @@ async def summarise_turns(
                 ],
                 **_call_kwargs,
                 max_tokens=max_tokens,
+                timeout=request_timeout_for(ctx.config, summary_model),
             )
         except BaseException as e:
             _exc = e
@@ -178,8 +180,8 @@ async def summarise_turns(
         finally:
             try:
                 ctx.llm_elapsed_ms += (time.time() - _t0) * 1000.0
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("LLM time not added: %r", err)
             # Feed the breaker (observation only; review K7 — summary calls are real
             # provider traffic the breaker must see).
             try:
@@ -187,8 +189,11 @@ async def summarise_turns(
                 note_provider_outcome(
                     getattr(summary_adapter, "name", ""), _exc, ctx.config or {}
                 )
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("provider outcome not recorded: %r", err)
+        # A paid call that is not the answer: G18 adds it to the request's cost.
+        from middleware import record_provider_call
+        record_provider_call(ctx, summary_model, response, side=True)
         return response.choices[0].message.content or ""
     except Exception as exc:
         logger.warning("summarisation failed: %s", exc)

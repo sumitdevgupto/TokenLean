@@ -10,7 +10,7 @@
 #        - docker VM (commercial DEFAULT): `gcloud compute instances start` if
 #          stopped, or recreate via terraform apply if stop-gcp.sh never ran /
 #          the VM was deleted out-of-band. Cold container, no data to restore
-#          (the redis:7-alpine container runs with --save "").
+#          (the redis:7.2-alpine container runs with --save "").
 #        - memorystore: recreate via terraform apply if missing (stop-gcp.sh
 #          deletes it — Memorystore has no stop/start, only delete/create).
 #   2. Starts Cloud SQL instance
@@ -173,61 +173,94 @@ echo ""
 success "Cloud SQL is RUNNABLE"
 
 # ─── Step 3: Verify Qdrant rag_docs collection ───────────────────────────────
-info "Checking Qdrant rag_docs collection..."
-QDRANT_URL=$(gcloud run services describe token-opt-qdrant \
-  --region="$REGION" --project="$PROJECT_ID" \
-  --format="value(status.url)" 2>/dev/null || echo "")
+# Qdrant's steady state is ingress ALL + Cloud Run IAM (run.invoker) + its app-layer api-key
+# (infra/main.tf): internal-only ingress rejects the proxy and the jobs. So this step never
+# changes ingress. It reads the collection as you (an identity token) with the key.
 
-QDRANT_STATUS="unknown"
-if [[ -n "$QDRANT_URL" ]]; then
-  # Temporarily open ingress to check collection count
-  gcloud run services update token-opt-qdrant \
+# The points in rag_docs: 0 when the collection is missing, "unreadable" when the request
+# fails otherwise (no invoker role for you, a wrong key, Qdrant down), which is not "empty".
+qdrant_points() {
+  QDRANT_URL="$1" QDRANT_API_KEY="$2" ID_TOKEN="$3" python3 -c '
+import json, os, urllib.error, urllib.request
+try:
+    req = urllib.request.Request(os.environ["QDRANT_URL"] + "/collections/rag_docs")
+    if os.environ.get("QDRANT_API_KEY"):
+        req.add_header("api-key", os.environ["QDRANT_API_KEY"])
+    if os.environ.get("ID_TOKEN"):
+        req.add_header("Authorization", "Bearer " + os.environ["ID_TOKEN"])
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print(json.loads(r.read()).get("result", {}).get("points_count", 0))
+except urllib.error.HTTPError as e:
+    print(0 if e.code == 404 else "unreadable")
+except Exception:
+    print("unreadable")
+' 2>/dev/null || echo "unreadable"
+}
+
+can_seed() { command -v python3 &>/dev/null && python3 -c "import sentence_transformers" &>/dev/null; }
+
+close_qdrant_window() {
+  gcloud run services remove-iam-policy-binding token-opt-qdrant \
     --region="$REGION" --project="$PROJECT_ID" \
-    --ingress=all --quiet &>/dev/null
+    --member=allUsers --role=roles/run.invoker &>/dev/null \
+    || warn "Could not remove Qdrant's allUsers grant — run: gcloud run services remove-iam-policy-binding token-opt-qdrant --member=allUsers --role=roles/run.invoker --region=${REGION}"
+}
+
+# seed-data.sh sends the api-key but no identity token, so seeding from here needs a short
+# allUsers invoker window (the key still gates every request). The trap closes it however
+# this script ends, a Ctrl-C included.
+seed_qdrant() {
+  trap close_qdrant_window EXIT
+  trap 'exit 130' INT TERM
   gcloud run services add-iam-policy-binding token-opt-qdrant \
     --region="$REGION" --project="$PROJECT_ID" \
     --member=allUsers --role=roles/run.invoker &>/dev/null || true
-  sleep 8
+  sleep "${QDRANT_IAM_SETTLE_SECONDS:-8}"
+  QDRANT_API_KEY="$1" "${REPO_ROOT}/scripts/seed-data.sh" --qdrant-url "$QDRANT_URL" \
+    && { QDRANT_STATUS="seeded"; success "Qdrant seeded"; } \
+    || warn "Seeding failed — run manually: QDRANT_API_KEY=<qdrant-api-key secret> ./scripts/seed-data.sh --qdrant-url ${QDRANT_URL}"
+  close_qdrant_window
+  trap - EXIT INT TERM
+}
 
-  POINTS_COUNT=$(python3 -c "
-import urllib.request, json, sys
-try:
-    r = urllib.request.urlopen('${QDRANT_URL}/collections/rag_docs', timeout=10)
-    d = json.loads(r.read())
-    print(d.get('result',{}).get('points_count', 0))
-except Exception as e:
-    print(0)
-" 2>/dev/null || echo "0")
-
-  if [[ "$POINTS_COUNT" -gt 0 ]] 2>/dev/null; then
-    QDRANT_STATUS="seeded (${POINTS_COUNT} docs)"
-    success "Qdrant rag_docs has ${POINTS_COUNT} documents"
+verify_qdrant() {
+  info "Checking Qdrant rag_docs collection..."
+  QDRANT_URL=$(gcloud run services describe token-opt-qdrant \
+    --region="$REGION" --project="$PROJECT_ID" \
+    --format="value(status.url)" 2>/dev/null || echo "")
+  if [[ -z "$QDRANT_URL" ]]; then
+    warn "Qdrant service not found — deploy first with gcp-deploy.sh"
+    return 0
+  fi
+  local key token points do_seed
+  key=$(timeout 30 gcloud secrets versions access latest --secret="qdrant-api-key" \
+    --project="$PROJECT_ID" 2>/dev/null || echo "")
+  token=$(gcloud auth print-identity-token 2>/dev/null || echo "")
+  points=$(qdrant_points "$QDRANT_URL" "$key" "$token")
+  if [[ "$points" == "unreadable" ]]; then
+    QDRANT_STATUS="unknown (could not read rag_docs)"
+    warn "Could not read Qdrant's rag_docs — check that your account has roles/run.invoker on token-opt-qdrant"
+  elif [[ "$points" -gt 0 ]] 2>/dev/null; then
+    QDRANT_STATUS="seeded (${points} docs)"
+    success "Qdrant rag_docs has ${points} documents"
   else
     QDRANT_STATUS="EMPTY — needs seeding"
     warn "Qdrant rag_docs collection is empty or missing"
-    if command -v python3 &>/dev/null && python3 -c "import sentence_transformers" &>/dev/null; then
+    if can_seed; then
       echo -en "${YELLOW}Re-seed rag_docs now? (y/yes/no): ${NC}"
-      read -r do_seed
+      read -r do_seed || do_seed=""
+      do_seed="${do_seed%$'\r'}"
       if [[ "$do_seed" == "y" || "$do_seed" == "yes" ]]; then
-        "${REPO_ROOT}/scripts/seed-data.sh" --qdrant-url "$QDRANT_URL" \
-          && { QDRANT_STATUS="seeded"; success "Qdrant seeded"; } \
-          || warn "Seeding failed — run manually: ./scripts/seed-data.sh --qdrant-url ${QDRANT_URL}"
+        seed_qdrant "$key"
       fi
     else
-      warn "python3/sentence-transformers not available — run manually: ./scripts/seed-data.sh --qdrant-url ${QDRANT_URL}"
+      warn "python3/sentence-transformers not available — run manually: QDRANT_API_KEY=<qdrant-api-key secret> ./scripts/seed-data.sh --qdrant-url ${QDRANT_URL}"
     fi
   fi
+}
 
-  # Revert ingress to internal-only
-  gcloud run services remove-iam-policy-binding token-opt-qdrant \
-    --region="$REGION" --project="$PROJECT_ID" \
-    --member=allUsers --role=roles/run.invoker &>/dev/null || true
-  gcloud run services update token-opt-qdrant \
-    --region="$REGION" --project="$PROJECT_ID" \
-    --ingress=internal --quiet &>/dev/null
-else
-  warn "Qdrant service not found — deploy first with gcp-deploy.sh"
-fi
+QDRANT_STATUS="unknown"
+verify_qdrant
 
 # ─── Get proxy endpoint ───────────────────────────────────────────────────────
 PROXY_URL=$(gcloud run services describe token-proxy \

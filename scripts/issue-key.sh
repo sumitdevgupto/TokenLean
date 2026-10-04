@@ -6,10 +6,17 @@
 #   ./scripts/issue-key.sh issue  --tenant <id> [--tier free|enterprise] [--admin] [--gateway] [--project ID]
 #   ./scripts/issue-key.sh revoke --tenant <id>  [--project ID]
 #   ./scripts/issue-key.sh list                  [--project ID]
+#   (issue/revoke also take --backend blob and --region R — see "Key store" below)
 #
 #   --admin    key may impersonate another tenant via X-Tenant-ID (operator/benchmark).
 #   --gateway  key is a customer API gateway: its X-Team header is trusted (selects the
 #              rate-limit bucket + team metric label). Every other key's X-Team is ignored.
+#
+# Key store: this script writes ONLY the Secret Manager blob. issue/revoke first read the
+# deployed Cloud Run service (PROXY_SERVICE_NAME, default token-proxy; --region or
+# GCP_REGION, default asia-south1) and refuse when it validates keys against Postgres
+# (PROXY_KEYS_BACKEND=postgres, the commercial deploy) — use the admin console there.
+# If the service cannot be read, pass --backend blob to confirm the blob store.
 #
 # The proxy key secret in Secret Manager is a JSON object mapping the SHA-256 of
 # each raw key to its tenant metadata (new format):
@@ -38,6 +45,8 @@ ADMIN="false"
 GATEWAY="false"
 PROJECT_ID=""
 SECRET_NAME="${PROXY_KEYS_SECRET_NAME:-token-proxy-api-keys}"
+BACKEND=""
+REGION_ARG=""
 
 # ─── Load .env if present ─────────────────────────────────────────────────────
 ENV_FILE="${REPO_ROOT}/.env"
@@ -56,6 +65,8 @@ while [[ $# -gt 0 ]]; do
     --gateway) GATEWAY="true";  shift ;;
     --project) PROJECT_ID="$2"; shift 2 ;;
     --secret)  SECRET_NAME="$2"; shift 2 ;;
+    --backend) BACKEND="$2";    shift 2 ;;
+    --region)  REGION_ARG="$2"; shift 2 ;;
     --help)
       sed -n '/^# Usage:/,/^# ===/p' "$0" | head -10
       exit 0 ;;
@@ -64,17 +75,76 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$COMMAND" ]] && error "Command required: issue | revoke | list"
+case "$BACKEND" in
+  ""|blob|postgres) ;;
+  *) error "--backend must be blob|postgres (got '${BACKEND}')" ;;
+esac
+SERVICE_NAME="${PROXY_SERVICE_NAME:-token-proxy}"
+REGION="${REGION_ARG:-${GCP_REGION:-asia-south1}}"
 
 # ─── Resolve project ──────────────────────────────────────────────────────────
 if [[ -z "$PROJECT_ID" ]]; then
   PROJECT_ID="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 fi
 [[ -z "$PROJECT_ID" ]] && error "No GCP project set. Use --project or: gcloud config set project PROJECT_ID"
+[[ "$PROJECT_ID" == "your-gcp-project-id" ]] && \
+  error "GCP_PROJECT_ID is still the template's placeholder: set your project id, or use --project"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+# Errors from functions run inside $(...) go to stderr: error() writes to stdout, which a
+# command substitution would swallow into the variable instead of showing.
+die() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+
 fetch_keys_json() {
-  gcloud secrets versions access latest \
-    --secret="$SECRET_NAME" --project="$PROJECT_ID" 2>/dev/null || echo "{}"
+  # A secret with no version yet is an empty store (the first issue creates it). Any other
+  # read failure stops the script: treating it as empty made the next write keep only the
+  # new key, revoking every other tenant's.
+  local out err_file err
+  err_file="$(mktemp)"
+  if out=$(gcloud secrets versions access latest \
+             --secret="$SECRET_NAME" --project="$PROJECT_ID" 2>"$err_file"); then
+    rm -f "$err_file"
+    printf '%s' "$out"
+    return 0
+  fi
+  if grep -q "NOT_FOUND" "$err_file"; then
+    rm -f "$err_file"
+    echo "{}"
+    return 0
+  fi
+  err="$(tr '\n' ' ' < "$err_file")"
+  rm -f "$err_file"
+  die "Could not read secret '${SECRET_NAME}': ${err}— stopping so no key is lost."
+}
+
+detect_backend() {
+  # The proxy validates keys against the store PROXY_KEYS_BACKEND names on the deployed
+  # service; unset means the Secret Manager blob.
+  local svc_json
+  svc_json=$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" \
+               --region="$REGION" --format=json 2>/dev/null) || return 1
+  echo "$svc_json" | python3 -c "
+import json, sys
+svc = json.load(sys.stdin)
+containers = svc.get('spec', {}).get('template', {}).get('spec', {}).get('containers') or [{}]
+env = containers[0].get('env') or []
+value = next((e.get('value', '') for e in env if e.get('name') == 'PROXY_KEYS_BACKEND'), '')
+print((value or 'blob').strip().lower())
+"
+}
+
+require_blob_backend() {
+  local backend="$BACKEND"
+  if [[ -z "$backend" ]]; then
+    backend=$(detect_backend) || die "Could not read Cloud Run service '${SERVICE_NAME}' in ${REGION} \
+(project ${PROJECT_ID}) to see which key store it uses. If it validates keys against the \
+Secret Manager blob, re-run with --backend blob; otherwise pass --region or set PROXY_SERVICE_NAME."
+  fi
+  if [[ "$backend" == "postgres" ]]; then
+    die "'${SERVICE_NAME}' validates keys against Postgres (PROXY_KEYS_BACKEND=postgres). This \
+script only writes the Secret Manager blob, so it would change nothing the proxy reads. Issue and \
+revoke keys from the admin console instead."
+  fi
 }
 
 store_keys_json() {
@@ -102,6 +172,7 @@ cmd_issue() {
     free|enterprise) ;;
     *) error "--tier must be free|enterprise (got '${TIER}')" ;;
   esac
+  require_blob_backend
 
   local raw_key
   raw_key="tok-$(openssl rand -hex 24)"
@@ -159,11 +230,15 @@ print(json.dumps(d))
 cmd_revoke() {
   local tenant="${TENANT_ID:-$USER_ID}"
   [[ -z "$tenant" ]] && error "--tenant (or --user) is required for revoke"
+  require_blob_backend
 
   local existing_json
   existing_json=$(fetch_keys_json)
 
-  local updated_json removed
+  # The count comes back on stderr, through a file only this run can write (a fixed
+  # /tmp/revoke_count could be planted by another user of the host).
+  local updated_json removed count_file
+  count_file="$(mktemp)"
   updated_json=$(echo "$existing_json" | TENANT="$tenant" python3 -c "
 import os, sys, json
 d = json.load(sys.stdin)
@@ -173,8 +248,9 @@ before = len(d)
 d = {k: v for k, v in d.items() if owner(v) != t}
 print(json.dumps(d))
 print(before - len(d), file=sys.stderr)
-" 2>/tmp/revoke_count)
-  removed=$(cat /tmp/revoke_count)
+" 2>"$count_file")
+  removed=$(cat "$count_file")
+  rm -f "$count_file"
 
   if [[ "$removed" -eq 0 ]]; then
     warn "No keys found for tenant '${tenant}' — nothing to revoke."

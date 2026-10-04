@@ -10,7 +10,7 @@ Technique: Intercept tool result messages and apply server-side filter/sort/proj
 """
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List
 
 from middleware import RequestContext, resolve_group_config
 from savings.calculator import estimate_tokens
@@ -151,8 +151,8 @@ def _apply_hook(data: Any, hook: Dict) -> Any:
                 key=lambda x: x.get(sort_key, 0) if isinstance(x, dict) else x,
                 reverse=reverse,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("sort hook failed, data left unsorted: %r", exc)
 
     # top_n: keep only first N items
     if isinstance(data, list) and hook.get("top_n"):

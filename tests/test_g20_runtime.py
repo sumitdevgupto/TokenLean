@@ -61,13 +61,49 @@ class TestFingerprintHelper:
     def test_fp_differs_for_different_text(self):
         assert _fp("text A") != _fp("text B")
 
-    def test_fp_truncates_at_512_chars(self):
-        long_text = "x" * 1000
-        truncated = "x" * 512
-        assert _fp(long_text) == _fp(truncated)
+    def test_fp_covers_the_whole_prompt(self):
+        """Two prompts that share their first 512 characters are different prompts: a
+        template made from one replaced the other (and its per-user tail) wholesale."""
+        policy = "x" * 600
+        assert _fp(policy + " Customer: Alice") != _fp(policy + " Customer: Bob")
 
 
 class TestG20PromptOptimizer:
+    @pytest.mark.asyncio
+    async def test_a_prompt_sharing_only_its_start_gets_no_template(self):
+        policy = "Follow the support policy carefully. " * 20          # > 512 chars
+        alice, bob = policy + "Customer: Alice (acct 123).", policy + "Customer: Bob (acct 456)."
+        store = {f"tok_opt:g20:tpl:{_fp(alice)}": "Optimised for Alice."}
+        redis = MagicMock()
+        redis.get = AsyncMock(side_effect=lambda key: store.get(key))
+        ctx = _make_ctx([{"role": "system", "content": bob}, {"role": "user", "content": "Hi"}])
+        result = await G20PromptOptimizer(redis_client=redis).process_request(ctx)
+        assert result.messages[0]["content"] == bob
+
+    @pytest.mark.asyncio
+    async def test_list_content_is_left_alone(self):
+        """A multimodal system message raised AttributeError (a 500) in the fingerprint."""
+        parts = [{"type": "text", "text": "You are a helpful assistant."}]
+        ctx = _make_ctx([{"role": "system", "content": parts}, {"role": "user", "content": "Hi"}])
+        try:
+            result = await G20PromptOptimizer(redis_client=_make_redis("x")).process_request(ctx)
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(f"list content must be skipped, raised {exc!r}")
+        assert result.messages[0]["content"] == parts
+
+    @pytest.mark.asyncio
+    async def test_the_step_counts_tokens_not_words(self):
+        from savings.calculator import count_messages_tokens
+        original = "Antidisestablishmentarianism-heavy instructions: summarise_everything_carefully."
+        optimised = "Be brief."
+        ctx = _make_ctx([{"role": "system", "content": original}, {"role": "user", "content": "Hi"}])
+        result = await G20PromptOptimizer(redis_client=_make_redis(optimised)).process_request(ctx)
+        step = [s for s in result.savings.step_savings if s.group == "G20"][0]
+        expect_before = count_messages_tokens([{"role": "system", "content": original}], "gpt-4o")
+        expect_after = count_messages_tokens([{"role": "system", "content": optimised}], "gpt-4o")
+        assert (step.tokens_before, step.tokens_after) == (expect_before, expect_after)
+        assert expect_before != len(original.split())       # words would be wrong here
+
     @pytest.mark.asyncio
     async def test_disabled_returns_ctx_unchanged(self):
         msgs = [{"role": "system", "content": "You are a helpful assistant."},

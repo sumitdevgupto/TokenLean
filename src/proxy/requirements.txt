@@ -74,12 +74,6 @@ confection==1.3.3
     #   weasel
 cryptography==50.0.0
     # via google-auth
-cuda-bindings==13.3.1
-    # via torch
-cuda-pathfinder==1.6.0
-    # via cuda-bindings
-cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3.0
-    # via torch
 cymem==2.0.13
     # via
     #   preshed
@@ -313,32 +307,6 @@ numpy==2.4.6
     #   spacy
     #   thinc
     #   transformers
-    # via
-    #   cuda-toolkit
-    #   nvidia-cudnn-cu13
-    #   nvidia-cusolver
-    # via cuda-toolkit
-    # via
-    #   cuda-toolkit
-    #   nvidia-cublas
-    # via cuda-toolkit
-    # via torch
-    # via cuda-toolkit
-    # via cuda-toolkit
-    # via cuda-toolkit
-    # via cuda-toolkit
-    # via
-    #   cuda-toolkit
-    #   nvidia-cusolver
-    # via torch
-    # via torch
-    # via
-    #   cuda-toolkit
-    #   nvidia-cufft
-    #   nvidia-cusolver
-    #   nvidia-cusparse
-    # via torch
-    # via cuda-toolkit
 onnxruntime==1.28.0
     # via fastembed
 openai==2.53.0

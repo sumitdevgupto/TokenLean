@@ -107,3 +107,44 @@ class TestSingletonsAreIndependentAcrossKinds:
         assert st is not te
         assert st.kind == "st"
         assert te.kind == "te"
+
+
+# ─── Cloud Run IAM for the G01 / G03 sidecars ────────────────────────────────
+# The sidecars refuse callers without an identity token. The token goes only to a Cloud
+# Run URL, for the service origin, and only on GCP.
+
+class TestCloudRunAuthHeaders:
+
+    @staticmethod
+    def _patch(monkeypatch, on_gcp=True):
+        minted = []
+        monkeypatch.setattr(ml_models, "_on_gcp", lambda: on_gcp)
+        monkeypatch.setattr(ml_models, "_gcp_identity_token",
+                            lambda audience: minted.append(audience) or "tok")
+        return minted
+
+    def test_a_cloud_run_url_gets_a_token_for_its_origin(self, monkeypatch):
+        minted = self._patch(monkeypatch)
+        headers = ml_models.cloud_run_auth_headers(
+            "https://llmlingua-svc-abc123-el.a.run.app/compress?x=1")
+        assert headers == {"Authorization": "Bearer tok"}
+        assert minted == ["https://llmlingua-svc-abc123-el.a.run.app"]   # no path: Cloud Run checks the origin
+
+    @pytest.mark.parametrize("url", [
+        "http://llmlingua-svc:8080/compress",               # local compose
+        "http://llmlingua-svc-abc123-el.a.run.app/compress",  # plain http
+        "https://sidecar.example.com/compress",             # not Cloud Run: never sent the identity
+        "https://evil.example/llmlingua.run.app",           # .run.app only in the path
+        "https://llmlingua.run.app.evil.example/compress",  # .run.app only as a label
+        "https://evilrun.app/compress",                     # run.app, but not a subdomain of it
+        "",
+    ])
+    def test_any_other_url_gets_nothing(self, monkeypatch, url):
+        minted = self._patch(monkeypatch)
+        assert ml_models.cloud_run_auth_headers(url) == {}
+        assert minted == []
+
+    def test_off_gcp_nothing_is_attached(self, monkeypatch):
+        minted = self._patch(monkeypatch, on_gcp=False)
+        assert ml_models.cloud_run_auth_headers("https://tika-svc-abc123-el.a.run.app") == {}
+        assert minted == []

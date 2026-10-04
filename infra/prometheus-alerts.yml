@@ -27,24 +27,8 @@ groups:
             increase(token_opt_reasoning_tokens_total[1d])
           )
 
-      # Recording rules: per-user request and cost aggregations
-      - record: token_opt:requests_daily:user
-        expr: |
-          sum by (user_id) (
-            increase(token_opt_requests_total[1d])
-          )
-
-      - record: token_opt:cost_usd_daily:user
-        expr: |
-          sum by (user_id) (
-            increase(token_opt_cost_usd_total[1d])
-          )
-
-      - record: token_opt:requests_hourly:user
-        expr: |
-          sum by (user_id) (
-            increase(token_opt_requests_total[1h])
-          )
+      # No per-user rules: the metrics carry no user label (unbounded, and personal data).
+      # Per-user requests and cost are in usage_events.
 
       # Alert rules: budget breach (default threshold $100/day; override via config)
       - alert: TokenOptDailyCostBudgetExceeded

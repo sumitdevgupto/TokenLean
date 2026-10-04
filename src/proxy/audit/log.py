@@ -1,7 +1,11 @@
 """
-AuditLogger — appends immutable audit events to the Postgres `audit_events`
-table.  The Postgres role used at runtime has INSERT-only privilege on this
-table; UPDATE and DELETE are forbidden at the database level.
+AuditLogger — appends audit events to the Postgres `audit_events` table.
+
+This class only inserts. Existing rows change only through audit/enforcement.py:
+right-to-erasure sets `user_id` to NULL, and the retention job deletes rows past
+`retention.audit_days`. The database enforces that only when the application connects
+as the restricted runtime role that module sets up; otherwise the application's role
+owns the table. (The INSERT-only `proxy_audit_role` the migrations create is unused.)
 """
 import json
 import logging
@@ -68,6 +72,9 @@ async def ensure_audit_schema(pg_pool) -> None:
     """
     if pg_pool is None:
         return
+    from cache.pg_pool import may_run_ddl
+    if not await may_run_ddl(pg_pool, "audit_events"):
+        return  # a restricted runtime role: the schema job keeps the table current
     try:
         async with pg_pool.acquire() as conn:
             await conn.execute(AUDIT_EVENTS_DDL)
@@ -76,7 +83,9 @@ async def ensure_audit_schema(pg_pool) -> None:
 
 
 class AuditLogger:
-    """Write one audit row per proxy request to `audit_events`.
+    """Write audit rows to `audit_events`: config changes (``log_config_change``),
+    G29/G30 security events (``log_security_events``), and one row per request
+    (``log``) when G18 is given a logger, which the pipeline currently does not do.
 
     Parameters
     ----------
@@ -204,6 +213,14 @@ class AuditLogger:
                     "mode": cti_action,
                     "source": "retrieved",
                 },
+            ))
+        # G31 managed rules running record-only: which managed rules matched retrieved
+        # context while nothing was done about it. Rule ids from the managed set only.
+        recorded = list(getattr(ctx, "context_trust_managed_recorded", []) or [])
+        if recorded:
+            events.append((
+                "context_trust.managed_recorded",
+                {"rule_ids": recorded, "mode": "record", "source": "retrieved"},
             ))
         # G31 PII pass over RETRIEVED context — distinct `source` so a compliance reviewer
         # can tell request-PII (G29) apart from retrieved-corpus PII (G31). PII-free: types +

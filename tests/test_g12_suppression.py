@@ -250,5 +250,40 @@ class TestG12AccuracyTradeoff:
         assert "low" in call_args[1]
 
 
+class TestSuppressionOnListContent:
+    """A system message given as a list of parts is valid OpenAI input. G12 (on by default,
+    effort medium, with a medium suppression prompt) concatenated a string onto it: a
+    TypeError, and a 500 for a valid request."""
+
+    PARTS = [{"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}]
+
+    def test_a_text_part_is_appended_after_the_existing_parts(self):
+        result = _inject_suppression(
+            [{"role": "system", "content": [dict(p) for p in self.PARTS]},
+             {"role": "user", "content": "Hi"}], "Be concise.")
+        assert result[0]["content"] == [*self.PARTS, {"type": "text", "text": "Be concise."}]
+        assert result[1] == {"role": "user", "content": "Hi"}
+
+    def test_the_callers_messages_are_not_mutated(self):
+        parts = [dict(p) for p in self.PARTS]
+        messages = [{"role": "system", "content": parts}]
+        _inject_suppression(messages, "Be concise.")
+        assert messages == [{"role": "system", "content": self.PARTS}]
+
+    @pytest.mark.parametrize("content", [None, ""])
+    def test_empty_content_becomes_the_prompt(self, content):
+        result = _inject_suppression([{"role": "system", "content": content}], "Be concise.")
+        assert result == [{"role": "system", "content": "Be concise."}]
+
+    async def test_the_request_no_longer_fails(self, make_ctx):
+        ctx = make_ctx([{"role": "system", "content": [dict(p) for p in self.PARTS]},
+                        {"role": "user", "content": "What is 2+2?"}])
+        ctx.config["groups"]["G12_reasoning"] = {
+            "enabled": True, "default_effort": "medium",
+            "reasoning_suppression_prompts": {"medium": "Be concise."}}
+        ctx = await G12ReasoningBudget().process_request(ctx)
+        assert ctx.messages[0]["content"] == [*self.PARTS, {"type": "text", "text": "Be concise."}]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -270,3 +270,118 @@ def test_disabled_resilience_single_call_passthrough():
     resp = _drive(cfg, mock)
     assert resp.status_code == 429
     assert mock.await_count == 1  # no retry, no failover when disabled
+
+
+# ── How long a provider call waits, and who retries it ───────────────────────────────
+# No call set a timeout, so litellm's fallback of 10 minutes applied, and the OpenAI client
+# inside litellm retried twice under this layer's own retries: up to 6 calls per target.
+def _limits(mock):
+    return [(c.kwargs.get("timeout"), c.kwargs.get("max_retries", "client default"))
+            for c in mock.await_args_list]
+
+
+def test_every_attempt_waits_its_provider_s_timeout_and_only_this_layer_retries():
+    rate_limited = litellm.exceptions.RateLimitError(
+        message="rl", llm_provider="openai", model="gpt-4o-mini")
+    mock = AsyncMock(side_effect=[rate_limited, rate_limited,
+                                  _resp("claude-3-5-haiku", "from-fallback")])
+    cfg = _config({"enabled": True, "num_retries": 1, "retry_base_delay": 0,
+                   "request_timeout_seconds": 45,
+                   "fallbacks": {"gpt-4o-mini": ["claude-3-5-haiku"]}})
+    cfg["providers"][1]["resilience"] = {"request_timeout_seconds": 90}   # anthropic
+    resp = _drive(cfg, mock)
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "from-fallback"
+    # the primary and its one retry, then the fallback at its own provider's timeout
+    assert _limits(mock) == [(45.0, 0), (45.0, 0), (90.0, 0)]
+
+
+def test_without_the_setting_a_call_waits_300_seconds():
+    mock = AsyncMock(return_value=_resp("gpt-4o-mini", "served"))
+    resp = _drive(_config({"enabled": True}), mock)
+    assert resp.status_code == 200
+    assert _limits(mock) == [(300.0, 0)]
+
+
+def test_with_resilience_off_the_client_keeps_its_own_retries():
+    # This layer makes exactly one attempt then, so the client's retries are the only ones.
+    mock = AsyncMock(return_value=_resp("gpt-4o-mini", "served"))
+    resp = _drive(_config({"enabled": False, "request_timeout_seconds": 45}), mock)
+    assert resp.status_code == 200
+    assert _limits(mock) == [(45.0, "client default")]
+
+
+def test_a_stream_is_opened_with_the_timeout_and_no_client_retries():
+    mock = AsyncMock(side_effect=lambda **kwargs: _stream_chunks("gpt-4o-mini", "streamed"))
+    cfg = _config({"enabled": True, "num_retries": 0, "request_timeout_seconds": 45})
+    resp = _drive(cfg, mock, body={**_body(), "stream": True})
+    assert resp.status_code == 200 and "streamed" in resp.text
+    assert _limits(mock) == [(45.0, 0)]
+
+
+def test_a_provider_that_stalls_fails_over():
+    stalled = litellm.exceptions.Timeout(
+        message="timed out", model="gpt-4o-mini", llm_provider="openai")
+    mock = AsyncMock(side_effect=[stalled, _resp("claude-3-5-haiku", "from-fallback")])
+    cfg = _config({"enabled": True, "num_retries": 0, "retry_base_delay": 0,
+                   "fallbacks": {"gpt-4o-mini": ["claude-3-5-haiku"]}})
+    resp = _drive(cfg, mock)
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "from-fallback"
+
+
+# ── Prompt-cache markers across providers ─────────────────────────────────────
+# A `cache_control` marker is an Anthropic breakpoint. It goes only to a provider that
+# caches by marker: a failover to any other provider sends the prompt without them, and
+# one to another Anthropic model keeps them. The old strip did not know where the call
+# was going: it removed markers on a message for every fallback and left the ones
+# inside a message's content for every fallback.
+_MARK = {"type": "ephemeral"}
+
+
+def _marked_body(model):
+    return {"model": model, "messages": [
+        {"role": "system", "content": [{"type": "text", "text": "Rules.", "cache_control": _MARK}]},
+        {"role": "user", "content": "hi", "cache_control": _MARK}]}
+
+
+def _markers(obj):
+    if isinstance(obj, dict):
+        return ("cache_control" in obj) + sum(_markers(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_markers(v) for v in obj)
+    return 0
+
+
+def _fail_over(fallback):
+    # A 503, not a 429: a rate limit cools the whole provider down, which would skip a
+    # fallback to another Anthropic model by design.
+    unavailable = litellm.exceptions.ServiceUnavailableError(
+        message="overloaded", llm_provider="anthropic", model="claude-3-5-haiku")
+    mock = AsyncMock(side_effect=[unavailable, _resp(fallback, "from-fallback")])
+    cfg = _config({"enabled": True, "num_retries": 0, "retry_base_delay": 0,
+                   "fallbacks": {"claude-3-5-haiku": [fallback]}})
+    resp = _drive(cfg, mock, body=_marked_body("claude-3-5-haiku"))
+    assert resp.status_code == 200
+    assert mock.await_count == 2
+    primary, served = (c.kwargs for c in mock.call_args_list)
+    assert served["model"].endswith(fallback)
+    return primary, served
+
+
+def test_a_failover_to_another_provider_sends_no_cache_marker():
+    primary, served = _fail_over("gpt-4o-mini")
+    assert _markers(primary["messages"]) == 2
+    assert _markers(served["messages"]) == 0
+
+
+def test_a_failover_to_another_anthropic_model_keeps_the_cache_markers():
+    primary, served = _fail_over("claude-3-7-sonnet")
+    assert _markers(served["messages"]) == 2
+
+
+def test_a_marked_request_openai_serves_carries_no_cache_marker():
+    mock = AsyncMock(return_value=_resp("gpt-4o-mini", "ok"))
+    resp = _drive(_config({"enabled": False}), mock, body=_marked_body("gpt-4o-mini"))
+    assert resp.status_code == 200
+    assert _markers(mock.call_args.kwargs["messages"]) == 0

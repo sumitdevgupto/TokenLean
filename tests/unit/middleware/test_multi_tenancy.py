@@ -6,11 +6,10 @@ tenant-alpha from tenant-beta:
   1. G05 L2 pgvector — WHERE tenant_id filter + tenant-scoped query_hash
   2. G05 L3 GPTCache — tenant-scoped query string
   3. G04 Bypass rules — tenant-scoped DB query + per-tenant rule cache
-  4. G10 Mem0 — tenant-scoped user_id
-  5. G10 Zep — tenant-scoped session_id
-  6. G05 Step Cache — tenant-scoped key prefix (High row #7)
-  7. G00 Rate Limit — tenant-scoped bucket keys (High row #8)
-  8. G04 Bypass stats key — tenant-scoped Redis key (Medium row #10)
+  4. G10 Mem0 — tenant-scoped user_id (G10's Zep client was removed; it stays gone)
+  5. G05 Step Cache — tenant-scoped key prefix (High row #7)
+  6. G00 Rate Limit — tenant-scoped bucket keys (High row #8)
+  7. G04 Bypass stats key — tenant-scoped Redis key (Medium row #10)
 
 Each test simulates two tenants reusing the same raw id (query text, user_id,
 session_id) and asserts the underlying call/SQL is tenant-scoped so a
@@ -104,9 +103,18 @@ class TestG04BypassRuleTenantIsolation:
         monkeypatch.setenv("DATABASE_URL", "postgresql://test/db")
         mock_conn = AsyncMock()
         mock_conn.fetch = AsyncMock(return_value=[])
-        mock_conn.close = AsyncMock()
 
-        with patch("asyncpg.connect", new_callable=AsyncMock, return_value=mock_conn):
+        class _Pool:  # the shared asyncpg pool: acquire() is an async context manager
+            def acquire(self):
+                class _Ctx:
+                    async def __aenter__(self):
+                        return mock_conn
+
+                    async def __aexit__(self, *exc):
+                        return False
+                return _Ctx()
+
+        with patch("cache.pg_pool.get_pg_pool", new=AsyncMock(return_value=_Pool())):
             from middleware.g04_bypass import _load_rules_from_db
             await _load_rules_from_db(tenant_id="tenant-alpha")
 
@@ -179,14 +187,14 @@ class TestG10Mem0TenantIsolation:
     async def test_mem0_retrieve_called_with_tenant_scoped_user_id(self, make_ctx):
         ctx = make_ctx(
             [{"role": "user", "content": "What did I tell you about my order?"}],
-            params={"x_user_id": "shared-user-id"},
         )
+        ctx.user_id = "shared-user-id"                  # the authenticated user
         ctx.tenant_id = "tenant-alpha"
         ctx.config["groups"]["G10_memory"]["mem0_enabled"] = True
 
         mock_mem0 = AsyncMock()
         mock_mem0.retrieve_memories = AsyncMock(return_value=[])
-        mock_mem0.store_memory = AsyncMock(return_value=True)
+        mock_mem0.store_exchange = MagicMock(return_value=True)
 
         from middleware.g10_memory import G10Memory
         memory = G10Memory()
@@ -202,7 +210,7 @@ class TestG10Mem0TenantIsolation:
     async def test_two_tenants_same_user_id_get_different_scoped_ids(self, make_ctx):
         mock_mem0 = AsyncMock()
         mock_mem0.retrieve_memories = AsyncMock(return_value=[])
-        mock_mem0.store_memory = AsyncMock(return_value=True)
+        mock_mem0.store_exchange = MagicMock(return_value=True)
 
         from middleware.g10_memory import G10Memory
         memory = G10Memory()
@@ -211,8 +219,8 @@ class TestG10Mem0TenantIsolation:
         for tenant in ("tenant-alpha", "tenant-beta"):
             ctx = make_ctx(
                 [{"role": "user", "content": "Remember my preference"}],
-                params={"x_user_id": "shared-user-id"},
             )
+            ctx.user_id = "shared-user-id"
             ctx.tenant_id = tenant
             ctx.config["groups"]["G10_memory"]["mem0_enabled"] = True
             with patch("middleware.g10_memory._get_redis", side_effect=Exception("no redis needed")):
@@ -220,64 +228,6 @@ class TestG10Mem0TenantIsolation:
 
         seen_user_ids = {c.args[0] for c in mock_mem0.retrieve_memories.await_args_list}
         assert seen_user_ids == {"tenant-alpha::shared-user-id", "tenant-beta::shared-user-id"}
-
-
-@pytest.mark.asyncio
-class TestG10ZepTenantIsolation:
-    async def test_zep_get_memory_called_with_tenant_scoped_session_id(self, make_ctx):
-        ctx = make_ctx(
-            [{"role": "user", "content": "Continue our conversation"}],
-            params={"x_session_id": "shared-session-id"},
-        )
-        ctx.tenant_id = "tenant-alpha"
-        ctx.config["groups"]["G10_memory"]["zep_enabled"] = True
-
-        mock_zep = AsyncMock()
-        mock_zep.get_memory = AsyncMock(return_value=[])
-
-        from middleware.g10_memory import G10Memory
-        memory = G10Memory()
-        memory._zep = mock_zep
-
-        mock_redis = AsyncMock()
-        mock_redis.get = AsyncMock(return_value=None)
-        mock_redis.set = AsyncMock()
-        mock_redis.expire = AsyncMock()
-
-        with patch("middleware.g10_memory._get_redis", return_value=mock_redis):
-            with patch("middleware.g10_memory._summarise", new_callable=AsyncMock, return_value="summary"):
-                await memory.process_request(ctx)
-
-        called_session_id = mock_zep.get_memory.await_args.args[0]
-        assert called_session_id == "tenant-alpha::shared-session-id"
-        assert called_session_id != "shared-session-id"
-
-    async def test_two_tenants_same_session_id_never_collide(self, make_ctx):
-        mock_zep = AsyncMock()
-        mock_zep.get_memory = AsyncMock(return_value=[])
-
-        from middleware.g10_memory import G10Memory
-        memory = G10Memory()
-        memory._zep = mock_zep
-
-        mock_redis = AsyncMock()
-        mock_redis.get = AsyncMock(return_value=None)
-        mock_redis.set = AsyncMock()
-        mock_redis.expire = AsyncMock()
-
-        for tenant in ("tenant-alpha", "tenant-beta"):
-            ctx = make_ctx(
-                [{"role": "user", "content": "Continue our conversation"}],
-                params={"x_session_id": "shared-session-id"},
-            )
-            ctx.tenant_id = tenant
-            ctx.config["groups"]["G10_memory"]["zep_enabled"] = True
-            with patch("middleware.g10_memory._get_redis", return_value=mock_redis):
-                with patch("middleware.g10_memory._summarise", new_callable=AsyncMock, return_value="summary"):
-                    await memory.process_request(ctx)
-
-        seen_session_ids = {c.args[0] for c in mock_zep.get_memory.await_args_list}
-        assert seen_session_ids == {"tenant-alpha::shared-session-id", "tenant-beta::shared-session-id"}
 
 
 @pytest.mark.asyncio
@@ -394,25 +344,48 @@ class TestG04BypassStatsKeyTenantIsolation:
     """Medium row #10 — bypass rule effectiveness stats must not blend
     tenant-alpha's hit-rate into tenant-beta's (and vice versa)."""
 
+    class _StatsRedis:
+        """Records the key of every hincrby queued on a pipeline (the stats are written in
+        one round trip)."""
+
+        def __init__(self):
+            self.hincrby_keys = []
+
+        def pipeline(self, transaction=True):
+            redis = self
+
+            class _Pipe:
+                def hincrby(self, key, *args):
+                    redis.hincrby_keys.append(key)
+
+                def __getattr__(self, name):
+                    return lambda *a, **k: None
+
+                async def execute(self):
+                    return []
+            return _Pipe()
+
     async def test_record_bypass_stat_key_includes_tenant_id(self):
         from middleware.g04_bypass import _record_bypass_stat, _BYPASS_STATS_PREFIX
 
-        mock_redis = AsyncMock()
-        with patch("middleware.g04_bypass._get_redis", return_value=mock_redis):
+        redis = self._StatsRedis()
+        with patch("middleware.g04_bypass._get_redis", return_value=redis):
             await _record_bypass_stat("rule-1", True, 0.9, tenant_id="tenant-alpha")
 
-        called_key = mock_redis.hincrby.await_args_list[0].args[0]
+        assert redis.hincrby_keys, "no stats were written"
+        called_key = redis.hincrby_keys[0]
         assert called_key == f"{_BYPASS_STATS_PREFIX}tenant-alpha:rule-1"
 
     async def test_two_tenants_same_rule_get_independent_stats_keys(self):
         from middleware.g04_bypass import _record_bypass_stat
 
-        mock_redis = AsyncMock()
+        redis = self._StatsRedis()
         seen_keys = []
-        with patch("middleware.g04_bypass._get_redis", return_value=mock_redis):
+        with patch("middleware.g04_bypass._get_redis", return_value=redis):
             for tenant in ("tenant-alpha", "tenant-beta"):
                 await _record_bypass_stat("shared-rule", True, 0.9, tenant_id=tenant)
-                seen_keys.append(mock_redis.hincrby.await_args_list[-1].args[0])
+                assert redis.hincrby_keys, "no stats were written"
+                seen_keys.append(redis.hincrby_keys[-1])
 
         assert seen_keys[0] != seen_keys[1]
 
@@ -431,10 +404,11 @@ class TestTenantIsolationCallSiteLint:
     """CI lint: assert that soft-isolation helpers have exactly one call site each.
 
     A second call site that bypasses the scoped-id helpers
-    (Mem0MemoryClient.retrieve_memories / store_memory, ZepMemoryClient.add_message /
-    get_memory) would silently cross tenant boundaries.  These tests catch that before it
-    ships. The L3 cache helpers that used to head this list were removed with the tier on
-    2026-09-07; `test_l3_helpers_stay_gone` below now asserts ZERO call sites for them.
+    (Mem0MemoryClient.retrieve_memories / store_exchange) would silently cross tenant
+    boundaries.  These tests catch that before it ships. The L3 cache helpers that used to
+    head this list were removed with the tier on 2026-09-07, and G10's Zep client on
+    2026-10-04; `test_l3_helpers_stay_gone` and `test_zep_stays_gone` assert ZERO call
+    sites for them.
 
     The search is done with a simple string scan of the source tree so there
     is no import-time dependency on the middleware itself.
@@ -480,34 +454,21 @@ class TestTenantIsolationCallSiteLint:
             f"New call sites may use an unscoped user_id: {hits}"
         )
 
-    def test_mem0_store_memory_single_call_site(self):
-        # g10_memory.py has exactly 2 external store_memory() awaits
-        hits = self._grep(r"await mem0\.store_memory\(")
-        assert len(hits) == 2, (
-            f"store_memory has {len(hits)} external call sites (expected 2 — user+assistant). "
+    def test_mem0_store_exchange_single_call_site(self):
+        # g10_memory.py sends each exchange to Mem0 from one place, with scoped_user_id
+        hits = self._grep(r"mem0\.store_exchange\(")
+        assert len(hits) == 1, (
+            f"store_exchange has {len(hits)} external call sites (expected 1). "
             f"New call sites may bypass scoped_user_id: {hits}"
         )
+        assert self._grep(r"store_memory\(") == [], "the old two-call store is back"
 
-    def test_zep_add_message_no_unintended_call_sites(self):
-        # add_message is defined in ZepMemoryClient but currently not called from
-        # process_request (Zep session state is read, not written, in the proxy path).
-        # If a caller adds it, it MUST use scoped_session_id — this test asserts 0
-        # external await calls so any future addition is intentionally reviewed.
-        hits = self._grep(r"await zep\.add_message\(")
-        assert len(hits) == 0, (
-            f"zep.add_message has {len(hits)} external call site(s) (expected 0 — "
-            f"any new call site MUST use scoped_session_id not bare session_id): {hits}"
-        )
-
-    def test_zep_get_memory_single_call_site(self):
-        # Only the process_request call `await zep.get_memory(scoped_session_id, ...)` counts.
-        # The internal `self._client.memory.get_memory(session_id)` in ZepMemoryClient is
-        # already scoped (the outer wrapper enforces the scope).
-        hits = self._grep(r"await zep\.get_memory\(")
-        assert len(hits) == 1, (
-            f"zep.get_memory has {len(hits)} external call sites (expected 1). "
-            f"New call sites must use scoped_session_id: {hits}"
-        )
+    def test_zep_stays_gone(self):
+        """G10's Zep client was removed on 2026-10-04: it never matched the library it
+        imported, and nothing could test it. Like L3 above, a Zep integration that comes
+        back must design its tenant scoping again, not inherit it unexercised."""
+        hits = self._grep(r"zep_python|ZepClient|ZepMemoryClient|\bzep\.(get|add)_")
+        assert hits == [], f"a Zep client is back in middleware: {hits}"
 
 
 class TestNoUnprefixedTemporalCache:

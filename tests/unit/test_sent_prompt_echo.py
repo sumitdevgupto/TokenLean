@@ -305,13 +305,16 @@ class TestTheCaptureFollowsTheCallThatServed:
             assert "capture_sent_prompt(" not in window
 
     def test_the_primary_capture_uses_the_hygienic_outgoing_params(self):
-        assert "capture_sent_prompt(ctx, ctx.messages, outgoing_params, _call_model)" in self.SRC
+        """Messages too: the echo shows what the provider received, which for a provider
+        that does not cache by marker is the prompt without its cache markers."""
+        assert "capture_sent_prompt(ctx, _sent_messages, outgoing_params, _call_model)" in self.SRC
+        assert "messages=_sent_messages," in self.SRC
 
     def test_the_failover_target_captures_its_own_sanitised_payload(self):
-        """A failover sends DIFFERENT bytes — sanitised messages/tools, another model — so
+        """A failover sends DIFFERENT bytes — its own messages/tools, another model — so
         it must overwrite the primary's snapshot rather than inherit it."""
         assert (
-            "capture_sent_prompt(ctx, _failover_messages, _failover_outgoing, call_model)"
+            "capture_sent_prompt(ctx, _failover_messages, outgoing, call_model)"
             in self.SRC
         )
 

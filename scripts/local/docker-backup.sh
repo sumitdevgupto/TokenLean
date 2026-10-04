@@ -5,7 +5,10 @@
 # Usage:
 #   ./scripts/local/docker-backup.sh [--project ID] [--bucket NAME]
 #
-# Backs up Redis, PostgreSQL, and Qdrant to GCS for persistence.
+# Backs up Redis, PostgreSQL, and Qdrant to gs://BUCKET/backups/<timestamp>/. The bucket is
+# --bucket or CONFIG_GCS_BUCKET from .env, and it must be in your project (it is created there
+# when missing): the dumps hold every tenant's usage and audit rows, portal password hashes and
+# encrypted provider keys, so they never go to a bucket someone else owns.
 # =============================================================================
 set -euo pipefail
 
@@ -42,25 +45,40 @@ fi
 if [[ -z "$PROJECT_ID" ]]; then
   PROJECT_ID=$(gcloud config get-value project 2>/dev/null || echo "")
 fi
+[[ -n "$PROJECT_ID" ]] || error "No GCP project: pass --project ID or run: gcloud config set project ID"
 if [[ -z "$CONFIG_BUCKET" ]]; then
-  CONFIG_BUCKET="${CONFIG_GCS_BUCKET:-token-opt-config}"
+  CONFIG_BUCKET="${CONFIG_GCS_BUCKET:-}"
+fi
+[[ -n "$CONFIG_BUCKET" ]] \
+  || error "No backup bucket: pass --bucket NAME or set CONFIG_GCS_BUCKET in .env (a bucket in project ${PROJECT_ID})"
+
+# Bucket names are global, so the name proves nothing: the bucket must be among this project's.
+in_project() {
+  gcloud storage buckets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null \
+    | grep -qxF "$CONFIG_BUCKET"
+}
+if ! in_project; then
+  info "Creating gs://${CONFIG_BUCKET} in ${PROJECT_ID}..."
+  gcloud storage buckets create "gs://${CONFIG_BUCKET}" --project="$PROJECT_ID" \
+    --uniform-bucket-level-access &>/dev/null || true
+  in_project || error "gs://${CONFIG_BUCKET} is not in project ${PROJECT_ID} and could not be created there (the name may belong to someone else): refusing to upload backups to it"
 fi
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-info "Backing up to gs://${CONFIG_BUCKET}/backups/${TIMESTAMP}/..."
-
-# Ensure bucket exists
-if [[ -n "$PROJECT_ID" ]]; then
-  gsutil mb -p "$PROJECT_ID" "gs://${CONFIG_BUCKET}" 2>/dev/null || true
-fi
+DEST="gs://${CONFIG_BUCKET}/backups/${TIMESTAMP}/"
+# The dumps go to a temp dir only you can read, removed however the script ends.
+WORK=$(mktemp -d)
+chmod 700 "$WORK"
+trap 'rm -rf "$WORK"' EXIT
+info "Backing up to ${DEST}..."
 
 # Backup Redis
 if docker ps --filter "name=token-opt-redis" --format "{{.Names}}" | grep -q redis; then
   info "Backing up Redis..."
   docker exec token-opt-redis redis-cli BGSAVE 2>/dev/null || true
   sleep 2
-  docker cp token-opt-redis:/data/dump.rdb "/tmp/redis-${TIMESTAMP}.rdb" 2>/dev/null && \
-    gsutil cp "/tmp/redis-${TIMESTAMP}.rdb" "gs://${CONFIG_BUCKET}/backups/" && \
+  docker cp token-opt-redis:/data/dump.rdb "${WORK}/redis-${TIMESTAMP}.rdb" 2>/dev/null && \
+    gcloud storage cp "${WORK}/redis-${TIMESTAMP}.rdb" "$DEST" && \
     success "Redis backed up"
 else
   warn "Redis container not running, skipping"
@@ -69,22 +87,21 @@ fi
 # Backup PostgreSQL
 if docker ps --filter "name=token-opt-postgres" --format "{{.Names}}" | grep -q postgres; then
   info "Backing up PostgreSQL..."
-  docker exec token-opt-postgres pg_dumpall -U token_opt > "/tmp/postgres-${TIMESTAMP}.sql" 2>/dev/null && \
-    gsutil cp "/tmp/postgres-${TIMESTAMP}.sql" "gs://${CONFIG_BUCKET}/backups/" && \
+  docker exec token-opt-postgres pg_dumpall -U token_opt > "${WORK}/postgres-${TIMESTAMP}.sql" 2>/dev/null && \
+    gcloud storage cp "${WORK}/postgres-${TIMESTAMP}.sql" "$DEST" && \
     success "PostgreSQL backed up"
 else
   warn "PostgreSQL container not running, skipping"
 fi
 
-# Backup Qdrant
+# Backup Qdrant (the archive is streamed out, so nothing is left in the container)
 if docker ps --filter "name=token-opt-qdrant" --format "{{.Names}}" | grep -q qdrant; then
   info "Backing up Qdrant..."
-  docker exec token-opt-qdrant tar czf "/tmp/qdrant-${TIMESTAMP}.tar.gz" -C /qdrant/storage . 2>/dev/null && \
-    docker cp "token-opt-qdrant:/tmp/qdrant-${TIMESTAMP}.tar.gz" "/tmp/" && \
-    gsutil cp "/tmp/qdrant-${TIMESTAMP}.tar.gz" "gs://${CONFIG_BUCKET}/backups/" && \
+  docker exec token-opt-qdrant tar czf - -C /qdrant/storage . > "${WORK}/qdrant-${TIMESTAMP}.tar.gz" 2>/dev/null && \
+    gcloud storage cp "${WORK}/qdrant-${TIMESTAMP}.tar.gz" "$DEST" && \
     success "Qdrant backed up"
 else
   warn "Qdrant container not running, skipping"
 fi
 
-success "Backups complete: gs://${CONFIG_BUCKET}/backups/"
+success "Backups complete: ${DEST}"

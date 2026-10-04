@@ -107,8 +107,8 @@ Then open `http://localhost:8080` in your browser.
 
 | Role | Purpose |
 |---|---|
-| `roles/run.invoker` | For service accounts (proxy, Grafana) calling Langfuse internally |
-| `roles/cloudsql.client` | For Langfuse service to connect to Cloud SQL |
+| `roles/run.invoker` | For the proxy's service account, which calls Langfuse internally |
+| `roles/cloudsql.client` | For Langfuse's own service account (`token-opt-langfuse-sa`) to connect to Cloud SQL |
 
 For human operators who need UI access:
 

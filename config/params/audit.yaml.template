@@ -3,12 +3,15 @@
 # Keys are merged under ctx.config["audit"] at proxy startup.
 
 audit:
-  # Enable immutable audit logging to Postgres `audit_events` table.
-  # Requires the `proxy_audit_role` INSERT-only Postgres role.
+  # Not read by any code. It gated a per-request G18 row in Postgres `audit_events` that
+  # was never written (G18 was given no audit logger; the branch was removed 2026-10-01).
+  # Config-change and G29/G30 security rows are always written. The database stops the
+  # application changing audit rows only with the restricted runtime role:
+  # python -m audit.enforcement.
   enabled: true
 
-  # Number of days to retain audit events.  Automated nightly cleanup removes
-  # rows older than this threshold via Cloud Scheduler + Cloud Run Job.
+  # Not read by any code. Audit-row retention is `retention.audit_days` in
+  # config.yaml (0, the default, keeps audit_events forever).
   retention_days: 365
 
   # Postgres table name for audit events.

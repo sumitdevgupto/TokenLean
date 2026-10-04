@@ -3,8 +3,8 @@ G18 Observability - Admin Endpoint Tests
 
 Tests the admin endpoints:
 - POST /admin/alert-webhook (Alertmanager integration)
-- GET /admin/budget-status (Budget consumption query)
 - POST /admin/usage-export (Usage-records export over Postgres usage_events)
+- GET /admin/budget-status is not served (it read Redis keys nothing wrote)
 """
 import json
 import pytest
@@ -109,63 +109,51 @@ class TestAlertWebhook:
 
         assert response.status_code == 401
 
+    # Alertmanager posted with no credentials and the webhook takes only an admin key, so
+    # every alert was refused. It now presents its own token (ALERT_WEBHOOK_TOKEN), which
+    # opens this endpoint and nothing else.
+    @pytest.mark.asyncio
+    async def test_the_alertmanager_token_is_accepted(self, client, alertmanager_payload):
+        import main
+        mock_redis = AsyncMock()
+        with patch.object(main, "_ALERT_WEBHOOK_TOKEN", "am-token-123"), \
+             patch("cache.redis_pool.get_redis", return_value=mock_redis):
+            response = await client.post("/admin/alert-webhook", json=alertmanager_payload,
+                                         headers={"Authorization": "Bearer am-token-123"})
+        assert response.status_code == 200 and response.json()["alerts_count"] == 1
+        stored = json.loads(mock_redis.setex.call_args[0][2])
+        assert stored["processed_by"] == "alertmanager"
+
+    @pytest.mark.asyncio
+    async def test_a_wrong_or_unset_token_is_refused(self, client, alertmanager_payload):
+        import main
+        with patch.object(main, "_ALERT_WEBHOOK_TOKEN", "am-token-123"):
+            wrong = await client.post("/admin/alert-webhook", json=alertmanager_payload,
+                                      headers={"Authorization": "Bearer am-token-999"})
+        with patch.object(main, "_ALERT_WEBHOOK_TOKEN", ""):
+            empty = await client.post("/admin/alert-webhook", json=alertmanager_payload,
+                                      headers={"Authorization": "Bearer "})
+        assert wrong.status_code == 401 and empty.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_the_token_opens_no_other_admin_route(self, client):
+        import main
+        with patch.object(main, "_ALERT_WEBHOOK_TOKEN", "am-token-123"):
+            response = await client.post("/admin/usage-export", json={},
+                                         headers={"Authorization": "Bearer am-token-123"})
+        assert response.status_code == 401
+
 
 class TestBudgetStatus:
-    """Test GET /admin/budget-status endpoint."""
+    """GET /admin/budget-status summed Redis keys nothing in the proxy wrote, so it reported
+    zero consumption for every team and feature however much was spent. It is not served;
+    per-tenant spend is in /admin/usage-export and the spend cap."""
 
     @pytest.mark.asyncio
-    async def test_budget_status_returns_team_consumption(self, client):
-        """Test that budget status returns team consumption data."""
-        mock_redis = AsyncMock()
-        mock_redis.hgetall = AsyncMock(return_value={
-            "team:backend:used": "50000",
-            "team:backend:limit": "100000",
-            "team:frontend:used": "25000",
-            "team:frontend:limit": "50000",
-        })
-
-        with patch("cache.redis_pool.get_redis", return_value=mock_redis):
-            response = await client.get(
-                "/admin/budget-status",
-                headers={"Authorization": "Bearer admin-key"},
-            )
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "teams" in data
-        assert "features" in data
-        assert "queried_at" in data
-
-    @pytest.mark.asyncio
-    async def test_budget_status_calculates_remaining(self, client):
-        """Test that budget status calculates remaining tokens correctly."""
-        mock_redis = AsyncMock()
-        mock_redis.hgetall = AsyncMock(return_value={
-            "team:backend:used": "75000",
-            "team:backend:limit": "100000",
-        })
-
-        with patch("cache.redis_pool.get_redis", return_value=mock_redis):
-            response = await client.get(
-                "/admin/budget-status",
-                headers={"Authorization": "Bearer admin-key"},
-            )
-
-        assert response.status_code == 200
-        data = response.json()
-        
-        if "teams" in data and "backend" in data["teams"]:
-            backend = data["teams"]["backend"]
-            assert backend["used"] == 75000
-            assert backend["limit"] == 100000
-            assert backend["remaining"] == 25000
-
-    @pytest.mark.asyncio
-    async def test_budget_status_requires_auth(self, client):
-        """Test that budget status requires authentication."""
-        response = await client.get("/admin/budget-status")
-
-        assert response.status_code == 401
+    async def test_budget_status_is_not_served(self, client):
+        response = await client.get("/admin/budget-status",
+                                    headers={"Authorization": "Bearer admin-key"})
+        assert response.status_code == 404
 
 
 class _FakeConn:
@@ -261,6 +249,22 @@ class TestUsageExport:
         sql, args = pool.conn.fetched_args
         assert "tenant_id = $3" in sql
         assert "nova-med" in args
+
+    @pytest.mark.asyncio
+    async def test_a_non_admin_export_is_always_its_own_tenant(self, client, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
+        pool = _FakePool([])
+
+        async def _fake_get_pool(_dsn):
+            return pool
+
+        with patch("cache.pg_pool.get_pg_pool", _fake_get_pool):
+            response = await client.post(
+                "/admin/usage-export", json={"tenant_id": "nova-med"},
+                headers={"Authorization": "Bearer test-key"})     # a legacy, non-admin key
+        assert response.status_code == 200
+        sql, args = pool.conn.fetched_args
+        assert "tenant_id = $3" in sql and args[-1] == "default" and "nova-med" not in args
 
     @pytest.mark.asyncio
     async def test_usage_export_requires_auth(self, client):

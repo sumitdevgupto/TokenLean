@@ -319,3 +319,26 @@ def test_quality_gate_accepts_at_threshold():
     assert result["status"] == "optimized"
     assert result.get("pushed") is True
     mock_push.assert_called_once()
+
+
+# ─── The local Redis requires its password ───────────────────────────────────
+
+def test_the_optimizer_logs_in_to_redis_with_its_password(monkeypatch):
+    # docker-compose.yml's Redis requires REDIS_PASSWORD: sent as the `default` user's, as the
+    # proxy sends it, and nothing when it is unset (a Redis with no password).
+    import types
+    import run_prompt_optimization as rpo
+    seen = []
+
+    class _Redis:
+        def get(self, key):
+            return None
+
+    fake = types.ModuleType("redis")
+    fake.from_url = lambda url, **kwargs: seen.append(kwargs) or _Redis()
+    monkeypatch.setitem(sys.modules, "redis", fake)
+    monkeypatch.setenv("REDIS_PASSWORD", "pw-local")
+    rpo.get_current_template("redis://localhost:6379/0", "tpl")
+    monkeypatch.delenv("REDIS_PASSWORD")
+    rpo.get_current_template("redis://localhost:6379/0", "tpl")
+    assert seen == [{"username": "default", "password": "pw-local"}, {}]

@@ -50,8 +50,8 @@ def _non_gpt_tiktoken_fallback() -> bool:
         val = (get_config() or {}).get("savings", {}).get("non_gpt_tiktoken_fallback")
         if val is not None:
             return bool(val)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("savings.non_gpt_tiktoken_fallback unreadable: %r", exc)
     return os.getenv("NON_GPT_TIKTOKEN_FALLBACK", "false").lower() in ("1", "true", "yes")
 
 
@@ -181,8 +181,8 @@ def count_tools_tokens(tools: List[Dict[str, Any]], model: str) -> int:
         if _pc is not None:
             _body, _const = _pc
             return estimate_tokens(_body, model) + int(_const)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("adapter tool rendering failed, estimating generically: %r", exc)
     import json
     rendered: List[str] = []
     n_json_fallback = 0
@@ -193,8 +193,8 @@ def count_tools_tokens(tools: List[Dict[str, Any]], model: str) -> int:
                 # Signature syntax is part of the render — no extra per-tool pad.
                 rendered.append(_render_tool_signature(fn))
                 continue
-            except Exception:  # noqa: BLE001 — estimator must never fail a request
-                pass
+            except Exception as exc:  # noqa: BLE001 — estimator must never fail a request
+                logger.debug("tool signature render failed: %r", exc)
         try:
             rendered.append(json.dumps(tool, separators=(',', ':')))
         except (TypeError, ValueError):

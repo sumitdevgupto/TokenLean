@@ -1,8 +1,9 @@
 # ─── Commercial layer — excluded from the OSS proxy image (item 19) ───────────
 # The proxy build context is ./src/proxy and the Dockerfile does `COPY . .`, so
-# these commercial-layer modules must be excluded from the free image. Mirrors
-# the commercial .gitignore. Engines STAY in the image: billing/metering.py,
-# billing/models.py, billing/api.py, audit/, tenancy/.
+# these commercial-layer modules must be excluded from the free image. Every
+# commercial path under src/proxy in .gitignore must be listed here; CI checks it
+# (scripts/ci/commercial_paths.py --dockerignore src/proxy). Engines STAY in the
+# image: billing/metering.py, billing/models.py, billing/api.py, audit/, tenancy/.
 api/portal.py
 api/portal_auth.py
 api/email_sender.py
@@ -12,6 +13,12 @@ api/gdpr.py
 api/admin.py
 api/docs.py
 api/docs_cache.py
+api/tenant_provisioning.py
+api/upload.py
+api/webhooks.py
+# The commercial image's own build files.
+Dockerfile.commercial
+Dockerfile.commercial.dockerignore
 # Docs-seeder + docs snapshot staged for the COMMERCIAL image only — the OSS image must not
 # carry enterprise docs. (Dockerfile.commercial.dockerignore does NOT strip this, so the paid
 # image keeps it.)

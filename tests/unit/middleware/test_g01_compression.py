@@ -437,6 +437,49 @@ async def test_call_llmlingua_payload_includes_force_reserve_digit():
     assert payload["force_reserve_digit"] is False
 
 
+def _mock_sidecar_client():
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"compressed": "x"}
+    mock_resp.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    return mock_client
+
+
+@pytest.mark.asyncio
+async def test_call_llmlingua_sends_the_identity_token_the_sidecar_requires(monkeypatch):
+    """On GCP llmlingua-svc refuses callers without an identity token."""
+    import ml_models
+    from middleware.g01_compression import _call_llmlingua
+    asked = []
+    monkeypatch.setattr(ml_models, "cloud_run_auth_headers",
+                        lambda url: asked.append(url) or {"Authorization": "Bearer tok"})
+    mock_client = _mock_sidecar_client()
+    url = "https://llmlingua-svc-abc123-el.a.run.app/compress"
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        assert await _call_llmlingua(url, "some long text here", 0.5) == "x"
+    assert asked == [url]
+    assert mock_client.post.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+@pytest.mark.asyncio
+async def test_call_llmlingua_skips_compression_when_no_token_can_be_had(monkeypatch):
+    import ml_models
+    from middleware.g01_compression import _call_llmlingua
+
+    def metadata_down(url):
+        raise OSError("metadata server unreachable")
+
+    monkeypatch.setattr(ml_models, "cloud_run_auth_headers", metadata_down)
+    mock_client = _mock_sidecar_client()
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        out = await _call_llmlingua("https://llmlingua-svc-abc123-el.a.run.app/compress",
+                                    "some long text here", 0.5)
+    assert out == "some long text here" and not mock_client.post.called
+
+
 # ─── Deterministic regex prose fallback (Step 2c) ─────────────────────────────
 import pytest as _pytest
 from unittest.mock import AsyncMock as _AsyncMock, patch as _patch
@@ -504,3 +547,91 @@ class TestG01DeterministicFallback:
                     new=_AsyncMock(return_value=faithful_short)):
             ctx = await G01Compression().process_request(ctx)
         assert ctx.messages[0]["content"] == faithful_short  # DET did not re-run
+
+
+# ─── Layered composition is opt-in per system message ─────────────────────────
+_LAYERS = {
+    "base": "You are a helpful AI assistant.",
+    "role": "You specialize in {domain}.",
+    "task": "Your current task is to {task_description}.",
+    "dynamic": "Additional context: {context}",
+}
+_HANDLEBARS = "You write Handlebars emails. Use {{first_name}} for the name. Never mention pricing."
+_OPT_IN = {"domain": "billing", "task_description": "answer invoice questions",
+           "context": "EU customers"}
+
+
+@_pytest.mark.asyncio
+class TestLayeredCompositionIsOptIn:
+    """It used to fire on any system prompt containing "{{" and "}}", replacing the
+    developer's instructions with the generic layers, on by default."""
+
+    async def _run(self, make_ctx, messages, **cfg):
+        ctx = make_ctx(messages)
+        # A token floor no request reaches: only the composition step runs.
+        _g01_cfg(ctx, min_tokens_to_compress=10**9, layers=dict(_LAYERS), **cfg)
+        from middleware.g01_compression import G01Compression
+        return await G01Compression().process_request(ctx)
+
+    async def test_a_prompt_that_mentions_template_syntax_is_left_alone(self, make_ctx):
+        messages = [{"role": "system", "content": _HANDLEBARS}, {"role": "user", "content": "hi"}]
+        ctx = await self._run(make_ctx, messages, layered_composition_enabled=True)
+        assert ctx.messages == messages
+        assert not ctx.savings.step_savings
+
+    async def test_an_opted_in_message_is_composed_and_loses_the_field(self, make_ctx):
+        messages = [{"role": "system", "content": "{{layers}}", "layer_context": dict(_OPT_IN)},
+                    {"role": "user", "content": "hi"}]
+        ctx = await self._run(make_ctx, messages, layered_composition_enabled=True)
+        system = ctx.messages[0]
+        assert set(system) == {"role", "content"}
+        for text in ("You are a helpful AI assistant.", "You specialize in billing.",
+                     "Your current task is to answer invoice questions.",
+                     "Additional context: EU customers"):
+            assert text in system["content"]
+        assert ctx.messages[1] == {"role": "user", "content": "hi"}
+
+    async def test_the_composition_is_recorded_as_a_step(self, make_ctx):
+        messages = [{"role": "system", "content": "x", "layer_context": dict(_OPT_IN)}]
+        ctx = await self._run(make_ctx, messages, layered_composition_enabled=True)
+        assert len(ctx.savings.step_savings) == 1
+        step = ctx.savings.step_savings[0]
+        assert step.group == "G01" and "Layered system prompt composed" in step.description
+        assert step.tokens_after > step.tokens_before
+
+    async def test_off_by_default_and_the_field_is_still_removed(self, make_ctx):
+        ctx = make_ctx([{"role": "system", "content": "Keep me.", "layer_context": dict(_OPT_IN)}])
+        _g01_cfg(ctx, min_tokens_to_compress=10**9, layers=dict(_LAYERS))
+        ctx.config["groups"]["G1_compression"].pop("layered_composition_enabled")
+        from middleware.g01_compression import G01Compression
+        ctx = await G01Compression().process_request(ctx)
+        assert ctx.messages == [{"role": "system", "content": "Keep me."}]
+
+    async def test_only_a_system_message_with_an_object_is_composed(self, make_ctx):
+        messages = [{"role": "system", "content": "S", "layer_context": "billing"},
+                    {"role": "user", "content": "hi", "layer_context": dict(_OPT_IN)}]
+        ctx = await self._run(make_ctx, messages, layered_composition_enabled=True)
+        assert ctx.messages == [{"role": "system", "content": "S"},
+                                {"role": "user", "content": "hi"}]
+
+    async def test_the_layers_follow_the_config(self, make_ctx):
+        """The composer used to be built once, from the first request's config, and kept for
+        the process: a reload or another tenant's layers never took effect."""
+        from middleware.g01_compression import G01Compression
+        g01 = G01Compression()
+        composed = []
+        for base in ("You are the billing assistant.", "You are the travel assistant."):
+            ctx = make_ctx([{"role": "system", "content": "", "layer_context": {}}])
+            _g01_cfg(ctx, min_tokens_to_compress=10**9, layered_composition_enabled=True,
+                     layers={"base": base})
+            ctx = await g01.process_request(ctx)
+            composed.append(ctx.messages[0]["content"])
+        assert composed == ["You are the billing assistant.", "You are the travel assistant."]
+
+
+def test_the_template_ships_layered_composition_off():
+    import yaml
+    from pathlib import Path
+    template = Path(__file__).resolve().parents[3] / "config" / "config.yaml.template"
+    cfg = yaml.safe_load(template.read_text(encoding="utf-8"))
+    assert cfg["groups"]["G1_compression"]["layered_composition_enabled"] is False

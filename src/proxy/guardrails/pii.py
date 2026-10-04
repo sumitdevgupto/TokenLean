@@ -26,9 +26,13 @@ only (see G29 middleware), so no PII is ever persisted by this feature.
 """
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ── Entity type constants (stable strings — used as metric/audit labels) ───────
 EMAIL = "EMAIL"
@@ -55,7 +59,12 @@ PHI_ENTITIES: Tuple[str, ...] = (DEA, NPI, MRN, ICD10)
 # overlap-resolution time, not here.
 DEFAULT_ENTITIES: Tuple[str, ...] = (EMAIL, US_SSN, CREDIT_CARD, PHONE, IP_ADDRESS)
 
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+# Local part, domain and top-level domain are bounded to their RFC maximums (64, 253
+# and 63 chars). Unbounded, a long run of local-part characters with no '@' in it ("a."
+# repeated) made every word boundary rescan to the end of the run: quadratic, minutes
+# on the shared event loop for a few hundred KB. Bounded, each start position scans at
+# most 64 chars, so the whole scan is linear. Real addresses match exactly as before.
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,63}\b")
 
 # SSN: 3-2-4 with '-' or single-space separators. Reject the obviously-invalid area
 # numbers (000, 666, 900-999) and group/serial all-zero blocks so we don't mask an
@@ -192,7 +201,7 @@ class PiiDetector:
     ) -> None:
         self.entities = tuple(entities) if entities else DEFAULT_ENTITIES
         self.min_card_len = min_card_len
-        self._presidio = _build_presidio_analyzer() if use_presidio else None
+        self._presidio = _shared_presidio_analyzer() if use_presidio else None
 
     def detect(self, text: str) -> List[PiiMatch]:
         """Return non-overlapping PII spans in ``text``, left to right.
@@ -202,7 +211,7 @@ class PiiDetector:
         if not text or not isinstance(text, str):
             return []
         raw: List[PiiMatch] = []
-        if EMAIL in self.entities:
+        if EMAIL in self.entities and "@" in text:  # no '@', no address: skip the scan
             raw += [PiiMatch(EMAIL, m.start(), m.end(), m.group()) for m in _EMAIL_RE.finditer(text)]
         if US_SSN in self.entities:
             raw += [PiiMatch(US_SSN, m.start(), m.end(), m.group()) for m in _SSN_RE.finditer(text)]
@@ -246,7 +255,8 @@ class PiiDetector:
             etype = _PRESIDIO_TYPE_MAP.get(getattr(r, "entity_type", ""), getattr(r, "entity_type", "PII"))
             try:
                 out.append(PiiMatch(etype, r.start, r.end, text[r.start:r.end]))
-            except Exception:
+            except Exception as exc:
+                logger.debug("Presidio match unusable, skipped: %r", exc)
                 continue
         return out
 
@@ -351,3 +361,23 @@ def _build_presidio_analyzer():
         return AnalyzerEngine()
     except Exception:
         return None
+
+
+# The process's one AnalyzerEngine: building one loads the spaCy model (seconds, hundreds of
+# MB), and a detector is rebuilt whenever its entity set changes (a tenant's `phi` setting),
+# so each detector building its own stalled the event loop per request. An engine is not
+# tied to an entity set: detect() maps whatever it finds. _UNAVAILABLE records a failed build
+# so a missing package is not imported again on every detector.
+_UNAVAILABLE = object()
+_PRESIDIO_ENGINE: Any = None
+_PRESIDIO_LOCK = threading.Lock()
+
+
+def _shared_presidio_analyzer():
+    """The process's Presidio AnalyzerEngine, built on first use, or None if unavailable."""
+    global _PRESIDIO_ENGINE
+    with _PRESIDIO_LOCK:
+        if _PRESIDIO_ENGINE is None:
+            built = _build_presidio_analyzer()
+            _PRESIDIO_ENGINE = _UNAVAILABLE if built is None else built
+    return None if _PRESIDIO_ENGINE is _UNAVAILABLE else _PRESIDIO_ENGINE

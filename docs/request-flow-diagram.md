@@ -59,7 +59,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G28 CCR (req)     → replace repeated blocks with [CCR:sha256] + expose ccr MCP tools│       │
 │  │  G19 Headroom (req)→ structural pruning of code/JSON/logs/text                       │       │
 │  │  G09 Schema        → prose detection → Instructor typed output → compact handoffs    │       │
-│  │  G10 Memory        → sliding window + Mem0 + Zep + Qdrant skills → injected recall │       │
+│  │  G10 Memory        → sliding window + Mem0 + Qdrant skills → injected recall         │       │
 │  │  G22 Dedup         → collapse near-duplicate conversation turns (cosine / n-gram)    │       │
 │  │  G26 Ctx Budget    → over X% of usable window? prune → compress → summarise → drop   │       │
 │  │  G31 Context-Trust → re-scan assembled RAG/memory context → allow|flag|block|strip  │       │
@@ -95,7 +95,7 @@ The authoritative ordering lives in `src/proxy/middleware/pipeline.py` (`Optimis
 │  │  G32 Tool Eligibility→ allow/deny policy over requested tool_calls → flag | block   │       │
 │  │  G14 Tool Output    → field projection + truncation + parallel combining            │       │
 │  │  G28 CCR (resp)     → compress repeated response blocks for downstream reuse         │       │
-│  │  G23 Streaming Comp.→ collapse repeated n-grams → response["x_compressed_content"]  │       │
+│  │  G23 Streaming Comp.→ measure repeated n-grams (a counter; saves nothing)           │       │
 │  │  G19 Headroom (resp)→ structural pruning of response / tool outputs                  │       │
 │  │  G15 Server Compute → hook-based filter/sort/project + G28 MCP tool dispatch        │       │
 │  └─────────────────────────────────────────────────────────────────────────────────────┘       │
@@ -190,9 +190,9 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Populates `ctx.skip_groups` so groups with historically negative savings for this request
   pattern are skipped downstream
 
-**G04: Bypass Rules** (`g04_bypass.py` + `g04_db_resolution.py`)
-- Database-first resolution: PostgreSQL rules (`pg_trgm` fuzzy + exact hash, 60s cached) with
-  config-file fallback (`bypass-rules.yaml`)
+**G04: Bypass Rules** (`g04_bypass.py`)
+- Database-first rules: PostgreSQL `bypass_rules` (60s cached) with config-file fallback
+  (`bypass-rules.yaml`)
 - Confidence scoring: keyword (40%) + pattern (60%); dispatch `static_response` or `backend_url`
 - If match: set `ctx.bypassed=True`, skip LLM call entirely
 
@@ -243,14 +243,15 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Applies prompts/templates tuned by the offline optimiser inline
 - Heavy optimisation runs out-of-band (`scripts/run_prompt_optimization.py`, Opik/DSPy)
 
-**G07: Retrieval** (`g07_retrieval.py` + `g07_pgvector_fallback.py`)
+**G07: Retrieval** (`g07_retrieval.py`)
 - JIT toggle via config or `x_jit_retrieval` param
 - Hybrid dense+sparse (SPLADE/BM25) via Qdrant RRF fusion; pgvector fallback option
 - ChunkGuard size limits; cross-encoder rerank → top-1/2 before injection
 
-**G08: Tool Loading** (`g08_tool_loading.py` + `g08_mcp_loader.py`)
+**G08: Tool Loading** (`g08_tool_loading.py`)
 - Intent-based tool filtering; MCP manifest lazy-load from MCP servers (Redis-cached)
-- Tool-usage analytics; scheduled pruning of tools inactive for 30 days
+- Tool-usage records (first and last offered; last called, from the response) for a daily
+  pruning of registry tools the model has stopped calling (report only by default)
 
 **G28: Context Compression & Reuse — request side** (`g28_ccr.py`)
 - Replaces repeated verbatim blocks (≥ `min_tokens`) with a compact `[CCR:sha256]` reference token
@@ -267,12 +268,14 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Detect prose-heavy inter-agent context; Instructor-driven typed extraction with heuristic fallback
 - Enforce compact typed schema for structured handoffs
 
-**G10: Memory** (`g10_memory.py` + `g10_mem0_adapter.py`)
+**G10: Memory** (`g10_memory.py`)
 - Sliding window (last N turns verbatim, summarise older); Qdrant-backed skills retrieval
-- Optional Mem0 long-term entity memory and Zep conversation-graph memory (off by default)
+- Optional Mem0 long-term memory (off by default), kept per tenant and per authenticated
+  user
 
 **G22: Deduplication** (`g22_deduplication.py`)
-- Collapses near-duplicate conversation turns by cosine similarity
+- Drops near-duplicate consecutive turns of one role by cosine similarity, keeping the last
+  of each run word for word
 - Falls back to character n-gram similarity when sentence-transformers is unavailable
 
 **G26: Context Budget** (`g26_context_budget.py` + `history_utils.py`) — *runs last in Stage 3*
@@ -315,9 +318,10 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
   the same limitation the G29/G30 response scans carry. Default `mode: flag` with an empty
   policy, which can never deny anything, so a default install is byte-identical.
 
-**G16: Agent Architecture** (`g16_agent_arch.py` + `g16_langgraph_runtime.py`)
+**G16: Agent Architecture** (`g16_agent_arch.py`)
 - Anti-pattern advisories (role stacking, oversized system prompts, tool sprawl)
-- Optional `LangGraphRuntime` for budget-aware agent execution
+- Enforced limits: excess tool definitions pruned; oversized system prompts compacted when
+  the operator opts in (`system_prompt_overflow: compact`)
 
 **G11: Output Format** (`g11_output_format.py`)
 - Optionally cap `max_tokens` from past answer sizes — **off by default**
@@ -334,8 +338,10 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
   - OpenAI o1/o3: `reasoning_effort`; Anthropic: `thinking.budget_tokens`; Gemini: `thinking_config`
 - Optional reasoning-suppression prompt injected at low/medium effort
 
-**G13: Batch Processing** (`g13_batch.py` + `g13_toon.py`)
-- TOON compact notation (`#C1`/`#P1` code substitution, legend transmitted once)
+**G13: Batch Processing** (`g13_batch.py`)
+- TOON: arrays of uniform objects in user messages rewritten as a compact table, only where
+  that saves tokens (`toon_*` settings; off unless a system message carries the TOON marker
+  or `toon_auto_detect` is on)
 - Batch accumulation via Redis Streams; if batchable → `ctx.batch_deferred=True`, return 202
 - Optional **provider-native batch lane** (`provider_native: true`, default off): a flushed batch is grouped by provider and submitted to a native Batch API for the 50% discount — **OpenAI** via direct SDK, **Anthropic/Gemini** via litellm's unified batch API; `poll_batch_jobs`/`start_batch_poller` map results back to each `request_id` for `/v1/batch/results/{id}`. Missing key / unsupported provider / errors fall back to the per-item loop (failed provider memoised per process)
 
@@ -348,7 +354,8 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 **G21: Cache Alignment + Cache Policy v2** (`g21_cache_alignment.py`) — *final pre-send stage*
 - Reorders messages so shared prefixes are contiguous for provider prompt-caching
 - Emits a deterministic, tenant-scoped OpenAI `prompt_cache_key` (raises hit rate) via the provider adapter; skipped on `bypassed`/`cache_hit`
-- On the response path, G18 credits the **real** `cached_tokens` discount into `cost_actual_usd` using the adapter's per-provider `cache_read_multiplier` (OpenAI 0.5 / Anthropic 0.1 / Gemini 0.25) — replacing the old static estimate
+- On the response path, G18 credits the **real** `cached_tokens` discount into `cost_actual_usd` using the adapter's per-provider `cache_read_multiplier` (OpenAI 0.5 / Anthropic 0.1 / Gemini 0.25) — replacing the old static estimate. The baseline gets the same discount when the request would have been cached without the proxy, so only a discount the proxy made possible counts as a saving
+- Cache markers, the caller's or G21's, go only to providers that cache by marker (Anthropic, Bedrock); G21's Anthropic marker is not placed when the caller placed its own
 - Zero latency / zero quality risk; cost saving only (50–90% discount on the cached prefix)
 
 **Final Token Count Recording**
@@ -362,6 +369,13 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 ### 7. Response Pipeline (`middleware/pipeline.py`)
 
 **STAGE 5 — After the Response**
+
+*If a stage fails.* G29, G30 and G32 make the answer safe to serve: if one of them raises,
+the answer is withheld and the request ends in a 500. It is still recorded, as a non-billable
+usage row priced at what the provider billed, with its security audit row. Any other response
+stage (G14, G28, G23, G19, G15, G11, G18, the G05 cache store) is skipped when it raises, and
+the answer is served with the edits that stage had completed; a failed G18 still prices the
+call. Both are logged and counted on `token_opt_response_stage_errors_total{stage}`.
 
 **G29: PII Redaction — response side** (`g29_pii_redaction.py`) — *runs first*
 - Masks PII found in the model's OUTPUT and, when `mask` + reversible, restores the caller's own
@@ -381,7 +395,7 @@ Developer application sends `POST /v1/chat/completions` with `Authorization: Bea
 - Compresses repeated verbatim blocks in the response for downstream reuse / memory
 
 **G23: Streaming Compression** (`g23_streaming_compression.py`)
-- Collapses repeated n-gram patterns in response text → `response["x_compressed_content"]`
+- Measures how much of each answer repeats itself (repeated n-gram patterns) into `token_opt_g23_compressible_output_tokens_total`; the answer is not changed and no saving is recorded
 
 **G19: Headroom — response side** (`g19_headroom.py`)
 - Structural pruning of responses / tool outputs (same strategies as the request side)
@@ -453,17 +467,16 @@ Request → Auth → Context → G00 … G13 (batchable) → Return 202 Accepted
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/v1/chat/completions` | POST | Main proxy endpoint (OpenAI-compatible) |
-| `/v1/messages` | POST | **Native Anthropic Messages ingress** (#4) — Claude SDK / Claude Code point here one-line (`x-api-key` or Bearer). Normalised into the same pipeline; response re-serialised to Anthropic shape (streaming + non-streaming). `tool_use`/`tool_result` round-trip structurally (ids preserved) — not degraded to text |
+| `/v1/messages` | POST | **Native Anthropic Messages ingress** (#4) — Claude SDK / Claude Code point here one-line (`x-api-key` or Bearer). Normalised into the same pipeline; response re-serialised to Anthropic shape (streaming + non-streaming). `tool_use`/`tool_result` round-trip structurally (ids preserved) — not degraded to text; the caller's `cache_control` markers are kept where it placed them |
 | `/v1beta/models/{model}:generateContent` | POST | **Native Gemini ingress** (#4) — Gemini SDK (`x-goog-api-key` / `?key=`). Response re-serialised to Gemini `candidates` shape. `functionCall`/`functionResponse` round-trip structurally (id synthesised — Gemini carries none — and correlated by function name, FIFO; same-name parallel calls answered out of order can mis-bind — inherent to the id-less protocol) |
 | `/v1beta/models/{model}:streamGenerateContent` | POST | Native Gemini streaming ingress — SSE with `?alt=sse` (the Gemini wire contract); without it, a JSON array of `GenerateContentResponse`. `functionCall` deltas accumulate and emit structurally in the terminal frame |
 | `/v1/models` | GET | List available models from configured providers |
 | `/v1/groups` | GET | Effective optimisation-group enablement for the calling tenant — `{config_key: enabled}` booleans ONLY (no knob values, so it is safe on the same tenant-key auth as the rest of `/v1`). Reflects the operator `tenants.<id>.groups.*` overlay and the per-tenant DB overrides, i.e. what a REQUEST from that tenant would see. Exists so a deployment can distinguish "group disabled by config" from "group enabled but never fired" without the [Enterprise] portal |
 | `/v1/batch/results/{request_id}` | GET | Poll for deferred batch results |
 | `/ingest-doc` | POST | GCS pub/sub webhook for document ingestion (G03) |
-| `/health` | GET | Health check |
+| `/health` | GET | Health check. While `DATABASE_URL` is set but the database is not wired yet, `status` is `degraded` (HTTP 200) and `not_wired` lists what is missing: `billing`, `audit`, `tenant_config`. The proxy keeps serving and retries, 1 s apart at first and doubling to 30 s; with `MANAGED_DEPLOY=true`, startup waits for the database instead |
 | `/metrics` | GET | Prometheus scrape endpoint |
-| `/admin/alert-webhook` | POST | Alertmanager budget alert receiver |
-| `/admin/budget-status` | GET | Team/feature token usage and remaining budget |
+| `/admin/alert-webhook` | POST | Alertmanager budget alert receiver. Takes the `ALERT_WEBHOOK_TOKEN` bearer token (Terraform generates it and gives it to Alertmanager) or an admin key |
 | `/admin/usage-export` | POST | JSONL export of usage records (over Postgres `usage_events`)* |
 | `/admin/tool-governance` | GET | List stale tools with no recent calls |
 
@@ -513,11 +526,11 @@ from the bucket name and refuses unregistered buckets, so documents never mix be
 ### Job steps (`src/doc-pipeline/pipeline.py:run()`)
 
 1. **Download** the object from GCS (`GCS_BUCKET` / `GCS_OBJECT`).
-2. **Extract text** — Apache Tika sidecar when `USE_TIKA=true`, else Unstructured, else UTF-8 decode.
+2. **Extract text** — Unstructured first; then the Apache Tika sidecar (when `TIKA_SIDECAR_URL` is set) for what Unstructured cannot read, such as Excel and PowerPoint; then a plain-text file as UTF-8. Anything else is refused and nothing is stored.
 3. **Strip boilerplate** — headers/footers, base64 blobs, residual HTML, page numbers.
 4. **Tables → CSV** — markdown tables compacted to CSV rows (≈40–60% fewer tokens on table-heavy docs).
 5. **Chunk** — 256–512-token overlapping chunks (`CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS`).
-6. **Summarise oversized chunks** — any chunk over `MAX_CHUNK_TOKENS` (4,000) is condensed with a cheap model.
+6. **Cut oversized chunks** — a chunk over `MAX_CHUNK_TOKENS` (4,000) is cut into pieces within it, at a line break or a space where one is near the limit. No model is called. It is rare: the splitter targets 400-token chunks, so only token-dense text (some non-Latin scripts) or a raised `CHUNK_SIZE_TOKENS` runs over.
 7. **Embed** — dense (MiniLM-L6-v2) + sparse (BM25/SPLADE via fastembed).
 8. **Upsert** to the Qdrant collection as named `dense`/`sparse` vectors.
 
@@ -528,9 +541,9 @@ from the bucket name and refuses unregistered buckets, so documents never mix be
 | `GCS_BUCKET` / `GCS_OBJECT` | — | The object to ingest (injected per-run as container overrides) |
 | `QDRANT_COLLECTION` / `TENANT_ID` | `rag_docs` / `default` | Per-tenant target collection + tenant stamp (injected per-run; `rag_<tenant>` for multi-tenant, `rag_docs` for single-tenant) |
 | `QDRANT_URL` | `…:6333` | Target vector store |
-| `USE_TIKA` / `TIKA_SIDECAR_URL` | `false` / `http://tika-svc:9998` | Prefer Tika extraction |
+| `TIKA_SIDECAR_URL` | unset | Tika for files Unstructured cannot read; unset = no Tika (the GCP deploy sets it) |
 | `CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS` | `400` / `50` | Chunk sizing |
-| `MAX_CHUNK_TOKENS` | `4000` | Oversized-chunk summarisation threshold |
+| `MAX_CHUNK_TOKENS` | `4000` | Largest chunk stored; a longer one is cut into pieces (step 6) |
 | `DOC_PIPELINE_JOB_NAME` / `GCP_REGION` | `token-opt-doc-pipeline` / `us-central1` | Which Cloud Run Job the webhook launches |
 
 > **Scope of what's implemented.** Clients upload via a signed URL (`POST /portal/upload-url` →
@@ -540,6 +553,10 @@ from the bucket name and refuses unregistered buckets, so documents never mix be
 > `TENANT_ID` per run — the SAME collection the read path (`ctx.qdrant_collection`) uses — and stamps
 > `tenant_id` into every point. Single-tenant/self-host deploys with no registry fall back to the
 > shared `rag_docs` collection, byte-identical to before.
+>
+> The OIDC check is on whenever `DATABASE_URL` is set, unless `INGEST_REQUIRE_OIDC=false`, and it
+> needs both `INGEST_PUSH_SA_EMAIL` and `INGEST_OIDC_AUDIENCE`: with either unset the webhook
+> answers 503 rather than accept any Google-signed token. The GCP deploy sets all three.
 
 ### Fine-tuning (tenant-isolated, operator-invoked)
 
@@ -552,9 +569,12 @@ Operator ─ POST /api/v1/admin/tenants/NOVA-STG-01/finetune {domain}
    → trigger_fine_tuning_pipeline(tenant_id, domain, doc_count)   [g03_doc_pipeline.py]
        ├─ resolve tenant BYOK key (in-proxy) ─ strict-BYOK & none ▶ 402
        ├─ metric token_opt_finetune_jobs_total{tenant_id,status,provider}
-       └─ RunJob env: TENANT_ID, QDRANT_COLLECTION=rag_<tenant>, DOMAIN, TENANT_PROVIDER_KEY, BYOK_ENFORCE
+       ├─ key → a new version of the finetune-tenant-key secret (Secret Manager)
+       └─ RunJob env: TENANT_ID, QDRANT_COLLECTION=rag_<tenant>, DOMAIN, BYOK_ENFORCE,
+          TENANT_PROVIDER_KEY_VERSION (the version's name only: an execution keeps its env)
    → finetune-pipeline Job  [src/finetune-pipeline/pipeline.py]
        ├─ read rag_<tenant> WITH tenant_id filter   (only this tenant's chunks)
+       ├─ read the key from that version; destroy it once the run ends cleanly (exit 0)
        ├─ BYOK guard: strict-BYOK & no key ▶ exit 2 (never the platform key)
        ├─ export → finetune-training/<tenant>/<domain>/<ts>/training.jsonl
        └─ track → t:<tenant>:tok_opt:finetune:<job_id>   (tenant-prefixed Redis)
@@ -659,7 +679,7 @@ class InterAgentState(BaseModel):
 | **RouteLLM sidecar** | Model routing classifier | G06 |
 | **LiteLLM** | LLM provider abstraction | `main.py` |
 | **Langfuse / Prometheus / OTLP** | Observability & tracing | G18, `langfuse_tracing.py`, `tracing/otel.py` |
-| **Mem0 / Zep / Instructor (optional)** | Long-term memory / typed output | G10, G09 |
+| **Mem0 / Instructor (optional)** | Long-term memory / typed output | G10, G09 |
 
 ## Configuration Hot-Reload
 
@@ -673,7 +693,8 @@ Every 60 seconds, a daemon thread in `config_loader.py`:
 - **Config Hot-Reload** — every 60s
 - **G03 Doc Pipeline** — GCS pub/sub → `POST /ingest-doc` (Tika extraction, RAG fallback, optional fine-tune)
 - **G05 Auto-TTL** — `AutoTTLManager` adjusts TTLs from hit-rate stats
-- **G08 Scheduled Pruning** — removes MCP tools inactive for 30 days
+- **G08 Scheduled Pruning** — daily, per tenant: registry tools offered for 30 days that the
+  model did not call; reported, or marked pruned once `pruning.dry_run_first` is false
 - **G02 Template Deprecation** — scheduled stale-template checks
 - **G13 Batch Consumer** — Redis Streams background consumers (TOON legend amortisation)
 - **G20 Prompt Optimisation** — offline optimiser feeding G2/G20 learned templates
@@ -690,13 +711,19 @@ total_absolute_saving = baseline_tokens - final_tokens_sent
 total_pct_saving      = (total_absolute_saving / baseline_tokens) * 100
 cost_baseline_usd     = (baseline_tokens/1000)*input_price + (response_tokens/1000)*output_price
 cost_actual_usd       = (final_tokens_sent/1000)*input_price + (response_tokens/1000)*output_price
+                        + every other paid call at list price: cascade tier probes, the G06
+                          judge, G09 schema extraction, the G10/G26 summariser, G11 repair
 cost_saving_usd       = cost_baseline_usd - cost_actual_usd
 ```
 
 > **Fair disclosure.** Token counts are exact. **Cost figures are config-priced estimates** — they
-> use the static `pricing:` table in `config.yaml` and do **not** model provider discounts,
-> prompt-cache/batch credits, or reasoning surcharges; `baseline_tokens` is a counterfactual.
-> Treat `cost_*_usd` as directional, **not invoice-grade**.
+> use the static `pricing:` table in `config.yaml` and do **not** model negotiated provider
+> discounts, batch credits, or reasoning surcharges; `baseline_tokens` is a counterfactual.
+> Treat `cost_*_usd` as directional, **not invoice-grade**. Both costs price the provider's
+> reported prompt-cache reads and writes at the configured rates; the baseline does so only when
+> the request would have been cached without the proxy (its provider caches repeated prompts on
+> its own, or the caller marked the prompt for caching), so `cost_saving_usd` counts a cache
+> discount only where the proxy made it possible.
 
 ### Two-track model (savings vs billing)
 
@@ -719,19 +746,19 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 | **G01** | `g01_compression.py` | Prompt compression, layered composition |
 | **G02** | `g02_template_registry.py` | Template management, deprecation, budget |
 | **G03** | `g03_doc_pipeline.py` (+ `src/doc-pipeline/`, `src/finetune-pipeline/`, `src/tika-sidecar/`) | Document ingestion, RAG fallback, fine-tuning |
-| **G04** | `g04_bypass.py`, `g04_db_resolution.py` | Rules-based bypass with DB-first resolution |
+| **G04** | `g04_bypass.py` | Rules-based bypass with DB-first rules |
 | **G05** | `g05_cache.py` | L1/L2 caching, Auto-TTL, activity replay (`G05Cache.temporal_activity_replay`) |
 | **G06** | `g06_routing.py` | Model routing/cascade with confidence scoring |
-| **G07** | `g07_retrieval.py`, `g07_pgvector_fallback.py` | Hybrid RAG retrieval, pgvector fallback |
-| **G08** | `g08_tool_loading.py`, `g08_mcp_loader.py` | Intent-based tool loading, MCP lazy manifest |
+| **G07** | `g07_retrieval.py` | Hybrid RAG retrieval, pgvector fallback |
+| **G08** | `g08_tool_loading.py` | Intent-based tool loading, MCP lazy manifest |
 | **G09** | `g09_context_schema.py` | Prose detection, Instructor schema enforcement |
-| **G10** | `g10_memory.py`, `g10_mem0_adapter.py` | Conversation memory, Mem0, Zep, skills |
+| **G10** | `g10_memory.py` | Conversation memory, Mem0, skills |
 | **G11** | `g11_output_format.py` | JSON schema / `response_format`; opt-in (default OFF) per-workflow `max_tokens` cap |
 | **G12** | `g12_reasoning_budget.py` | Provider-specific reasoning budget, effort levels |
-| **G13** | `g13_batch.py`, `g13_toon.py` | Batch processing, TOON notation |
+| **G13** | `g13_batch.py` | Batch processing, TOON notation |
 | **G14** | `g14_tool_output.py` | Tool output projection and structural compaction |
 | **G15** | `g15_server_compute.py` | Server-side hooks for CCR tool dispatch |
-| **G16** | `g16_agent_arch.py`, `g16_langgraph_runtime.py` | Agent advisories, LangGraph |
+| **G16** | `g16_agent_arch.py` | Agent advisories, tool pruning, prompt compaction |
 | **G17** | `g17_loop_control.py` | Loop control, InterAgentState, budget propagation |
 | **G18** | `g18_observability.py`, `langfuse_tracing.py` | Prometheus metrics, Langfuse tracing, usage records |
 | **G19** | `g19_headroom.py` | Structural pruning (line/sentence/JSON, not AST) — request + response |
@@ -754,11 +781,12 @@ StepSaving(group="G01", description="LLMLingua-2 prompt compression",
 
 ## Implementation Status: 28 optimisation groups (G0–G28) + 4 trust & safety (G29/G30/G31/G32) + F2
 
-All 28 optimisation slots are implemented — G26 filled the last reserved slot with budget-aware
-context management — plus the four non-savings **trust & safety** groups
+27 of the 28 optimisation slots are implemented — G26 filled the last open one with budget-aware
+context management, and G27 (multimodal) is reserved: no image transform ships — plus the four
+non-savings **trust & safety** groups
 (G29 PII, G30 injection, G31 context-trust, G32 tool-call eligibility) and the OSS-core
 **F2 Intent Orchestration** stage.
-Optional integrations (Mem0, Zep, Instructor, Presidio) degrade
+Optional integrations (Mem0, Instructor, Presidio) degrade
 gracefully when their packages or backing services are absent.
 
 ---

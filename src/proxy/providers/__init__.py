@@ -7,7 +7,6 @@ the OpenAI adapter so single-provider deployments need no config change.
 """
 from __future__ import annotations
 
-import copy
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -26,19 +25,119 @@ REASONING_OFF = "off"
 # Ordered lowest-effort-first. `off` is a real rung below `low`, not a sentinel.
 REASONING_TIERS = (REASONING_OFF, "low", "medium", "high")
 
+# The first line of the system message G07 puts retrieved documents in. They change with
+# every query, so they belong to the prompt's changing tail, never its cacheable prefix: G21
+# keeps them out of the prefix and of the cache key it derives from it, and an adapter's
+# cacheable span leaves them out. G31 still scans them, as a system message.
+RETRIEVED_CONTEXT_MARKER = "[Retrieved context]"
 
-def build_batch_jsonl(items: List[Dict]) -> str:
+
+def is_retrieved_context(message: Dict) -> bool:
+    """Whether ``message`` is the system message G07 wrote retrieved documents into."""
+    content = message.get("content")
+    return (message.get("role") == "system" and isinstance(content, str)
+            and content.lstrip().startswith(RETRIEVED_CONTEXT_MARKER))
+
+
+CACHE_MARKER_KEY = "cache_control"
+
+
+def _unmarked(item: Dict) -> Dict:
+    """A copy of ``item`` without its prompt-cache marker."""
+    return {k: v for k, v in item.items() if k != CACHE_MARKER_KEY}
+
+
+def _parts_unmarked(parts: Any) -> Any:
+    """``parts`` with the marker removed from every dict in it, or ``parts`` itself when
+    none carries one, so the common case copies nothing."""
+    if not isinstance(parts, list) or not any(
+            isinstance(p, dict) and CACHE_MARKER_KEY in p for p in parts):
+        return parts
+    return [_unmarked(p) if isinstance(p, dict) else p for p in parts]
+
+
+def without_cache_markers(messages: Any) -> Any:
+    """``messages`` without a prompt-cache marker (``cache_control``) on any message,
+    content part or tool call, the places litellm reads one. The input is never changed:
+    a message carrying none is passed on as it is, and so is the list when none does."""
+    if not isinstance(messages, list):
+        return messages
+    out, changed = [], False
+    for m in messages:
+        if isinstance(m, dict):
+            clean = _unmarked(m) if CACHE_MARKER_KEY in m else m
+            for key in ("content", "tool_calls"):
+                value = clean.get(key)
+                stripped = _parts_unmarked(value)
+                if stripped is not value:
+                    clean = dict(clean) if clean is m else clean
+                    clean[key] = stripped
+            changed = changed or clean is not m
+            m = clean
+        out.append(m)
+    return out if changed else messages
+
+
+def _tools_without_cache_markers(tools: Any) -> Any:
+    """``tools`` without a marker on any tool or its ``function`` (litellm reads both)."""
+    if not isinstance(tools, list):
+        return tools
+    out, changed = [], False
+    for t in tools:
+        if isinstance(t, dict):
+            clean = _unmarked(t) if CACHE_MARKER_KEY in t else t
+            fn = clean.get("function")
+            if isinstance(fn, dict) and CACHE_MARKER_KEY in fn:
+                clean = dict(clean) if clean is t else clean
+                clean["function"] = _unmarked(fn)
+            changed = changed or clean is not t
+            t = clean
+        out.append(t)
+    return out if changed else tools
+
+
+def outgoing_messages_for(adapter: Optional["ProviderAdapter"], messages: Any) -> Any:
+    """The client's messages as ``adapter``'s provider should receive them.
+
+    A prompt-cache marker is an Anthropic cache breakpoint. litellm hands it on to a
+    provider that caches by marker, strips it for OpenAI, turns it into a separately
+    created explicit cache for Gemini (billed by the hour, and priced by nothing here),
+    and passes it to a custom OpenAI-compatible endpoint that may reject it. So only a
+    provider that caches by marker gets the markers; any other, and a call whose provider
+    is unknown, gets none. Every provider call made with the client's messages goes
+    through here: main's primary, streamed and failover calls, the G06 cascade tiers,
+    G11's repair and G13's batch lane. ``outgoing_params_for`` applies the same rule to
+    tools and the request-level marker.
+    """
+    if adapter is not None and adapter.prompt_cache_needs_marker():
+        return messages
+    return without_cache_markers(messages)
+
+
+def build_batch_jsonl(items: List[Dict], adapter: Optional["ProviderAdapter"] = None) -> str:
     """Build OpenAI-style batch JSONL: one line per item with custom_id=request_id.
 
     Shared by the OpenAI direct-SDK lane and the litellm unified-batch lane so both
-    produce an identical request envelope.
+    produce an identical request envelope. ``adapter`` is the provider the batch goes to,
+    for the prompt-cache marker rule every call follows (``outgoing_messages_for``);
+    without one, no marker is sent.
     """
+    keep_markers = adapter is not None and adapter.prompt_cache_needs_marker()
     lines = []
     for it in items:
-        body: Dict[str, Any] = {"model": it.get("model"), "messages": it.get("messages", [])}
+        messages = it.get("messages", [])
+        body: Dict[str, Any] = {
+            "model": it.get("model"),
+            "messages": messages if keep_markers else without_cache_markers(messages),
+        }
         for k, v in (it.get("params") or {}).items():
             if k.startswith("_") or k.startswith("x_") or k in _NON_FORWARDED_BATCH_PARAMS:
                 continue
+            if not keep_markers:
+                if k == CACHE_MARKER_KEY:
+                    continue
+                if k == "tools":
+                    v = _tools_without_cache_markers(v)
             body[k] = v
         lines.append(json.dumps({
             "custom_id": it["request_id"],
@@ -380,6 +479,19 @@ class ProviderAdapter(ABC):
         """
         return {}
 
+    def prompt_cache_needs_marker(self) -> bool:
+        """True when this provider caches only the prompt a request marks for caching
+        (Anthropic's ``cache_control``); False when it caches repeated prompts on its own.
+
+        G18 reads it to decide whose saving a prompt-cache discount is. The savings
+        baseline is the caller's own request sent straight to the model it asked for, and
+        a provider that caches on its own would have given that request the discount too.
+
+        Default False: assuming the provider caches on its own can under-state the proxy's
+        saving, never claim a discount the caller would have had without the proxy.
+        """
+        return False
+
     def cache_read_cost_multiplier(self, config: Dict) -> float:
         """
         Multiplier applied to provider-reported cached input tokens when computing
@@ -638,7 +750,9 @@ class ProviderAdapter(ABC):
     # (custom_llm_provider=self.name), which normalises results to OpenAI shape —
     # no per-provider response conversion needed. Default supports_native_batch()
     # is False (opt-in): a provider must override it to True, else G13 uses the
-    # per-item loop. Any litellm error → G13 catches it and falls back.
+    # per-item loop. Any litellm error → G13 catches it and falls back. Every call takes
+    # the key G13 resolved: without it litellm reads the provider's own env var, which a
+    # deployment keeps out of the proxy (it bypasses per-tenant key resolution).
 
     def supports_native_batch(self) -> bool:
         """True if this adapter opts into the native batch lane. Default False."""
@@ -651,22 +765,24 @@ class ProviderAdapter(ABC):
         ``{"request_id", "messages", "model", "params"}``.
         """
         import litellm
-        payload = build_batch_jsonl(items).encode("utf-8")
+        payload = build_batch_jsonl(items, self).encode("utf-8")
         file_obj = await litellm.acreate_file(
-            file=payload, purpose="batch", custom_llm_provider=self.name,
+            file=payload, purpose="batch", custom_llm_provider=self.name, api_key=api_key,
         )
         batch = await litellm.acreate_batch(
             input_file_id=file_obj.id,
             endpoint="/v1/chat/completions",
             completion_window=cfg.get("completion_window", "24h"),
             custom_llm_provider=self.name,
+            api_key=api_key,
         )
         return batch.id
 
     async def poll_batch(self, job_id: str, api_key: str) -> str:
         """Return the job status: ``"pending"`` | ``"completed"`` | ``"failed"``."""
         import litellm
-        batch = await litellm.aretrieve_batch(batch_id=job_id, custom_llm_provider=self.name)
+        batch = await litellm.aretrieve_batch(batch_id=job_id, custom_llm_provider=self.name,
+                                              api_key=api_key)
         status = getattr(batch, "status", "") or ""
         if status == "completed":
             return "completed"
@@ -679,11 +795,13 @@ class ProviderAdapter(ABC):
         ``[{"request_id", "response"}]`` / ``[{"request_id", "error"}]`` via litellm.
         """
         import litellm
-        batch = await litellm.aretrieve_batch(batch_id=job_id, custom_llm_provider=self.name)
+        batch = await litellm.aretrieve_batch(batch_id=job_id, custom_llm_provider=self.name,
+                                              api_key=api_key)
         out_id = getattr(batch, "output_file_id", None)
         if not out_id:
             return []
-        content = await litellm.afile_content(file_id=out_id, custom_llm_provider=self.name)
+        content = await litellm.afile_content(file_id=out_id, custom_llm_provider=self.name,
+                                              api_key=api_key)
         return parse_batch_jsonl_results(_file_content_text(content))
 
 
@@ -758,6 +876,22 @@ def _adapter_for_entry(entry: Dict) -> ProviderAdapter:
     return get_adapter_by_name(name)
 
 
+def provider_takes_tenant_key(provider: str, providers_config: List[Dict]) -> bool:
+    """Whether calls to ``provider`` authenticate with the key the BYOK seam resolves.
+
+    False for a provider whose adapter signs with credentials the platform holds (Bedrock's
+    AWS SigV4, or a providers[] entry with ``requires_api_key: false`` such as Vertex ADC):
+    a key stored for it is ignored when the call is made, so it cannot be served on a
+    tenant's own key. An unknown provider is assumed to take one, as before."""
+    entry = next((p for p in providers_config or []
+                  if isinstance(p, dict) and p.get("name") == provider), None)
+    try:
+        adapter = _adapter_for_entry(entry) if entry is not None else get_adapter_by_name(provider)
+        return bool(adapter.requires_api_key())
+    except Exception:
+        return True
+
+
 def build_litellm_call(
     model: str,
     providers_config: List[Dict],
@@ -805,6 +939,30 @@ def apply_context_management(
 # same hygiene without a middleware→main circular import.)
 INTERNAL_PARAM_KEYS = {"template_id", "workflow_id", "rag_query", "batch_id", "burst_block"}
 
+# litellm reads these as arguments of the upstream CALL — routing, credentials,
+# transport, retries, cost overrides, canned responses — not as model parameters.
+# Provider adapters supply the ones a call needs (build_call → call kwargs); they are
+# never taken from request params, whatever an ingress admits. Stripping them in
+# outgoing_params_for covers the primary call, every failover target and the G06
+# cascade tiers.
+LITELLM_CONTROL_KEYS = frozenset({
+    "additional_drop_params", "allowed_openai_params", "api_base", "api_key", "api_type",
+    "api_version", "base_url", "cache", "caching", "client", "client_id", "client_secret",
+    "context_window_fallback_dict", "custom_llm_provider", "deployment_id", "drop_params",
+    "extra_body", "extra_headers", "fallbacks", "headers", "input_cost_per_second",
+    "input_cost_per_token", "max_retries", "model_list", "no-log", "num_retries",
+    "organization", "output_cost_per_second", "output_cost_per_token", "preset_cache_key",
+    "project", "proxy_server_request", "region_name", "request_timeout", "ssl_verify",
+    "stream_timeout", "tenant_id", "timeout", "user_continue_message",
+})
+LITELLM_CONTROL_PREFIXES = ("aws_", "azure_", "litellm_", "mock_", "vertex_", "watsonx_")
+
+
+def is_litellm_control_key(key: Any) -> bool:
+    """True for a params key litellm would treat as an argument of the call itself."""
+    return isinstance(key, str) and (
+        key in LITELLM_CONTROL_KEYS or key.startswith(LITELLM_CONTROL_PREFIXES))
+
 
 def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
                         eff_cfg: Dict[str, Any], request_id: str = "") -> Dict[str, Any]:
@@ -814,12 +972,19 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
     primary path, every failover target, and the deferred G06 cascade tiers alike
     (reviews K4 + S2: no divergent copies). Steps: strip internal keys, strip
     reasoning-only params on non-reasoning models, strip service_tier / unsupported
-    params, cap the thinking budget, apply native context editing.
+    params, strip prompt-cache markers for a provider that does not cache by marker, cap
+    the thinking budget, apply native context editing.
     """
     outgoing = {
         k: v for k, v in ctx.params.items()
         if not k.startswith("_") and not k.startswith("x_") and k not in INTERNAL_PARAM_KEYS
+        and not is_litellm_control_key(k)
     }
+    if request_id:
+        stripped = sorted(k for k in ctx.params if is_litellm_control_key(k))
+        if stripped:
+            logger.debug("[%s] Stripped litellm call argument(s) %s from params",
+                         request_id, stripped)
     # The tier the CALLER asked for, captured before the strips below remove it. A
     # request that asked for `off` still reasons on a model that cannot disable it, so it
     # still needs output headroom — but at the SMALLEST tier, not the default one.
@@ -856,6 +1021,12 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
     for _uk in adapter.unsupported_params():
         if outgoing.pop(_uk, None) is not None and request_id:
             logger.debug("[%s] Stripped unsupported param '%s' for %s", request_id, _uk, model)
+    # Prompt-cache markers on the tools and the request go only to a provider that caches
+    # by marker — the rule outgoing_messages_for applies to the messages.
+    if not adapter.prompt_cache_needs_marker():
+        outgoing.pop(CACHE_MARKER_KEY, None)
+        if "tools" in outgoing:
+            outgoing["tools"] = _tools_without_cache_markers(outgoing["tools"])
     outgoing = adapter.cap_reasoning_params(outgoing, outgoing.get("max_tokens"))
     # Grow the OUTPUT budget so a reasoning model has room to think AND answer. This is
     # the one seam every call path shares (primary, failover, cascade tier), which is
@@ -874,8 +1045,8 @@ def outgoing_params_for(ctx, adapter: ProviderAdapter, model: str,
     if _raised:
         try:
             ctx.output_budget_raised = _raised
-        except Exception:
-            pass
+        except Exception as err:
+            logger.debug("output_budget_raised not recorded: %r", err)
         if request_id:
             logger.info(
                 "[%s] Raised %s %s → %s for %s (effort=%s) — a reasoning model's hidden "

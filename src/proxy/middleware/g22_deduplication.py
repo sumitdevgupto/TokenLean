@@ -1,9 +1,9 @@
 """G22 — Semantic deduplication for multi-turn conversations.
 
-Embeds each user/assistant turn and collapses near-duplicate turns
-(cosine similarity ≥ dedup_threshold) into a single placeholder
-``[summarised: N similar turns]``.  This reduces multi-turn bloat
-caused by repeated phrasings or reformulations of the same question.
+Embeds each user/assistant turn and, in a run of consecutive near-duplicate turns of
+one role (cosine similarity ≥ dedup_threshold), keeps only the last turn, word for
+word. This reduces multi-turn bloat caused by repeated phrasings or reformulations of
+the same question, and the model always sees the latest phrasing.
 
 Embedding is done inline using the same sentence-transformers model
 used by G05 (BGE-small-en-v1.5) when available, falling back to a
@@ -14,7 +14,9 @@ Reference: G22 in token_optimization_playbook_v7.md
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
+from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ _SUMMARISED_ROLES = {"user", "assistant"}
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(x * x for x in b))
     if mag_a == 0 or mag_b == 0:
@@ -87,21 +89,25 @@ class G22Deduplication:
     """
 
     def __init__(self, embedding_model: Optional[Any] = None):
-        self._model = embedding_model
-        self._model_loaded = embedding_model is not None
+        self._injected = embedding_model
+        # Models by name (None = it failed to load: use the n-gram fallback, and do not retry
+        # the load on every request). Read per request rather than once per instance, since a
+        # tenant overlay or a reload may switch use_embeddings or the model; the first
+        # request's choice used to stick for every later one.
+        self._models: Dict[str, Optional[Any]] = {}
 
     def _cfg(self, ctx: Any) -> Dict[str, Any]:
         return ctx.config.get("groups", {}).get("g22_deduplication", {})
 
     def _get_embedding_model(self, cfg: Dict) -> Optional[Any]:
-        if self._model_loaded:
-            return self._model
-        if cfg.get("use_embeddings", True):
-            self._model = _get_model(cfg)
-        # Mark as loaded regardless (None = use n-gram fallback) to avoid
-        # re-entering on every subsequent request when use_embeddings=false.
-        self._model_loaded = True
-        return self._model
+        if not cfg.get("use_embeddings", True):
+            return None
+        if self._injected is not None:
+            return self._injected
+        name = cfg.get("embedding_model", "BAAI/bge-small-en-v1.5")
+        if name not in self._models:
+            self._models[name] = _get_model(cfg)
+        return self._models[name]
 
     async def process_request(self, ctx: Any) -> Any:
         cfg = self._cfg(ctx)
@@ -118,11 +124,6 @@ class G22Deduplication:
         model = self._get_embedding_model(cfg)
         deduped: List[Dict] = []
         pending_group: List[Dict] = []
-        def _content_str(m: Dict) -> str:
-            c = m.get("content", "")
-            return c if isinstance(c, str) else ""
-
-        tokens_before = sum(len(_content_str(m).split()) for m in messages)
 
         for msg in messages:
             role = msg.get("role", "")
@@ -155,28 +156,25 @@ class G22Deduplication:
             if sim >= threshold:
                 pending_group.append(msg)
             else:
-                if len(pending_group) > 1:
-                    placeholder = dict(pending_group[0])
-                    placeholder["content"] = f"[summarised: {len(pending_group)} similar turns]"
-                    deduped.append(placeholder)
-                else:
-                    deduped.extend(pending_group)
+                # A run of near-duplicates keeps its LAST turn word for word: the latest
+                # phrasing, and the question itself when the run ends the conversation. It
+                # used to become "[summarised: N similar turns]", so the model got neither.
+                deduped.append(pending_group[-1])
                 pending_group = [msg]
 
         if pending_group:
-            if len(pending_group) > 1:
-                placeholder = dict(pending_group[0])
-                placeholder["content"] = f"[summarised: {len(pending_group)} similar turns]"
-                deduped.append(placeholder)
-            else:
-                deduped.extend(pending_group)
+            deduped.append(pending_group[-1])
 
+        dropped = len(messages) - len(deduped)
+        if not dropped:
+            return ctx
+        tokens_before = count_messages_tokens(messages, getattr(ctx, "model", ""))
         ctx.messages = deduped
-        tokens_after = sum(len(_content_str(m).split()) for m in deduped)
+        tokens_after = count_messages_tokens(deduped, getattr(ctx, "model", ""))
 
         ctx.savings.add_step(
             group="G22",
-            description=f"G22: collapsed {len(messages) - len(deduped)} duplicate turns",
+            description=f"G22: dropped {dropped} near-duplicate turn(s), kept the latest of each run",
             tokens_before=tokens_before,
             tokens_after=tokens_after,
         )

@@ -337,8 +337,8 @@ class TestArmC:
     with a rate dial, which on this deployment is the LLMLingua sidecar — `ratio` is a
     KEEP-fraction, so aiming just above the floor is one more call rather than a search.
 
-    WITHOUT that sidecar there is no dial and the code falls back to arm B, preserving the
-    span whole. The tests below stub the sidecar precisely because the deterministic
+    WITHOUT that sidecar there is no dial, so the choice is arm A or arm B (preserving the
+    span whole), whichever is cheaper. The tests below stub the sidecar precisely because the deterministic
     fallback cannot express a target rate; `docs/config-reference.md` and the config
     template say so plainly rather than implying arm C is always available.
     """
@@ -409,6 +409,29 @@ class TestArmC:
         )
         assert getattr(out, "g01_cache_floor_skips", 0) == 0
 
+    async def test_with_a_rate_dial_the_floor_is_aimed_at_even_on_a_small_discount(
+            self, make_ctx, minimal_config, monkeypatch):
+        """Preserving would cost more than compressing here, but landing on the floor costs
+        less still — G01 is the consumer that CAN reach it, so it must not settle for A."""
+        from savings.calculator import count_messages_tokens
+        ctx = self._ctx_two_part(make_ctx, minimal_config)
+        _, span_before = self._span_floor(ctx)
+        words = ctx.messages[0]["content"].split()
+        first = " ".join(words[:max(1, int(len(words) * 0.3))])    # the stub's first pass
+        first_tokens = count_messages_tokens([{**ctx.messages[0], "content": first}], ctx.model)
+        floor, read, write, n = first_tokens + 2, 0.98, 1.0, 30
+        k = write + (n - 1) * read
+        assert k * floor < n * first_tokens < k * span_before, "fixture: C < A < B"
+        ctx.provider_adapter = _Adapter(floor, read_mult=read, write_mult=write,
+                                        span_roles={"system"})
+        self._stub_sidecar(monkeypatch)
+        await _reserve(ctx, monkeypatch, reuse=n)
+
+        out = await G01Compression().process_request(ctx)
+
+        assert out.cache_floor_action == "floored"
+        assert count_messages_tokens([out.messages[0]], ctx.model) >= floor
+
     async def test_an_undershooting_retry_falls_back_to_preserving_the_span(
             self, make_ctx, minimal_config, monkeypatch):
         """When the engine cannot land where it was asked to, the result IS arm B and
@@ -450,6 +473,66 @@ class TestArmC:
             [{**ctx.messages[0], "content": det}], ctx.model)
         assert det_tokens < span_before, "the deterministic fallback must compress here"
         floor = (det_tokens + span_before) // 2
+        ctx.provider_adapter = _Adapter(floor, span_roles={"system"})
+        sys_before = ctx.messages[0]["content"]
+        await _reserve(ctx, monkeypatch)
+
+        out = await G01Compression().process_request(ctx)
+
+        assert out.cache_floor_action == "preserved"
+        assert out.messages[0]["content"] == sys_before
+
+    async def test_without_a_rate_dial_the_free_compression_stays_when_preserving_costs_more(
+            self, make_ctx, minimal_config, monkeypatch):
+        """Arm C out of reach makes the real choice A or B, and with a small cache discount
+        keeping the span whole costs more than compressing it — so the compression stays.
+        Weighing A against the unreachable C refused it and paid for B."""
+        ctx = self._ctx_two_part(make_ctx, minimal_config)
+        ctx.config["groups"]["G1_compression"]["deterministic_fallback"] = True
+        import middleware.g01_compression as g01
+        from savings.calculator import count_messages_tokens
+
+        async def _dead(url, text, ratio, force_reserve_digit=True):
+            return text
+
+        monkeypatch.setattr(g01, "_call_llmlingua", _dead)
+        _, span_before = self._span_floor(ctx)
+        det = g01._prose_compress_text(ctx.messages[0]["content"])
+        det_tokens = count_messages_tokens([{**ctx.messages[0], "content": det}], ctx.model)
+        floor, read, write, n = det_tokens + 1, 0.98, 1.0, 30
+        k = write + (n - 1) * read
+        assert k * floor < n * det_tokens < k * span_before, "fixture: C < A < B"
+        ctx.provider_adapter = _Adapter(floor, read_mult=read, write_mult=write,
+                                        span_roles={"system"})
+        await _reserve(ctx, monkeypatch, reuse=n)
+
+        out = await G01Compression().process_request(ctx)
+
+        assert out.messages[0]["content"] == det
+        assert getattr(out, "cache_floor_action", "none") != "preserved"
+        assert getattr(out, "g01_cache_floor_skips", 0) == 0
+
+    async def test_a_floored_pass_that_changes_an_identifier_is_refused(
+            self, make_ctx, minimal_config, monkeypatch):
+        """The milder, floor-aimed pass is a second compression of the same message, held to
+        the same check: one that breaks `fetch_user` must not land as arm C."""
+        import middleware.g01_compression as g01
+        self._ctx_two_part(make_ctx, minimal_config)      # sets the G1 config
+        sentence = "The deployment pipeline review records the same finding again. "
+        ctx = make_ctx(
+            [{"role": "system",
+              "content": "Call fetch_user(user_id) to load the account. " + sentence * 400},
+             {"role": "user", "content": sentence * 200}],
+            model="gpt-4o", config=minimal_config)
+        first_pass = ctx.config["groups"]["G1_compression"]["compression_ratio_target"]
+
+        async def _call(url, text, ratio, force_reserve_digit=True):
+            words = text.split()
+            out = " ".join(words[:max(1, int(len(words) * ratio))])
+            return out if ratio == first_pass else out.replace("fetch_user", "fetch user")
+
+        monkeypatch.setattr(g01, "_call_llmlingua", _call)
+        floor, _ = self._span_floor(ctx)
         ctx.provider_adapter = _Adapter(floor, span_roles={"system"})
         sys_before = ctx.messages[0]["content"]
         await _reserve(ctx, monkeypatch)

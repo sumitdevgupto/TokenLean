@@ -58,6 +58,35 @@ class TestItReportsWhatARequestWouldSee:
         assert (await pipeline.effective_group_enablement("NOVA-STG-01"))["G1_compression"] is False
         assert (await pipeline.effective_group_enablement("other"))["G1_compression"] is True
 
+    async def test_the_portal_overrides_apply(self, pipeline, monkeypatch, caplog):
+        """The Postgres overrides the portal writes go through the same loader a request
+        uses, which also records them on what it loads into: the probe's stand-in context
+        must accept that, or every call logs the overlay as unavailable."""
+        from tenancy.config import TenantConfigLoader
+
+        class _Conn:
+            def __init__(self, row):
+                self.row = row
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def fetchrow(self, query, tenant_id):
+                return self.row
+
+        class _Pool:
+            def acquire(self):
+                return _Conn({"config_overrides": {"groups": {"G1_compression": {"enabled": False}}}})
+
+        _cfg(monkeypatch, {"groups": {"G1_compression": {"enabled": True}}})
+        monkeypatch.setattr(pipeline, "_tenant_config_loader", TenantConfigLoader(db_pool=_Pool()))
+        with caplog.at_level("WARNING"):
+            assert (await pipeline.effective_group_enablement("acme"))["G1_compression"] is False
+        assert "tenant overlay unavailable" not in caplog.text
+
     async def test_g00_is_answerable_even_though_it_lives_outside_groups(self, pipeline, monkeypatch):
         """G00 reads the top-level `rate_limit` block. Readiness scores it, so an
         endpoint that only walked `groups.*` would leave it permanently unknowable."""

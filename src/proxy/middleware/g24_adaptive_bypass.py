@@ -12,9 +12,10 @@ ctx.skip_groups so downstream pipeline stages can skip it.
 Reference: Phase 4 in multi-tenant-validation-plan.md
 """
 
+import asyncio
 import logging
 import os
-from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -38,13 +39,22 @@ class G24AdaptiveBypass:
         self._last_loaded: float = 0.0
         self._rules_path: Optional[str] = None
 
-    def _load_rules(self, config: Dict[str, Any]) -> None:
-        """Load bypass rules from YAML config file."""
-        import time
+    def _due(self) -> bool:
+        return (not self._last_loaded
+                or time.time() - self._last_loaded >= _RULES_RELOAD_INTERVAL_S)
 
+    async def _refresh_rules(self, config: Dict[str, Any]) -> None:
+        """Reload the rules when the interval is up, in a thread: the load reads a file or
+        downloads from GCS, both blocking. Between reloads this is a timestamp check."""
+        if self._due():
+            await asyncio.to_thread(self._load_rules, config)
+
+    def _load_rules(self, config: Dict[str, Any]) -> None:
+        """Load bypass rules from YAML config file (callers go through _refresh_rules).
+        Whatever it finds is kept for the interval, NO rules included: an empty or missing
+        rules file used to be read again on every pass (on GCP, two blocking downloads per
+        request), because the interval check also required a non-empty rule list."""
         now = time.time()
-        if now - self._last_loaded < _RULES_RELOAD_INTERVAL_S and self._rules:
-            return
 
         # Determine rules file path
         g24_cfg = config.get("groups", {}).get("G24_adaptive_bypass", {})
@@ -123,7 +133,7 @@ class G24AdaptiveBypass:
         if not cfg.get("enabled", True):
             return ctx
 
-        self._load_rules(ctx.config)
+        await self._refresh_rules(ctx.config)
 
         if not self._rules:
             return ctx
@@ -177,7 +187,7 @@ class G24AdaptiveBypass:
         if not cfg.get("enabled", True):
             return ctx
 
-        self._load_rules(ctx.config)
+        await self._refresh_rules(ctx.config)
         if not self._rules:
             return ctx
 
@@ -242,8 +252,10 @@ class G24AdaptiveBypass:
         # Check dataset/feature tag (stored in params by ROI harness)
         datasets = conditions.get("datasets", [])
         if datasets:
+            # A rule learned on benchmark datasets applies to requests tagged with one of
+            # them, never to untagged (production) traffic.
             request_dataset = ctx.params.get("x_dataset", ctx.params.get("dataset_id", ""))
-            if request_dataset and request_dataset not in datasets:
+            if not request_dataset or request_dataset not in datasets:
                 return False
 
         return True

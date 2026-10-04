@@ -17,6 +17,10 @@ class BedrockAdapter(GenericLiteLLMAdapter):
     def requires_api_key(self) -> bool:
         return False
 
+    def prompt_cache_needs_marker(self) -> bool:
+        """Bedrock caches a prompt only up to a cache checkpoint the request places."""
+        return True
+
     def build_call(self, model: str, provider_cfg: Dict, api_key: Optional[str]) -> tuple:
         cfg = provider_cfg or {}
         model_str = model if model.startswith("bedrock/") else f"bedrock/{model}"

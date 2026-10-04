@@ -40,6 +40,28 @@ class TestG09ContextSchema:
         # Either compacted (savings recorded) or passed through (no match) — no exception
         assert ctx is not None
 
+    async def test_retrieved_documents_are_left_as_they_are(self, make_ctx):
+        """They are facts to quote, and G21 recognises them by their first line. They used to
+        sit first, which G09 protects; now they follow the tenant's prompt. G09 still leaves
+        them alone: their `[Retrieved context]` first line reads to it as a structured block.
+        The same prose in any other later system block is compacted."""
+        prose = ("Customer Bob called about order #Z1 pending. "
+                 "He requested a refund and the status was delivered. "
+                 "The customer mentioned the issue to us.")
+        from middleware.g09_context_schema import G09ContextSchema
+
+        async def run(later):
+            ctx = make_ctx([{"role": "system", "content": "You are support."},
+                            {"role": "user", "content": "q1"},
+                            {"role": "system", "content": later},
+                            {"role": "user", "content": "q2"}])
+            ctx.config["groups"]["G9_context_schema"]["enabled"] = True
+            return (await G09ContextSchema().process_request(ctx)).messages[2]["content"]
+
+        assert await run(prose) != prose                      # the control: it does compact
+        retrieved = "[Retrieved context]\n" + prose
+        assert await run(retrieved) == retrieved
+
     async def test_compaction_reduces_tokens(self, make_ctx):
         # Dense prose system message that compaction regex can match 2+ fields
         prose = (

@@ -11,7 +11,6 @@ Technique: Detect monolithic agent anti-patterns (role stacking, oversized conte
            templates in src/templates/ provide LangGraph OSS patterns
            for the larger, advisory-only role-decomposition gains.
 """
-import json
 import logging
 import re
 from typing import Any, Dict, List
@@ -250,7 +249,7 @@ class G16AgentArch:
             return ctx
 
         warnings: List[str] = []
-        tools = ctx.params.get("tools", [])
+        tools = ctx.params.get("tools") or []   # a body may send "tools": null
 
         tokens_before = count_messages_tokens(ctx.messages, ctx.model) + _tools_tokens(tools, ctx.model)
 
@@ -287,7 +286,7 @@ class G16AgentArch:
                 sys_msgs = compactable
                 sizes = [count_messages_tokens([m], ctx.model) for m in sys_msgs]
                 total = sum(sizes) or 1
-                for m, size in zip(sys_msgs, sizes):
+                for m, size in zip(sys_msgs, sizes, strict=True):
                     overhead = count_messages_tokens([{"role": m["role"], "content": ""}], ctx.model)
                     budget = max(0, int(max_sys * (size / total)) - overhead)
                     m["content"] = _compact_to_tokens(m["content"], budget, ctx.model)

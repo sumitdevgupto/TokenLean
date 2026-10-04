@@ -254,3 +254,65 @@ class TestSavingsDataIntegrity:
             assert 0.0 <= step["pct_saving_vs_baseline"] <= 100.0, (
                 f"{group} pct_saving_vs_baseline out of range: {step['pct_saving_vs_baseline']}"
             )
+
+
+def _cache_markers(obj):
+    if isinstance(obj, dict):
+        return ("cache_control" in obj) + sum(_cache_markers(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_cache_markers(v) for v in obj)
+    return 0
+
+
+@pytest.mark.asyncio
+class TestCallerCacheMarkersSurviveThePipeline:
+    """A native Anthropic client's prompt-cache markers reach the provider call.
+
+    A guard over every request-side group, all enabled: a group that rebuilt a message,
+    a content part, a tool call or a tool without copying its `cache_control` would cost
+    the caller its cache discount in silence, since the request still succeeds. The
+    proxy's own Anthropic marker (on in this config) stands down for such a request:
+    Anthropic rejects one with more than four."""
+
+    async def test_every_marker_the_caller_placed_is_still_there(self, make_ctx):
+        from protocols import AnthropicProtocol
+        from tests.conftest import _integration_config
+        mark = {"type": "ephemeral"}
+        body = {
+            "model": "claude-sonnet-4-5", "max_tokens": 256,
+            "system": [{"type": "text", "text": "You review pull requests. " * 40,
+                        "cache_control": mark}],
+            "tools": [{"name": "read_file", "input_schema": {"type": "object"}},
+                      {"name": "post_review", "input_schema": {"type": "object"},
+                       "cache_control": mark}],
+            "messages": [
+                {"role": "user", "content": "Review the change to the parser."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file", "input": {},
+                     "cache_control": mark}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "def parse(text): ...", "cache_control": mark},
+                    {"type": "text", "text": "Post the review.", "cache_control": mark}]},
+            ],
+        }
+        messages, model, params = AnthropicProtocol().parse_request(body)
+        cfg = _integration_config()
+        cfg["providers"] = [{"name": "anthropic", "model_prefixes": ["claude-"]}]
+        assert cfg["groups"]["G21_cache_alignment"]["providers"]["anthropic"]["marker"] is True
+        ctx = make_ctx(messages, model=model, params=params, config=cfg)
+        placed = _cache_markers(ctx.messages) + _cache_markers(ctx.params["tools"])
+        assert placed == 5
+
+        patches = _patch_all_external()
+        for p in patches:
+            p.__enter__()
+        try:
+            from middleware.pipeline import OptimisationPipeline
+            ctx = await OptimisationPipeline().process_request(ctx)
+        finally:
+            for p in reversed(patches):
+                p.__exit__(None, None, None)
+
+        assert ctx.routed_model == "claude-sonnet-4-5"
+        assert _cache_markers(ctx.messages) + _cache_markers(ctx.params["tools"]) == placed

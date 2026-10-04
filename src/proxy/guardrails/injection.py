@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Categories (stable strings — used as metric/audit labels).
 INSTRUCTION_OVERRIDE = "instruction_override"
@@ -68,6 +68,29 @@ DEFAULT_INJECTION_RULES: Tuple[Tuple[str, str, float, str], ...] = (
     ("bypass.jailbreak_literal", RESTRICTION_BYPASS, 0.85, r"\bjailbreak\b"),
 )
 
+# The highest threshold a TENANT may choose (its own portal setting): the weakest shipped
+# rule's severity. A tenant can make detection stricter, never silence a shipped rule; a
+# higher threshold is the operator's call.
+MAX_TENANT_THRESHOLD: float = min(r[2] for r in DEFAULT_INJECTION_RULES)
+
+
+def tenant_capped_threshold(cfg: Dict[str, Any], tenant_overrides: Any,
+                            group_key: str) -> Dict[str, Any]:
+    """``cfg`` (a G30/G31 group config) with the threshold capped at
+    :data:`MAX_TENANT_THRESHOLD` when the one in force is the tenant's own setting
+    (``tenant_overrides``, as RequestContext.tenant_config_overrides keeps it)."""
+    own = (((tenant_overrides or {}).get("groups") or {}).get(group_key) or {}) \
+        if isinstance(tenant_overrides, dict) else {}
+    if not isinstance(own, dict) or "threshold" not in own:
+        return cfg
+    try:
+        in_force = float(cfg.get("threshold", 0.5))
+        if in_force != float(own["threshold"]) or in_force <= MAX_TENANT_THRESHOLD:
+            return cfg                       # the operator's value, or within the cap
+    except (TypeError, ValueError):
+        return cfg
+    return {**cfg, "threshold": MAX_TENANT_THRESHOLD}
+
 
 @dataclass
 class InjectionVerdict:
@@ -94,7 +117,8 @@ class InjectionScanner:
     threshold:
         Minimum severity for :attr:`InjectionVerdict.matched`. Defaults to 0.5, so
         every default rule (severity ≥ 0.8) trips; raise it to require higher
-        confidence.
+        confidence. Capped at the strongest active rule's severity: above it nothing
+        could match, which is switching the scanner off, and only ``mode`` may do that.
     """
 
     def __init__(
@@ -107,13 +131,13 @@ class InjectionScanner:
         active = list(rules if rules is not None else DEFAULT_INJECTION_RULES)
         if extra_rules:
             active += list(extra_rules)
-        self.threshold = threshold
         self._compiled: List[Tuple[str, str, float, re.Pattern]] = []
         for rid, cat, sev, src in active:
             try:
                 self._compiled.append((rid, cat, sev, re.compile(src, re.IGNORECASE)))
             except re.error:
                 continue  # a malformed managed-feed rule must not break the scanner
+        self.threshold = min(threshold, max((r[2] for r in self._compiled), default=threshold))
 
     def scan(self, text: str) -> InjectionVerdict:
         """Scan one string, returning the highest-severity match."""

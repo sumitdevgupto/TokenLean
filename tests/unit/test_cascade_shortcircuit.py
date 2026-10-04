@@ -80,6 +80,47 @@ def test_cascade_response_skips_duplicate_main_llm_call(monkeypatch):
     assert called["acompletion"] == 0  # the provider was NOT called a second time
 
 
+class _PlanningPipeline:
+    """Leaves a cascade plan for main.py to execute, as G06 does."""
+
+    async def process_request(self, ctx, request_headers=None):
+        ctx.cascade_plan = {"tiers": {"simple": ["gpt-4o-mini"]}, "cfg": {},
+                            "tier1_model": "gpt-4o-mini", "max_tier_idx": 0}
+        return ctx
+
+    async def process_response(self, ctx, response):
+        return ctx, response
+
+
+def test_a_cascade_that_raises_is_logged_without_its_text(monkeypatch, caplog):
+    # A provider exception's text can carry a key or the base_url; main.py logged it raw.
+    caplog.set_level("DEBUG")
+
+    async def _cascade_raises(*args, **kwargs):
+        raise RuntimeError("api_key=sk-live-LEAKED0123456789 base_url=https://internal.example/v1")
+
+    async def _normal_call_down(**kwargs):
+        raise RuntimeError("normal call down")
+
+    monkeypatch.setattr(main, "_authenticate", _fake_auth)
+    monkeypatch.setattr(main, "get_config", lambda: {"groups": {}, "providers": []})
+    monkeypatch.setattr(main, "_pipeline", _PlanningPipeline())
+    monkeypatch.setattr("middleware.g06_routing._execute_three_tier_cascade", _cascade_raises)
+    monkeypatch.setattr(main.litellm, "acompletion", _normal_call_down)
+    # The fallback call looks for a platform key; keep that lookup off the network.
+    monkeypatch.setattr("auth.api_key_manager._fetch_secret", lambda *a, **k: None)
+
+    _client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer tok-x"},
+    )
+
+    assert "G06 deferred cascade errored (RuntimeError)" in caplog.text
+    assert "LEAKED0123456789" not in caplog.text
+    assert "internal.example" not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_timed_llm_accumulates_provider_time_into_ctx():
     ctx = SimpleNamespace(llm_elapsed_ms=0.0)

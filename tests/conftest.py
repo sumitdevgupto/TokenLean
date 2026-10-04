@@ -51,9 +51,39 @@ def _reset_proxy_key_cache():
         _akm.replace_cache({})
         _akm._CACHE_LOADED_AT = 0.0
         _akm._last_forced_reload = 0.0
+        _akm._last_load_attempt = 0.0
+        # The blob store's version check: when it last asked, what the cache holds, and
+        # whether its last answer was a failure (warned once).
+        _akm._last_version_check = 0.0
+        _akm._cache_version = None
+        _akm._version_check_failing = False
     except Exception:
         pass
     yield
+
+
+# ─── No real Secret Manager ──────────────────────────────────────────────────
+# A test that reaches a Secret Manager call it did not patch would otherwise call Google with
+# the developer's own credentials, or wait on the network without them. Both client classes
+# are swapped for a stand-in that refuses; the proxy's key fetch turns that into "no secret",
+# as it does without credentials. A test that needs Secret Manager patches it itself.
+class _NoSecretManager:
+    is_test_stand_in = True
+
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("tests must not call the real Secret Manager: patch the client, "
+                           "or the function that uses it")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_secret_manager(monkeypatch):
+    try:
+        from google.cloud import secretmanager
+    except ImportError:
+        return
+    for name in ("SecretManagerServiceClient", "SecretManagerServiceAsyncClient"):
+        if hasattr(secretmanager, name):
+            monkeypatch.setattr(secretmanager, name, _NoSecretManager)
 
 
 # ─── Minimal config fixture ───────────────────────────────────────────────────
@@ -219,7 +249,7 @@ def _minimal_config() -> Dict[str, Any]:
                 "min_length_to_compress": 50,
                 "compression_strategies": {
                     "json": {"remove_empty": True, "dedupe_keys": True},
-                    "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
+                    "code": {"strip_comments": True, "strip_whitespace": True},
                     "logs": {"dedupe_lines": True, "truncate_long_lines": 200},
                 },
             },

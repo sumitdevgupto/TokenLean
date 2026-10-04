@@ -206,7 +206,6 @@ REQUIRED_APIS=(
   "redis.googleapis.com"
   "storage.googleapis.com"
   "secretmanager.googleapis.com"
-  "cloudtasks.googleapis.com"
   "artifactregistry.googleapis.com"
   "cloudbuild.googleapis.com"
   "vpcaccess.googleapis.com"

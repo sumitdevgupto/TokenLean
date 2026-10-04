@@ -36,11 +36,13 @@ class GCSStorageBackend(StorageBackend):
         if not bucket:
             raise ValueError("GCSStorageBackend: bucket name must not be empty")
         self._bucket = bucket
+        self._handle = None  # made on first write: storage.Client() runs credential discovery
 
     def write(self, path: str, data: str) -> None:
-        from google.cloud import storage  # lazy: optional in non-GCP envs
-        client = storage.Client()
-        blob = client.bucket(self._bucket).blob(path)
+        if self._handle is None:
+            from google.cloud import storage  # lazy: optional in non-GCP envs
+            self._handle = storage.Client().bucket(self._bucket)
+        blob = self._handle.blob(path)
         blob.upload_from_string(data, content_type="application/json")
         logger.debug("GCSStorageBackend: uploaded gs://%s/%s", self._bucket, path)
 

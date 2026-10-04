@@ -14,6 +14,7 @@ import time
 import uuid
 from types import SimpleNamespace
 
+import pytest
 from prometheus_client import REGISTRY
 
 import main
@@ -46,6 +47,22 @@ def test_llm_call_splits_duration_between_llm_and_proxy():
     # (an unsubtracted overhead would be the full ~1000ms elapsed) while
     # tolerating up to ~500ms of scheduler/GC jitter on loaded CI runners.
     assert 300.0 <= overhead < 900.0
+
+
+@pytest.mark.parametrize("status", ["200", "502"])
+def test_a_provider_side_failure_is_reported_to_least_latency(monkeypatch, status):
+    # Only successes fed G06's latency table, so a model that always failed was picked by
+    # least_latency on every request. A 429 says nothing about the model.
+    import middleware.g06_routing as g6
+    from providers.resilience import Attempt
+    failed = []
+    monkeypatch.setattr(g6, "record_model_failure", failed.append)
+    ctx = _ctx(_tenant("lat-fail"), llm_ms=0.0)
+    ctx.provider_attempts = [Attempt("openai", "a", "error", "_Err(status=503)", transient=True),
+                             Attempt("openai", "b", "error", "_Err(status=429)"),
+                             Attempt("anthropic", "c", "success")]
+    main._record_outcome(ctx, time.time(), status)
+    assert failed == ["a"]
 
 
 def test_cache_hit_counts_entirely_as_proxy_time():

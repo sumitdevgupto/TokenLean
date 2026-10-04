@@ -116,7 +116,7 @@ class OpenAIAdapter(ProviderAdapter):
     async def submit_batch(self, items: List[Dict], api_key: str, cfg: Dict) -> str:
         """Upload a JSONL batch and create an OpenAI Batch job; return its id."""
         client = self._make_async_client(api_key)
-        payload = build_batch_jsonl(items).encode("utf-8")
+        payload = build_batch_jsonl(items, self).encode("utf-8")
         upload = await client.files.create(file=payload, purpose="batch")
         batch = await client.batches.create(
             input_file_id=upload.id,

@@ -27,16 +27,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          # The images' Python (python:3.11-slim): CI tests what ships.
+          python-version: "3.11"
           cache: pip
+
+      # Path rules never see a real key pasted into a tracked file (a template, a fixture, a
+      # doc). Prints `path:line: kind`, never the value.
+      - name: Secret scan (credential formats in tracked files)
+        run: python scripts/ci/leak_scan.py --tracked
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r src/proxy/requirements.txt -r tests/requirements-test.txt
+
+      # The licence rule in THIRD_PARTY_LICENSES.md: every pin of every image and CI lockfile is
+      # permissive, or MPL-2.0 for an unmodified transitive dependency. Reads each pinned
+      # release's licence (installed metadata, else pypi.org) and exits 1 on anything else.
+      - name: Licence audit (every pin permissive or MPL-2.0)
+        run: python scripts/audit_licenses.py
 
       - name: Clean-checkout boot gate (import main with no commercial files)
         working-directory: src/proxy
@@ -77,10 +89,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          # The images' Python (python:3.11-slim): CI tests what ships.
+          python-version: "3.11"
           cache: pip
 
       - name: Install dependencies
@@ -102,11 +115,15 @@ jobs:
       - name: "${{ matrix.tier }}: isolation (no commercial files / no gated imports in core)"
         run: |
           tree=/tmp/${{ matrix.tier }}-tree
-          for f in src/proxy/api/portal.py src/proxy/api/gdpr.py src/proxy/billing/tiers.py \
-                   src/proxy/billing/invoicing.py src/proxy/billing/payments.py \
-                   src/proxy/audit/attestation.py src/proxy/commercial_app.py; do
-            if [ -e "$tree/$f" ]; then echo "LEAK: commercial file in ${{ matrix.tier }} tree: $f"; exit 1; fi
-          done
+          # Commercial paths come from the commercial sections of .gitignore, so a new
+          # commercial module is checked as soon as its .gitignore line exists. The tree
+          # is `git archive HEAD`: a file tracked here is a file in the tree.
+          if ! leaked=$(python scripts/ci/commercial_paths.py --tracked); then
+            echo "LEAK: commercial files in the ${{ matrix.tier }} tree:"; echo "$leaked"; exit 1
+          fi
+          if ! leaked=$(python scripts/ci/commercial_paths.py --dockerignore src/proxy); then
+            echo "LEAK: commercial paths missing from src/proxy/.dockerignore:"; echo "$leaked"; exit 1
+          fi
           if grep -nE "is_group_enabled|include_router\(create_|from billing\.tiers|from api\.portal|from api\.gdpr" \
                "$tree/src/proxy/main.py" "$tree/src/proxy/middleware/pipeline.py"; then
             echo "LEAK: gated import/wiring in core"; exit 1

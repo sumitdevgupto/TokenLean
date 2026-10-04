@@ -212,3 +212,45 @@ class TestChunksItMustNotDisturb:
                     {"choices": [{"delta": {"tool_calls": "nope"}}]},
                     {"choices": [{"delta": {"tool_calls": [None]}}]}):
             gate.filter(bad)   # must not raise
+
+
+def _choices_chunk(*per_choice):
+    """One chunk carrying several choices: (choice_index, [tool-call entries])."""
+    return {"choices": [{"index": ci, "delta": {"tool_calls": list(calls)}, "finish_reason": None}
+                        for ci, calls in per_choice]}
+
+
+class TestSeveralChoices:
+    """With n>1 every choice numbers its tool calls from 0. The verdict for call 0 of choice 0
+    was cached under 0 alone, so choice 1's call 0 rode on it: a denied call was relayed after
+    an allowed one, and an allowed call was withheld after a denied one."""
+
+    def test_a_denied_call_in_another_choice_is_judged_on_its_own(self, make_ctx, minimal_config):
+        gate = _gate(make_ctx, minimal_config)
+        gate.filter(_choices_chunk((0, [_call(0, "search_docs", cid="a")])))
+        out = gate.filter(_choices_chunk((1, [_call(0, "delete_everything", cid="b")])))
+        assert out is None
+        assert gate.denied == ["delete_everything"]
+
+    def test_an_allowed_call_in_another_choice_is_not_withheld(self, make_ctx, minimal_config):
+        gate = _gate(make_ctx, minimal_config)
+        gate.filter(_choices_chunk((0, [_call(0, "delete_everything", cid="a")])))
+        out = gate.filter(_choices_chunk((1, [_call(0, "search_docs", cid="b")])))
+        assert out is not None
+        assert out["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "search_docs"
+
+    def test_argument_deltas_follow_their_own_choice_s_verdict(self, make_ctx, minimal_config):
+        gate = _gate(make_ctx, minimal_config)
+        gate.filter(_choices_chunk((0, [_call(0, "search_docs")]), (1, [_call(0, "delete_x")])))
+        out = gate.filter(_choices_chunk((0, [_call(0, args='{"q":')]),
+                                         (1, [_call(0, args='{"all":')])))
+        kept = {c["index"]: c["delta"].get("tool_calls") for c in out["choices"]}
+        assert kept[0] == [_call(0, args='{"q":')] and kept[1] is None
+
+    def test_a_nameless_delta_held_in_one_choice_is_not_settled_by_another(
+            self, make_ctx, minimal_config):
+        gate = _gate(make_ctx, minimal_config)
+        gate.filter(_choices_chunk((1, [_call(0, args="{")])))     # choice 1: no name yet
+        gate.filter(_choices_chunk((0, [_call(0, "search_docs")])))
+        gate.finish()
+        assert gate.denied == ["<unnamed>"]

@@ -625,6 +625,65 @@ class TestG11OutputFormat:
         assert mock_redis.zremrangebyrank.call_args.args[1:] == (0, -51)
 
 
+@pytest.mark.asyncio
+class TestTheCapUsesTheCalledModelsLimit:
+    """Every cap G11 sets is clamped to the limit of the model the request will call. That
+    limit was looked up under ctx.params['model'], which ingress never sets, so every cap was
+    clamped to the 4096 fallback and model_max_tokens was never read."""
+
+    @staticmethod
+    async def _run(ctx, redis=None):
+        from middleware.g11_output_format import G11OutputFormat
+        no_redis = Exception("no redis in this test")
+        with patch("middleware.g11_output_format._get_redis",
+                   **({"return_value": redis} if redis else {"side_effect": no_redis})):
+            return await G11OutputFormat().process_request(ctx)
+
+    async def test_a_fallback_under_the_models_limit_applies_whole(self, make_ctx):
+        ctx = make_ctx([{"role": "user", "content": "hello"}], model="gpt-4o")
+        g11 = ctx.config["groups"]["G11_output"]
+        g11["fallback_max_tokens"] = 8000
+        g11["model_max_tokens"] = {"gpt-4o": 16384}
+        ctx = await self._run(ctx)
+        assert ctx.params.get("max_tokens") == 8000
+
+    async def test_the_routed_model_sets_the_limit(self, make_ctx):
+        ctx = make_ctx([{"role": "user", "content": "hello"}], model="gpt-4o")
+        ctx.routed_model = "gpt-4o-mini"
+        g11 = ctx.config["groups"]["G11_output"]
+        g11["fallback_max_tokens"] = 8000
+        g11["model_max_tokens"] = {"gpt-4o": 16384, "gpt-4o-mini": 2000}
+        ctx = await self._run(ctx)
+        assert ctx.params.get("max_tokens") == 2000
+
+    async def test_a_tightened_cap_is_clamped_to_the_models_limit(self, make_ctx):
+        entries = [json.dumps({"max_tokens": 9000, "completion_tokens": 5000}) for _ in range(10)]
+        redis = AsyncMock()
+        redis.zrevrange = AsyncMock(return_value=entries)
+        ctx = make_ctx(model="gpt-4o")
+        g11 = ctx.config["groups"]["G11_output"]
+        g11["tighten_multiplier"] = 1.2
+        g11["model_max_tokens"] = {"gpt-4o": 16384}
+        ctx.params["workflow_id"] = "wf-test"
+        ctx.params["template_id"] = "tmpl-test"
+        ctx = await self._run(ctx, redis)
+        assert ctx.params.get("max_tokens") == 6000  # 5000 × 1.2, under 16384
+
+    async def test_an_unknown_model_gets_the_configured_default(self, make_ctx):
+        ctx = make_ctx([{"role": "user", "content": "hello"}], model="house-model")
+        g11 = ctx.config["groups"]["G11_output"]
+        g11["fallback_max_tokens"] = 8000
+        g11["default_model_max_tokens"] = 6000
+        ctx = await self._run(ctx)
+        assert ctx.params.get("max_tokens") == 6000
+
+
+def test_no_model_gets_the_configured_default():
+    from middleware.g11_output_format import _get_model_max_tokens
+    assert _get_model_max_tokens(None, {"default_model_max_tokens": 8192}) == 8192
+    assert _get_model_max_tokens("", {"default_model_max_tokens": 8192}) == 8192
+
+
 class TestG11ShippedDefaults:
     """The template is what a fresh install runs, so the defence against the 2026-09-08
     truncation defect has to be pinned there and not only in the code."""
@@ -936,6 +995,40 @@ class TestG11OutputValidation:
         assert resp["choices"][0]["message"].get("finish_reason") is None
 
 
+_MARK = {"type": "ephemeral"}
+_MARKED = [{"role": "system", "content": [{"type": "text", "text": "Rules.", "cache_control": _MARK}]},
+           {"role": "user", "content": "Give me JSON.", "cache_control": _MARK}]
+
+
+@pytest.mark.asyncio
+class TestRepairCacheMarkers:
+    """The repair re-ask resends the conversation to the served model. Its prompt-cache
+    markers go along only when that provider caches by marker: anywhere else litellm
+    would turn them into a separately billed Gemini cache, or hand them to an endpoint
+    that may reject them."""
+
+    async def _repair_messages(self, make_ctx, model, adapter_name):
+        from middleware.g11_output_format import _reask
+        from providers import get_adapter_by_name
+        ctx = make_ctx(messages=_MARKED, model=model)
+        ctx.provider_adapter = get_adapter_by_name(adapter_name)
+        with patch("litellm.acompletion", new_callable=AsyncMock) as call:
+            call.return_value = {"choices": [{"message": {"content": '{"a": 1}'}}]}
+            assert await _reask(ctx, "not json", None, 50) == '{"a": 1}'
+        return call.await_args.kwargs["messages"]
+
+    async def test_a_provider_that_caches_by_marker_gets_them(self, make_ctx):
+        sent = await self._repair_messages(make_ctx, "claude-3-5-haiku", "anthropic")
+        assert sent[:2] == _MARKED
+
+    async def test_any_other_provider_gets_none(self, make_ctx):
+        sent = await self._repair_messages(make_ctx, "gpt-4o-mini", "openai")
+        assert sent[:2] == [{"role": "system", "content": [{"type": "text", "text": "Rules."}]},
+                            {"role": "user", "content": "Give me JSON."}]
+        assert sent[2] == {"role": "assistant", "content": "not json"}
+        assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
+
+
 # ─── Verbosity steering — terse-output presets + cache scoping ────────────────
 from middleware.g11_output_format import (
     _get_verbosity_suffix,
@@ -1008,6 +1101,22 @@ class TestVerbositySteeringInjection:
         sysmsg = _last_system(ctx.messages)
         assert sysmsg.startswith("BASE POLICY")  # prefix preserved → G21 cache-safe
         assert _VERBOSITY_PRESETS["lite"] in sysmsg
+
+    async def test_a_system_message_of_parts_gets_a_text_part(self, make_ctx):
+        """A list of parts is a valid system message; concatenating a string onto it raised
+        TypeError and returned a 500."""
+        base = {"type": "text", "text": "BASE POLICY", "cache_control": {"type": "ephemeral"}}
+        ctx = make_ctx([
+            {"role": "system", "content": [dict(base)]},
+            {"role": "user", "content": "hi"},
+        ])
+        ctx.config["groups"]["G11_output"]["verbosity_steering"] = {"enabled": True, "level": "lite"}
+        from middleware.g11_output_format import G11OutputFormat
+        with patch("middleware.g11_output_format._get_redis", side_effect=Exception("no redis")):
+            ctx = await G11OutputFormat().process_request(ctx)
+        parts = _last_system(ctx.messages)
+        assert parts[0] == base                      # the cached prefix is untouched
+        assert parts[-1]["type"] == "text" and _VERBOSITY_PRESETS["lite"] in parts[-1]["text"]
 
 
 class TestVerbosityCacheTag:

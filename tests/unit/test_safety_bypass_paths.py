@@ -9,7 +9,8 @@ that guarantee, so each one needs an explicit decision and a test pinning it:
   * **streaming** -> NOT gated; a documented limitation, pinned in
     `test_g32_tool_eligibility.py`.
   * **batch defer** -> the request is refused batching when it carries tools, so it
-    falls through to the normal gated path. Pinned here.
+    falls through to the normal gated path. Pinned here. So is the same refusal for the
+    response-side trust & safety steps: G29 masking and G30 response scanning.
 
 Also here: the G31 audit gap. `context_trust_action` was absent from BOTH the audit
 branch and main.py's scheduling guard, so a context-trust block wrote no audit row at
@@ -49,6 +50,12 @@ class TestBatchDoesNotBypassTheGate:
     see its tool calls. G13 ships `enabled: true`, so this was reachable with nothing but
     a `batch_topic` on a tool-bearing request."""
 
+    @pytest.fixture(autouse=True)
+    def _bulk_is_consumed(self, monkeypatch):
+        # Batching now also needs a consumer for the topic: give "bulk" one.
+        from middleware import g13_batch
+        monkeypatch.setattr(g13_batch, "_CONSUMED_TOPICS", {"bulk"})
+
     async def test_tool_bearing_request_is_not_deferred(self):
         ctx = _ctx({"batch_topic": "bulk", "tools": _TOOLS})
         with patch("middleware.g13_batch._accumulate", new=AsyncMock()) as acc:
@@ -78,6 +85,55 @@ class TestBatchDoesNotBypassTheGate:
         with patch("middleware.g13_batch._accumulate", new=AsyncMock()), \
              patch("middleware.g13_batch._record_batch_owner", new=AsyncMock()):
             assert (await G13Batch().process_request(ctx)).batch_deferred is True
+
+
+def _configured(groups=None, tenants=None):
+    ctx = _ctx({"batch_topic": "bulk"})
+    ctx.config = {"groups": {"G13_batch": {"enabled": True}, **(groups or {})}}
+    if tenants:
+        ctx.config["tenants"] = tenants
+    return ctx
+
+
+class TestBatchDoesNotBypassResponseSafety:
+    """Batch results skip process_response, so G29 never masked the model's PII
+    (or restored the caller's own masked values) and G30 never scanned or withheld the
+    output. A tenant that relies on either is served synchronously instead."""
+
+    @pytest.fixture(autouse=True)
+    def _bulk_is_consumed(self, monkeypatch):
+        from middleware import g13_batch
+        monkeypatch.setattr(g13_batch, "_CONSUMED_TOPICS", {"bulk"})
+
+    @pytest.mark.parametrize("groups", [
+        {"G29_pii_redaction": {"mode": "mask"}},
+        {"G30_guardrails": {"scan_response": True}},
+        {"G30_guardrails": {"scan_response": True, "response_mode": "block"}},
+    ])
+    async def test_a_response_the_tenant_protects_is_not_batched(self, groups):
+        with patch("middleware.g13_batch._accumulate", new=AsyncMock(return_value=True)) as acc:
+            out = await G13Batch().process_request(_configured(groups))
+        assert out.batch_deferred is False
+        acc.assert_not_awaited()
+
+    async def test_an_operator_overlay_for_this_tenant_counts(self):
+        ctx = _configured({"G29_pii_redaction": {"mode": "flag"}},
+                          tenants={"acme": {"groups": {"G29_pii_redaction": {"mode": "mask"}}}})
+        with patch("middleware.g13_batch._accumulate", new=AsyncMock(return_value=True)) as acc:
+            assert (await G13Batch().process_request(ctx)).batch_deferred is False
+        acc.assert_not_awaited()
+
+    @pytest.mark.parametrize("groups", [
+        {},                                                        # defaults: G29 flag, no response scan
+        {"G29_pii_redaction": {"mode": "flag"}},                   # detect-only
+        {"G29_pii_redaction": {"mode": "block"}},                  # acts on the request only
+        {"G29_pii_redaction": {"enabled": False, "mode": "mask"}},
+        {"G30_guardrails": {"enabled": False, "scan_response": True}},
+    ])
+    async def test_otherwise_batching_still_works(self, groups):
+        with patch("middleware.g13_batch._accumulate", new=AsyncMock(return_value=True)), \
+             patch("middleware.g13_batch._record_batch_owner", new=AsyncMock()):
+            assert (await G13Batch().process_request(_configured(groups))).batch_deferred is True
 
 
 class TestContextTrustAudit:

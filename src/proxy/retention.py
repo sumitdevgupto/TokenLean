@@ -58,10 +58,14 @@ async def run_retention_pass(pg_pool, cfg: Dict[str, Any]) -> Dict[str, int]:
             logger.warning("retention: %s purge failed: %s", label, exc)
 
     if audit_days:
-        await _purge(
-            "audit_events",
-            "DELETE FROM audit_events WHERE timestamp < NOW() - ($1 || ' days')::interval",
-            str(audit_days))
+        # Audit rows change only through audit.enforcement, which uses the database's
+        # retention function when this role may not delete them itself.
+        try:
+            from audit.enforcement import delete_older_than
+            async with pg_pool.acquire() as conn:
+                out["audit_events"] = await delete_older_than(conn, audit_days)
+        except Exception as exc:
+            logger.warning("retention: audit_events purge failed: %s", exc)
     if usage_days:
         await _purge(
             "usage_events",
@@ -87,8 +91,9 @@ async def run_retention_loop(get_pg_pool, get_config) -> None:
         cfg = {}
         try:
             cfg = (get_config() or {}).get("retention", {}) or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("retention: the config could not be read, so this pass deletes "
+                           "nothing: %s", exc)
         interval = 3600 * max(1, int(cfg.get("interval_hours", 24) or 24))
         if cfg.get("enabled", False):
             try:

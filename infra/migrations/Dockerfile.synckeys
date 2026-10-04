@@ -9,7 +9,8 @@
 # The job reaches the (public OR private) Cloud SQL instance over the Cloud SQL Auth
 # Proxy Unix socket mounted at /cloudsql/<conn> by --set-cloudsql-instances, so no
 # private IP address is ever needed and the SAME image works for both connectivity modes.
-FROM python:3.11-slim
+# Pinned by digest; Dependabot proposes the tag's new digest for review.
+FROM python:3.11-slim@sha256:94c50be2dc994b873b55bc123e95e6dbade08095b3dfd790f51c34de3f08cbb7
 
 RUN pip install --no-cache-dir asyncpg
 
@@ -19,5 +20,9 @@ COPY sync_proxy_keys.py /app/sync_proxy_keys.py
 # local-keys.json is copied into infra/migrations/ by sync-proxy-keys-job.sh right
 # before `docker build` and removed immediately after (it holds key hashes — never lingers).
 COPY local-keys.json /app/local-keys.json
+
+# Runs as an unprivileged user (uid 1000), not root: it only reads the two files above.
+RUN useradd --create-home --uid 1000 --user-group app
+USER 1000
 
 CMD ["python", "/app/sync_proxy_keys.py"]

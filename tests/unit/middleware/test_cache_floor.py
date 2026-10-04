@@ -111,6 +111,33 @@ class TestTheDecision:
         shrank."""
         assert compress_is_cheaper(2044, 1500, F, 0.1, 1.25, 30) is True
 
+    def test_a_consumer_that_cannot_floor_weighs_compressing_against_preserving(self):
+        """Arm C needs a compressor with a rate dial. G08 and G19 can only take a shrink or
+        refuse it, and a refusal keeps the span WHOLE (arm B). On the whole-prompt provider
+        arm C (15,872) beats compressing (19,140), but preserving (31,682) does not — judged
+        against arm C, the refusal paid 1.66x the cost of the shrink it refused."""
+        assert compress_is_cheaper(P, P_WHOLE, F, 0.5, 1.0, 30) is False
+        assert compress_is_cheaper(P, P_WHOLE, F, 0.5, 1.0, 30, can_floor=False) is True
+
+    def test_preserving_still_wins_where_it_is_cheaper(self):
+        """The breakpoint provider: preserving (8,483) beats compressing (22,080)."""
+        assert compress_is_cheaper(P, P_BREAKPOINT, F, 0.1, 1.25, 30, can_floor=False) is False
+
+
+class TestAllowsShrinkByConsumer:
+    """`allows_shrink` defaults to a take-or-refuse consumer; only G01 can reach arm C."""
+
+    class _Ctx:
+        def __init__(self):
+            self.cache_floor = cache_floor.CacheFloor(
+                active=True, floor=F, span_tokens=P, read_mult=0.5, write_mult=1.0, reuse=30)
+
+    def test_take_or_refuse_is_the_default(self):
+        assert cache_floor.allows_shrink(self._Ctx(), P, P_WHOLE, "G08") is True
+
+    def test_a_consumer_that_can_floor_says_so(self):
+        assert cache_floor.allows_shrink(self._Ctx(), P, P_WHOLE, "G01", can_floor=True) is False
+
 
 class TestReservation:
     """The reservation is fail-SAFE in every direction: anything unknown leaves it inert,
@@ -353,11 +380,73 @@ class TestConsumers:
     lived only in G01 would be undone here, silently.
     """
 
-    def _floor(self, floor, roles=None):
+    def _floor(self, floor, roles=None, read=0.1, write=1.25):
         return cache_floor.CacheFloor(
-            active=True, floor=floor, span_tokens=floor + 10, read_mult=0.1,
-            write_mult=1.25, reuse=30, span_roles=frozenset(roles or []),
+            active=True, floor=floor, span_tokens=floor + 10, read_mult=read,
+            write_mult=write, reuse=30, span_roles=frozenset(roles or []),
             span_is_whole_prompt=roles is None)
+
+    # A small cache discount (read x0.98): flooring would beat the shrink, but G08 and G19
+    # cannot floor — a refusal keeps the span whole, which costs more than shrinking it.
+    SMALL_DISCOUNT = {"read": 0.98, "write": 1.0}
+
+    @staticmethod
+    def _assert_c_beats_a_beats_b(before, after, floor, read, write, n=30):
+        a = n * after
+        b = write * before + (n - 1) * read * before
+        c = write * floor + (n - 1) * read * floor
+        assert after < floor <= before and c < a < b, (a, b, c)
+
+    @pytest.mark.asyncio
+    async def test_g19_prunes_when_holding_the_span_would_cost_more(
+            self, make_ctx, minimal_config, monkeypatch):
+        from middleware.g19_headroom import G19Headroom
+        from savings.calculator import count_messages_tokens
+
+        ctx = self._g19_ctx(make_ctx, minimal_config, monkeypatch)
+        before = ctx.messages[0]["content"]
+        span = count_messages_tokens(ctx.messages, ctx.model)
+        pruned = count_messages_tokens(
+            [{**ctx.messages[0], "content": before[: len(before) // 4]}], ctx.model)
+        self._assert_c_beats_a_beats_b(span, pruned, pruned + 1, **self.SMALL_DISCOUNT)
+        ctx.cache_floor = self._floor(pruned + 1, **self.SMALL_DISCOUNT)
+        out = await G19Headroom().process_request(ctx)
+        assert out.messages[0]["content"] != before
+        assert getattr(out, "cache_floor_action", "none") != "preserved"
+
+    @pytest.mark.asyncio
+    async def test_g08_trims_when_keeping_the_list_whole_would_cost_more(
+            self, make_ctx, minimal_config):
+        from middleware.g08_tool_loading import G08ToolLoading
+        from savings.calculator import count_messages_tokens, count_tools_tokens
+
+        def _tools():
+            return [{"type": "function", "function": {
+                "name": f"tool_{i}",
+                "description": ("This particular function is in fact used in order to "
+                                "retrieve the relevant data that is needed. " * 6),
+                "parameters": {"type": "object", "properties": {}}}} for i in range(6)]
+
+        minimal_config["groups"]["G8_tools"] = {
+            "enabled": True, "compress_descriptions": True, "registry_path": ""}
+        probe = make_ctx([{"role": "user", "content": "fetch the data"}],
+                         model="gpt-4o", config=minimal_config)
+        probe.params["tools"] = _tools()
+        # A whole-prompt span: the messages plus the tool definitions, as G08 measures it.
+        fixed = count_messages_tokens(probe.messages, probe.model)
+        span = fixed + count_tools_tokens(probe.params["tools"], probe.model)
+        trimmed = count_tools_tokens(
+            (await G08ToolLoading().process_request(probe)).params["tools"], probe.model)
+        self._assert_c_beats_a_beats_b(span, fixed + trimmed, fixed + trimmed + 1,
+                                       **self.SMALL_DISCOUNT)
+
+        ctx = make_ctx([{"role": "user", "content": "fetch the data"}],
+                       model="gpt-4o", config=minimal_config)
+        ctx.params["tools"] = _tools()
+        ctx.cache_floor = self._floor(fixed + trimmed + 1, **self.SMALL_DISCOUNT)
+        out = await G08ToolLoading().process_request(ctx)
+        assert count_tools_tokens(out.params["tools"], ctx.model) == trimmed
+        assert getattr(out, "cache_floor_action", "none") != "preserved"
 
     def _g19_ctx(self, make_ctx, minimal_config, monkeypatch):
         """G19 with its content detector and compressor stubbed.

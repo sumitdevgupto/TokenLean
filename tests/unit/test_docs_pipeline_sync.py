@@ -144,6 +144,35 @@ class TestResponseChainOrderMatchesDocs:
         self._assert_order(line, "AGENTS.md response pipeline")
 
 
+def _ids(text: str) -> list:
+    """Stage ids in order, as `G05` / `F2`: the docstring writes G5, the stage names G05."""
+    return [f"G{int(n):02d}" if n else "F2" for n in re.findall(r"\bG(\d+)|\bF2\b", text)]
+
+
+def _docstring_path(label: str) -> list:
+    src = _read(PIPELINE)
+    start = src.index("class OptimisationPipeline")
+    doc = src[start:src.index("def __init__", start)]
+    line = next((l for l in doc.splitlines() if l.strip().startswith(label)), None)
+    assert line, f"OptimisationPipeline's docstring lost its {label!r} line"
+    return _ids(line.split(":", 1)[1])
+
+
+class TestPipelineDocstringMatchesTheCode:
+    """The class docstring listed a response path without G29, G30, G32, G28 or grounding:
+    a reader reasoning about the security ordering was shown the wrong one."""
+
+    def test_the_request_path_is_the_stage_order(self):
+        src = _read(PIPELINE)
+        body = src[src.index("async def process_request"):src.index("async def process_response")]
+        stages = _ids(" ".join(re.findall(r'"((?:G\d{2}|F2)-[-\w]*)"', body)))
+        assert _docstring_path("Request path:") == stages
+
+    def test_the_response_path_starts_with_the_response_chain(self):
+        chain = _response_chain()
+        assert _docstring_path("Response path:")[:len(chain)] == chain
+
+
 class TestSafetyGroupsDocumentedAsNonBypassable:
     """A reader must be able to tell the trust & safety groups from the savings ones —
     they are excluded from the published savings headline, so conflating them misstates

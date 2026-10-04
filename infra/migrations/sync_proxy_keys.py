@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sync_proxy_keys.py — in-VPC upsert of local-keys.json into the proxy_keys table.
+"""sync_proxy_keys.py — in-VPC insert of NEW local-keys.json keys into proxy_keys.
 
 WHY: the commercial proxy runs PROXY_KEYS_BACKEND=postgres and validates proxy API
 keys against Cloud SQL's proxy_keys table. The Postgres backend only ingests the
@@ -8,9 +8,14 @@ harness/tenant keys minted AFTER the first deploy never reach proxy_keys and eve
 request 401s. Cloud SQL is private-IP, reachable only from an in-VPC Cloud Run Job
 over the /cloudsql/<conn> socket — hence this runs as such a job.
 
+Insert-only, and it runs on every deploy: a key already in the table keeps its row
+untouched (a console suspension, IP allowlist or contract flag is never reset), and a
+hash recorded in revoked_proxy_keys is never re-inserted — local-keys.json keeps every
+key ever minted, including revoked ones.
+
 Standalone by design: it does NOT import the proxy app package (runs in a minimal
-image with only asyncpg), so the ON CONFLICT upsert + the CREATE TABLE DDL are
-inlined here to mirror src/proxy/auth/pg_key_store.py.
+image with only asyncpg), so the insert statement + the CREATE TABLE DDL are inlined
+here to mirror src/proxy/auth/pg_key_store.py.
 
 Env (injected by scripts/gcp/sync-proxy-keys-job.sh):
   KEYS_JSON_PATH       path to the keys JSON  (default /app/local-keys.json)
@@ -40,9 +45,22 @@ CREATE TABLE IF NOT EXISTS proxy_keys (
     extra      JSONB   NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_keys_tenant ON proxy_keys (tenant_id);
+CREATE TABLE IF NOT EXISTS revoked_proxy_keys (
+    key_hash   TEXT        PRIMARY KEY,
+    tenant_id  TEXT,
+    revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 _CORE_FIELDS = ("tenant_id", "tier", "admin", "suspended", "created_at")
+
+# Inlined copy of INSERT_NEW_KEY_SQL from src/proxy/auth/pg_key_store.py.
+INSERT_NEW_KEY_SQL = (
+    "INSERT INTO proxy_keys (key_hash, tenant_id, tier, admin, suspended, created_at, extra) "
+    "SELECT $1::text, $2::text, $3::text, $4::boolean, $5::boolean, $6::text, $7::jsonb "
+    "WHERE NOT EXISTS (SELECT 1 FROM revoked_proxy_keys WHERE key_hash = $1::text) "
+    "ON CONFLICT (key_hash) DO NOTHING"
+)
 
 
 def _load_store(path: str) -> dict:
@@ -54,19 +72,16 @@ def _load_store(path: str) -> dict:
 
 
 async def _upsert(conn, store: dict) -> list:
-    """UPSERT each {key_hash: metadata} entry (same ON CONFLICT logic as pg_key_store.upsert_keys)."""
-    tenant_ids = []
+    """Insert each {key_hash: metadata} entry the table lacks (same statement as
+    pg_key_store.upsert_keys). Returns the tenant ids of the keys actually inserted."""
+    inserted = []
     for key_hash, entry in store.items():
         if not isinstance(entry, dict):
             # Legacy string-format rows: keep them round-trippable.
             entry = {"tenant_id": str(entry), "tier": "legacy"}
         extra = {k: v for k, v in entry.items() if k not in _CORE_FIELDS}
-        await conn.execute(
-            "INSERT INTO proxy_keys (key_hash, tenant_id, tier, admin, suspended, created_at, extra) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) "
-            "ON CONFLICT (key_hash) DO UPDATE SET "
-            "tenant_id=EXCLUDED.tenant_id, tier=EXCLUDED.tier, admin=EXCLUDED.admin, "
-            "suspended=EXCLUDED.suspended, created_at=EXCLUDED.created_at, extra=EXCLUDED.extra",
+        status = await conn.execute(
+            INSERT_NEW_KEY_SQL,
             key_hash,
             entry.get("tenant_id", "default"),
             entry.get("tier", "free"),
@@ -75,8 +90,9 @@ async def _upsert(conn, store: dict) -> list:
             entry.get("created_at"),
             json.dumps(extra),
         )
-        tenant_ids.append(entry.get("tenant_id", "default"))
-    return tenant_ids
+        if status.split()[-1] == "1":  # "INSERT 0 1" inserted | "INSERT 0 0" kept/revoked
+            inserted.append(entry.get("tenant_id", "default"))
+    return inserted
 
 
 async def main() -> None:
@@ -110,7 +126,8 @@ async def main() -> None:
     finally:
         await conn.close()
 
-    print(f"sync_proxy_keys: upserted {len(tenant_ids)} key(s) into proxy_keys.")
+    print(f"sync_proxy_keys: inserted {len(tenant_ids)} new key(s); "
+          f"{len(store) - len(tenant_ids)} already present or revoked, left unchanged.")
     for tid in sorted(set(tenant_ids)):
         print(f"  - {tid}")
 

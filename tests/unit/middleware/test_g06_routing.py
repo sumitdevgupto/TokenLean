@@ -3,7 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy")))
 
 import pytest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 
 class FakeClient:
@@ -68,7 +68,8 @@ async def _drive_deferred_cascade(ctx):
             max_tier_idx=ctx.cascade_plan.get("max_tier_idx"),
         )
     except Exception as exc:  # noqa: BLE001 — mirror main.py's never-500 guard
-        model, resp = None, {"error": f"{type(exc).__name__}: {exc}"}
+        from providers.resilience import describe_error
+        model, resp = None, {"error": describe_error(exc)}
     if model and isinstance(resp, dict) and "error" not in resp:
         ctx.routed_model = model
         ctx.savings.routed_model = model
@@ -265,6 +266,7 @@ class TestG06Routing:
             ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
         assert ctx.savings.routing_mode == "llm_judge"
+        assert [c["model"] for c in ctx.provider_calls if c.get("side")] == ["gpt-4o-mini"]
 
     async def test_llm_judge_fallback_on_error(self, make_ctx):
         ctx = make_ctx(
@@ -351,6 +353,8 @@ class TestG06Routing:
             ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"  # judge overrode medium → simple
         assert ctx.savings.routing_mode == "cascade"
+        # The judge is a paid call that is not the answer: recorded as a side call.
+        assert "gpt-4o-mini" in [c["model"] for c in ctx.provider_calls if c.get("side")]
 
     async def test_cascade_no_judge_model_skips_llm(self, make_ctx):
         ambiguous = " ".join(["word"] * 100)
@@ -1008,6 +1012,21 @@ class TestG06CascadeOverEscalationGuards:
         ctx = await self._run(ctx, mock, judge=judge)
         assert ctx.routed_model == "gpt-4o"
 
+    async def test_every_cascade_judge_call_is_given_ctx_to_record_itself(self, make_ctx):
+        """The confidence judge records its own (side) call, so it must be handed ctx."""
+        ctx = make_ctx([{"role": "user", "content": _MEDIUM_PROMPT}], model="gpt-4o")
+        self._cfg(ctx, judge_model="gpt-4o-mini", cascade_confidence_threshold=0.90)
+        handed = []
+
+        async def mock(*a, **k):
+            return _mk_resp(k.get("model", ""), "answer", "stop")
+
+        async def judge(*a, **k):
+            handed.append(k.get("ctx") is ctx)
+            return 0.40                                  # below threshold: escalate
+        await self._run(ctx, mock, judge=judge)
+        assert handed == [True, True], handed            # tier 1, then tier 2
+
     # ── x_complexity override ─────────────────────────────────────────────────
 
     async def test_x_complexity_override_bypasses_cascade(self, make_ctx):
@@ -1178,16 +1197,46 @@ class TestG06UnreachableTierGuard:
         g["tiers"] = {"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["gpt-4o"]}
 
     async def test_fallback_serves_requested_model(self, make_ctx):
-        # Simple prompt routes to the gpt-4o-mini tier, but that tier is unreachable → serve
-        # the caller's own model (claude-haiku-4-5, which is reachable).
+        # Simple prompt routes to the gpt-4o-mini tier, but that tier is unreachable (no
+        # platform key, and none of the tenant's own) → serve the caller's own model
+        # (claude-haiku-4-5, which is reachable).
         ctx = make_ctx([{"role": "user", "content": "What is Python?"}], model="claude-haiku-4-5")
         self._tiers_cfg(ctx, "fallback")
         from middleware.g06_routing import G06Routing
         with patch("middleware.g06_routing._tier_reachable",
-                   side_effect=lambda m: m == "claude-haiku-4-5"):
+                   side_effect=lambda m: m == "claude-haiku-4-5"), \
+                patch("middleware.g06_routing._resolve_provider_key", new=AsyncMock(return_value=None)):
             ctx = await G06Routing().process_request(ctx)
             ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "claude-haiku-4-5"
+
+    async def test_a_tenants_own_key_makes_the_tier_reachable(self, make_ctx):
+        # Strict BYOK: no platform key for the tier's provider, but this tenant has its own.
+        # The guard asked about platform keys only, so cost routing never ran there.
+        ctx = make_ctx([{"role": "user", "content": "What is Python?"}], model="claude-haiku-4-5")
+        ctx.tenant_id = "acme"
+        self._tiers_cfg(ctx, "fallback")
+        from middleware.g06_routing import G06Routing
+        tenant_key = AsyncMock(return_value="sk-tenant")
+        with patch("middleware.g06_routing._tier_reachable",
+                   side_effect=lambda m: m == "claude-haiku-4-5"), \
+                patch("middleware.g06_routing._resolve_provider_key", new=tenant_key):
+            ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
+        assert ctx.routed_model == "gpt-4o-mini"
+        assert ("gpt-4o-mini", "acme") in [c.args for c in tenant_key.await_args_list]
+
+    async def test_a_platform_key_needs_no_tenant_lookup(self, make_ctx):
+        ctx = make_ctx([{"role": "user", "content": "What is Python?"}], model="claude-haiku-4-5")
+        self._tiers_cfg(ctx, "fallback")
+        from middleware.g06_routing import G06Routing
+        tenant_key = AsyncMock(return_value=None)
+        with patch("middleware.g06_routing._tier_reachable", return_value=True), \
+                patch("middleware.g06_routing._resolve_provider_key", new=tenant_key):
+            ctx = await G06Routing().process_request(ctx)
+            ctx = await _drive_deferred_cascade(ctx)
+        assert ctx.routed_model == "gpt-4o-mini"
+        tenant_key.assert_not_awaited()
 
     async def test_error_mode_keeps_unreachable_tier(self, make_ctx):
         # In error mode the unreachable tier is kept so main.py's provider-key guard 503s.
@@ -1195,7 +1244,8 @@ class TestG06UnreachableTierGuard:
         self._tiers_cfg(ctx, "error")
         from middleware.g06_routing import G06Routing
         with patch("middleware.g06_routing._tier_reachable",
-                   side_effect=lambda m: m == "claude-haiku-4-5"):
+                   side_effect=lambda m: m == "claude-haiku-4-5"), \
+                patch("middleware.g06_routing._resolve_provider_key", new=AsyncMock(return_value=None)):
             ctx = await G06Routing().process_request(ctx)
             ctx = await _drive_deferred_cascade(ctx)
         assert ctx.routed_model == "gpt-4o-mini"
@@ -1624,7 +1674,177 @@ class TestG06CascadeDeferralHardening:
         ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
         self._cfg(ctx)
         from middleware.g06_routing import G06Routing
-        with patch("middleware.g06_routing._tier_reachable", return_value=False):
+        with patch("middleware.g06_routing._tier_reachable", return_value=False), \
+                patch("middleware.g06_routing._resolve_provider_key",
+                      new=AsyncMock(return_value=None)):   # no tenant key either
             ctx = await G06Routing().process_request(ctx)
         assert ctx.routed_model == "gpt-4o"          # guard fell back to requested
         assert ctx.cascade_plan is None              # doomed plan disarmed
+
+
+class _KeyedProviderError(Exception):
+    """A provider error whose text carries what a litellm message can: a key, a base_url."""
+    status_code = 401
+
+
+_LEAK = "AuthenticationError: api_key=sk-live-LEAKED0123456789 base_url=https://internal.example/v1"
+
+
+def _assert_nothing_leaked(caplog):
+    assert "LEAKED0123456789" not in caplog.text
+    assert "internal.example" not in caplog.text
+
+
+@pytest.mark.asyncio
+class TestG06CascadeFailuresKeepSecretsOutOfLogs:
+    """A tier's provider error can carry key material and the base_url in its text. The
+    cascade logged it raw at every tier, and returned it as the error main.py logged again;
+    it now gives the class and status only (describe_error)."""
+
+    def _cfg(self, ctx, **overrides):
+        g = ctx.config["groups"]["G6_routing"]
+        g.update(enabled=True, classifier="cascade", cascade_execution=True,
+                 cascade_confidence_threshold=0.90, judge_model="gpt-4o-mini",
+                 tiers={"simple": ["gpt-4o-mini"], "medium": ["gpt-4o"], "complex": ["o1"]})
+        g.update(overrides)
+
+    async def _execute(self, ctx, acompletion, judge=0.50):
+        from middleware.g06_routing import G06Routing, _execute_three_tier_cascade
+
+        async def _judge(*args, **kwargs):
+            return judge
+
+        with patch("middleware.g06_routing.litellm.acompletion", acompletion), \
+                patch("middleware.g06_routing._evaluate_response_confidence", _judge), \
+                patch("middleware.g06_routing._resolve_provider_key", return_value="mock-key"), \
+                patch("config_loader.get_pricing_table",
+                      return_value=TestG06CascadeExecution._PRICING_WITH_REASONING):
+            ctx = await G06Routing().process_request(ctx)
+            plan = ctx.cascade_plan
+            assert plan is not None
+            return await _execute_three_tier_cascade(
+                ctx, plan.get("tiers") or {}, plan.get("cfg") or {},
+                tier1_model=plan.get("tier1_model"), max_tier_idx=plan.get("max_tier_idx"))
+
+    async def test_a_tier1_failure_returns_and_logs_the_class_only(self, make_ctx, caplog):
+        caplog.set_level("DEBUG")
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cfg(ctx)
+
+        async def acompletion(**kwargs):
+            raise _KeyedProviderError(_LEAK)
+
+        model, resp = await self._execute(ctx, acompletion)
+        assert (model, resp) == (None, {"error": "_KeyedProviderError(status=401)"})
+        assert "G06 cascade tier1 failed: _KeyedProviderError(status=401)" in caplog.text
+        _assert_nothing_leaked(caplog)
+
+    @pytest.mark.parametrize("failing,served", [("gpt-4o", "gpt-4o-mini"), ("o1", "gpt-4o")])
+    async def test_tier2_and_tier3_failures_log_the_class_only(self, make_ctx, caplog,
+                                                               failing, served):
+        caplog.set_level("DEBUG")
+        ctx = make_ctx([{"role": "user", "content":
+                         "Analyze and architect a strategy for this complex system."}],
+                       model="gpt-4o")
+        self._cfg(ctx, allow_escalation_above_requested=True, max_escalation_cost_usd=10.0)
+
+        async def acompletion(**kwargs):
+            if kwargs.get("model", "").split("/")[-1] == failing:
+                raise _KeyedProviderError(_LEAK)
+            return _mk_resp(kwargs.get("model", ""))
+
+        model, _resp = await self._execute(ctx, acompletion)
+        assert model == served                            # rolled back to the best tier
+        tier = "tier2" if failing == "gpt-4o" else "tier3"
+        assert f"G06 cascade {tier} failed: _KeyedProviderError(status=401)" in caplog.text
+        _assert_nothing_leaked(caplog)
+
+    async def test_a_failed_uncapped_retry_logs_the_class_only(self, make_ctx, caplog):
+        caplog.set_level("DEBUG")
+        ctx = make_ctx([{"role": "user", "content": "What is 2+2?"}], model="gpt-4o")
+        self._cfg(ctx, cascade_confidence_threshold=0.70, judge_model="")
+        calls = []
+
+        async def acompletion(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _mk_resp("gpt-4o-mini", content="truncated mid-", finish_reason="length")
+            raise _KeyedProviderError(_LEAK)
+
+        model, _resp = await self._execute(ctx, acompletion)
+        assert model == "gpt-4o-mini" and len(calls) == 2  # the capped answer is served
+        assert "uncapped tier1 retry failed (_KeyedProviderError(status=401))" in caplog.text
+        _assert_nothing_leaked(caplog)
+
+
+class _RouteResp:
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"routed_model": "weak-m", "confidence": 0.9}
+
+
+@pytest.mark.asyncio
+class TestG06RouteLLMSendsAnIdentityToken:
+    """routellm-svc requires Cloud Run IAM. G06 posted to it with no token, so on GCP every
+    routing call was refused and fell back to the heuristic."""
+
+    _CFG = {"routellm": {"url": "https://routellm-svc-x.a.run.app",
+                         "weak_model": "weak-m", "strong_model": "strong-m"}}
+
+    def _client(self, monkeypatch, seen):
+        import middleware.g06_routing as g06
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, json=None, headers=None):
+                seen.append({"url": url, "headers": headers})
+                return _RouteResp()
+
+        monkeypatch.setattr(g06.httpx, "AsyncClient", _Client)
+        monkeypatch.setattr(g06, "_openai_key_available", lambda: True)
+        return g06
+
+    async def test_the_call_carries_the_cloud_run_token(self, monkeypatch):
+        seen, asked = [], []
+        g06 = self._client(monkeypatch, seen)
+        monkeypatch.setattr("ml_models.cloud_run_auth_headers",
+                            lambda url: asked.append(url) or {"Authorization": "Bearer id-tok"})
+        tier = await g06._classify_routellm([{"role": "user", "content": "hi"}], {}, self._CFG)
+        assert tier == "simple"
+        assert asked == ["https://routellm-svc-x.a.run.app"]
+        assert seen == [{"url": "https://routellm-svc-x.a.run.app/route",
+                         "headers": {"Authorization": "Bearer id-tok"}}]
+
+    async def test_no_token_to_attach_still_calls(self, monkeypatch):
+        seen = []
+        g06 = self._client(monkeypatch, seen)
+        monkeypatch.setattr("ml_models.cloud_run_auth_headers", lambda url: {})
+        assert await g06._classify_routellm([{"role": "user", "content": "hi"}], {},
+                                            self._CFG) == "simple"
+        assert seen[0]["headers"] == {}
+
+    async def test_a_token_failure_falls_back_to_the_heuristic(self, monkeypatch):
+        seen = []
+        g06 = self._client(monkeypatch, seen)
+
+        def _metadata_down(url):
+            raise OSError("metadata server unreachable")
+
+        monkeypatch.setattr("ml_models.cloud_run_auth_headers", _metadata_down)
+        messages = [{"role": "user", "content": "hi"}]
+        try:
+            tier = await g06._classify_routellm(messages, {}, self._CFG)
+        except OSError:
+            pytest.fail("a token failure escaped instead of falling back to the heuristic")
+        assert seen == []
+        assert tier == g06._classify_heuristic(messages, {})[0]

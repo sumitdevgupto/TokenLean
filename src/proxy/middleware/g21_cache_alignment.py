@@ -13,14 +13,14 @@ Technique:
   This is a *cost* optimisation, not a token-count optimisation.
   Output is identical; only message order and metadata change.
 """
-import copy
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-from middleware import RequestContext, resolve_group_config
+from middleware import RequestContext, insert_before_last_user, resolve_group_config
 from middleware import cache_floor
 from middleware import langfuse_tracing
+from providers import is_retrieved_context
 from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -155,9 +155,19 @@ class G21CacheAlignment:
         messages = ctx.messages
         tokens_before = ctx.current_token_count
 
-        # Partition messages into stable prefix vs variable suffix
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        variable_msgs = [m for m in messages if m.get("role") != "system"]
+        # Partition messages into stable prefix vs variable suffix. Retrieved documents (G07)
+        # change with every query, so they belong to the suffix, just before the latest user
+        # turn, wherever a system-first rebuild (G10, G26) left them: never to the prefix, or
+        # to the cache key derived from it.
+        if any(is_retrieved_context(m) for m in messages):
+            messages = insert_before_last_user(
+                [m for m in messages if not is_retrieved_context(m)],
+                [m for m in messages if is_retrieved_context(m)])
+            ctx.messages = messages
+        system_msgs = [m for m in messages
+                       if m.get("role") == "system" and not is_retrieved_context(m)]
+        variable_msgs = [m for m in messages
+                         if m.get("role") != "system" or is_retrieved_context(m)]
 
         # ── Prefix stabilisation (#33) ───────────────────────────────────────────
         # Must run BEFORE align_prefix AND before _apply_cache_policy: the latter hashes

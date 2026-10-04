@@ -58,7 +58,7 @@ def _make_ctx(messages, config=None):
                     "min_length_to_compress": 30,
                     "compression_strategies": {
                         "json": {"remove_empty": True, "dedupe_keys": False},
-                        "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
+                        "code": {"strip_comments": True, "strip_whitespace": True},
                         "logs": {"dedupe_lines": True, "truncate_long_lines": 200},
                     },
                 }
@@ -181,8 +181,10 @@ async def test_agent_quality_gate_no_data_loss():
 
 @pytest.mark.asyncio
 async def test_agent_code_block_stripping():
-    """Agent code blocks in response-side content are compressed."""
-    code = """# Import system modules
+    """Agent code blocks in response-side content are compressed. The block names its
+    language: comments are stripped only from code whose language is known."""
+    code = """```python
+# Import system modules
 import os
 import sys
 
@@ -193,7 +195,7 @@ def helper():
 class Worker:
     def run(self):
         return 42
-"""
+```"""
     msgs = [{"role": "user", "content": "test"}]
     ctx = _make_ctx(msgs)
     response = {

@@ -8,6 +8,15 @@
 #   docker-compose down               # Stop all (zero cost)
 #
 # All services support the G0-G28 optimisations via local Docker networking.
+#
+# Only the proxy (port 4000, which authenticates every call) listens beyond this machine;
+# its /metrics is open here for the local Prometheus (METRICS_ALLOW_UNAUTHENTICATED below).
+# Every other published port — Redis, Postgres, Qdrant, the sidecars and the admin UIs — is
+# bound to TOKEN_OPT_BIND, 127.0.0.1 unless set, because Docker's published ports bypass a
+# host firewall. Redis, Qdrant, Langfuse's and Grafana's admins each require a credential
+# from .env (REDIS_PASSWORD, QDRANT_API_KEY, LANGFUSE_INIT_USER_PASSWORD, GRAFANA_PASSWORD):
+# compose will not start without them, and scripts/local/deploy-local.sh generates any that
+# .env lacks. Widen TOKEN_OPT_BIND only on a private network.
 # =============================================================================
 # (No `version:` key — Compose v2 ignores it and warns that it is obsolete.)
 
@@ -24,13 +33,21 @@ name: token-opt
 services:
   # ─── Infrastructure Layer ─────────────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    # 7.2: the last BSD-3-Clause Redis. From 7.4 Redis is RSALv2/SSPLv1, outside the licence
+    # rule in THIRD_PARTY_LICENSES.md (and `redis:7-alpine` resolves to 7.4.x).
+    image: redis:7.2-alpine
     container_name: token-opt-redis
     ports:
-      - "6379:6379"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --save 60 1
+    # A password of its own (.env; scripts/local/deploy-local.sh generates it): the clients
+    # send it as the `default` user's (REDIS_PASSWORD).
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env (scripts/local/deploy-local.sh generates it)}",
+              "--appendonly", "yes", "--save", "60", "1"]
+    environment:
+      # redis-cli in this container (the healthcheck, and scripts that docker exec it) logs in with it.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     networks:
       - token-opt-net
     healthcheck:
@@ -48,7 +65,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: token_opt
     ports:
-      - "5432:5432"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -63,8 +80,12 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.12.6
     container_name: token-opt-qdrant
+    environment:
+      # Every API call needs it (QDRANT_API_KEY in .env, generated as REDIS_PASSWORD is); the
+      # health endpoints do not.
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env (scripts/local/deploy-local.sh generates it)}
     ports:
-      - "6333:6333"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
@@ -83,7 +104,7 @@ services:
       dockerfile: Dockerfile
     container_name: token-opt-llmlingua
     ports:
-      - "8080:8080"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:8080:8080"
     environment:
       LOG_LEVEL: INFO
     networks:
@@ -107,8 +128,10 @@ services:
     environment:
       PORT: "4000"
       REDIS_URL: redis://redis:6379/0
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       DATABASE_URL: postgresql://token_opt:${DB_PASSWORD}@postgres:5432/token_opt
       QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
       LLMLINGUA_URL: http://llmlingua:8080
       ROUTELLM_URL: http://routellm:8080
       G06_JUDGE_MODEL: ${G06_JUDGE_MODEL:-}
@@ -120,12 +143,19 @@ services:
       CONFIG_LOCAL_PATH: /app/config/config.yaml
       GCP_PROJECT_ID: ${GCP_PROJECT_ID:-}
       LOCAL_PROXY_KEYS_FILE: /app/config/local-keys.json
-      # H2: gate /metrics with a bearer token. Unset by default for local dev
-      # (endpoint stays open with a startup warning); set it to require auth.
+      # H2: /metrics lists tenant ids with their token and cost figures. With no
+      # METRICS_SCRAPE_TOKEN the proxy refuses every scrape unless
+      # METRICS_ALLOW_UNAUTHENTICATED is on, as it is here for the local Prometheus, which
+      # sends no token. Port 4000 listens beyond this machine: before anyone else can reach
+      # it, set METRICS_SCRAPE_TOKEN (and the same token in the local Prometheus scrape
+      # config), or set METRICS_ALLOW_UNAUTHENTICATED=false.
       METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:-}
-      # WS25: CORS is default-deny; local dev keeps the old wildcard behaviour.
-      # Production sets CORS_ORIGINS instead and leaves this unset.
-      CORS_ALLOW_ALL: ${CORS_ALLOW_ALL:-true}
+      METRICS_ALLOW_UNAUTHENTICATED: ${METRICS_ALLOW_UNAUTHENTICATED:-true}
+      # WS25: CORS is default-deny, here too: the portal calls the proxy through its own
+      # server, so no browser page needs it. A browser app on another origin: list it in
+      # CORS_ORIGINS (or set CORS_ALLOW_ALL=true) in .env.
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      CORS_ALLOW_ALL: ${CORS_ALLOW_ALL:-false}
       LLM_KEY_OPENAI: ${LLM_KEY_OPENAI:-}
       LLM_KEY_ANTHROPIC: ${LLM_KEY_ANTHROPIC:-}
       LLM_KEY_GOOGLE: ${LLM_KEY_GOOGLE:-}
@@ -191,7 +221,7 @@ services:
       dockerfile: Dockerfile
     container_name: token-opt-routellm
     ports:
-      - "8081:8080"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:8081:8080"
     environment:
       PORT: "8080"
       LOG_LEVEL: INFO
@@ -216,7 +246,7 @@ services:
       dockerfile: Dockerfile
     container_name: token-opt-tika
     ports:
-      - "9998:9998"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:9998:9998"
     environment:
       TIKA_MAX_FILE_SIZE: ${TIKA_MAX_FILE_SIZE:-100000000}
       TIKA_TIMEOUT_MS: ${TIKA_TIMEOUT_MS:-30000}
@@ -235,7 +265,7 @@ services:
     image: langfuse/langfuse:2
     container_name: token-opt-langfuse
     ports:
-      - "3100:3000"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:3100:3000"
     environment:
       DATABASE_URL: postgresql://token_opt:${DB_PASSWORD}@postgres:5432/langfuse
       NEXTAUTH_URL: http://localhost:3100
@@ -250,7 +280,8 @@ services:
       LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@local.dev}
       LANGFUSE_INIT_USER_NAME: Local Admin
-      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-changeme123}
+      # Read once, when Langfuse first creates this admin: changing it later changes nothing.
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?set LANGFUSE_INIT_USER_PASSWORD in .env (scripts/local/deploy-local.sh generates it)}
       LANGFUSE_INIT_USER_ROLE: ADMIN
     networks:
       - token-opt-net
@@ -264,9 +295,10 @@ services:
     image: grafana/grafana-oss:10.4.0
     container_name: token-opt-grafana
     ports:
-      - "3000:3000"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      # Read on Grafana's first start (its volume keeps the admin's password after that).
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env (scripts/local/deploy-local.sh generates it)}
       PROMETHEUS_HOST: http://prometheus:9090
       LANGFUSE_DB_HOST: postgres
       LANGFUSE_DB_NAME: langfuse
@@ -289,7 +321,7 @@ services:
     image: prom/prometheus:v2.52.0
     container_name: token-opt-prometheus
     ports:
-      - "9090:9090"
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:9090:9090"
     volumes:
       - ./infra/prometheus.local.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -312,9 +344,9 @@ services:
     image: jaegertracing/all-in-one:1.57
     container_name: token-opt-jaeger
     ports:
-      - "16686:16686"   # Jaeger UI
-      - "4317:4317"     # OTLP gRPC receiver
-      - "4318:4318"     # OTLP HTTP receiver
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:16686:16686"   # Jaeger UI
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:4317:4317"     # OTLP gRPC receiver
+      - "${TOKEN_OPT_BIND:-127.0.0.1}:4318:4318"     # OTLP HTTP receiver
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     networks:

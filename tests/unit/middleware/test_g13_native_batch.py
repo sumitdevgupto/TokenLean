@@ -275,6 +275,76 @@ class TestBaselineTokensAttribution:
         assert stored["r0"]["baseline_tokens"] == 0
 
 
+class _SpendCounter:
+    """The spend counter's Redis: records what is added to it."""
+
+    def __init__(self):
+        self.added = []
+
+    async def incrbyfloat(self, key, amount):
+        self.added.append((key, amount))
+        return amount
+
+    async def expire(self, key, ttl):
+        pass
+
+
+@pytest.mark.asyncio
+class TestNativeBatchCostReachesTheSpendCap:
+    """The native lane's answers arrive in the poller. It adds each completed answer's cost,
+    at the configured native-batch discount, to the spend counter of the tenant whose request
+    it was."""
+
+    async def test_the_job_keeps_whose_spend_each_request_is(self):
+        redis = MagicMock()
+        redis.hset = AsyncMock()
+        items = [{"request_id": "r0", "model": "gpt-4o-mini", "spend_prefix": "t:acme:"},
+                 {"request_id": "r1", "model": "gpt-4o-mini", "spend_prefix": ""},
+                 {"request_id": "r2", "model": "gpt-4o-mini"}]
+        with patch.object(g13_batch, "_get_redis", return_value=redis):
+            await g13_batch._record_batch_job("job-1", "openai", items)
+        stored = json.loads(redis.hset.await_args.args[2])
+        assert stored["spend"] == {"r0": {"prefix": "t:acme:", "model": "gpt-4o-mini"}}
+
+    @staticmethod
+    async def _poll(monkeypatch, meta):
+        from middleware import g00_rate_limit
+        counter = _SpendCounter()
+        monkeypatch.setattr(g00_rate_limit, "_get_redis", lambda: counter)
+        redis = MagicMock()
+        redis.hgetall = AsyncMock(return_value={"batch-1": json.dumps(meta)})
+        redis.hdel = AsyncMock()
+        adapter = MagicMock()
+        adapter.poll_batch = AsyncMock(return_value="completed")
+        adapter.fetch_batch_results = AsyncMock(return_value=[
+            {"request_id": "r0", "response": {
+                "id": "c0", "usage": {"prompt_tokens": 1200, "completion_tokens": 300}}},
+            {"request_id": "r1", "error": "bad"},
+        ])
+        adapter.extract_usage.return_value = {}
+        cfg = {"groups": {"G18_observability": {"enabled": True, "batch_discount_multiplier": 0.5}}}
+        with patch.object(g13_batch, "_get_redis", return_value=redis), \
+             patch("providers.get_adapter_by_name", return_value=adapter), \
+             patch("auth.api_key_manager.get_llm_provider_key", return_value="sk-test"), \
+             patch.object(g13_batch, "_store_batch_result", new=AsyncMock()):
+            assert await g13_batch.poll_batch_jobs(cfg) == 1
+        return counter.added
+
+    async def test_a_completed_answer_s_discounted_cost_is_added(self, monkeypatch):
+        from middleware.g00_rate_limit import G00RateLimit
+        from savings.calculator import estimate_cost
+        owed = {"prefix": "t:acme:", "model": "gpt-4o-mini"}
+        added = await self._poll(monkeypatch, {"provider": "openai", "request_ids": ["r0", "r1"],
+                                               "spend": {"r0": owed, "r1": owed}})
+        # r1 failed, so only r0's cost is added.
+        assert added == [(G00RateLimit.spend_key("t:acme:"),
+                          pytest.approx(0.5 * estimate_cost(1200, 300, "gpt-4o-mini")))]
+
+    async def test_a_job_that_names_no_counter_adds_nothing(self, monkeypatch):
+        added = await self._poll(monkeypatch, {"provider": "openai", "request_ids": ["r0", "r1"]})
+        assert added == []
+
+
 @pytest.mark.asyncio
 async def test_start_batch_poller_noop_when_native_disabled():
     # Returns immediately (no infinite loop) when provider_native is off.

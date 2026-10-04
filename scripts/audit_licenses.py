@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
 # =============================================================================
-# audit_licenses.py — OSS licence compliance audit
+# audit_licenses.py — the licence rule, checked
 # -----------------------------------------------------------------------------
-# Substantiates the compliance claim in THIRD_PARTY_LICENSES.md:
+# The rule (THIRD_PARTY_LICENSES.md): everything TokenLean installs is free to use
+# and to host — permissively licensed (MIT, Apache-2.0, BSD, ISC, PSF, PostgreSQL,
+# BSL-1.0, CNRI-Python, Zlib, CC0, Unlicense, HPND), or MPL-2.0 for an unmodified
+# transitive dependency. This script checks every pin of every lockfile the images
+# and CI install against it.
 #
-#   "No GPL, AGPL, or SSPL code is imported into or redistributed as part of
-#    this Work."
+# Method: each pin is judged by the licence of THAT release — the installed
+# distribution's metadata when the same version is installed, else the release's
+# published PyPI metadata (/pypi/<name>/<version>/json). Signals, most specific
+# first: the SPDX License-Expression, then the License :: classifiers, then the
+# License field. Every licence an expression or classifier list names must be
+# allowed, so a dual licence with a disallowed alternative needs an override below.
 #
-# Method (two passes, so partial environments can't produce a false clean):
-#   1. Scan the installed environment via importlib.metadata — the authoritative
-#      source, since it sees what is actually importable.
-#   2. For declared dependencies NOT installed locally, fall back to published
-#      PyPI metadata, so coverage reaches 100% of the declared set rather than
-#      silently auditing whatever happens to be on the machine.
-#
-# Scope is the *imported libraries* of the Work — the proxy runtime and its test
-# deps. The sidecars (Tika, LLMLingua, RouteLLM) run as separate network services
-# and are covered by the bundled-services table in THIRD_PARTY_LICENSES.md, not
-# here. Add to REQ_FILES if that ever changes.
+# Scope: Python packages. Services, images and model weights are listed, with their
+# licences, in THIRD_PARTY_LICENSES.md.
 #
 # Usage:
-#   python scripts/audit_licenses.py              # full audit (needs network)
-#   python scripts/audit_licenses.py --offline    # installed env only
+#   python scripts/audit_licenses.py              # full audit (needs network to pypi.org)
+#   python scripts/audit_licenses.py --offline    # installed distributions only
 #
 # Exit codes:
-#   0 — no strong copyleft, every declared dependency resolved
-#   1 — strong copyleft found, or a licence could not be determined
+#   0 — every pin is permissive or MPL-2.0 (pending removals are reported only)
+#   1 — a pin's licence is outside the rule, or could not be determined
 #
-# Wired into:
-#   - nothing automatic. Run before refreshing the "Last verified" date in
-#     THIRD_PARTY_LICENSES.md. Safe to add as a CI gate, but note pass 2 needs
-#     outbound network to pypi.org.
+# Wired into: .github/workflows/ci.yml (the "Licence audit" step).
 # =============================================================================
-"""OSS licence compliance audit — see module banner."""
+"""OSS licence rule audit — see module banner."""
 from __future__ import annotations
 
 import argparse
@@ -40,191 +36,239 @@ import importlib.metadata as md
 import json
 import re
 import sys
+import time
 import urllib.request
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Every lockfile an image or CI installs: what scripts/compile-requirements.sh writes.
 REQ_FILES = [
     REPO_ROOT / "src" / "proxy" / "requirements.txt",
     REPO_ROOT / "tests" / "requirements-test.txt",
+    REPO_ROOT / "src" / "llmlingua-sidecar" / "requirements.txt",
+    REPO_ROOT / "src" / "routellm-sidecar" / "requirements.txt",
+    REPO_ROOT / "src" / "doc-pipeline" / "requirements.txt",
+    REPO_ROOT / "src" / "finetune-pipeline" / "requirements.txt",
 ]
 
-# Strong copyleft — a hit here fails the audit and the claim in
-# THIRD_PARTY_LICENSES.md would need revisiting.
-STRONG = re.compile(r"\b(A?GPL(?:v[23])?|SSPL|LGPL)\b", re.I)
-# Weak / file-level copyleft — reported for visibility, not a failure. MPL-2.0
-# does not impose copyleft on the larger Apache-2.0 Work.
-WEAK = re.compile(r"\bMPL\b|Mozilla Public License", re.I)
+PYPI_URL = "https://pypi.org/pypi/{name}/{version}/json"
 
-PYPI_URL = "https://pypi.org/pypi/{name}/json"
+# The allowed licences, as SPDX ids and as the words classifiers and License fields use.
+PERMISSIVE = re.compile(
+    r"\b(MIT|MIT-0|MIT-CMU|Apache|BSD|0BSD|ISC|PSF|Python Software Foundation|Python-2\.0|"
+    r"PostgreSQL|BSL-1\.0|Boost Software|CNRI-Python|Zlib|CC0|Unlicense|HPND|"
+    r"Historical Permission Notice|Public Domain)\b", re.I)
+MPL = re.compile(r"\bMPL\b|Mozilla Public License", re.I)
+# Free-text licence fields can name several licences; any of these makes one outside the rule.
+DISALLOWED = re.compile(
+    r"\b(A?GPL|LGPL|SSPL|BUSL|Business Source|Commons Clause|Proprietary|Non-?Commercial|"
+    r"Elastic License|RSAL)", re.I)
+# An SPDX expression: licence ids joined by AND / OR / WITH, with parentheses.
+_EXPRESSION = re.compile(r"^[A-Za-z0-9.+()\- ]+$")
 
-# Packages that publish no machine-readable licence, verified by hand against the
-# project's own source. The evidence URL is the audit trail — keep it, and re-check
-# if the pin ever moves to a major version.
+# Licences verified by hand, with their evidence. A bare name fills a package that publishes
+# no licence metadata at all; "name==version" corrects metadata that exists but is wrong, for
+# that release only (a new release has to prove itself).
 MANUAL_OVERRIDES = {
-    "zep-python": (
-        "Apache-2.0",
-        "github.com/getzep/zep-python LICENSE, verified 2026-08-05",
-    ),
+    "fsspec": ("BSD-3-Clause",
+               "github.com/fsspec/filesystem_spec LICENSE at tag 2026.7.0, verified 2026-10-04"),
+    "google-crc32c": ("Apache-2.0",
+                      "github.com/googleapis/python-crc32c LICENSE at tag v1.8.0, verified 2026-10-04"),
+    "py-rust-stemmers": ("MIT",
+                         "github.com/qdrant/py-rust-stemmers LICENSE at tag v0.1.8, verified 2026-10-04"),
+    "routellm": ("Apache-2.0",
+                 "github.com/lm-sys/RouteLLM LICENSE, there since 2024-06-25, before the first "
+                 "PyPI release (no release tags), verified 2026-10-04"),
+    "fastembed==0.8.0": ("Apache-2.0",
+                         "github.com/qdrant/fastembed LICENSE at tag v0.8.0; this release's PyPI "
+                         "classifier says Other/Proprietary (0.8.1 corrected it), verified 2026-10-04"),
 }
+
+# Pins outside the rule that are already on their way out: reported, not failed, while
+# src/proxy/requirements.in still marks them "drop at the next recompile" (a unit test holds that).
+PENDING_REMOVAL = {
+    "zep-python": "2.0.2 ships no licence file or licence metadata; the proxy no longer imports it",
+}
+
+Row = namedtuple("Row", "name version verdict source licence")
 
 
 def norm(name: str) -> str:
     """PEP 503 normalisation, so `zep-python` and `zep_python` compare equal."""
-    return re.sub(r"[-_.]+", "-", name).lower()
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 
-def parse_requirements(path: Path) -> set[str]:
-    """Extract bare package names. Ignores comments, flags, and `-r` includes."""
-    names: set[str] = set()
-    if not path.exists():
-        print(f"  warning: {path} not found — skipped", file=sys.stderr)
-        return names
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line or line.startswith("-"):
-            continue
-        match = re.match(r"^([A-Za-z0-9._-]+)", line)
+_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s;#]+)")
+
+
+def parse_pins(text: str) -> dict[str, str]:
+    """{name: version} for every `name==version` line of a pip-compile lockfile."""
+    pins: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _PIN.match(line.strip())
         if match:
-            names.add(norm(match.group(1)))
-    return names
+            pins[norm(match.group(1))] = match.group(2)
+    return pins
 
 
-def licence_of_installed(dist) -> str:
-    """Join every licence signal a distribution exposes into one searchable blob."""
-    parts: list[str] = []
-    meta = dist.metadata
-    for key in ("License-Expression", "License"):
-        value = meta.get(key)
-        if value and value.strip() and value.strip().upper() != "UNKNOWN":
-            parts.append(value.strip().splitlines()[0][:120])
-    parts += [
-        cls.split("::")[-1].strip()
-        for cls in (meta.get_all("Classifier") or [])
-        if cls.startswith("License ::")
-    ]
-    return " | ".join(dict.fromkeys(parts))
+def _first_line(value) -> str:
+    text = (value or "").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    return "" if first.upper() == "UNKNOWN" else first
 
 
-def licence_from_pypi(name: str) -> str:
-    """Published metadata for a package that isn't installed locally."""
-    with urllib.request.urlopen(PYPI_URL.format(name=name), timeout=20) as fh:
-        info = json.load(fh)["info"]
-    parts: list[str] = []
-    if info.get("license_expression"):
-        parts.append(info["license_expression"])
-    if info.get("license"):
-        parts.append(info["license"].strip().splitlines()[0][:120])
-    parts += [
-        cls.split("::")[-1].strip()
-        for cls in (info.get("classifiers") or [])
-        if cls.startswith("License ::")
-    ]
-    return " | ".join(dict.fromkeys(p for p in parts if p))
+def _judge(licences: list[str]) -> str:
+    """'permissive' / 'mpl' / 'other' for licences that must ALL be allowed."""
+    if any(not (PERMISSIVE.search(lic) or MPL.search(lic)) for lic in licences):
+        return "other"
+    return "mpl" if any(MPL.search(lic) for lic in licences) else "permissive"
 
 
-def classify(blob: str) -> str:
-    if not blob:
+def _expression_licences(expression: str) -> list[str]:
+    """The licence ids an SPDX expression names (a WITH exception only adds permissions)."""
+    terms = re.split(r"\s+(?:AND|OR)\s+|[()]", expression)
+    return [t.split(" WITH ")[0].strip() for t in terms if t.strip()]
+
+
+def classify(evidence: dict) -> str:
+    """'permissive', 'mpl', 'other' (outside the rule) or 'unknown' (no licence signal)."""
+    expression = (evidence.get("expression") or "").strip()
+    if expression:
+        return _judge(_expression_licences(expression))
+    named = [c.split("::")[-1].strip() for c in evidence.get("classifiers") or []]
+    named = [c for c in named if c and c != "OSI Approved"]   # says nothing about WHICH licence
+    if named:
+        return _judge(named)
+    field = _first_line(evidence.get("license"))
+    if not field:
         return "unknown"
-    if STRONG.search(blob):
-        return "strong"
-    if WEAK.search(blob):
-        return "weak"
-    return "ok"
+    if _EXPRESSION.match(field) and re.search(r"\b(AND|OR)\b|-\d", field):
+        return _judge(_expression_licences(field))
+    if DISALLOWED.search(field):
+        return "other"
+    if MPL.search(field):
+        return "mpl"
+    return "permissive" if PERMISSIVE.search(field) else "other"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="skip the PyPI pass; audits only what is installed locally",
-    )
-    args = parser.parse_args()
+def resolve(name: str, version: str, evidence: dict) -> tuple[str, str]:
+    """(verdict, source) for one pin, with MANUAL_OVERRIDES applied."""
+    exact = MANUAL_OVERRIDES.get(f"{name}=={version}")
+    if exact:
+        return classify({"expression": exact[0]}), f"override: {exact[1]}"
+    verdict = classify(evidence)
+    if verdict == "unknown" and name in MANUAL_OVERRIDES:
+        licence, why = MANUAL_OVERRIDES[name]
+        return classify({"expression": licence}), f"override: {why}"
+    return verdict, "metadata"
 
-    declared: set[str] = set()
-    for path in REQ_FILES:
-        declared |= parse_requirements(path)
 
-    installed = {}
+def describe(evidence: dict) -> str:
+    named = [c.split("::")[-1].strip() for c in evidence.get("classifiers") or []]
+    return (evidence.get("expression") or ", ".join(named) or _first_line(evidence.get("license")))[:80]
+
+
+def evidence_from_metadata(meta) -> dict:
+    return {"expression": (meta.get("License-Expression") or "").strip(),
+            "license": meta.get("License") or "",
+            "classifiers": [c for c in (meta.get_all("Classifier") or []) if c.startswith("License ::")]}
+
+
+def evidence_from_pypi(info: dict) -> dict:
+    return {"expression": (info.get("license_expression") or "").strip(),
+            "license": info.get("license") or "",
+            "classifiers": [c for c in (info.get("classifiers") or []) if c.startswith("License ::")]}
+
+
+def installed_distributions() -> dict:
+    found = {}
     for dist in md.distributions():
         name = dist.metadata.get("Name")
         if name:
-            installed[norm(name)] = dist
+            found[norm(name)] = dist
+    return found
 
-    strong: list[tuple[str, str]] = []
-    weak: list[tuple[str, str]] = []
-    unknown: list[str] = []
 
-    # ── Pass 1: the installed environment (authoritative) ────────────────────
-    resolved = set()
-    for key, dist in sorted(installed.items()):
-        blob = licence_of_installed(dist)
-        verdict = classify(blob)
-        if key in declared:
-            resolved.add(key)
-        if verdict == "strong":
-            strong.append((key, blob))
-        elif verdict == "weak":
-            weak.append((key, blob))
-        elif verdict == "unknown" and key in declared:
-            unknown.append(key)
+def fetch(name: str, version: str, attempts: int = 3) -> dict:
+    """The published PyPI metadata (`info`) of one release, retried on a transient failure."""
+    url = PYPI_URL.format(name=name, version=version)
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=20) as fh:  # noqa: S310 — fixed https URL
+                return json.load(fh)["info"]
+        except Exception:  # noqa: BLE001 — retried, then re-raised to the caller
+            if attempt == attempts - 1:
+                raise
+            time.sleep(2 ** attempt)
+    raise RuntimeError("unreachable")
 
-    # ── Pass 2: declared but not installed → published metadata ──────────────
-    gaps = sorted(declared - resolved)
-    if gaps and not args.offline:
-        print(f"Resolving {len(gaps)} declared dependencies not installed locally…\n")
-        for name in gaps:
-            if name in MANUAL_OVERRIDES:
-                blob, evidence = MANUAL_OVERRIDES[name]
-                if classify(blob) == "strong":
-                    strong.append((name, blob))
-                else:
-                    resolved.add(name)
-                print(f"  {name:34s} {blob:22s} [manual: {evidence}]")
-                continue
-            try:
-                blob = licence_from_pypi(name)
-            except Exception as exc:  # noqa: BLE001 — network/404/parse all mean "unresolved"
-                print(f"  {name:34s} LOOKUP FAILED: {exc}")
-                unknown.append(name)
-                continue
-            verdict = classify(blob)
-            if verdict == "strong":
-                strong.append((name, blob))
-            elif verdict == "weak":
-                weak.append((name, blob))
-            elif verdict == "unknown":
-                print(f"  {name:34s} no published licence metadata — check the source repo")
-                unknown.append(name)
-            else:
-                resolved.add(name)
-                print(f"  {name:34s} {blob[:70]}")
-        print()
-    elif gaps:
-        print(f"--offline: {len(gaps)} declared dependencies unaudited: {', '.join(gaps)}\n")
-        unknown.extend(gaps)
 
-    coverage = len(resolved) / len(declared) * 100 if declared else 0.0
-    print(f"declared dependencies : {len(declared)}")
-    print(f"resolved              : {len(resolved)}  ({coverage:.1f}% coverage)")
-    print(f"distributions scanned : {len(installed)}")
-
-    print(f"\nstrong copyleft (GPL/AGPL/SSPL/LGPL): {len(strong)}")
-    for name, blob in strong:
-        print(f"  ✗ {name}: {blob}")
-    print(f"weak copyleft (MPL — compatible, informational): {len(weak)}")
-    for name, blob in weak:
-        print(f"  · {name}: {blob}")
-    if unknown:
-        print(f"unresolved ({len(unknown)}): {', '.join(sorted(set(unknown)))}")
-
-    if strong or unknown:
-        print("\nAUDIT FAILED — resolve the above before refreshing THIRD_PARTY_LICENSES.md.")
+def audit(rows: list[Row]) -> int:
+    """Print the report; 1 if any pin is outside the rule or undetermined (pending removals
+    excepted), else 0."""
+    failing = [r for r in rows if r.verdict in ("other", "unknown") and r.name not in PENDING_REMOVAL]
+    pending = [r for r in rows if r.verdict in ("other", "unknown") and r.name in PENDING_REMOVAL]
+    mpl = [r for r in rows if r.verdict == "mpl"]
+    overridden = [r for r in rows if r.source.startswith("override")]
+    print(f"pins audited: {len(rows)}  (permissive or MPL-2.0: {len(rows) - len(failing) - len(pending)})")
+    if mpl:
+        print(f"\nMPL-2.0 (allowed: unmodified transitive dependencies): {len(mpl)}")
+        for r in mpl:
+            print(f"  {r.name}=={r.version}  {r.licence}")
+    if overridden:
+        print(f"\nlicensed by a recorded override (its evidence, not the published metadata): {len(overridden)}")
+        for r in overridden:
+            print(f"  {r.name}=={r.version}  {r.source}")
+    if pending:
+        print(f"\npending removal (reported, not failed): {len(pending)}")
+        for r in pending:
+            print(f"  {r.name}=={r.version}  {PENDING_REMOVAL[r.name]}")
+    if failing:
+        print(f"\nOUTSIDE THE RULE or undetermined: {len(failing)}")
+        for r in failing:
+            print(f"  {r.name}=={r.version}  [{r.verdict}] {r.licence or r.source}")
+        print("\nAUDIT FAILED — replace the package, or verify its licence and record an override.")
         return 1
-    print("\nAUDIT CLEAN — no GPL/AGPL/SSPL among the declared dependencies.")
+    print("\nAUDIT CLEAN — every pin is permissive or MPL-2.0.")
     return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--offline", action="store_true",
+                        help="audit installed distributions only; any other pin is undetermined")
+    args = parser.parse_args(argv)
+
+    pins = sorted({pin for path in REQ_FILES
+                   for pin in parse_pins(path.read_text(encoding="utf-8")).items()})
+    installed = installed_distributions()
+
+    def look_up(pin):
+        name, version = pin
+        dist = installed.get(name)
+        if dist is not None and dist.version == version:
+            return pin, evidence_from_metadata(dist.metadata), ""
+        if args.offline:
+            return pin, None, "not installed (--offline)"
+        try:
+            return pin, evidence_from_pypi(fetch(name, version)), ""
+        except Exception as exc:  # noqa: BLE001 — reported as undetermined, which fails the audit
+            return pin, None, f"lookup failed: {exc}"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        found = list(pool.map(look_up, pins))
+
+    rows = []
+    for (name, version), evidence, problem in found:
+        if evidence is None:
+            rows.append(Row(name, version, "unknown", problem, ""))
+        else:
+            verdict, source = resolve(name, version, evidence)
+            rows.append(Row(name, version, verdict, source, describe(evidence)))
+    return audit(rows)
 
 
 if __name__ == "__main__":

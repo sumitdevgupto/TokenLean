@@ -364,3 +364,96 @@ def test_anthropic_streaming_tool_calls_emit_tool_use():
     assert '"id":"toolu_stream_e2e"' in resp.text
     assert "get_weather" in resp.text
     assert '"stop_reason":"tool_use"' in resp.text
+
+
+# ── Prompt-cache markers ──────────────────────────────────────────────────────
+# Translation used to drop every `cache_control` a native Anthropic client placed, so
+# nothing was cached and every turn paid full input price. The markers now reach an
+# Anthropic call where the caller put them, and no other provider sees them: litellm
+# would turn them into a separately billed Gemini cache, or hand them to an endpoint
+# that may reject them.
+_MARK = {"type": "ephemeral"}
+
+
+def _marked_body(model, **extra):
+    return {"model": model, "max_tokens": 64, "cache_control": _MARK,
+            "system": [{"type": "text", "text": "Rules.", "cache_control": _MARK}],
+            "tools": [{"name": "read_log", "input_schema": {"type": "object"},
+                       "cache_control": _MARK}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Fix the build.", "cache_control": _MARK}]}],
+            **extra}
+
+
+def _markers(obj):
+    if isinstance(obj, dict):
+        return ("cache_control" in obj) + sum(_markers(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_markers(v) for v in obj)
+    return 0
+
+
+def test_the_callers_cache_markers_reach_anthropic_where_it_put_them():
+    mock = AsyncMock(return_value=_resp("ok"))
+    resp = _drive(mock, "/v1/messages", {"x-api-key": _KEY}, _marked_body("claude-3-5-haiku"))
+    assert resp.status_code == 200
+    sent = mock.call_args.kwargs
+    assert sent["messages"] == [
+        {"role": "system", "content": [
+            {"type": "text", "text": "Rules.", "cache_control": _MARK}]},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Fix the build.", "cache_control": _MARK}]},
+    ]
+    assert sent["tools"][0].get("cache_control") == _MARK
+    assert sent.get("cache_control") == _MARK
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+def test_a_request_another_provider_serves_carries_no_cache_marker(stream):
+    sent = {}
+
+    async def acompletion(**kwargs):
+        sent.update(kwargs)
+        return _stream_chunks("ok") if stream else _resp("ok", model="gpt-4o-mini")
+
+    resp = _drive(acompletion, "/v1/messages", {"x-api-key": _KEY},
+                  _marked_body("gpt-4o-mini", stream=stream))
+    assert resp.status_code == 200
+    assert sent["messages"] and _markers(sent["messages"]) == 0
+    assert sent["tools"] and _markers(sent["tools"]) == 0
+    assert "cache_control" not in sent
+
+
+# ── fields the proxy cannot carry are refused by name ─────────────────────────
+def test_an_anthropic_tool_choice_it_cannot_carry_is_a_400_that_names_it():
+    mock = AsyncMock(return_value=_resp("ok"))
+    body = {"model": "claude-3-5-haiku", "max_tokens": 10,
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "sometimes"},
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp = _drive(mock, "/v1/messages", {"x-api-key": _KEY}, body)
+    assert resp.status_code == 400
+    assert "tool_choice" in resp.text
+    mock.assert_not_called()
+
+
+def test_anthropic_tool_choice_none_reaches_the_model_as_none():
+    mock = AsyncMock(return_value=_resp("ok"))
+    body = {"model": "claude-3-5-haiku", "max_tokens": 10,
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp = _drive(mock, "/v1/messages", {"x-api-key": _KEY}, body)
+    assert resp.status_code == 200
+    assert mock.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_a_gemini_generation_field_it_cannot_carry_is_a_400_that_names_it():
+    mock = AsyncMock(return_value=_resp("ok", model="gemini-2.5-flash"))
+    body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"]}}
+    resp = _drive(mock, "/v1beta/models/gemini-2.5-flash:generateContent",
+                  {"x-goog-api-key": _KEY}, body)
+    assert resp.status_code == 400
+    assert "responseModalities" in resp.text
+    mock.assert_not_called()

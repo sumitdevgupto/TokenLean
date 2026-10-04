@@ -8,6 +8,7 @@ Technique:
   3. LLMLingua-2 runtime compression for large messages
   4. Selective Context integration for relevance-based pruning
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ from middleware import RequestContext
 from middleware import cache_floor
 from middleware import langfuse_tracing
 from middleware.prose_compress import compress_text as _prose_compress_text
+from middleware.prose_compress import protected_segments as _protected_segments
 from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -211,30 +213,55 @@ _WORD_RE = _re.compile(r"[a-z0-9']+")
 
 
 def _is_faithful_compression(before: str, after: str) -> bool:
-    """Refuse a compression that drops a negation or a scope-limiting qualifier.
+    """Refuse a compression that drops a negation or a scope-limiting qualifier, or that
+    changes code, a URL, a path, an identifier or a version number.
 
-    One refusal, learned from one defect (E26): if a meaning-critical word appears in the
-    source and not in the output, the output may assert something the source did not. We
-    cannot tell "harmlessly terse" from "inverted" without reading it, so the compression is
-    declined and the ORIGINAL is sent — the same fail-safe direction as every other guard in
-    this codebase: a request that costs more is recoverable, a wrong answer is not.
+    The first refusal was learned from one defect (E26): if a meaning-critical word appears
+    in the source and not in the output, the output may assert something the source did not.
+    The second: LLMLingua-2 drops word tokens and Kompress rewrites text, and neither can
+    tell `fetch_user` or `/v2/users/` from filler, so the model would answer about, or edit,
+    code it never wrote. We cannot tell "harmlessly terse" from "inverted" without reading
+    it, so the compression is declined and the ORIGINAL is sent — the same fail-safe
+    direction as every other guard in this codebase: a request that costs more is
+    recoverable, a wrong answer is not.
 
-    Word-level and case-insensitive, so it is deterministic, provider-agnostic and cheap
-    enough to run on every compressed message.
+    Deterministic, provider-agnostic and linear in the message length, so it runs on every
+    compressed message.
     """
+    return _unfaithful_reason(before, after) is None
+
+
+def _unfaithful_reason(before: str, after: str) -> Optional[str]:
+    """Why compressing ``before`` into ``after`` must be refused, or None."""
     if not before or not after:
-        return bool(after) or not before
+        return None if (after or not before) else "the whole message was dropped"
     src_words = set(_WORD_RE.findall(before.lower()))
     out_words = set(_WORD_RE.findall(after.lower()))
-    dropped = (src_words & _MEANING_CRITICAL) - out_words
-    return not dropped
+    if (src_words & _MEANING_CRITICAL) - out_words:
+        return "a negation or scope qualifier was dropped"
+    # Every protected segment must survive unchanged and in its original order (the
+    # compressors only delete, so a moved segment was rewritten). One forward pass.
+    pos = 0
+    for segment in _protected_segments(before):
+        found = after.find(segment, pos)
+        if found < 0:
+            return "code, a URL, a path or an identifier was changed"
+        pos = found + len(segment)
+    return None
 
 
+# A fenced code block: ``` or ~~~ opening a line (up to any indentation).
+_CODE_FENCE_RE = _re.compile(r"^[ \t]*(?:```|~~~)", _re.MULTILINE)
+
+
+# These run on client-supplied history inside the event loop, so each must stay linear. The
+# stack-frame indentation is spaces and tabs only: `^\s+` also matched newlines, so on a run
+# of blank lines every line start rescanned the rest of the message (quadratic).
 _LOG_ERROR_PATTERNS = [
     _re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}", _re.MULTILINE),   # timestamps
     _re.compile(r"^\[?(INFO|DEBUG|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\]?", _re.MULTILINE),
     _re.compile(r"Traceback \(most recent call last\)", _re.MULTILINE),
-    _re.compile(r"^\s+at \w[\w.]+\([\w.]+:\d+\)", _re.MULTILINE),              # Java stack frames
+    _re.compile(r"^[ \t]+at \w[\w.]+\([\w.]+:\d+\)", _re.MULTILINE),           # Java stack frames
     _re.compile(r'^\d{2}:\d{2}:\d{2}\.\d+ \[', _re.MULTILINE),                # structured logs
 ]
 
@@ -280,13 +307,51 @@ class G01Compression:
     """G01 with layered composition, build-time compression, and Selective Context."""
     
     def __init__(self):
-        self._composer: Optional[LayeredPromptComposer] = None
+        self._composers: Dict[str, LayeredPromptComposer] = {}
         self._selective_pruner: Optional[SelectiveContextPruner] = None
-    
+
     def _get_composer(self, cfg: Dict) -> LayeredPromptComposer:
-        if self._composer is None:
-            self._composer = LayeredPromptComposer(cfg)
-        return self._composer
+        # One composer per layer set, so the layers follow the current config (a reload,
+        # a per-tenant setting) rather than the first request's for the process lifetime.
+        key = json.dumps([cfg.get("layers", {}), cfg.get("build_time_compression", True)],
+                         sort_keys=True, default=str)
+        composer = self._composers.get(key)
+        if composer is None:
+            composer = self._composers[key] = LayeredPromptComposer(cfg)
+        return composer
+
+    def _compose_layers(self, ctx: RequestContext, cfg: Dict) -> None:
+        """Layered composition, for the system messages that ask for it.
+
+        A system message opts in by carrying a ``layer_context`` object; its content is then
+        replaced by the configured layers, filled from that object. Nothing else triggers
+        it: it used to fire on any system prompt containing ``{{`` and ``}}`` (template
+        syntax a prompt may simply mention) and replaced the developer's instructions with
+        the generic layers. ``layer_context`` is TokenLean's field, not the provider's, so it
+        is removed from every message here, composed or not."""
+        if not any(isinstance(m, dict) and "layer_context" in m for m in ctx.messages):
+            return
+        enabled = cfg.get("layered_composition_enabled", False)
+        tokens_before = count_messages_tokens(ctx.messages, ctx.model)
+        composed_count = 0
+        for i, msg in enumerate(ctx.messages):
+            if not isinstance(msg, dict) or "layer_context" not in msg:
+                continue
+            layer_context = msg["layer_context"]
+            msg = {k: v for k, v in msg.items() if k != "layer_context"}
+            if enabled and msg.get("role") == "system" and isinstance(layer_context, dict):
+                composed = self._get_composer(cfg).compose(layer_context)
+                if composed:
+                    msg["content"] = composed
+                    composed_count += 1
+            ctx.messages[i] = msg
+        if composed_count:
+            tokens_after = count_messages_tokens(ctx.messages, ctx.model)
+            ctx.savings.add_step(
+                GROUP, f"Layered system prompt composed ({composed_count} message(s))",
+                tokens_before, tokens_after)
+            logger.info("[%s] G01 composed %d layered system prompt(s): %d -> %d tokens",
+                        ctx.request_id, composed_count, tokens_before, tokens_after)
     
     def _get_selective_pruner(self, cfg: Dict) -> Optional[SelectiveContextPruner]:
         if not cfg.get("selective_context_enabled", True):
@@ -316,22 +381,9 @@ class G01Compression:
         # a compression outage degrades to *some* savings instead of pass-through.
         deterministic_fallback: bool = cfg.get("deterministic_fallback", False)
         
-        # Check for layered composition in context
-        use_layers = cfg.get("layered_composition_enabled", True)
-        if use_layers:
-            composer = self._get_composer(cfg)
-            # If this is a system prompt with layer variables, compose it
-            for i, msg in enumerate(ctx.messages):
-                if msg.get("role") == "system":
-                    content = msg.get("content", "")
-                    # Check if content references layers
-                    if "{{" in content and "}}" in content:
-                        # Extract layer context from message
-                        layer_context = msg.get("layer_context", {})
-                        composed = composer.compose(layer_context)
-                        if composed:
-                            ctx.messages[i] = {**msg, "content": composed}
-                            logger.debug("[%s] G01 composed layered prompt", ctx.request_id)
+        # Layered composition: opt-in per system message (layer_context), default off.
+        use_layers = cfg.get("layered_composition_enabled", False)
+        self._compose_layers(ctx, cfg)
 
         tokens_before = ctx.current_token_count
         if tokens_before < min_tokens:
@@ -371,20 +423,26 @@ class G01Compression:
                 if isinstance(content, str) and len(content) > min_chars:
                     compressed = content
                     reduction_info = []
+                    # The model-based steps drop or rewrite tokens with no notion of code, so
+                    # a message holding a fenced code block skips them (no sidecar call). The
+                    # deterministic fallback keeps code byte-for-byte and may still run.
+                    model_steps = not _CODE_FENCE_RE.search(content)
 
                     # Step 1: Selective Context pruning (if enabled)
-                    if selective_pruner:
+                    if selective_pruner and model_steps:
                         pruned, reduction = selective_pruner.prune_context(compressed)
                         if reduction < reduction_threshold:
                             compressed = pruned
                             reduction_info.append(f"SC:{reduction:.2f}")
-                    
+
                     # Step 2: LLMLingua-2 compression
-                    llm_compressed = await _call_llmlingua(sidecar_url, compressed, ratio, force_reserve_digit)
+                    llm_compressed = (
+                        await _call_llmlingua(sidecar_url, compressed, ratio, force_reserve_digit)
+                        if model_steps else None)
                     if llm_compressed and len(llm_compressed) < len(compressed):
                         compressed = llm_compressed
                         reduction_info.append("LLML2")
-                    elif kompress_enabled and _is_log_error_content(compressed):
+                    elif model_steps and kompress_enabled and _is_log_error_content(compressed):
                         # Step 2b: Kompress-v2-base fallback for log/error content when
                         # LLMLingua sidecar is unavailable or produced no reduction
                         k_compressed = _kompress_compress(compressed, kompress_model, kompress_max_new_tokens)
@@ -409,8 +467,9 @@ class G01Compression:
                         # so any future compressor is too (E26).
                         logger.warning(
                             "[%s] G01 refused an unfaithful compression of a %s message "
-                            "(%d->%d chars): a negation or scope qualifier was dropped",
+                            "(%d->%d chars): %s",
                             ctx.request_id, role, len(content), len(compressed),
+                            _unfaithful_reason(content, compressed),
                         )
                         compressed = content
 
@@ -446,7 +505,8 @@ class G01Compression:
             span_before = cache_floor.span_tokens(ctx, ctx.messages)
             span_after = cache_floor.span_tokens_paired(
                 ctx, ctx.messages, compressed_messages)
-            if not cache_floor.allows_shrink(ctx, span_before, span_after, "G01"):
+            if not cache_floor.allows_shrink(ctx, span_before, span_after, "G01",
+                                             can_floor=True):
                 in_span = [i for i in changed_indices if floor_state.covers(ctx.messages[i])]
                 # Arm C — re-compress the in-span messages at a milder, floor-targeted
                 # rate. Anything outside the span keeps its full compression regardless.
@@ -492,6 +552,16 @@ class G01Compression:
                         ctx.request_id, floor_state.floor, span_before,
                         floored_span, floor_state.reuse,
                     )
+                elif cache_floor.allows_shrink(ctx, span_before, span_after, "G01"):
+                    # Arm C was out of reach, so the choice is A or B — and with a small
+                    # cache discount, keeping the span whole costs more than compressing it.
+                    logger.info(
+                        "[%s] G01: could not land the cacheable span on the provider's "
+                        "%d-token minimum, and keeping it whole (%dt) would cost more than "
+                        "compressing it to %dt at reuse=%d — compressing",
+                        ctx.request_id, floor_state.floor, span_before, span_after,
+                        floor_state.reuse,
+                    )
                 else:
                     # Arm B — the milder rate still undershot. Keep the span whole; the
                     # suffix stays compressed, which is the half that was never at stake.
@@ -507,11 +577,11 @@ class G01Compression:
                         "forfeit the prefix-cache discount (preserve_cacheable_prefix)",
                         ctx.request_id, span_before, span_after, floor_state.floor,
                     )
-                changed = any(a != b for a, b in zip(ctx.messages, compressed_messages))
+                changed = any(a != b for a, b in zip(ctx.messages, compressed_messages, strict=True))
 
         if changed:
             original_messages = ctx.messages
-            compressed_count = sum(1 for a, b in zip(original_messages, compressed_messages) if a != b)
+            compressed_count = sum(1 for a, b in zip(original_messages, compressed_messages, strict=True) if a != b)
             ctx.messages = compressed_messages
             # The floor reservation identifies its span by content, so the assignment
             # above has just invalidated it — and an invalid snapshot reads as an EMPTY
@@ -548,11 +618,17 @@ class G01Compression:
 
 
 async def _call_llmlingua(url: str, text: str, ratio: float, force_reserve_digit: bool = True) -> str:
+    if not url:
+        return text  # an empty sidecar_url turns LLMLingua off
     try:
+        # On GCP the sidecar requires IAM: send the proxy's identity token (none locally).
+        from ml_models import cloud_run_auth_headers
+        headers = await asyncio.to_thread(cloud_run_auth_headers, url)
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 url,
                 json={"text": text, "ratio": ratio, "force_reserve_digit": force_reserve_digit},
+                headers=headers,
             )
             resp.raise_for_status()
             return resp.json().get("compressed", text)

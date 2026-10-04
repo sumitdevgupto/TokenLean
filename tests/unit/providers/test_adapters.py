@@ -184,6 +184,28 @@ class TestNativeBatchInterface:
         assert GeminiAdapter().supports_service_tier() is False
 
 
+class TestPromptCacheNeedsMarker:
+    """Whether a provider caches only the prompt a request marks for caching. G18 reads it
+    to decide whether a prompt-cache discount is the proxy's saving."""
+
+    def test_providers_that_cache_repeated_prompts_on_their_own(self):
+        from providers.azure_adapter import AzureOpenAIAdapter
+        from providers.deepseek_adapter import DeepSeekAdapter
+        from providers.generic_adapter import GenericLiteLLMAdapter
+        for adapter in (OpenAIAdapter(), AzureOpenAIAdapter(), GeminiAdapter(),
+                        DeepSeekAdapter(), GenericLiteLLMAdapter("custom", {})):
+            assert adapter.prompt_cache_needs_marker() is False, adapter.name
+
+    def test_providers_that_cache_only_a_marked_prompt(self):
+        from providers.bedrock_adapter import BedrockAdapter
+        assert AnthropicAdapter().prompt_cache_needs_marker() is True
+        assert BedrockAdapter().prompt_cache_needs_marker() is True
+
+    def test_base_default_assumes_the_provider_caches_on_its_own(self):
+        # The safe default: it can under-state the proxy's saving, never over-state it.
+        assert _BareAdapter().prompt_cache_needs_marker() is False
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

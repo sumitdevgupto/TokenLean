@@ -21,6 +21,1788 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-10-04
+
+### Every dependency checked against one license rule, in CI — Enhancement (OSS)
+
+TokenLean now has one written license rule: everything it uses must be free to use and to host,
+so permissively licensed (MIT, Apache-2.0, BSD, ISC, PSF, PostgreSQL, BSL-1.0, CNRI-Python, Zlib,
+CC0) or MPL-2.0 for an unmodified transitive dependency, with Grafana (AGPL-3.0, run unmodified)
+the one exception. `scripts/audit_licenses.py` now enforces it on every CI run: each pin of all six
+lockfiles, judged by that release's own license metadata (it used to fail only on GPL/SSPL, and
+read the latest release). `THIRD_PARTY_LICENSES.md` gains the rule and a Models table;
+`docs/oss-licenses.md` lists every `requirements.in` dependency, and a test keeps it in step.
+`pgvector` and `google-cloud-tasks`, imported nowhere, are marked for the next recompile, and
+Terraform no longer enables the unused Cloud Tasks API.
+- **OSS:** the rule, the CI audit, and both license documents.
+
+### Redis pinned to 7.2, the last BSD-licensed release — Bug fix
+
+`redis:7-alpine` had moved to Redis 7.4, which is licensed RSALv2/SSPLv1 rather than BSD. Docker
+Compose and the GCP Redis VM now run `redis:7.2-alpine` (BSD-3-Clause, still patched); nothing in
+TokenLean needs a newer Redis (managed GCP already runs Memorystore 7.0). On GCP, reset the Redis
+VM once after `terraform apply` so it starts the 7.2 image; Redis then starts empty (cache,
+sessions and rate-limit counters).
+
+### G06 RouteLLM defaults to the licensed `bert` router — Bug fix
+
+With `classifier: routellm`, G06 defaulted to the `mf` router, whose published checkpoint carries
+no license, and without an OpenAI key it fell back to `causal_llm`, a 16 GB Meta Llama 3
+derivative that cannot load in the 2 GB sidecar. The default is now `bert` (Apache-2.0
+checkpoint, no OpenAI key needed) at its own calibrated threshold, 0.4066: about half the requests
+go to the strong model, as with `mf`'s 0.11593. `mf` and `sw_ranking` still run when configured
+with an OpenAI key; without one G06 logs the switch and uses `bert`. An unset threshold now takes
+the configured router's own calibration.
+
+### Scripts that run git name it when it is missing — Bug fix
+
+The open-core path check (`scripts/ci/commercial_paths.py`) and the PR template token budget
+(`scripts/ci/pr-diff-token-check.py`) ran git by bare name, so a machine without it got a bare
+"No such file or directory". They now look git up on your PATH, run it by the path found, and
+say "git is not on PATH" when it is not there. Nothing else changes.
+
+### G10's Zep memory backend is removed — Bug fix
+
+G10 could also keep conversation memory in Zep, but that client was written against a
+zep-python API it never matched, so it never worked. It is removed rather than rewritten
+without a server to test against. A config that still sets `zep_enabled` gets one warning that
+nothing reads it. G10's memory is the session window with summaries, plus Mem0
+(`mem0_enabled`) for long-term memory. The `zep-python` package leaves the image at the next
+dependency refresh.
+
+## 2026-10-03
+
+### The managed proxy and portal images use pinned bases and a pinned torch — Bug fix [Enterprise]
+
+The managed proxy image now runs as an unprivileged user like the open-source one, its base
+image is pinned by digest, and it installs the same pinned CPU build of torch (2.14.0) instead of
+whatever was newest at build time. The portal image's two bases are pinned by digest too —
+<https://tokenlean.cbeyond.cloud/>
+
+### The images run as an unprivileged user, on pinned bases — Bug fix
+
+Every image ran as root, so code that broke into one ran as root inside it; their base images
+were floating tags, so a rebuild could take a different OS or Python patch level; and CI
+tested Python 3.12 while the images run 3.11. The proxy, both sidecars and the pipelines now
+run as uid 1000 (the Tika sidecar as its own user, the migration job as `postgres`), every
+base is pinned by digest, and CI runs 3.11. Dependabot now proposes base-image digest bumps
+(OS patches), never a new major or minor tag. On a Linux host whose user is not uid 1000, keep
+`config/` readable by others (the default `644` is).
+
+### Each response names its trace in an X-Trace-ID header — Bug fix
+
+`tracing.propagate_trace_id_header` (on in the template) was documented but read by nothing,
+so no response said which trace it was. While the proxy exports OpenTelemetry spans, every
+response to a model request now carries `X-Trace-ID`, the request's trace id (32 hex
+characters), on streamed answers and refusals too, so a slow or failed call can be found in
+Jaeger or your collector. Set `propagate_trace_id_header: false` to leave it out.
+
+### The portal and admin console say when a change was not fully applied — Bug fix [Enterprise]
+
+When a portal user was deleted or had their password reset and their live sessions could not
+be revoked, those sessions stayed valid until they expired, with no sign of it. The same held
+when a portal save could not refresh the tenant's cached settings (the old ones applied until
+the cache expired), when the login rate limiter could not count a failed attempt, and when a
+failed signup could not give back its company code. Each now logs a warning —
+<https://tokenlean.cbeyond.cloud/>
+
+### Errors the proxy used to ignore are now logged — Bug fix
+
+Dozens of places in the proxy and its document and fine-tune pipelines caught an error and
+carried on without a word: a metric that did not record, a stream chunk or queue message that
+could not be read, a setting that could not be read and fell back to its default, a provider
+outcome the circuit breaker never saw. Each now logs the error at DEBUG, so debug logging shows
+what was skipped and why. Nothing else changes.
+
+### A revoked or suspended key stops working on every proxy instance within seconds — Bug fix
+
+With the default key stores (a local key file or Secret Manager), each proxy instance trusted
+its key cache for up to five minutes, so a key revoked or suspended through another instance,
+or with `scripts/issue-key.sh`, kept working there that long. Each instance now checks whether
+the store changed, the key file every second and Secret Manager's latest version every 5
+seconds, and reloads at once when it did. Run `terraform apply` before deploying: the proxy
+needs to read the key secret's version names (`roles/secretmanager.viewer` on that one secret).
+Until then it logs a warning and a revoke still waits up to five minutes.
+`KEY_FILE_CHECK_SECONDS` and `KEY_SECRET_CHECK_SECONDS` set the intervals.
+
+### The proxy image no longer carries 1.8 GB of unused GPU libraries — Bug fix
+
+The proxy installs PyTorch's CPU build, but its pinned requirements also pinned the CUDA runtime
+that recent torch releases depend on (`cuda-toolkit`, `cuda-bindings`, `cuda-pathfinder`), so
+every proxy image carried about 1.8 GB of GPU libraries it never loads: slower builds and
+pushes, more registry storage per revision, and more packages for image scanners to flag.
+Those pins are gone, `scripts/compile-requirements.sh` now drops them along with `nvidia-*`, and
+the proxy's torch is pinned to 2.14.0. The next image build is about 1.8 GB smaller.
+
+### The LLMLingua, RouteLLM, document and fine-tune images install exact dependency versions — Bug fix
+
+These four images installed open version ranges, so each rebuild took whatever was newest that
+day and no past image could be rebuilt. Each now installs a fully pinned `requirements.txt`,
+compiled from its `requirements.in` by `scripts/compile-requirements.sh` as the proxy's is. The
+LLMLingua and RouteLLM images pin the CPU build of torch they install (2.14.0), the version
+their pins are resolved against. Refresh the pins with that script.
+
+### The local Docker stack requires its own Redis, Qdrant and admin passwords — Bug fix
+
+The local `docker compose` stack ran Redis without a password and Qdrant without an API key,
+created Langfuse's admin with a fixed default password, left Grafana's admin password empty,
+and accepted cross-origin browser calls to the proxy. Redis, Qdrant and the Langfuse and
+Grafana admins now each require a credential from `.env` (`REDIS_PASSWORD`, `QDRANT_API_KEY`,
+`LANGFUSE_INIT_USER_PASSWORD`, `GRAFANA_PASSWORD`). `docker compose` refuses to start without
+them, and `scripts/local/deploy-local.sh` and `start-local.sh` generate any that `.env` lacks.
+Cross-origin calls are off unless `CORS_ORIGINS` (or `CORS_ALLOW_ALL=true`) is set. On an
+existing stack, Langfuse and Grafana keep the admin passwords they already have: change them in
+their UIs if they are still the old defaults.
+
+### The docs assistant keeps its documents across a Qdrant restart — Bug fix [Enterprise]
+
+On GCP, a new Qdrant revision or a restart restores each tenant's documents from their
+snapshots, but the docs assistant's collection had none: the managed deploy seeded it without
+writing one, so after a restart the assistant answered "not found" until the next deploy. The
+seed job now writes the collection's snapshot to the same bucket after every sync, and Qdrant
+restores it with the others. A deploy on a Terraform state from before the bucket warns and
+seeds without one. Self-hosters have nothing to upgrade —
+<https://tokenlean.cbeyond.cloud/>
+
+### Ingested documents survive a restart of Qdrant on GCP — Bug fix
+
+On GCP, Qdrant keeps its collections in its Cloud Run container, so a new revision of the
+Qdrant service or a restart of its instance lost every tenant's ingested documents, and RAG
+answers and fine-tuning silently found nothing. Each ingest now writes the changed
+collection's snapshot to a private bucket (`<project>-qdrant-snapshots`), and Qdrant restores
+the newest snapshot of each collection before it serves again. Only an ingest that is running
+at the moment of the restart has to run again. Deleting a tenant's data deletes its snapshots
+too, and the bucket keeps no soft-deleted copies, so erased documents cannot come back.
+
+## 2026-10-02
+
+### Redis requires its password and encrypts its traffic by default — Bug fix
+
+On GCP, Redis accepted connections without a password by default and carried every tenant's
+cached prompts and answers, sessions and counters, and the password itself, in clear across
+the VPC. Both Redis backends now require the password and serve only TLS by default: the
+proxy and the fine-tune job connect with a `rediss://` URL and trust only the deployment's
+own CA (`REDIS_CA_CERT`). Memorystore uses its built-in TLS; for the Redis VM, Terraform
+creates a CA and a certificate, and the VM reads its key at boot from Secret Manager. When the
+VM is not yet running the configured settings, the deploy restarts it just before updating the
+proxy. Switching TLS on Memorystore recreates the instance. Either way Redis starts empty
+once. `REDIS_AUTH_ENFORCE=false` and `REDIS_TLS=false` in `.env.gcp` opt out.
+
+### A GDPR erase also deletes the tenant's Langfuse traces — Bug fix [Enterprise]
+
+An erase or offboard left the tenant's request traces in Langfuse, with the user's identifier
+and, where content capture was on, the prompts and responses; the erase summary listed them as
+retained. The version of Langfuse the stack runs has no way to delete traces through its API,
+so the erase now deletes the tenant's traces, and everything attached to them, in Langfuse's
+own database, including traces written before this change. On the managed service the proxy
+does this through a database role allowed only to read and delete those records. If the
+traces cannot be deleted, the erase reports that step as failed and can be retried —
+<https://tokenlean.cbeyond.cloud/>
+
+### The managed service protects the audit log at the database level by default — Bug fix [Enterprise]
+
+The restricted database role that can only read and insert audit rows was built but not
+used by default, so the managed proxy still connected as the tables' owner and could rewrite
+or delete the audit trail. Every managed deploy now moves the proxy onto that role, after
+the deploy's schema step has created the tables, the role and the semantic cache's vector
+index; if that step fails, the deploy stops before the proxy moves. Setting
+`DB_RUNTIME_ROLE=false` keeps the old behaviour, and the evidence pack then reports the audit
+log as not protected —
+<https://tokenlean.cbeyond.cloud/>
+
+### Each tenant's batched requests queue on their own stream — Bug fix
+
+G13 batching queued every tenant's deferred requests on one Redis stream per topic, so one
+tenant that filled `max_backlog` made every other tenant's batchable requests skip the batch
+discount, and a large backlog from one tenant delayed everyone's results. Each tenant now has
+its own stream per topic, `max_backlog` applies per tenant, and one consumer reads them all.
+The default tenant keeps the old stream name, so requests already queued before an upgrade
+are still answered.
+
+### The semantic cache looks up through a vector index — Bug fix
+
+Every G05 L2 (semantic cache) lookup scanned all of the tenant's stored questions, on the
+request path, because nothing indexed the embeddings and the query was not written in a
+shape an index could serve. The proxy now builds an HNSW index on the embeddings in the
+background the first time the cache is used (without blocking writes), and the lookup takes
+the nearest stored question through it, serving it only within `l2_similarity_threshold`.
+With pgvector 0.8 or later the index search also keeps going past other tenants' rows, so a
+tenant with few cached answers among many still finds its own; on an older pgvector, run
+`ALTER EXTENSION vector UPDATE`.
+
+### The Tika sidecar moves to Apache Tika 3.3.1, past the PDF-parser XXE — Bug fix
+
+The document-parsing sidecar was built on Apache Tika 2.9.1, inside the range of
+CVE-2025-54988 and CVE-2025-66516, an XML external entity flaw in Tika's PDF parsing (1.13 to
+3.2.1). The ingestion pipeline sends uploaded documents that its main parser cannot read to
+this sidecar, so a crafted upload could reach the flaw. The sidecar is now built on Apache
+Tika 3.3.1, and a test refuses any base image older than 3.2.2. The pipeline's call is
+unchanged, and a local check read text, PDF, Word and Excel files through it. Rebuild and
+redeploy the Tika sidecar to pick it up.
+
+### Pipeline traces: one trace per request, and the tracing settings apply — Bug fix
+
+The proxy's OpenTelemetry pipeline tracing ignored the `tracing` settings and started each
+middleware stage as a trace of its own, so a request's stages could not be seen together
+and the trace id stored with each usage event led to a trace with none of them. It also
+exported to `jaeger:4317` by default even where no collector runs, and never used TLS. Now
+each stage is a child of the request's pipeline span. `tracing.enabled`, `otlp_endpoint`,
+`sample_rate` and `service_name` are read at startup (`OTEL_EXPORTER_OTLP_ENDPOINT` still
+wins for the endpoint). With no `tracing.enabled` set, spans are exported only when
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set. TLS is used unless the endpoint is `http://`.
+
+### A GDPR purge or trial change that could not refresh a cache now says so — Bug fix [Enterprise]
+
+After a GDPR purge, if the in-process key cache could not be cleared, a purged key could
+still serve from memory until the cache expired, and the purge reported nothing. After a
+trial change, if the cached tenant config could not be refreshed, requests kept the old
+limits for a while, also without a word. Both now log a warning —
+<https://tokenlean.cbeyond.cloud/>
+
+### A billed call the proxy could not record, or a skipped retention pass, is now logged — Bug fix
+
+Two failures were swallowed without a word. When a provider call's usage could not be
+recorded, the request was still served, but its cost silently left that call out. When the
+retention job could not read its config, that pass deleted nothing, so data outlived its
+retention period with no sign of why. Both now log a warning that says what was lost.
+
+### Evidence packs count retrieved-context and tool-call enforcement — Bug fix [Enterprise]
+
+The trust & safety section of the signed audit evidence pack counted only guardrail (G30)
+and PII (G29) events. Blocks, strips and flags of poisoned retrieved documents (G31), its
+record-only managed-rule matches, and tool calls the policy flagged or denied or the proxy
+refused to execute (G32) were all left out, so the record handed to an auditor understated
+what was enforced. Each now has its own count, by attack category, rule id or tool name, and
+the pack's attested controls describe G31 and G32 too —
+<https://tokenlean.cbeyond.cloud/>
+
+### G8 now finds the registry tools the model has stopped calling — Enhancement (OSS)
+
+G8's pruning of unused tools never ran, and as written it could not have run safely: it
+treated a tool with no usage record as unused, nothing ever lifted a pruned mark, and it
+counted the tools a request offered rather than the tools the model called. It now runs
+once a day (`pruning.schedule`, UTC), for each tenant and against that tenant's own tool
+registry. It looks for registry tools that every request carried for the whole
+`inactivity_threshold_days` window and that the model never called. A tool with no history
+is never one. By default (`dry_run_first: true`) it only reports them, in a log line and the
+`token_opt_tool_pruning_candidates` gauge. Set `dry_run_first: false` and it drops them from
+that tenant's requests. A dropped tool returns after the same window, or at once when a
+request names it. The model's calls are recorded from streamed and non-streamed answers
+alike, and only for tools from your registry.
+
+### Mem0 long-term memory works, and keeps each user's memory to that user — Bug fix
+
+G10's Mem0 long-term memory could not run: it imported a class the pinned mem0ai 2.x does not
+have, so its client never loaded, and its calls did not match the library's API. Had it
+loaded, it would have keyed memory on a user id taken from the request body, which any
+caller can set, and on `anonymous` when there was none. It now uses mem0ai's
+`AsyncMemoryClient` and keys memory on the authenticated user within the tenant: a legacy
+key's user, or an `X-User-ID` the tenant's allowlist accepted. A tenant key with no
+accepted `X-User-ID` gets no long-term memory, and the first such request logs a warning,
+because one memory for the whole tenant would mix what its users said. A request waits at
+most 2 seconds for its memories; the exchange is stored in the background; and the client is
+built off the request path, retried after a failed start. The mem0ai library's own usage
+analytics are off unless you set `MEM0_TELEMETRY=true`. A read-only home directory no
+longer stops the proxy from loading when mem0ai is installed. A missing `MEM0_API_KEY` is
+now reported at the first request, as a missing `MEM0_API_URL` already was.
+
+### Ship newer managed guardrail rules without a release, signed — Enhancement [Enterprise]
+
+The managed injection ruleset that Enterprise adds to G30 (and to G31, record-only by default)
+was fixed at build time: the setting meant to fetch newer rules did nothing. The proxy now loads a newer
+ruleset bundle from a `gs://` or `https://` location you choose, and only one that carries a
+valid Ed25519 signature from your own key. A bundle that is unsigned, tampered with, older than
+the rules in force, or that holds any invalid rule (including a pattern that would backtrack
+badly) is refused whole, and the rules in force stay. A rule a newer bundle leaves out is
+removed, so a bad rule can be withdrawn; your own extra rules are kept. The fetch runs off the
+request path, and the refusal log never shows a token carried in the bundle's URL. A command-line
+tool makes the signing key, signs a bundle after checking it exactly as the proxy will, and
+verifies a signed pair.
+- **[Enterprise]:** signed managed-ruleset updates for G30 and G31 — <https://tokenlean.cbeyond.cloud/>
+
+### Managed guardrail rules reach retrieved content, record-only until you enforce them — Enhancement (OSS + Enterprise)
+
+G31 scans the documents and memories that retrieval adds to a prompt for indirect prompt
+injection. It can now run an extra set of managed rules in record-only mode: a match is counted
+and audited, and the request is left alone, so you can see the rules' false positives before
+they change anything.
+- **OSS:** G31 settings `managed_rules: record | enforce` (operator) and `managed_rules_enforce`
+  (a tenant's own opt-in, which can only add enforcement); a new metric,
+  `token_opt_context_trust_managed_recorded_total`; a `context_trust.managed_recorded` audit
+  row; and a G31 row on the Trust & Safety dashboard, which had none.
+- **[Enterprise]:** the managed guardrail ruleset now feeds G31 as well as G30, and tenants can
+  turn enforcement on for themselves in the portal's G31 settings —
+  <https://tokenlean.cbeyond.cloud/>
+
+### The admin console guide shows how to restrict the admin key to your network — Bug fix [Enterprise]
+
+The admin API accepts the admin key on its own, so a leaked key could be used from anywhere.
+The admin console guide now shows how to limit the admin key to your operators' and scripts'
+addresses with the existing per-tenant IP allowlist, how to lift that limit, and that on GCP it
+holds only once the client-IP check is switched to enforce —
+<https://tokenlean.cbeyond.cloud/>
+
+### Managed deploys use Qdrant for RAG by default — Bug fix [Enterprise]
+
+The managed deploy scripts defaulted to pgvector for document retrieval, but the
+document-ingestion job writes to Qdrant only and nothing fills the pgvector tables. On a
+default deploy, tenants' uploads were never searchable and both RAG and the docs assistant
+returned nothing. Both the GCP and the local managed deploy now default to Qdrant, and choosing
+`--vector pgvector` prints a warning that RAG will find nothing. Qdrant on Cloud Run runs one
+always-on instance, which adds to the hosting cost, and its data is still lost when the Qdrant
+service gets a new revision (durable storage is a separate open item) —
+<https://tokenlean.cbeyond.cloud/>
+
+### Ingestion reads Excel and PowerPoint through Tika and refuses unreadable files — Bug fix
+
+The document-ingestion job read files with Unstructured, whose Excel and PowerPoint parsers are
+not in the job image. When Unstructured could not read a file, the job decoded the file's raw
+bytes as text and stored that as RAG context, so such an upload filled the tenant's knowledge
+base with noise. The job now reads every file with Unstructured first, so PDF and Word results
+are unchanged. It then asks the Tika sidecar, which the GCP deploy now connects to the job, for
+what Unstructured cannot read. A file neither can read is refused and nothing is stored, unless
+it is a plain-text file that really is UTF-8.
+
+### Oversized document chunks are cut, not summarised — Bug fix
+
+The document-ingestion job was meant to condense any chunk over `MAX_CHUNK_TOKENS` (4,000 by
+default) with a cheap model, but the libraries it needed were never installed, so such chunks
+were stored whole. Had it run, it would have sent tenants' document text to a model on the
+platform's own key and stored a lossy summary instead of the text. The job now cuts an
+oversized chunk into pieces within the limit, preferring a line break or a space near it. No
+model is called and nothing leaves the job. Such chunks are rare: only token-dense text (some
+non-Latin scripts) or a raised `CHUNK_SIZE_TOKENS` produces them.
+
+### The GCP deploy summary no longer prints the Grafana admin password — Bug fix
+
+At the end of a GCP deploy, the summary read the Grafana admin password from Secret Manager and
+printed it, so it ended up in terminal scrollback and in any CI log of the deploy. The summary
+now shows the command that fetches the password instead.
+
+### The guardrail ruleset feed is described as it works — Bug fix [Enterprise]
+
+The managed guardrail ruleset was described as a feed kept current against new jailbreak
+techniques and as covering context-trust scanning (G31). In this release it is a bundled set of
+extra rules added to the prompt guardrail (G30) only; it does not fetch newer rules, and G31 does
+not receive them. The code comments and the configuration reference now say so. Making the feed
+update itself, and applying it to G31, are planned separately —
+<https://tokenlean.cbeyond.cloud/>
+
+### Background work in the managed service is kept until it finishes — Bug fix [Enterprise]
+
+Several pieces of background work in the managed service were started without the service
+keeping hold of them: the message that tells other instances a tenant's provider key changed,
+the audit row recorded when a stored provider key is used, and three long-running loops (the
+key-change listener, the guardrail ruleset feed and the learning loop). Python keeps only a weak
+reference to such work, so in rare cases it could be discarded before it finished. The service
+now keeps each one until it completes, and a test fails if new code starts work this way —
+<https://tokenlean.cbeyond.cloud/>
+
+### Removed an unused pgvector retrieval helper — Bug fix
+
+The proxy carried a second pgvector retrieval helper that nothing called. It built its SQL by
+inserting a table name into the query text without checking it, and it kept every tenant's
+documents in one shared table, so wiring it in later would have been unsafe. It is deleted.
+Retrieval is unchanged: G07's own pgvector search, which validates the collection name, is
+the one that runs. A test now also fails if any middleware module is left that nothing
+imports.
+
+## 2026-10-01
+
+### The ingestion docs no longer promise chunk summarisation — Bug fix
+
+The document-ingestion job is meant to condense any chunk longer than 4,000 tokens with a cheap
+model before storing it. The job image does not include the libraries this needs, so such a
+chunk is stored at full size and a warning is logged. This is rare, because the splitter aims
+for chunks of about 400 tokens. The architecture notes said every oversized chunk was condensed;
+they now describe what happens.
+
+### The docs no longer say G8 prunes unused tools on a schedule — Bug fix
+
+G8 includes a job that would remove tools no request has used for 30 days, with
+`G8_tools.pruning` settings for its schedule. Nothing runs that job, so the settings have no
+effect. The configuration reference said so, but the README, the architecture notes and the
+settings template still described scheduled pruning as working. They now say it is not run in
+this release.
+
+### Unused Tika settings removed; the docs say tika-svc is not called yet — Bug fix
+
+The GCP deploy runs a Tika document-extraction service, but nothing calls it: the
+document-ingestion job uses Tika only when it runs with `USE_TIKA=true`, which the deploy does
+not set. The proxy also carried a Tika client that nothing used. The template's
+`G3_doc_pipeline.tika_sidecar` settings and a deploy step that patched a Tika URL into the
+configuration had no effect either. The client, the settings and the deploy step are removed,
+and the deployment guides now say that `tika-svc` is deployed but not called. Whether to have
+the ingestion job use it or stop deploying it is still open.
+
+### Removed an unused Tika wrapper from the Tika sidecar — Bug fix
+
+The Tika sidecar directory held a Python wrapper service that was never built into the image:
+the image runs the standard Apache Tika server directly. The wrapper also expected a different
+upload format from the one the document pipeline sends, so it could only mislead anyone reading
+or changing it. It is deleted, and a test now fails if a sidecar directory holds Python code
+that its Dockerfile does not build.
+
+### Mem0 memory says when it cannot run — Bug fix
+
+Turning on `mem0_enabled` with a Mem0 URL appeared to work but did nothing: the integration
+expects a client class that the bundled mem0ai release does not provide, so the client was
+never created and no memory was stored or recalled, without any message. The proxy now logs a
+warning on the first request whenever Mem0 or Zep memory is switched on but its client library
+could not be loaded, and the configuration reference says Mem0 does not work in this release.
+The README and deployment guides no longer describe Mem0 as how G10 works: G10 keeps a sliding
+window with a per-session summary and adds relevant agent skills.
+
+### Memory lookup settings take effect per tenant — Bug fix
+
+Two G10 memory settings were ignored. `memory_query_max_chars`, which the portal offers as a
+per-tenant setting, had no effect: lookups always used the `MEMORY_QUERY_MAX_CHARS` environment
+variable, and one lookup path used a fixed 400 characters. `skills_similarity_threshold` was read
+by only one of the two skill lookups; the other used the `SKILLS_SIMILARITY_THRESHOLD` environment
+variable. Both settings now apply to every lookup, and the environment variables are the defaults
+when a setting is not given.
+
+The documentation also described `skills_qdrant_enabled: false` as a non-Qdrant fallback. Both
+choices search the tenant's skills collection in Qdrant: `false` uses the retrieval stage's hybrid
+search and reranker instead of a plain vector search. The description is corrected.
+
+### Cache TTL adjustment follows recent traffic and honours its settings — Bug fix
+
+The cache adapts how long it keeps new entries to each tenant's hit rate: above 80% they are
+kept 25% longer, below 20% 25% shorter. Three things were wrong with it. The hit rate was
+counted over the tenant's whole history, so early traffic decided the TTLs for good; it is now
+counted over the last one to two hours. Setting `auto_ttl_enabled: false` had no effect, and
+now it keeps the configured TTLs. The `auto_ttl_min_multiplier` and `auto_ttl_max_multiplier`
+settings were not read either; they now bound the adapted TTL. Each lookup also made four Redis
+reads whose results were thrown away; those reads are gone.
+
+### Removed unwired modules, including a memory adapter that mixed tenants — Bug fix
+
+Several modules were present but reachable from nowhere. A Mem0 memory adapter looked a
+user's memories up by bare user ID in one collection shared by every tenant, so two tenants
+with a user of the same name would have read each other's memories had it been switched on.
+An agent runtime for G16 priced runs from a hardcoded table and estimated cost at a flat
+rate per token. A TOON legend module for G13 was never called (G13's own TOON step, which
+rewrites arrays of uniform objects as a compact table, is unchanged), and neither were two
+skill-writing functions in G10. All are deleted.
+
+G18 also carried branches that billed each request through a usage meter and wrote an audit
+row per request. The pipeline never gave G18 a meter or an audit logger, so neither branch
+ran: billing is the usage row written for each request outcome, and the audit log records
+configuration changes and security events. The branches are removed, and so the `enabled`
+switches in the billing and audit settings files are no longer read; their comments now say
+so. A new test fails if a middleware module is added that nothing imports.
+
+### Removed three unwired modules that mixed tenants' data — Bug fix
+
+Three pieces of code were present but reachable from nowhere: a database answer cache for
+G04 with no tenant column, so one tenant's stored answer would have served another tenant's
+question; an MCP manifest loader for G8 whose cache key was not scoped to a tenant; and an
+older G03 middleware class, with an "out-of-distribution" fallback that searched a collection
+shared by every tenant. None was in the request pipeline, and nothing else used them. Had
+any been switched on, it would have leaked data between tenants, so all three are deleted
+along with their tests.
+
+The configuration reference listed their settings as pending wiring and documented two
+environment variables for the fallback. Those entries, and the architecture notes that named
+the modules, are removed.
+
+### The docs no longer tell clients to send `x-token-opt-state` back — Bug fix [Enterprise]
+
+The portal docs said to send the `x-token-opt-state` response header back on your next call,
+to carry the token budget across agents. The proxy never read it, so echoing it changed
+nothing. The docs now describe it as a response header for your information. G17 counts a
+conversation's turns itself, by its `workflow_id` —
+<https://tokenlean.cbeyond.cloud/>
+
+### `.env.template` no longer points the GCP scripts at the maintainer's project — Bug fix
+
+The public `.env.template` set `GCP_PROJECT_ID` to the maintainer's own GCP project. The key,
+backup and deploy scripts use that value before gcloud's current project, so a user who copied
+the template sent commands to someone else's project. The value is now empty, so the scripts
+use your gcloud project. The deploy-host setup script also defaulted to that project and set
+gcloud to it; it now keeps your current gcloud project. `issue-key.sh`, `gcp-deploy.sh` and
+the host setup also refuse the `your-gcp-project-id` placeholder from `.env.gcp.template`
+instead of passing it to gcloud.
+
+### The docs no longer call G26 a reserved slot — Bug fix
+
+G26 (Context Budget Compaction) has shipped, but the deployment guides, the onboarding guide
+and the API description still listed it as reserved. The reserved slot is G27 (multimodal),
+which ships no image transform yet. The pipeline's own description of its response order
+also left out the trust and safety stages; it now matches the code, and a test keeps it so.
+- **OSS:** the four guides, `docs/config-reference.md`, `docs/request-flow-diagram.md`, and
+  the API description.
+- **[Enterprise]:** the portal's knob reference (and the Docs assistant's copy) now documents
+  G26 and its settings, and no longer offers G27 settings that were removed. Reseed the Docs
+  assistant after deploying —
+  <https://tokenlean.cbeyond.cloud/>
+
+### Group settings in `config/params` files now take effect — Bug fix
+
+`config/params/*.yaml` files are merged into the configuration so that a group's settings can
+live in their own file. A group's settings written there never reached the group, because
+the files placed them at the top level while every group reads `groups.<name>`. The five
+group templates shipped in `config/params` had the same problem, and some of their key
+names were wrong too.
+
+Put group settings under `groups:` and name only the keys you change, for example
+`groups: {g22_deduplication: {enabled: false}}`. The group's other settings keep their values
+from `config.yaml`. If a file sets a group at the top level, the proxy now logs a warning.
+The five broken templates have been removed, since `config.yaml.template` documents every
+group setting.
+
+### A rotated BYOK key stops being used on every instance — Bug fix [Enterprise]
+
+When a tenant rotates or deletes a provider key, each proxy instance is told to drop its
+cached copy. The listener waited in a way that reconnected every 5 seconds while nothing
+arrived, and a notice sent during a reconnect was lost. That instance then kept using the
+old key until its cache expired, about a minute later by default. The listener now polls
+without dropping its connection. Whenever it subscribes again, it clears its cached keys,
+since any notice sent in the meantime is lost —
+<https://tokenlean.cbeyond.cloud/>
+
+### Streamed Gemini and Anthropic responses report their token usage — Bug fix
+
+In a streamed response through the Gemini endpoint, the final frame's `usageMetadata` always
+showed 0 tokens. The proxy sent the final frame as soon as the model stopped, but the token
+counts arrive just after that. The final frame now waits for them.
+
+On the Anthropic endpoint, `message_start` still reports 0 input tokens, because it is sent
+before the counts are known. The closing `message_delta` now reports `input_tokens` as well
+as `output_tokens`.
+
+### One slow check no longer switches off GCP sign-in until a restart — Bug fix
+
+To call services that require Google sign-in (Qdrant, the sidecars), the proxy and its
+document jobs first check whether they run on GCP by asking the metadata server. If that
+first check was slow or failed, the answer "not GCP" was kept for the life of the process,
+and every such call was refused until a restart. On Cloud Run the check now reads Cloud Run's
+own environment, so no metadata call is needed. Elsewhere, a "not GCP" answer is checked
+again after 5 minutes.
+
+### A bad or huge `X-Rag-Top-K` header no longer breaks or loads retrieval — Bug fix
+
+G07 read the caller's `X-Rag-Top-K` header without checking it. A value that is not a number
+made the request fail with a 500, and nothing limited a large one, so `X-Rag-Top-K: 1000000`
+sized every vector-store search for that request to a million. The header is now used only
+when it is a whole number of at least 1, and is capped at the new `max_top_k` setting
+(default 50). Otherwise the configured `top_k` applies.
+
+### A partly written config no longer switches off controls on reload — Bug fix
+
+The proxy rereads `config.yaml` every 60 seconds. If it read a partly written file, it
+applied whatever parsed, so a config cut short lost its later sections. Rate limits and spend
+caps switched off and providers disappeared, with no error. A reload that lacks a top-level
+section the running config has is now refused, and the running config stays. The proxy logs
+an error and counts it in the new `token_opt_config_reload_failures_total` metric, as it does
+for any reload that fails. To remove a whole section, restart the proxy.
+
+### A cancelled request no longer goes on to the next provider — Bug fix
+
+When a request was cancelled while the proxy was trying a fallback provider (the client
+disconnected, or the proxy was shutting down), the cancellation was treated as that
+provider's failure. The proxy then tried the next provider, and the request ended in a 502
+that nobody received. A cancellation now stops the request at once.
+
+### G06 `least_latency` stops picking a model that keeps failing — Bug fix
+
+With `strategy: least_latency`, G06 picks the tier model with the lowest measured latency.
+Only successful calls were measured, so a model whose calls always failed was never measured.
+It counted as the fastest and was picked first on every request, and each request paid for a
+failed call before failing over. A model whose call fails on the provider's side (a server
+error, timeout or lost connection) is now passed over for 5 minutes, then tried again. A
+rate limit or a rejected key does not count.
+
+### G06 can reach the RouteLLM sidecar on GCP — Bug fix
+
+On GCP the RouteLLM sidecar accepts only authenticated calls from inside its network. G06
+called it without credentials, from outside that network, so every RouteLLM routing call
+was refused, and routing fell back to the built-in heuristic. G06 now sends the proxy's
+identity token. The deploy keeps the sidecar private through access control and lets the
+proxy reach it, and the post-deploy check now fails if the sidecar answers anyone without
+credentials. The change takes effect on your next GCP deploy.
+
+### Deploy scripts keep scratch files private on a shared host — Bug fix
+
+Several deploy and maintenance scripts wrote working files to fixed paths under `/tmp`.
+Another user on the same machine could create those files first. The GCP deploy uploaded
+whatever was at `/tmp/config.yaml` as the live configuration, and reused a copy an earlier run
+had left there. The DSPy step ran a script from `/tmp`. The deploy-host setup installed
+`terraform` and `cloud-sql-proxy` with `sudo` from files it had downloaded to guessable paths.
+Each script now works in a private temporary directory that it removes when it exits.
+- **OSS:** `gcp-deploy.sh`, `issue-key.sh`, `ci/dspy-optimize.sh` and
+  `prepare-gcp-deploy-host.sh`.
+- **[Enterprise]:** the managed deploy also keeps its config copies private, and no longer
+  patches and uploads a leftover copy when a download fails. It no longer passes the database
+  password as a command argument, which other users could see in the process list. Secret
+  files restored from backup are now readable only by their owner —
+  <https://tokenlean.cbeyond.cloud/>
+
+### Prometheus on GCP now checks the proxy's certificate before sending its token — Bug fix
+
+The Prometheus that Terraform sets up on GCP scraped the proxy over HTTPS with certificate
+checks turned off, so anyone able to intercept the connection could have collected its
+`/metrics` token. It now verifies the proxy's certificate like any other client. After you
+apply Terraform, restart Prometheus so it loads the new configuration.
+
+### Webhooks refuse addresses that resolve inside your network — Bug fix [Enterprise]
+
+A webhook's address was checked only as written. A name that pointed (or was later
+re-pointed) at a private address or the cloud metadata server passed both registration and
+delivery, so the proxy sent requests into its own network.
+
+- Registering a webhook now looks up its name and refuses it if the name points at a private
+  or reserved address.
+- Every delivery attempt looks the name up again. An unsafe answer stops the delivery and
+  records it in the dead-letter list. A name that does not resolve is retried like any
+  network error —
+<https://tokenlean.cbeyond.cloud/>
+
+### Ingest PII masking now stops the job instead of storing unmasked text — Bug fix
+
+With `INGEST_PII_MODE=mask`, the document pipeline masks personal data before a document is
+stored for retrieval. If its masking engine could not be loaded, it logged a warning and
+stored the document unmasked. It now fails the job instead, and stores nothing.
+
+A value other than `off`, `flag` or `mask` (for example a typo of `mask`) used to mean off.
+It now fails the job too. `flag` mode is unchanged: it never alters the text, so it still
+warns and continues.
+
+### G06 cascade failures no longer write provider error text to the log — Bug fix
+
+When a tier of the G06 cascade failed, the proxy logged the provider's error message twice:
+once in G06 and again before falling back to a normal call. Those messages can include an
+API key or the provider's base URL. The log now names the error class and HTTP status only.
+
+### /ingest-doc checks its caller on every multi-tenant deploy — Bug fix
+
+The document-ingestion webhook verified the Pub/Sub token only when `INGEST_REQUIRE_OIDC`
+was `true`. A multi-tenant deployment that left it unset let anyone make it re-ingest any
+object in a tenant's bucket, at the cost of extraction and embedding. With the flag on but
+the push account's email or the audience unset, it accepted any token Google had signed.
+
+- The check is now on whenever `DATABASE_URL` is set, unless `INGEST_REQUIRE_OIDC=false`.
+- When it is on, it needs both `INGEST_PUSH_SA_EMAIL` and `INGEST_OIDC_AUDIENCE`. Without
+  them the webhook answers 503, and the proxy logs why at startup.
+
+The GCP deployment script already sets all three.
+
+### /metrics now needs a scrape token, or an explicit opt-out — Bug fix
+
+`/metrics` lists every tenant's id with its token and cost figures. With no
+`METRICS_SCRAPE_TOKEN` set it was open to anyone who could reach the proxy. It now refuses
+every scrape until you set the token, which your Prometheus presents as a Bearer token.
+
+- To keep it open on a machine nobody else can reach, set `METRICS_ALLOW_UNAUTHENTICATED=true`.
+- The local docker-compose stack sets it, so its Prometheus keeps working. Before anyone else
+  can reach port 4000, set a token, or set `METRICS_ALLOW_UNAUTHENTICATED=false`.
+- On GCP, Terraform now generates the token when `metrics_scrape_token` is empty and gives
+  the same one to Prometheus. Apply Terraform before you next deploy the proxy.
+
+### G07 and G22 settings now take effect per tenant and on reload — Bug fix
+
+G07's chunk limits (`max_chunk_tokens`, `max_total_context_tokens`) and G22's embedding
+settings (`use_embeddings`, `embedding_model`) were read once, from the first request after
+start-up. A tenant's own values, or a config reload, then changed nothing until a restart.
+Both are now read on every request.
+
+### G28's statistics tool no longer counts other tenants' blocks — Bug fix
+
+For a caller on the default tenant (a legacy key), the `headroom_stats` tool counted every
+tenant's stored blocks, which showed how busy other tenants were. It now counts only the
+caller's own. G28 is off by default.
+
+### A workflow id cannot write into another tenant's usage logs — Bug fix
+
+With G18's JSONL export on the local storage backend, a caller could send a workflow id such as
+`../other-tenant/x` and have its usage record written into another tenant's folder: the path
+stayed inside the export root, which was all the backend checked. The workflow id is now reduced
+to a single safe path segment under the caller's own tenant.
+
+### A malformed key without a tenant is refused — Bug fix
+
+A proxy key whose stored record named an empty or null tenant (only possible by editing the key
+store by hand) was accepted, and the usage export then skipped its tenant filter and returned
+every tenant's usage. Such a key is now refused, and the export refuses any non-admin caller
+without a tenant.
+
+### A deactivated operator is signed out of the admin console at once — Bug fix [Enterprise]
+
+Deactivating an operator stopped new logins but left their console session working until it
+expired. The session is now re-checked on every use and ends as soon as the operator is
+deactivated. The console guide also no longer calls its sign-in a two-factor gate: the operator
+login protects the console screens, while the admin API accepts the admin key alone —
+<https://tokenlean.cbeyond.cloud/>
+
+### Admin audit rows name the authenticated admin — Bug fix [Enterprise]
+
+The audit rows for re-encrypting stored provider keys and for generating an evidence pack took
+their actor from a request header, so whoever held the admin key could record any name; every
+other admin action already recorded the authenticated caller. These two now do too —
+<https://tokenlean.cbeyond.cloud/>
+
+### A password-reset request no longer reveals whether an account exists — Bug fix [Enterprise]
+
+The forgot-password answer was the same for every address, but for a registered one the portal
+sent the reset email before answering, which took noticeably longer: timing a few requests told
+anyone which addresses had accounts. The email is now sent after the answer, so both cases
+answer equally fast —
+<https://tokenlean.cbeyond.cloud/>
+
+### A portal session is not trusted when its checks cannot run — Bug fix [Enterprise]
+
+Every portal request re-checks that the user is still active and unsuspended and that the
+tenant's contract is active. When that check failed, for example during a database outage, the
+session was accepted as if it had passed, so a suspended user kept the portal for as long as the
+outage lasted. The portal now answers 503 ("try again shortly") until the check can run, and
+keeps the session for when it can —
+<https://tokenlean.cbeyond.cloud/>
+
+### The portal image installs the versions it was tested with — Bug fix [Enterprise]
+
+The portal image was built without its npm lockfile, running `npm install` with a flag npm does
+not have, so every build took whatever versions the ranges allowed that day; its Python
+server installed the newest `fastapi`, `uvicorn` and `httpx`; and it ran as root. It now builds
+with `npm ci` from the lockfile, installs the Python packages at the versions the proxy image
+pins, and runs as an unprivileged user —
+<https://tokenlean.cbeyond.cloud/>
+
+### The LLMLingua sidecar answers while it compresses — Bug fix
+
+The compression sidecar ran the model on its only event loop, and loaded it there on the first
+request after a start: a long prompt, or that first request, held up every other tenant's
+compression and the health check for seconds, or tens of seconds after a start, until the proxy
+gave up. The model now loads before the sidecar serves, and compression runs on worker threads
+(`LLMLINGUA_CONCURRENCY` at a time, default 2).
+
+### Local backups go only to a bucket in your own project — Bug fix
+
+`scripts/local/docker-backup.sh` (run by `stop-local.sh --backup`) fell back to the bucket name
+`token-opt-config` when none was configured. Bucket names are global, so the full database and
+Redis dumps went to whoever owned that name, and they were left in `/tmp`. The backup now needs
+`--bucket` or `CONFIG_GCS_BUCKET`, checks that the bucket is in your project (creating it there
+if missing, refusing it otherwise), writes the dumps to a private temporary folder that is
+deleted afterwards, and uploads them to `backups/<timestamp>/`.
+
+### Starting a paused GCP deployment no longer cuts the proxy off from Qdrant — Bug fix
+
+`scripts/gcp/start-gcp.sh` checked the Qdrant collection by opening Qdrant to everyone, probed it
+without its API key (so it always looked empty and offered a reseed), then set Qdrant to
+internal-only access, which the proxy and the pipeline jobs cannot use: retrieval and docs chat
+returned nothing until the next Terraform apply. It now reads the collection as you, with the
+key, and leaves Qdrant's access as deployed; only a reseed opens Qdrant to everyone, briefly,
+and closes it again however the script ends, a Ctrl-C included. `gcp-deploy.sh`'s seeding
+window closes the same way.
+
+### The GCP deploy completes without Qdrant — Bug fix
+
+With `enable_qdrant=false` (the pgvector set-up, and the default of the managed deploy),
+Terraform reports no Qdrant address and `scripts/gcp/gcp-deploy.sh` stopped with "QDRANT_URL is
+empty" after the sidecars and Langfuse but before the proxy. It now requires the address only
+when `ENABLE_QDRANT` is on, and the proxy and the pipeline jobs get no `QDRANT_URL` without it
+(an update in place removes one an earlier Qdrant deploy left).
+
+### Langfuse's database password is no longer in its plain environment — Bug fix
+
+`scripts/gcp/gcp-deploy.sh` put the Langfuse database URL, password included, in the service's
+environment variables, readable by anyone with view access to Cloud Run, and did not URL-encode
+the password, so a generated password containing `#`, `?`, `%`, `@` or `/` stopped Langfuse from
+starting. The password is now encoded and the URL kept in Secret Manager
+(`langfuse-database-url`), which Langfuse reads at start. If your deployment ran the old script,
+consider rotating the database password.
+
+### Alertmanager's alerts reach the proxy — Bug fix
+
+The Terraform-built Alertmanager posted alerts to the proxy's `/admin/alert-webhook` with no
+credentials, and the endpoint accepts only an admin key, so every alert was refused; with no
+proxy address it posted to `localhost` inside its own container. Terraform now generates a
+token that Alertmanager presents and the proxy reads as `ALERT_WEBHOOK_TOKEN` (`gcp-deploy.sh`
+mounts it); it opens that endpoint only, and is not sent to a webhook URL of your own
+(`alert_webhook_url`). With nowhere to send alerts, `terraform plan` now warns.
+
+### Cloud SQL is backed up, with point-in-time recovery — Bug fix
+
+The Terraform module created the Cloud SQL instance with neither automated backups nor
+point-in-time recovery, though it holds `usage_events` (the billing record), the audit log,
+tenant configuration and keys: a bad migration or a mistaken `DELETE` could not be undone. Daily
+backups (7 kept) and point-in-time recovery over 7 days of logs are now on by default
+(`db_backups`, `db_point_in_time_recovery`, `db_backup_retained_count`,
+`db_transaction_log_days`, `db_backup_start_time`). Applying it may restart the instance once,
+and backup storage is billed.
+
+### Prometheus alert rules use only labels the metrics carry — Bug fix
+
+Three recording rules in `infra/prometheus-alerts.yml` grouped requests and cost by `user_id`,
+a label no metric has, so each recorded one series with no breakdown; they are removed
+(per-user figures are in `usage_events`). The Terraform module now loads every `*rules.yaml`
+file beside the alert rules into the one rules file Prometheus reads, and a test checks that
+every metric and label a rule uses is one the proxy exports.
+- **OSS:** the rule fix, the loading of extra rule files, and the test.
+- **[Enterprise]:** the per-tenant SLA alerts (p99 latency, error rate) had never been loaded
+  by Prometheus, and the error-rate alert filtered on a status label its metric lacks, so
+  neither could fire. Both are now loaded and the error rate counts responses by status —
+  <https://tokenlean.cbeyond.cloud/>
+
+### The local Docker stack no longer exposes its databases and admin tools to the network — Bug fix
+
+`docker-compose.yml` published Redis and Qdrant (neither with authentication), Postgres, the
+sidecars and the admin tools (Langfuse with a default admin password, Grafana, Prometheus,
+Jaeger) on every network interface, and ports Docker publishes bypass the host firewall: on a
+machine with a public address all of them were reachable. They now listen on 127.0.0.1 only;
+set `TOKEN_OPT_BIND` in `.env` to widen them deliberately, after setting real passwords. The
+proxy itself still listens on all interfaces.
+
+### A tenant that upgraded this month sees its enterprise quota — Bug fix [Enterprise]
+
+The portal's usage page and the admin console's tenant view took the tenant's tier from the
+alphabetically last tier on this month's usage, and "free" sorts after "enterprise": a tenant
+that upgraded during the month was shown as free with an unlimited quota. Both now use the
+tier of the most recent request, as the spend-limit and SLA views already did —
+<https://tokenlean.cbeyond.cloud/>
+
+### SOC2 evidence packs are signed, and large months no longer load into memory — Bug fix [Enterprise]
+
+An evidence pack's only proof that it was unaltered was a SHA-256 over its own events, which
+anyone editing the pack could recompute, and the hash left out each event's details (the
+guardrail categories and PII entity types the trust & safety evidence rests on). Packs are now
+signed with an Ed25519 key held by the service, over everything in them, and the hash covers
+the details. Auditors check a pack against the public key the admin console publishes; a pack
+from a deployment with no signing key says it is unsigned. A month with many audit rows was
+read whole into the proxy's memory to build its pack; the rows are now read in batches and the
+pack streamed to the download. A row with no request id no longer counts as a request in the
+summary —
+<https://tokenlean.cbeyond.cloud/>
+
+### Portal emails' one-time links are no longer written to the logs — Bug fix [Enterprise]
+
+With no email provider configured, the portal fell back to a stand-in sender that wrote every
+verification, password-reset and invite email, one-time link included, to the proxy log: anyone
+able to read the logs could request a reset for any customer and take the account. The stand-in
+now logs only recipient and subject (the link only on a local development stack that asks for
+it). On a managed deploy with no provider, no email is sent and each one is logged as an error
+rather than passing for delivered, and an admin invite now reports `invited: false` when the
+email did not go out —
+<https://tokenlean.cbeyond.cloud/>
+
+### A tenant's IP allowlist is enforced whether or not the global allowlist is on — Bug fix
+
+A tenant's own source-IP allowlist was checked only while `ip_allowlist.enabled` was on, and that
+switch is off by default, so a list saved for a tenant could restrict nothing. A tenant's list is
+now enforced whenever it has one; `enabled` switches on only `global_cidrs`. A key issued to the
+tenant after its list was set, or by rotation, now carries the list too (before, a new key was an
+unrestricted way in). Before upgrading, review the tenants that have a list: if the global switch
+was off, they become restricted.
+- **OSS:** enforcement, and the list on new and rotated keys.
+- **[Enterprise]:** the admin console shows the list each stack's keys enforce. It was kept per
+  company, so a sibling stack appeared restricted when it was not, and creating another stack
+  blanked the list shown for the first while its keys stayed restricted. A stack whose keys carry
+  different lists is flagged —
+  <https://tokenlean.cbeyond.cloud/>
+
+### Checking a proxy key no longer stalls the proxy on Secret Manager — Bug fix
+
+With proxy keys kept in Secret Manager (the default for a self-hosted deploy on GCP), a key the
+proxy had not cached, or a cache past its five-minute lifetime, made the request read the secret
+with a blocking call on the server's event loop, stalling every request on that worker for the
+call, for its full timeout during a Secret Manager outage. A stream of random keys forced one
+every five seconds. That read now happens off the event loop, one at a time, and while Secret
+Manager is failing the proxy keeps answering from the keys it has instead of retrying on every
+request.
+
+### Cost routing works for tenants that bring their own provider keys — Bug fix
+
+G06 only routes a request to a cheaper tier model whose provider it can reach, and it judged
+that from platform keys alone. On a deployment that holds no platform keys and serves every
+tenant on its own key, every routed model looked unreachable, so each request was served on the
+model it asked for and G06's cost routing, including a tenant's own tier choices, did nothing.
+A tenant's own key for the provider now counts.
+
+### Code blocks keep their import lines as written — Bug fix
+
+G19's import "compression", on by default, merged nothing: it only removed the leading
+whitespace of every import line, so an import inside a function reached the model at the top
+level, an indentation error the user never wrote. Import lines are now left as they are, and the
+`compression_strategies.code.compress_imports` setting is no longer read.
+
+### The injection threshold cannot switch detection off — Bug fix
+
+A tenant cannot turn G30 or G31 off, but could set their `threshold` to 1.0, above every rule's
+severity, so nothing was ever flagged. The scanner now caps any threshold at its strongest rule,
+and a tenant's own threshold is capped at the weakest built-in rule (0.8), including a value
+saved earlier.
+- **OSS:** the scanner cap and the cap on a tenant's override.
+- **[Enterprise]:** the portal's threshold setting now ranges 0.0–0.8 —
+  <https://tokenlean.cbeyond.cloud/>
+
+### Masked personal data is restored inside tool calls too — Bug fix
+
+In G29 `mask` mode, personal data in an earlier tool call was replaced by a placeholder on the
+way to the model, but the placeholders the model then wrote into a new tool call came back to
+the client unchanged: an agent's tool would send mail to `[PII:EMAIL:1]`. Tool-call arguments in
+responses are now restored like message text, and personal data the model writes into them is
+masked (or, in `flag` mode, counted).
+
+### A Presidio-backed PII check no longer reloads its model per request — Bug fix
+
+With `use_presidio` on, every PII detector built its own Presidio engine, loading the spaCy
+model (seconds, hundreds of MB) on the request path, and G29/G31 rebuild their detector whenever
+the entity set changes, so tenants with different `phi` settings made it rebuild on alternate
+requests. One engine is now built per process and shared.
+
+### A recovering provider gets one probe, not all the traffic — Bug fix
+
+When a provider's circuit breaker finished its cooldown, it let every request through while the
+first one tested the provider, so all of them hit a provider that might still be failing, each
+paying retry time before failing over. And if that first request ended with a 4xx, the breaker
+stayed in its testing state and let everything through for good. Now one request tests the
+provider while the rest fail over, and a test that never reports an outcome makes way for a new
+one after the cooldown.
+
+### Anthropic and Gemini batch jobs use the resolved key — Bug fix
+
+The provider-native batch lane for Anthropic and Gemini never passed the key it was given to
+the provider calls, so litellm fell back to the provider's own environment variable. Where that
+variable is kept out of the proxy, as recommended, batch submission always failed and the
+discounted lane never ran; where it is present, jobs ran on a credential nobody resolved. Every
+batch call now uses the resolved key.
+
+### Anthropic and Gemini tool and format controls are no longer lost — Bug fix
+
+An Anthropic `tool_choice` of `{"type": "none"}` reached the model as `auto`, so it could call
+tools the client had forbidden, and `disable_parallel_tool_use` was ignored. On the Gemini route,
+`toolConfig` (function-calling mode and allowed functions), JSON mode (`responseMimeType` and
+`responseSchema`), `topK`, `candidateCount`, `seed`, the penalties and `thinkingConfig` were
+silently dropped. All are now carried. A Gemini `generationConfig` field the proxy cannot carry,
+or an Anthropic `tool_choice` it does not know, is refused with a 400 that names the field.
+
+### `/admin/budget-status` is removed — Bug fix
+
+The endpoint summed Redis keys that nothing in the proxy writes, so it reported zero
+consumption for every team and feature however much had been spent. It is no longer served.
+Per-tenant usage and cost are in `/admin/usage-export`, and spend is enforced by the spend cap.
+
+### Billing rows and counters of the last requests survive a shutdown — Bug fix
+
+A served request's billing row, security audit row, quota, trial and spend counter updates and
+webhook event deliveries ran as background tasks that nothing kept: their failures were never
+logged, and on a scale-in or deploy the proxy closed its Redis and database pools under them,
+so the last moments' invoice rows and counter updates could be lost. They are now held until
+they finish, failures are logged, and shutdown waits up to five seconds for them before the
+pools close.
+
+### Langfuse traces no longer store request text by default — Bug fix
+
+`capture_trace_content` defaulted to on, so with Langfuse tracing enabled every prompt and
+answer was written to a Langfuse project that all tenants share, including personal data that
+G29 had detected but, in its default `flag` mode, left in place. It now defaults to off. When
+it is on, a request whose personal data G29 or G31 found and did not mask is still traced
+without its text. Spans keep their token counts either way. If your config sets
+`capture_trace_content: true`, review that choice.
+
+### Agent URLs that point inside the network are refused — Bug fix
+
+An F2 agent URL was checked only against three host names and literal private addresses,
+so `http://metadata.google.internal./` (trailing dot), `http://2852039166/` (the metadata
+address written as a number) or, for an agent a tenant saved, `http://langfuse:3000` were
+accepted, and a matching prompt made the proxy send the conversation there.
+- **OSS:** every agent URL is refused if its host is the metadata service or loopback (with
+  or without a trailing dot), an IPv4 address spelled as a number, or any address that is
+  not public. Agents defined in your own config file may still name hosts on your network,
+  as the configuration example does.
+- **[Enterprise]:** an agent saved from the portal must also name a public host (no
+  single-label, `.internal`, `.local` or `.svc` name), and its name is resolved before each
+  call and refused if it points inside; webhook URLs are held to the same name and address
+  rules when saved and before delivery — <https://tokenlean.cbeyond.cloud/>
+
+### Streamed tool calls are checked per answer when a request asks for several — Bug fix
+
+With `n` above 1, each streamed answer numbers its tool calls from 0, and G32's stream gate
+remembered its verdict by that number alone. A tool call your policy denies could then reach
+the client in the second answer because an allowed call with the same number came first in the
+first answer, and an allowed call could be withheld the other way round. Each answer's calls
+are now judged on their own.
+
+### G23 no longer reports savings it never made — Bug fix
+
+G23 collapsed repeated phrases in each answer into a second, shorter copy that it added to the
+response as `x_compressed_content`, and booked the difference as savings. The client always
+received the full answer and nothing ever read the shorter copy, so those savings (in group
+savings and the per-group USD figure, priced at the input rate) were not real, and every
+response carrying repetition grew by a second copy, which the cache stored too. G23 now only
+measures: the response is returned unchanged and the repetition is counted in
+`token_opt_g23_compressible_output_tokens_total`. Dashboards that showed G23 savings will show
+none.
+
+### G18's JSONL export no longer blocks other requests — Enhancement
+
+With `jsonl_gcs_bucket` set, G18 built a new Cloud Storage client and uploaded each request's
+record on the event loop, stalling every request on that worker for the length of the upload.
+The upload now runs off the event loop, and one client is reused for the process.
+
+### The `feature` metric label is bounded by default — Bug fix
+
+Any caller could send a new `X-Feature` value on every request, and each one created new
+Prometheus series on G18's counters that were never removed, growing proxy memory and the
+`/metrics` scrape without limit. With no `label_values.feature` list configured, every value
+other than `default` is now counted as `other`; list the features you want to see, or set
+`"*"` to keep every value as before.
+
+### Switching G18 off no longer zeroes a tenant's costs — Bug fix
+
+A tenant can switch G18 (observability) off in the portal. That also skipped pricing every
+non-streamed answer, so its cost was recorded as $0, its spend counter never grew and a spend
+cap could never trip, while streamed answers were still priced. Pricing now runs whether G18 is
+on or off, for batched answers too; the switch covers G18's metrics, export and tracing.
+
+### Batched results are served only to the tenant that sent the request — Bug fix
+
+`GET /v1/batch/results/{id}` checked the owner only when one was on record, and the owner
+record expired an hour after the request was queued, before a provider batch (24-hour window)
+or a long backlog finished. Any key that knew the request id could then read the answer. The
+owner is now recorded before the request is queued (a request whose owner cannot be recorded
+is answered at once), lasts longer than any batch can wait and as long as its result, and an
+id with no owner on record is not found for every caller but an admin key.
+
+### TOON leaves data it cannot write faithfully as JSON — Bug fix
+
+G13's TOON notation turned on whenever a system prompt mentioned "schema" and contained a "|",
+as any markdown table does, and wrote values unescaped: a "|" or a line break inside a value
+shifted the columns or split the row, and null, an empty string and a missing key all came out
+as an empty cell. TOON now needs the marker itself (a system line such as `schema:name|age`)
+unless `toon_auto_detect` is on, a block with a "|" or line break in any value or key stays
+JSON, and null, empty and missing are written differently.
+
+### G11 caps reach the model's configured limit — Bug fix
+
+G11 looked the model's output limit up under a request parameter that is never set, so every
+`max_tokens` it applied, from `fallback_max_tokens` or from completion history, was clamped to
+4096 and the `model_max_tokens` table was never read: a configured 8000-token fallback on a
+16k-output model cut answers at 4096. The limit now comes from the model the request is routed
+to, and a model missing from the table gets `default_model_max_tokens`.
+
+### Tool descriptions keep 'make sure', 'might' and 'not just' — Bug fix
+
+G08 compresses tool descriptions by default, and the compressor removed words that carry the
+instruction: "Make sure the date is ISO-8601. This might return an empty list." reached the model
+as "Make date is ISO-8601. This return empty list.", "just-in-time" lost its "just", and "not just
+the IDs but the records" became "not the IDs but the records". Those words are now kept, as are
+hyphenated compounds, no surviving word changes case (a lowercase parameter name opening a
+sentence stays lowercase), and a description whose compression would drop a negation or a bound
+is sent as written, the same check G01 applies to prompts.
+
+### Adaptive-bypass rules learned on benchmarks stay with benchmark traffic — Bug fix
+
+A G24 rule that named benchmark `datasets` also matched requests that carried no dataset tag,
+which is all production traffic, so a skip learned on one benchmark applied to every tenant. It
+now matches only requests tagged with one of its datasets. `scripts/review_bypass_candidates.py`
+now requires `--tenants <ids>` or an explicit `--global`, and writes that scope into each approved
+rule. G24 also stopped re-reading an empty rules source on every request (on GCP, two blocking
+downloads per request) and loads its rules off the event loop.
+
+### G20 matches a template to the whole system prompt — Bug fix
+
+G20 looked up an optimised prompt by a fingerprint of the system prompt's first 512 characters,
+so two prompts sharing a long common start, such as a policy followed by per-user details, got the
+same template: the second user's prompt was replaced by the first user's. The fingerprint now
+covers the whole prompt, a system message with image or other non-text parts is left alone
+instead of failing the request, and the saving is counted in tokens rather than words. Templates
+stored under the old fingerprint have to be stored again (G20 is off by default).
+
+### Tool pruning no longer removes a tool the request names — Bug fix
+
+G08 could prune the very tool a request forced with `tool_choice` (or the legacy
+`function_call`), or one an earlier assistant turn had already called, whenever the operator's
+tool registry gave it intents the latest message did not mention. The provider then rejected the
+request. Those tools are now always kept.
+
+### A malformed `tenants:` block no longer switches the response cache off — Bug fix
+
+An operator `config.yaml` whose `tenants:` key was left empty, or held a tenant entry that was
+not a mapping, made G05 fail on every cache lookup and store for every tenant: nothing was
+cached or served from the cache. G05 now reads its per-tenant scope through the same
+type-checked lookup the other groups use, and falls back to the global setting.
+
+### Bypass rules from the database now apply for their whole cache window — Bug fix
+
+G04 used a rule loaded from the `bypass_rules` table for one request, then switched back to the
+config rules until the cache window expired, so a database rule applied to about one request a
+minute per worker. Without such a table (no migration creates one) it opened a new Postgres
+connection on every request to find that out. The database's answer, rules or none, is now kept
+for `db_cache_ttl_seconds`, the query uses the shared connection pool, and the per-rule
+statistics go to Redis in one round trip.
+
+### The RAG fallback no longer blocks the server — Bug fix
+
+When a tenant's primary document search found nothing, G03's fallback chain embedded the query
+and searched Qdrant synchronously for each of up to four strategies, holding up every other
+request on the worker, and with Qdrant unreachable each attempt waited out its full timeout. The
+chain now embeds once, off the event loop, uses one asynchronous Qdrant client that is always
+closed, and skips a collection that does not exist. Its `G3_doc_pipeline.rag_fallback` settings
+(`enabled`, `strategies`, `top_k`, `similarity_threshold`) were documented but never read;
+they are now. G07's primary search also closes its client when it fails.
+
+### A rate-limit override that sets one window no longer lifts the limit — Bug fix
+
+A `rate_limit.per_user` or `per_team` entry that set only `requests_per_minute` (or only
+`requests_per_hour`) made the limiter fail on the missing window and let every request from
+that user or team through. Overrides are now merged over the default limits, as `per_tenant`
+and `tiers` already were, and an entry that is not a mapping falls back to them.
+
+### Judge, summary and repair calls now count toward a request's cost — Bug fix
+
+A request's `cost_actual_usd` priced its answer (and, since an earlier fix, every cascade tier
+it tried) but not the other paid calls made on its behalf: the G06 judge, G09's schema
+extraction, the G10/G26 summariser and G11's repair re-ask. The figure, the spend cap that accrues
+it and the savings percentage all flattered the proxy. Each such call is now recorded and added
+at list price, wherever it happens. The G06 judge also uses the served tenant's provider key,
+as the request's own call does.
+
+### Only TokenLean's own X-* headers are kept with a request — Bug fix
+
+Every `X-*` request header was copied into the request's parameters, which the batch lane stores
+in Redis, so infrastructure headers such as `X-Cloud-Trace-Context` were kept with queued requests
+(client-address headers were already removed by an earlier fix). Only the headers TokenLean reads,
+such as `X-Template-ID` and `X-Session-ID`, are kept now. G06 routing rules still match any
+`X-*` header, through a copy that is never stored.
+
+### LLMLingua compression on GCP is now an explicit choice — Bug fix
+
+The GCP deploy pointed G01 at the LLMLingua sidecar without its `/compress` route, so every call
+failed and G01 quietly fell back to its other compressors: GCP tenants never got LLMLingua and paid
+a failing call per message. Switching LLMLingua on changes what compressed prompts look like, so
+on GCP it is now opt-in: set `LLMLINGUA_ON_GCP=true` in `.env.gcp` and the deploy points G01 at
+the right route. Otherwise the deploy turns it off explicitly, which is what tenants were already
+getting. An empty `sidecar_url` now skips the call entirely.
+
+### The RouteLLM sidecar decides without making a billed completion — Bug fix
+
+With `classifier: routellm`, every routing decision made a real one-token completion on the
+sidecar's OpenAI key, sending the tenant's conversation to the strong model. The name it answered
+with never matched the model G06 expected either, so G06 fell back to its heuristic anyway. The
+sidecar now asks RouteLLM only to decide, which calls no model, and answers with the weak or
+strong model name G06 sent. Each router loads on first use, so the large `causal_llm` model
+loads only when asked for. The config reference now names the `routellm.url` key G06 reads.
+
+### The prefix-cache floor no longer keeps a span whole when that costs more — Bug fix
+
+With `preserve_cacheable_prefix` on, G08 and G19 refused to shrink the cacheable span whenever
+compressing it down to the provider's minimum would have been cheaper. They cannot do that:
+they can only shrink or not, so a refusal kept the span whole, and with a small cache discount
+that costs more than the shrink it refused (1.66x on one measured provider). G01 had the same gap
+when its rate-dial compressor was unavailable. Each now compares compressing with what it can
+actually do instead. The setting is off by default.
+
+### CI now scans tracked files for credentials — Enhancement (OSS)
+
+Path rules catch a secret file, but never a real key pasted into a tracked one: a template, a
+test fixture or a doc. A new `scripts/ci/leak_scan.py` looks for high-confidence credential
+formats (private keys, cloud and model-provider API keys, TokenLean proxy keys) and CI runs it
+over every tracked file on each push and pull request. It prints the file, line and kind of
+credential, never the value. A fixture line that must hold such a value can carry
+`leak-scan: allow`.
+- **OSS:** `python scripts/ci/leak_scan.py --tracked`, or `--staged` before a commit.
+
+### The proxy image leaves out every commercial path, and CI now checks them all — Bug fix
+
+The open-core checks each kept their own copy of the commercial file list, and the copies had
+drifted: `src/proxy/.dockerignore` missed five commercial paths, so a proxy image built from a
+tree that has the commercial files (the maintainers' own builds) included them. Images built
+from this public repository were never affected, since it doesn't contain those files. The
+paths are now excluded, and CI reads the commercial paths from the commercial sections of
+`.gitignore` (new `scripts/ci/commercial_paths.py`) instead of a list of seven, so a new
+commercial path is checked as soon as its `.gitignore` line exists. CI also fails if a
+commercial path under `src/proxy` is missing from `.dockerignore`.
+
+## 2026-09-30
+
+### Batched requests are no longer marked failed while another instance works on them — Bug fix
+
+With more than one proxy instance, a batch that took over 30 seconds had its unfinished
+requests taken by another instance and marked failed, though the first was still working on
+them; a client polling in between saw "failed", resubmitted and paid twice. An instance now
+keeps its claim on what it is processing, so only work left by a stopped instance is taken
+over, and that work is retried (`max_attempts`, default 3) before being marked failed. A
+failure never replaces an answer already stored, and each process uses its own consumer name.
+
+### Claude Code and other Anthropic SDK clients keep their prompt caching — Bug fix
+
+The Anthropic endpoint (`/v1/messages`) dropped the `cache_control` markers a client places
+on its system prompt, messages, tools and tool results, so Anthropic cached nothing and every
+turn paid full input price for a prefix it would otherwise bill at about a tenth. The markers
+now reach Anthropic where the client put them, and the proxy adds none of its own to such a
+request (Anthropic rejects more than four). Markers go only to providers that cache by marker
+(Anthropic, Bedrock): a request routed, cascaded or failed over to another provider is sent
+without them, on either endpoint, instead of becoming a separately billed Gemini cache.
+
+### Reported savings no longer count a provider's own prompt-cache discount — Bug fix
+
+OpenAI, Gemini and other providers cache repeated prompts on their own, with or without the
+proxy, but the savings figure priced the "without the proxy" cost at full price, so their
+cache discount showed as the proxy's saving on the portal and on invoices. That cost now gets
+the same discount whenever the request would have been cached without the proxy: its provider
+caches on its own, or the caller marked the prompt for caching itself. A discount the proxy
+made possible (its Anthropic cache marker, or routing to a provider that caches) still counts.
+Figures already recorded are unchanged.
+
+### The proxy and the fine-tune job reach their private Redis on every GCP deploy — Bug fix
+
+The Redis Terraform creates on GCP (VM or Memorystore) has only a private address, but the
+deploy gave Cloud Run access to the private network only when Cloud SQL was private. On the
+open-source default the proxy could therefore not reach Redis, so rate limits, quotas, spend
+caps, trial counters, the cache and sessions quietly stopped working, and the fine-tune job
+could not reach it on any deploy. Both now get Direct VPC egress on the project's default
+network whenever the Redis is Terraform's, for private addresses only.
+
+### Qdrant on GCP no longer loses its documents when it sits idle — Bug fix
+
+On GCP, Qdrant keeps its collections in its Cloud Run instance's own storage, and it scaled to
+zero whenever it sat idle, which erased every tenant's ingested documents and the docs-chat
+collection. Under load, Cloud Run could also start a second instance holding different
+documents. Qdrant now runs as exactly one instance that is always on, billed at Cloud Run's idle
+rate, including while a project is paused. A change to the Qdrant service or a Cloud Run restart
+still starts it empty: ingest the documents again after one. Durable storage is a separate
+change.
+
+### Retrieved documents no longer stop the provider caching the system prompt — Bug fix
+
+G07 (on by default) put retrieved documents in front of the caller's own system prompt, so
+every prompt started with text that changes with each query. The provider's prompt cache
+never matched the stable system prompt, and G21 hashed the documents into OpenAI's
+`prompt_cache_key`, spreading requests across cache shards. The documents now sit just
+before the latest user turn and stay out of the cached prefix and its key. They remain a
+system message, so G31 still scans them, and G11's and G12's appended instructions still
+go to the caller's system prompt rather than into them.
+
+### A session id no longer costs an extra model call on every request — Bug fix
+
+G10 is on by default. For every request carrying a session id it asked a model to summarise the
+whole conversation, adding cost and latency, and put that summary into the next request,
+although a chat client resends the whole conversation anyway. For a client that sends only its
+newest turn, the summary covered just that one request, so it remembered one request back. Now
+a request that resends the conversation costs no summary call and gets nothing added, while a
+request with no more turns than last time gets the stored summary, which builds on the previous
+one. Each session's first request is summarised once.
+
+### Claude requests no longer get extended thinking they did not ask for — Bug fix
+
+When G25 was off for a tenant, or a G24 rule skipped it, G12 gave every request that named no
+reasoning its configured default, `medium`. On Anthropic that switched extended thinking on, so
+the customer paid for reasoning nobody had asked for. G12 now caps the platform's default at
+the provider's own default, as G25 already does: an Anthropic request that asks for nothing gets
+no thinking, OpenAI's o-series and Gemini keep reasoning at medium, and a platform default of
+`high` becomes medium on the o-series. A request's own setting, and a default the tenant set in
+the portal, are used as they are. An operator can raise a provider's default with
+`providers[].default_reasoning_effort`.
+
+### Grafana, Langfuse, Qdrant, Prometheus and Alertmanager no longer run as the proxy's service account — Bug fix
+
+On GCP these services ran as the proxy's service account, so whoever compromised one (Grafana is
+public; all five are third-party images) could read the proxy's provider keys and database
+password, decrypt tenants' stored provider keys, reach Cloud SQL and call any Cloud Run service.
+On the open-source default that also meant every secret and bucket in the project, including the
+backups of the operator's own secrets. Each now runs as an account of its own holding only what
+it uses, and the proxy's account reads only its own secrets by default (`least_privilege_secret_iam`
+now defaults to `true`). Two grants nothing used, on the RouteLLM account, are gone. After
+upgrading, run one deploy without `--skip-infra`. If you point a bucket of your own at
+`/ingest-doc`, grant `token-opt-proxy-sa` `roles/storage.objectViewer` on it.
+
+## 2026-09-29
+
+### Batched requests count against the quota, trial and spend cap — Bug fix
+
+A request sent with a `batch_topic` was billed when it was queued, but it never counted
+against the tenant's monthly quota or free trial, and its cost never reached the spend cap, so
+a tenant could send everything as batched requests and never reach a limit. It now counts
+against the quota and trial when it is queued. When its answer arrives, its cost, priced from
+the usage the provider reported (at `batch_discount_multiplier` on the native batch lane), is
+added to the tenant's spend counter. A request an admin key sends as the tenant counts against
+none of them.
+
+### An admin key acting as a tenant is no longer billed to that tenant — Bug fix
+
+An admin key that sends `X-Tenant-ID` acts as that tenant, for support or benchmarks. Each of
+its answers wrote a billable usage row for the tenant and counted against the tenant's monthly
+quota, spend cap and trial, and nothing recorded who had sent it. Such a row now names the
+admin key's own tenant in a new `impersonated_by` column and is not billable, so it stays off
+invoices and usage counts, and the counters are left alone. The provider call itself is
+unchanged: under strict BYOK it uses the tenant's own provider key.
+
+### Redis can now require a password — Bug fix
+
+Redis ran with no password, and its network rules let any private address reach it: a
+compromised host in the VPC could read every tenant's cached prompts and answers, sessions and
+memory, and reset rate-limit and spend-cap counters. Terraform now keeps a Redis password in
+Secret Manager (`redis-auth`), and the GCP deploy mounts it into the proxy and the fine-tune job,
+which log in with it. `REDIS_AUTH_ENFORCE=true` then makes Redis require it: on the VM backend
+with no outage, in a later deploy followed by one restart of the Redis VM; on Memorystore by
+turning AUTH on. See "Make Redis require its password" in docs/deployment-gcp.md. Traffic to
+Redis is still unencrypted.
+
+### A tenant's own provider key no longer appears on a fine-tune job's execution — Bug fix
+
+A fine-tune for a tenant with its own provider key passed that key to the Cloud Run job as a plain
+environment override, and an execution keeps its overrides: anyone who could view the job's
+executions could read the key. The key is now stored as a new version of a Secret Manager secret,
+`finetune-tenant-key`, and the job is given only the version's name. It destroys the version once
+the run has ended cleanly. Terraform creates the secret and gives the proxy's service account
+version rights on that secret alone: run `terraform apply` before deploying, since such
+fine-tunes do not start until the secret exists. Executions from before this change still hold
+the key in plain text: delete them, and consider rotating the keys concerned.
+
+### Provider calls now time out, and retries no longer stack — Bug fix
+
+No provider call set a timeout. A provider that accepted the connection and then stalled held the
+request for 10 minutes, the client library's own limit, long after the client had given up, so
+failover never happened. On a 429 or 5xx the client library also retried twice under the proxy's
+own retries: up to six calls to one provider, each of which could be billed. Every provider call
+now waits at most `resilience.request_timeout_seconds` (default 300; for a stream, each wait
+between chunks), and a call that runs out is retried and failed over like any provider error.
+While the resilience layer is on, only it retries the main call and its failover.
+
+### A failing response stage no longer turns a paid answer into an unrecorded error — Bug fix
+
+After the provider had answered and billed, the response stages ran with no error handling: one
+that raised ended the request in a 500, and no usage row, quota or spend count, or security audit
+row was written. A failing optimisation or observability stage is now skipped, logged and counted
+on `token_opt_response_stage_errors_total`, and the answer is served. A failing safety stage
+(response PII masking, response guardrails, tool eligibility) still withholds the answer with a
+500, but the request is recorded: a non-billable usage row priced at what the provider billed, and
+its security audit row. G16 also accepts `"tools": null`, which used to fail the request.
+
+### A managed proxy instance no longer serves before its API keys have loaded — Bug fix [Enterprise]
+
+On the managed service, proxy API keys are checked against a Postgres key store. If setting up
+that store failed while an instance was starting, the instance checked keys against the key list
+kept from before the move to Postgres, which is no longer updated: keys revoked since still worked
+there, and keys created since were refused. If only the first read of the keys failed, the
+instance refused every key until it was replaced. An instance now retries until the keys have
+loaded, and serves only after that.
+
+Self-hosters have nothing to upgrade — <https://tokenlean.cbeyond.cloud/>
+
+## 2026-09-28
+
+### Strict BYOK no longer lets a stored "Bedrock key" bill the platform — Bug fix [Enterprise]
+
+Under strict bring-your-own-key, a tenant could store any string of eight or more characters as its
+Bedrock key and have it accepted. Calls to Bedrock are signed with the platform's AWS credentials
+and ignore that key, so the platform paid for the tenant's usage. Under strict BYOK, a provider
+called with platform-held credentials (Bedrock, or any provider configured with
+`requires_api_key: false`) now returns 402 for tenants whatever key they stored, and the portal
+refuses to store a key for it. Exempt tenants and deployments without strict BYOK are unchanged.
+
+Self-hosters have nothing to upgrade — <https://tokenlean.cbeyond.cloud/>
+
+### The managed prompt-injection rules no longer drop out between config reloads — Bug fix [Enterprise]
+
+On the managed service, a feed adds the managed prompt-injection rules to G30's configuration
+every five minutes, but the configuration reloads every minute and each reload replaced it whole.
+For about four minutes in every five, G30 ran with the open-source rules only. The rules are now
+applied to every reloaded configuration before it takes effect. The open-source core gains the
+hook this uses (`config_loader.register_post_load`); self-hosted behaviour does not change.
+
+Self-hosters have nothing to upgrade — <https://tokenlean.cbeyond.cloud/>
+
+### Document ingestion and fine-tuning reach Qdrant on GCP — Bug fix
+
+On GCP, Qdrant runs on Cloud Run behind IAM and its own API key. The doc-pipeline and finetune
+jobs connected with neither, and on port 6333, which Cloud Run does not serve, so uploaded
+documents never reached the vector store and fine-tuning found no training data. Both jobs now
+connect the way the proxy does: with the Qdrant API key (the GCP deploy mounts the
+`qdrant-api-key` secret on both jobs), a Cloud Run identity token, and port 443. The
+doc-pipeline image also installs `tiktoken`, which it imported without installing.
+
+### A withheld answer is now recorded at what the provider billed — Bug fix
+
+When G30 checks responses in block mode, or G11 blocks an answer that does not match the
+requested schema, the answer the provider already produced and billed is replaced with a refusal
+that reports zero usage. G18 priced that refusal, so the request was recorded as costing $0 with a
+100% token saving, the spend cap was not charged, and cost reports under-counted. The call is now
+recorded at the provider's usage; the caller still receives the refusal unchanged.
+
+### A tenant's model choice for a routing tier now takes effect — Bug fix
+
+In the portal's model preferences a tenant picks the model for each routing tier (simple,
+medium, complex), and the portal shows that pick as in effect. With the per-provider ladders the
+shipped config enables (`tiers_by_provider`), G06 used the ladder for the requested model's
+provider and ignored the pick. Now a tier the tenant set wins for all of that tenant's requests,
+including a request for another provider's model, and tiers it did not set keep the ladder. The
+same holds for tiers an operator sets for one tenant under `tenants.<id>`. Picks already saved
+take effect with this release.
+
+The configuration reference now states the precedence the proxy applies: an operator's
+`tenants.<id>` block is merged after the portal's settings and wins where both set a key.
+
+### Blank lines in chat history no longer stall G01 — Bug fix
+
+G01, on by default, checks assistant history for log output whenever LLMLingua does not
+shorten a message. One of its patterns, for Java stack frames, let a frame's indentation include
+newlines, so on a long run of blank lines its time grew with the square of the length. It ran in
+the event loop, so one crafted request could hold up every other request on that worker for
+seconds or longer. A stack frame's indentation is now spaces and tabs only, which is linear and
+still matches real stack traces; a test times every log pattern on crafted inputs.
+
+## 2026-09-27
+
+### G01 no longer hands the model a corrupted copy of its own code — Bug fix
+
+G01, on by default, sent every assistant message in the history over 100 characters to the
+LLMLingua-2 sidecar, which keeps about half the word tokens. Log and error text went to Kompress,
+which rewrites it with a seq2seq model. Neither can tell a function name or a URL path from
+filler, and the only check looked for dropped negations. In a coding conversation the model could
+get its own earlier code back with names or paths missing, and edit that version.
+- A message with a fenced code block is no longer sent to LLMLingua, Kompress or Selective Context.
+- A compression that changes or moves inline code, a URL, a file path, an identifier or a version
+  number is refused, and the original is sent. The check covers every compressor, including the
+  cache-floor re-compression.
+- The patterns that find those parts now run in linear time. Two of them took quadratic time on
+  crafted input, and G08 already runs them by default on client-supplied tool descriptions.
+
+### The GCP deploy script builds the doc-pipeline image again — Bug fix
+
+Since the doc-pipeline image started bundling the proxy's guardrails engine (for opt-in
+`INGEST_PII_MODE` masking at ingest), its Dockerfile copies a folder that only
+`ci/cloudbuild.yaml` created. `scripts/gcp/gcp-deploy.sh` and `ci/cloudbuild-images-only.yaml`
+never did, so from a fresh clone the doc-pipeline build failed and the deploy stopped, with the
+proxy and LLMLingua images already pushed.
+- The new `scripts/ci/stage-doc-pipeline-guardrails.sh` stages exactly the three files the image
+  needs, starting from an empty folder each time. Every build path runs it first.
+- To build the image by hand, run that script before `docker build src/doc-pipeline`.
+
+### A database that is down when the proxy starts no longer leaves billing, the audit log and tenant settings off — Bug fix
+
+With `DATABASE_URL` set, the proxy uses the database to record usage, write the security audit
+log (G29–G32 events) and apply tenant settings made in the portal. It connected once, at
+startup. If the database was briefly unreachable then (a failover, a connection limit), the
+proxy logged a warning and served every request unbilled, unaudited and without those tenant
+settings until it was restarted.
+- The proxy now keeps retrying, 1 s apart at first and doubling to 30 s, until all three are
+  wired. Each is wired on its own, so one failing schema step no longer holds back the others.
+- Meanwhile `/health` answers `"status": "degraded"`, still with HTTP 200, and lists what is
+  missing under `not_wired`. The error itself goes only to the log.
+- With `MANAGED_DEPLOY=true`, startup waits for the database instead, so the proxy accepts no
+  request until all three are wired.
+
+### Deploying the managed service no longer takes the proxy off its managed settings — Bug fix [Enterprise]
+
+A managed-service deploy first ran the base GCP deploy, which redeployed the proxy on the
+open-source image and replaced all of its environment and secrets. The managed step that put
+them back came near the end, after the image and portal builds. Until then portal-issued keys
+were refused and requests were not metered, and if a step in between failed the proxy stayed
+that way.
+- The base deploy (`scripts/gcp/gcp-deploy.sh`) now takes `SKIP_PROXY_DEPLOY=true` from a
+  wrapper that deploys the proxy itself. A running proxy then keeps its image and settings, and
+  only the base deploy's own environment variables and secrets are merged in.
+- The Cloud Build deploy step refuses to replace a proxy running the managed image.
+
+Self-hosters have nothing to upgrade — <https://tokenlean.cbeyond.cloud/>
+
+### G08 no longer adds a Redis entry for every tool on every request — Bug fix
+
+G08, on by default, added a sorted-set entry for every tool on every request. The entries were
+kept 90 days and read by nothing, and each tool cost about six sequential Redis round trips. Its
+per-tool record never expired, and tool names chosen by the caller became Redis keys. Under
+agent traffic Redis filled up. Depending on its eviction policy it then either evicted other
+keys, including the spend-cap, quota and rate-limit counters, or refused writes.
+- G08 now keeps only a last-used time and a call count, and only for tools the registry or an
+  MCP manifest names.
+- They are written in one pipelined call per request and expire after `tool_usage_ttl_days`.
+- The pruned-status check is one call per request.
+
+The sorted sets written before this release (`*tok_opt:tool:usage:<tool>`, without `:meta`)
+expire within 90 days, or can be deleted now.
+
+### Chats that send a workflow id no longer switch to terse JSON answers — Bug fix
+
+G17 loop control, on by default, kept a 10,000-token budget per `workflow_id` per hour. Each turn
+it subtracted the whole prompt, history included, so an ordinary chat ran the budget out within
+a few turns. Every conversation sending the same workflow id drew on the same total. From then
+on the system prompt began "[BUDGET] … Respond ONLY with required JSON fields", which turned prose
+answers into terse JSON; changing the start of the prompt also broke the provider's prompt
+caching.
+- The budget is now measured against each conversation's own prompt size.
+- The brief-answer instruction is opt-in (`G17_loop.compact_output_enabled`, default off).
+- It now asks only for a brief answer, not JSON, and is added at the end of the system prompt.
+
+### A repeated question is no longer deleted from the conversation — Bug fix
+
+G22 deduplication, on by default, replaced two near-identical consecutive turns with the text
+`[summarised: 2 similar turns]`. When a user double-sent "Can you check order 1234?", the model
+received no question and no order number, and a saving was recorded. G22 now keeps the last
+turn of such a run word for word and drops only the earlier repeats. It records the saving in
+tokens.
+
+### Pasted code keeps its `#include` lines, and JSON keeps its null values — Bug fix
+
+G19, on by default, deleted every line starting with `#` in code sent in a request: C
+`#include` and `#define`, Rust `#[derive]`, shebangs. It also cut lines at ` #` or ` //`,
+turning CSS `color: #fff;` into `color:` and Python `a // b` into `a`. The model then answered
+about code the user never wrote. Comments are now stripped only from a fenced block that
+names its language, using that language's comment marker. Unlabelled code keeps its comments.
+G19's JSON cleanup also dropped `null` and `""` fields, which do not mean the same as absent
+ones. It now keeps them and drops only empty lists and objects.
+
+## 2026-09-26
+
+### A system prompt that mentions template syntax is no longer replaced — Bug fix
+
+G01's layered composition, on by default, replaced any system prompt containing `{{` and `}}`
+with the generic layers from the config ("You are a helpful AI assistant…"), so a prompt that
+mentions Handlebars or Jinja fields lost all of the developer's instructions, and nothing
+recorded it. Composition is now off by default and applies only to a system message that asks
+for it with a `layer_context` object. G01 removes that field before the provider call and
+records each composition as a savings step. The layers also follow the current config, rather
+than the first request's.
+
+### A system message sent as a list of parts no longer fails the request — Bug fix
+
+A system message whose content is a list of parts (a valid OpenAI shape) made G12's reasoning
+suppression prompt (on by default) and G11's verbosity steering fail with a 500. Both append
+their text as an extra text part now, which leaves any `cache_control` marker on the earlier
+parts where it was.
+
+### Streaming OpenAI clients get a stream on a cache hit or a guardrail block — Bug fix
+
+An OpenAI-SDK client that asked for a stream (`stream=true`) got a plain JSON body whenever the
+proxy answered without calling the model: a cache hit, a G04 bypass, a G29/G30/G31 block or an
+F2 agent answer. The SDK found no stream events, so the user saw an empty reply (a block's
+refusal text was lost too), and the request was still billed as served. These answers are now
+sent as a stream: one chunk with the answer, then the usage chunk, then `[DONE]`. As on a live
+stream, the usage chunk is left out when the client's `stream_options` did not ask for it. The
+Anthropic and Gemini routes already did this.
+
+### The response cache no longer serves one request's answer to a different request — Bug fix
+
+The response cache (G05) could serve a stored answer that did not fit the request:
+- **Settings.** Its key ignored the settings that change the answer (`tools`, `tool_choice`,
+  `response_format`, `n`, `max_tokens`, the sampling settings, `stop` and others) and the
+  arguments of earlier tool calls. A request could get JSON in another schema, calls to tools
+  it never offered, or the wrong number of choices. Both tiers now key on them, and on
+  TokenLean's own fields that change the prompt later: retrieval (G07), session context (G10)
+  and output format (G11).
+- **Images.** The semantic tier matched two requests about different images as the same
+  question. It now skips requests whose user turns carry images, audio or files.
+- **Expiry.** Semantic-tier entries never expired. A row past `l2_ttl_seconds` is now never
+  served, and the store deletes expired rows, whether or not `retention` is enabled.
+
+After upgrading, requests that set any of these parameters get new cache keys, so their entries
+are rebuilt once.
+
+### A batched request is queued only when it will be answered, and keeps its output checks — Bug fix
+
+A request with any `batch_topic` got a 202 and was billed even when no consumer read that topic
+(the default config runs none) or the queue write had failed, so its result stayed "pending"
+forever. It is now batched only when the topic is listed in `G13_batch.batch_topics` and the
+write succeeded; otherwise it is answered at once. A topic's queue stops taking requests at
+`max_backlog` (default 10000), and processed entries are deleted. Batched results also skipped
+the response-side checks: G29's masking of PII in the model's output (and restoring the
+caller's own masked values) and G30's response scan. Requests from tenants with either on are
+no longer batched.
+
+### The Observability tab and the FinOps anomaly panel load again — Bug fix [Enterprise]
+
+With the proxy's keys stored in Postgres (the managed setup), the operator console's
+Observability tab failed on every load: it read the key store on the server's event loop,
+which that store refuses because the read would block it. It now reads it in a worker thread,
+like every other admin page. The portal's FinOps cost-anomaly panel also failed on every
+call, from a missing import. Self-hosters have nothing to upgrade —
+<https://tokenlean.cbeyond.cloud/>
+
+### The database can stop the application from changing audit rows — Enhancement (OSS + Enterprise)
+
+The audit log was protected only by the application's own code: its database role owned
+`audit_events` and could rewrite or delete any row. `python -m audit.enforcement`, run as the
+tables' owner, now creates a restricted role for the proxy: it can read and insert audit rows,
+changes them only through two database functions (right-to-erasure pseudonymisation, and
+retention that never deletes a row younger than 90 days), and cannot regain the owner's rights.
+Startup schema steps skip tables the role does not own. See `retention` in
+docs/config-reference.md.
+
+- **[Enterprise]:** every managed deploy runs a schema job that creates the role, and the SOC2
+  evidence pack reports, checked live, whether the protection holds; the proxy moves onto the
+  role once verified — <https://tokenlean.cbeyond.cloud/>
+
+### The SOC2 evidence pack attests only the audit controls that are in place — Bug fix [Enterprise]
+
+The pack's audit statements said `audit_events` was append-only at the database level and
+that every served request wrote an audit row. Neither holds: the application's database
+role can change and delete audit rows, and ordinary requests write none. The statements now
+say what the audit log records, name the only two code paths that change rows
+(right-to-erasure pseudonymisation and the optional retention job), and list exactly which
+fields the pack's integrity hash covers; a test ties each statement to the code. The
+open-source audit engine's comments now say the same. Self-hosters have nothing to
+upgrade — <https://tokenlean.cbeyond.cloud/>
+
+### The managed service's image no longer downgrades its encryption library — Bug fix [Enterprise]
+
+The commercial proxy image installed the core requirements, which pin the patched
+`cryptography` 50.0.0, and then ran a second install capped at `<46`, so pip replaced 50.0.0
+with 45.0.7, a release with seven published advisories. That library encrypts tenants' own
+provider keys. The image now keeps the core pin, and a test fails any image install whose
+version range would replace a pinned package. Self-hosters have nothing to upgrade: the
+open-source image was never affected — <https://tokenlean.cbeyond.cloud/>
+
+### The compression and document-extraction services on GCP accept only the proxy — Bug fix
+
+`gcp-deploy.sh` deployed `llmlingua-svc` (G01 compression) and `tika-svc` (document
+extraction) as public services that took calls from anyone, running as the proxy's service
+account. Anyone could flood them (one instance each) or send Tika crafted files, under an
+identity that can read the project's secrets. Both now require Cloud Run IAM and run as their
+own service accounts with no roles; the proxy and the doc-pipeline job send an identity token,
+and the deploy stops if either service is still public. The compression service also refuses
+text over 200,000 characters (`LLMLINGUA_MAX_TEXT_CHARS`), and `post-deploy-check.sh` fails a
+sidecar that answers an anonymous call. Redeploy to apply. Under Docker Compose only the text
+limit changes.
+
+### Erasing or offboarding a tenant no longer leaves its webhooks and documents behind — Bug fix [Enterprise]
+
+The GDPR erase and the admin offboard left a tenant's webhook endpoints (URLs and signing
+secrets) and its uploaded documents in place, and passed over any step that failed, such as
+an unreachable Qdrant or a denied delete. Offboarding then released the company code, so a
+new company given that code got the same tenant id and inherited what remained, including
+the old webhook URLs, which were sent the new tenant's events. Both now also delete webhook
+endpoints and every version of the tenant's uploaded documents (offboard also removes the
+bucket and the contract record), and report a failed step: the erase answers 503 and the
+offboard keeps the code reserved until a retry completes. The summary also states what is
+kept: invoices (legal retention), request traces for now, and deleted document versions for
+the bucket's soft-delete period. Self-hosters have nothing to upgrade —
+<https://tokenlean.cbeyond.cloud/>
+
+### One request can no longer stall the proxy through a regular expression — Bug fix
+
+Two regular expressions could hold the event loop, which every tenant on a worker shares,
+for minutes. G29's email pattern was quadratic: one request of `a.` repeated to a few
+hundred KB stalled a worker. G06 routing-rule patterns, which a tenant writes, ran on
+Python's backtracking engine, so a rule such as `^(\w+\s?)+$` could freeze a worker. The
+email pattern now caps an address's parts at their RFC maximums, which makes the scan linear
+(400 KB of hostile input: under 0.1 s), and skips text without an `@`. Rule patterns run on
+the `regex` engine within one 50 ms budget per request; a pattern that runs out counts as no
+match, and is logged and counted (`token_opt_g06_rule_pattern_timeouts_total`).
+- **OSS:** both fixes, in the core engines.
+- **[Enterprise]:** the portal's Routing tab also refuses to save a pattern that repeats a
+  repeated group, such as `(a+)+` — <https://tokenlean.cbeyond.cloud/>
+
+### Streamed calls are always priced, and priced like any other call — Bug fix
+
+A streamed call was priced from the provider's final usage chunk by a separate copy of the
+cost code. A client that sent `stream_options: {"include_usage": false}`, or disconnected
+before that chunk, left the call at $0: outside the spend cap, with no tokens on its usage
+row. Streams also skipped paid side calls (such as G06's judge) and the reasoning surcharge,
+recorded the prompt on a different basis, and moved none of the token or cost metrics, so
+budget alerts missed streaming traffic. The usage chunk is now always requested (a client
+that opted out still does not receive it); a stream without one is priced from an estimate
+and recorded like any unreported usage (`provider_prompt_tokens` empty); and streams go
+through the same pricing and metrics as other calls. New counters:
+`token_opt_stream_usage_estimated_total`, `token_opt_stream_accounting_errors_total`.
+
+### A caller can no longer choose the address the IP allowlist and login limits see — Bug fix
+
+The source-IP allowlist and the portal's login, signup and password-reset limits took the
+caller's address from the first `X-Forwarded-For` entry, which the caller writes. A leaked
+key plus `X-Forwarded-For: <an allowlisted address>` got past the tenant's allowlist, and a
+new value on each request escaped the per-IP login limit. The address is now the entry
+`network.trusted_proxy_hops` places from the right (`auto`: 1 on Cloud Run, else 0). If a
+proxy other than Cloud Run fronts TokenLean, set it (`docs/config-reference.md`);
+`ip_allowlist.trust_x_forwarded_for` is deprecated.
+- **OSS:** the right-counted parser, the `network` settings, forwarding headers dropped
+  before they reach request parameters, and optional vouching by a trusted forwarder with a
+  Google-signed ID token.
+- **[Enterprise]:** the portal vouches for the browser's address with its own service
+  account's ID token; a successful login no longer resets the per-IP count; IPv6 callers
+  count per /64. Managed deploys start in observe mode (log only) until a live Cloud Run
+  check confirms the header shape — <https://tokenlean.cbeyond.cloud/>
+
+### A suspended or revoked key stops working on every instance, not just one — Bug fix
+
+With several proxy instances, a key change reached only the instance that made it. The
+others kept accepting a suspended or revoked key until their next cache reload: up to 30
+seconds on the Postgres key store, and up to `KEY_CACHE_TTL_SECONDS` (default 300) on the
+Secret Manager or file store.
+- **OSS:** every key change is now reported to a new `on_change` hook on
+  `install_key_store_backend`, and the Postgres store's new `CacheRefresher` re-reads one
+  tenant the moment it is told to. The Secret Manager and file stores are unchanged;
+  `DEPLOYMENT.md` now states their delay and how to shorten it.
+- **[Enterprise]:** the managed service announces each change over Redis, and the other
+  instances apply it within milliseconds — <https://tokenlean.cbeyond.cloud/>
+
+## 2026-09-25
+
+### The OpenAI-compatible endpoint accepts only documented request fields — Bug fix
+
+`/v1/chat/completions` used to copy every field of the request body into the request it
+builds for the provider. It now keeps only the documented Chat Completions parameters,
+TokenLean's own client parameters (every `x_*` field, plus `workflow_id`, `template_id`,
+`rag_query`, `session_id` and the rest), and any names listed in the new
+`ingress.extra_allowed_params` setting. Other fields are dropped and their names logged,
+never their values. Fields starting with `_` are never accepted, and litellm call arguments
+such as `api_base`, `extra_headers` and `extra_body` are also stripped before every provider
+call. A client that sent one of those in the JSON body loses it; list any other dropped name
+in `ingress.extra_allowed_params` to keep it.
+
+### An agent's API key can only come from operator config — Bug fix
+
+An F2 agent's `api_key_env` names the server environment variable that holds its API key.
+It is now honoured only when the operator's config defines an agent with the same `id`,
+`url` and `api_key_env`, either in `orchestration.agents` or under a static
+`tenants.<id>.orchestration`. Agents that arrive through tenant overrides are called
+without a key, and a refused name is logged, never its value. The Enterprise agent console
+no longer stores `api_key_env`: saving an agent that carries one succeeds, drops the field
+and returns a warning.
+
+### The GCP config bucket no longer deletes the live config — Bug fix
+
+The Terraform config bucket (`infra/main.tf`) had one lifecycle rule: delete every object
+90 days after upload. That included the live `config/config.yaml` and
+`config/local-keys.json`, which are uploaded only on deploy — so a deployment left alone for
+90 days lost them, and the next cold start served with an empty config. The rule now
+deletes only `backups/` objects older than 90 days, and a second rule removes superseded
+object versions 30 days after they stop being current; a live object is never matched.
+Run `terraform apply` (or redeploy) to update an existing bucket.
+
+### The proxy refuses to start without a readable config — Bug fix
+
+When the config could not be read at startup — a missing GCS object, a storage error, an
+empty or unparsable file — the proxy logged "using last known good" and served on an empty
+config: no rate card (so every invoice came out $0), no spend cap, no provider tiers. Startup
+now retries twice, then stops with an error naming the source it tried, so the failure is
+visible (a failed instance) instead of silent. Hot reload is unchanged: a failed reload keeps
+the last good config. The Enterprise invoicing job likewise refuses to run without a config.
+A deployment that was starting without a readable config will now fail at startup and say
+where it looked.
+
+### Key scripts no longer report a change they did not make, or wipe the key store — Bug fix
+
+`scripts/issue-key.sh` writes only the Secret Manager key blob. It now checks which store the
+deployed proxy validates keys against, and refuses to issue or revoke when that is Postgres
+(the managed deploy) — where it used to report success while changing nothing the proxy
+reads. Pass `--backend blob` if the service cannot be read. A failed secret read now stops
+the script instead of counting as an empty store, which made the next write keep only the
+new key. `scripts/generate_proxy_key.py` likewise refuses to overwrite a `local-keys.json`
+it cannot read, tolerates a UTF-8 byte-order mark, and writes atomically.
+
+### A deploy no longer brings back revoked keys or resets console key settings — Bug fix
+
+With the Postgres key store, every deploy's key sync wrote each key in
+`config/local-keys.json` back into `proxy_keys`: it reset a tenant's suspension, IP allowlist
+and contract flags, and re-inserted keys that had been revoked (a revoke deletes the row and
+left no record). The sync is now insert-only, and every removed key is recorded in a new
+`revoked_proxy_keys` table. No writer — the sync, the one-time blob import, or a store write
+from an out-of-date snapshot — can put a recorded key back. Keys revoked before this change
+have no record: remove them from `local-keys.json` before your next deploy.
+
+### One instance's key change can no longer undo another's — Bug fix
+
+With the Postgres key store, each key change (signup, rotate, suspend, contract flag, IP
+allowlist, offboard) read the whole store, then rewrote the whole table, with only a lock
+inside one process between the two. When two instances wrote at about the same time, the
+later write could undo the earlier one: a suspension lifted, an allowlist dropped, a new key
+lost. A write that timed out was reported as failed but could still commit afterwards. Each
+change is now one transaction: it takes a database lock, reads the current store inside it,
+and writes only the rows that change; a write that times out is cancelled and rolls back. If
+you install the Postgres store yourself, pass `transact_fn=pg_key_store.make_transact(pool,
+loop)` to `install_key_store_backend`.
+
 ## 2026-09-18
 
 ### Request-header values could weaken rate limiting and inflate metrics — Bug fix

@@ -5,30 +5,34 @@ Saving: 10–30% iterative tokens + downstream verbosity control
 Technique:
   1. Enforce max_iterations via turn count tracking in Redis.
   2. Inject token_budget_remaining into every inter-agent message.
-  3. Trigger compact-output instruction when budget is low.
+  3. Opt-in (compact_output_enabled): ask for brief answers when the conversation's
+     prompt nears the budget.
   4. Confidence-based stop condition.
   5. Wall-clock timeout-based stop.
   6. Structured inter-agent state schema for token budget.
 """
 import logging
-import os
 import time
-from typing import Dict, Optional
+from typing import Optional
 from pydantic import BaseModel
 
-from middleware import RequestContext
+from middleware import RequestContext, append_to_system_prompt
 from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G17"
 
-# WS21: all three loop-state keys are tenant-prefixed at use (ctx.redis_prefix +
-# these suffixes). workflow_id is CLIENT-supplied — without the tenant prefix two
-# tenants sending the same workflow_id would share/drain one budget and trip each
-# other's loop stops (cross-tenant DoS). Same pattern as G18's turn_baseline key.
-_BUDGET_PREFIX = "tok_opt:budget:"
+# WS21: both loop-state keys are tenant-prefixed at use (ctx.redis_prefix + these
+# suffixes). workflow_id is CLIENT-supplied — without the tenant prefix two tenants
+# sending the same workflow_id would share one turn count and trip each other's loop
+# stops (cross-tenant DoS). Same pattern as G18's turn_baseline key.
 _TURN_PREFIX = "tok_opt:turns:"
 _START_TIME_PREFIX = "tok_opt:start_time:"
+
+# Format-neutral and constant: the old instruction demanded "ONLY required JSON fields"
+# (turning prose answers into JSON) and carried the remaining count, so it changed on
+# every turn and was prepended, breaking the provider's cached prefix.
+_COMPACT_INSTRUCTION = "Keep your answer brief: the token budget for this workflow is nearly used up."
 
 
 def _scoped(ctx, prefix: str, workflow_id: str) -> str:
@@ -77,6 +81,7 @@ class G17LoopControl:
 
         max_iterations: int = cfg.get("max_iterations", 10)
         starting_budget: int = cfg.get("starting_budget_tokens", 10000)
+        compact_enabled: bool = bool(cfg.get("compact_output_enabled", False))
         compact_below: int = cfg.get("compact_output_below_tokens", 500)
         confidence_threshold: float = cfg.get("confidence_stop_threshold", 0.95)
         wall_clock_timeout_seconds: int = cfg.get("wall_clock_timeout_seconds", 300)
@@ -164,19 +169,11 @@ class G17LoopControl:
                     ctx.params["_token_opt_loop_limit_reached"] = True
                     ctx.params.setdefault("_token_opt_warnings", []).append(stop_reason)
 
-            # Track and propagate token budget
-            budget_key = _scoped(ctx, _BUDGET_PREFIX, workflow_id)
-            budget_raw = await redis.get(budget_key)
-            if budget_raw is None:
-                remaining = starting_budget
-            else:
-                try:
-                    remaining = max(0, int(budget_raw) - tokens_before)
-                except ValueError:
-                    logger.warning("G17 corrupt budget value in Redis (%r), resetting to starting budget", budget_raw)
-                    remaining = starting_budget
-
-            await redis.set(budget_key, str(remaining), ex=3600)
+            # The budget is measured against this conversation's own prompt. It used to be a
+            # running total per workflow_id that subtracted the WHOLE prompt, history
+            # included, on every turn, so an ordinary chat ran out within a few turns; and
+            # every conversation sending the same workflow_id drained the same total.
+            remaining = max(0, int(starting_budget) - tokens_before)
 
             # Build structured inter-agent state
             state = InterAgentState(
@@ -189,9 +186,9 @@ class G17LoopControl:
             )
             ctx.params["_token_budget"] = state.model_dump()
 
-            # Inject compact-output instruction if budget is low
-            if remaining < compact_below:
-                ctx.messages = _inject_compact_instruction(ctx.messages, remaining)
+            # Ask for brief answers when the budget is low (opt-in).
+            if compact_enabled and remaining < compact_below:
+                ctx.messages = _inject_compact_instruction(ctx.messages)
                 tokens_after = count_messages_tokens(ctx.messages, ctx.model)
                 ctx.savings.add_step(
                     GROUP,
@@ -213,19 +210,8 @@ class G17LoopControl:
         return ctx
 
 
-def _inject_compact_instruction(messages: list, remaining: int) -> list:
-    """Prepend a compact-output instruction when budget is low."""
-    instruction = (
-        f"[BUDGET] token_budget_remaining={remaining}. "
-        "Respond ONLY with required JSON fields — no explanation, no preamble."
-    )
-    # Add to the last system message or prepend a new one
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "system":
-            messages = list(messages)
-            messages[i] = {
-                **messages[i],
-                "content": instruction + "\n" + messages[i].get("content", ""),
-            }
-            return messages
-    return [{"role": "system", "content": instruction}] + list(messages)
+def _inject_compact_instruction(messages: list) -> list:
+    """Append the brief-answer instruction to the end of the last system message (or add
+    one): the start of the prompt, the provider's cached prefix, is left as it was, and a
+    system message given as a list of parts gets a text part (append_to_system_prompt)."""
+    return append_to_system_prompt(messages, _COMPACT_INSTRUCTION)

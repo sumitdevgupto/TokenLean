@@ -6,7 +6,7 @@ Technique:
   L1 Exact-match: hash(normalised_prompt) → Redis lookup (sub-millisecond)
   L2 Semantic:    embed query → pgvector cosine similarity (threshold from config)
   Temporal:       Activity replay for durable step cache execution
-  Auto-TTL:       Dynamic TTL based on hit rate and access patterns
+  Auto-TTL:       TTLs follow the tenant's hit rate over the last one to two hours
 """
 import asyncio
 import hashlib
@@ -17,7 +17,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from middleware import langfuse_tracing
+from middleware import langfuse_tracing, resolve_group_config
 
 logger = logging.getLogger(__name__)
 GROUP = "G05"
@@ -45,74 +45,90 @@ def _get_redis():
     return _pool_get_redis()
 
 
+_TTL_STATS_WINDOW_S = 3600   # hit-rate stats are counted per window of this many seconds
+_clock = time.time           # wall clock: every replica must agree on the window
+
+
+def _auto_ttl_enabled(cfg: Dict) -> bool:
+    return bool(cfg.get("auto_ttl_enabled", True))
+
+
 class AutoTTLManager:
-    """Dynamic TTL management based on cache hit rates and access patterns.
-    
-    Implements adaptive TTL adjustment:
-    - High hit rate (>80%): increase TTL by 25%
-    - Low hit rate (<20%): decrease TTL by 25%
-    - Access recency: reset TTL on access to hot items
+    """Adaptive TTLs from a tenant's recent cache hit rate.
+
+    Hits and misses are counted per level in hourly windows, and a TTL is chosen from the
+    current and previous window together. Above an 80% hit rate the TTL grows by a quarter;
+    below 20% it shrinks by a quarter; with fewer than 10 lookups it stays as configured.
+    The result is kept within auto_ttl_min_multiplier and auto_ttl_max_multiplier of the
+    configured TTL (defaults 0.25 and 2.0), and is never under one second.
     """
-    
+
     def __init__(self, redis_client, prefix: str = ""):
         self.redis = redis_client
         # I4: tenant-scope the stat hashes so one tenant's hit-rate never skews
         # another tenant's adaptive TTL. prefix = ctx.redis_prefix ("" = default).
         self._prefix = prefix
-        self._hit_key = f"{prefix}tok_opt:cache:stats:hits"
-        self._miss_key = f"{prefix}tok_opt:cache:stats:misses"
-        self._last_adjustment_key = f"{prefix}tok_opt:cache:stats:last_adjustment"
+
+    def _stats_key(self, window: int) -> str:
+        return f"{self._prefix}tok_opt:cache:ttl_stats:{window}"
+
+    async def _count(self, cache_level: str, outcome: str) -> None:
+        key = self._stats_key(int(_clock() // _TTL_STATS_WINDOW_S))
+        try:
+            await self.redis.hincrby(key, f"{cache_level}:{outcome}", 1)
+            await self.redis.expire(key, 2 * _TTL_STATS_WINDOW_S)
+        except Exception as exc:
+            logger.debug("AutoTTL %s recording failed: %s", outcome, exc)
 
     async def record_hit(self, cache_level: str) -> None:
-        """Record a cache hit for statistics."""
-        try:
-            await self.redis.hincrby(self._hit_key, cache_level, 1)
-            await self.redis.hincrby(self._hit_key, "total", 1)
-        except Exception as exc:
-            logger.debug("AutoTTL hit recording failed: %s", exc)
-    
+        await self._count(cache_level, "hit")
+
     async def record_miss(self, cache_level: str) -> None:
-        """Record a cache miss for statistics."""
+        await self._count(cache_level, "miss")
+
+    async def get_recommended_ttl(self, base_ttl: int, cache_level: str, cfg: Dict) -> int:
+        """The TTL for a new entry at ``cache_level``, from the recent hit rate."""
         try:
-            await self.redis.hincrby(self._miss_key, cache_level, 1)
-            await self.redis.hincrby(self._miss_key, "total", 1)
-        except Exception as exc:
-            logger.debug("AutoTTL miss recording failed: %s", exc)
-    
-    async def get_recommended_ttl(self, base_ttl: int, cache_level: str) -> int:
-        """Calculate recommended TTL based on hit rate."""
-        try:
-            hits = int(await self.redis.hget(self._hit_key, cache_level) or 0)
-            misses = int(await self.redis.hget(self._miss_key, cache_level) or 0)
+            hits = misses = 0
+            window = int(_clock() // _TTL_STATS_WINDOW_S)
+            for counted in (window, window - 1):
+                hit, miss = await self.redis.hmget(
+                    self._stats_key(counted), [f"{cache_level}:hit", f"{cache_level}:miss"])
+                hits += int(hit or 0)
+                misses += int(miss or 0)
             total = hits + misses
-            
             if total < 10:  # Not enough data
                 return base_ttl
-            
             hit_rate = hits / total
-            
-            # Adjust TTL based on hit rate
             if hit_rate > 0.80:
-                # High hit rate - extend TTL
-                new_ttl = int(base_ttl * 1.25)
-                logger.debug("AutoTTL: high hit rate (%.2f), extending TTL %d → %d", hit_rate, base_ttl, new_ttl)
-                return min(new_ttl, base_ttl * 2)  # Cap at 2x base
+                scale = 1.25
             elif hit_rate < 0.20:
-                # Low hit rate - reduce TTL
-                new_ttl = int(base_ttl * 0.75)
-                logger.debug("AutoTTL: low hit rate (%.2f), reducing TTL %d → %d", hit_rate, base_ttl, new_ttl)
-                return max(new_ttl, base_ttl // 4)  # Floor at 25% base
-            
-            return base_ttl
+                scale = 0.75
+            else:
+                return base_ttl
+            low = float(cfg.get("auto_ttl_min_multiplier", 0.25))
+            high = float(cfg.get("auto_ttl_max_multiplier", 2.0))
+            new_ttl = max(1, int(base_ttl * min(max(scale, low), high)))
+            logger.debug("AutoTTL: %s hit rate %.2f, TTL %d -> %d",
+                         cache_level, hit_rate, base_ttl, new_ttl)
+            return new_ttl
         except Exception as exc:
             logger.debug("AutoTTL calculation failed: %s", exc)
             return base_ttl
 
 
+# Message fields the model reads besides role and content. An assistant turn that only
+# calls tools has content None, so without its tool_calls two agent transcripts that
+# called the same tool with different arguments normalised to the same L1 key.
+_TURN_FIELDS = ("tool_calls", "function_call", "tool_call_id", "name")
+
+
 def _normalise(messages: list) -> str:
     """Normalise messages for the L1 exact-match key: strip whitespace, lowercase.
 
-    Used for L1 only — exact matching needs the full request (system + every turn).
+    Used for L1 only — exact matching needs the full request (system + every turn),
+    including each turn's tool calls (arguments verbatim), the call a tool result
+    answers, and a message ``name``. A turn without those keeps its old form.
     """
     parts = []
     for msg in messages:
@@ -120,7 +136,12 @@ def _normalise(messages: list) -> str:
         content = msg.get("content", "")
         if isinstance(content, str):
             content = re.sub(r"\s+", " ", content).strip().lower()
-        parts.append(f"{role}:{content}")
+        part = f"{role}:{content}"
+        fields = {k: msg[k] for k in _TURN_FIELDS if msg.get(k)}
+        if fields:
+            part += " " + json.dumps(fields, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, default=str)
+        parts.append(part)
     return "|".join(parts)
 
 
@@ -132,15 +153,39 @@ def _semantic_query_text(messages: list) -> str:
     dominate and truncate the vector, collapsing distinct user queries onto the same
     point — which returns a cached answer for a *different* question. Matching on the
     user turns keys the semantic cache on what actually carries the query intent.
-    Falls back to the full normalised string when there are no user turns.
+
+    Returns "" (L2 is skipped; L1 still applies) when a user turn carries anything but
+    text, such as an image, audio or a file: the embedding would see only the words,
+    so "describe this image" would match across different images. Also "" when there
+    is no user text at all. It never falls back to the whole transcript.
     """
-    users = [
-        re.sub(r"\s+", " ", m.get("content", "")).strip().lower()
-        for m in messages
-        if m.get("role") == "user" and isinstance(m.get("content"), str)
-    ]
-    text = "\n".join(u for u in users if u)
-    return text or _normalise(messages)
+    users = []
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            if not all(isinstance(p, dict) and p.get("type") == "text"
+                       and isinstance(p.get("text"), str) for p in content):
+                return ""
+            content = "\n".join(p["text"] for p in content)
+        if not isinstance(content, str):
+            return ""
+        users.append(re.sub(r"\s+", " ", content).strip().lower())
+    return "\n".join(u for u in users if u)
+
+
+def _request_messages(ctx) -> list:
+    """The messages as the caller sent them (``ctx.original_messages``).
+
+    Stages after the lookup rewrite ``ctx.messages``: compression, retrieval, memory,
+    image handling, history compaction. The L2 store must decide and embed on the same
+    request its lookup saw; otherwise a compacted multi-turn request, or an image a later
+    stage replaced, is stored as a single-turn text question."""
+    msgs = getattr(ctx, "original_messages", None)
+    if isinstance(msgs, list) and msgs:
+        return msgs
+    return getattr(ctx, "messages", None) or []
 
 
 # Embedding-window guard (M2). bge-small-en-v1.5 truncates input at ~512 tokens;
@@ -172,8 +217,11 @@ def _is_multiturn_continuation(ctx) -> bool:
     "fetch logs" turn at cosine 0.99 because the shared, long first turn
     dominates the embedding.) L1 exact-match is unaffected — only the fuzzy
     semantic layers are skipped.
+
+    Read from the request as sent (:func:`_request_messages`), so a later stage that
+    compacts the history cannot make the store treat the request as single-turn.
     """
-    msgs = getattr(ctx, "messages", None) or []
+    msgs = _request_messages(ctx)
     return any(
         isinstance(m, dict) and m.get("role") in ("assistant", "tool")
         for m in msgs
@@ -250,14 +298,10 @@ def _resolve_cache_scope(ctx) -> str:
     Anything unrecognised fails CLOSED to "tenant" (the safe, pre-feature default)
     and logs a one-time warning naming the valid values — see _CACHE_SCOPE_CANONICAL.
     """
-    base = ctx.config.get("groups", {}).get("G5_cache", {}).get("cache_scope", "tenant")
-    tenant_cfg = (
-        ctx.config.get("tenants", {})
-        .get(getattr(ctx, "tenant_id", "") or "", {})
-        .get("groups", {})
-        .get("G5_cache", {})
-    )
-    raw = str(tenant_cfg.get("cache_scope", base)).lower().strip()
+    # resolve_group_config type-checks every level of the operator's `tenants:` overlay: a
+    # node that is not a mapping (`tenants:` left empty, `acme: off`) used to raise here on
+    # every lookup and store, for every tenant.
+    raw = str(resolve_group_config(ctx, "G5_cache").get("cache_scope", "tenant")).lower().strip()
     canonical = _CACHE_SCOPE_CANONICAL.get(raw)
     if canonical is None:
         # Fail CLOSED to "tenant" (safe, pre-feature keys) but say so once — a typo
@@ -359,10 +403,73 @@ def _verbosity_scope_tag(ctx) -> str:
     return tag
 
 
+# ─── Request parameters in the cache key ──────────────────────────────────────
+# Parameters that change the answer's content or shape. Two requests that differ in one
+# of them must not share a cache entry: an answer made for one response_format, tool
+# list, choice count or token budget is the wrong answer for another. The provider names
+# are the answer-affecting part of protocols.base.OPENAI_CHAT_PARAMS (the Anthropic and
+# Gemini adapters map onto the same names). The TokenLean names change the prompt or the
+# output format in a stage that runs after this lookup.
+_ANSWER_PARAMS = frozenset({
+    "audio", "frequency_penalty", "function_call", "functions", "logit_bias", "logprobs",
+    "max_completion_tokens", "max_tokens", "modalities", "n", "parallel_tool_calls",
+    "presence_penalty", "reasoning_effort", "response_format", "seed", "stop",
+    "temperature", "thinking", "thinking_config", "tool_choice", "tools", "top_k",
+    "top_logprobs", "top_p", "verbosity", "web_search_options",
+    "json_schema", "x_json_output",                                      # G11 output format
+    "rag_query", "x_rag_collection", "x_rag_top_k", "x_jit_retrieval",   # G07 retrieval
+    "session_id", "x_session_id",                                        # G10 session context
+})
+# Admitted request fields that do not change the answer. A unit test fails when a field
+# admitted at ingress, or an `x_` field the proxy reads, is in neither set, so a new
+# parameter is classified before it can share entries across different answers.
+_ANSWER_NEUTRAL_PARAMS = frozenset({
+    # Delivery, provider-side storage and caching, abuse-monitoring ids: same answer.
+    "stream", "stream_options", "store", "service_tier", "prediction", "prompt_cache_key",
+    "prompt_cache_retention", "user", "safety_identifier", "metadata", "batch_topic",
+    # Routing hints: the default cache_scope shares answers across models on purpose
+    # (cache_scope "tenant+model" keys on the requested model instead).
+    "complexity", "complexity_tier", "x_complexity", "x_complexity_tier", "x_route_to",
+    # Labels and budget buckets (G11, G17, G18, G24, traces).
+    "user_id", "x_user_id", "workflow_id", "x_workflow_id", "template_id", "x_template_id",
+    "dataset_id", "x_dataset", "x_team", "x_feature", "rag_collection", "token_opt_state",
+    "x_confidence_score",
+    # This cache's own switches, and the step cache (keyed separately).
+    "x_cache_semantic", "x_no_cache", "x_step_name", "x_step_inputs_hash",
+    "x_template_version",
+    # Prompt layout and compression, which preserve the answer by design, and the prompt
+    # echo (attached after the cache).
+    "x_prefix_profile", "x_compress_user", "x_echo_prompt",
+})
+
+
+def _params_scope_tag(ctx) -> str:
+    """Fingerprint of the request's :data:`_ANSWER_PARAMS` values; "" when it sets none.
+
+    Folded into the L1 key and the L2 scope. Computed once, at lookup, and memoised on
+    ``ctx.params``: later stages rewrite some of these fields (G08 and G16 filter
+    ``tools``, G11 sets ``max_tokens``, G25 sets ``reasoning_effort``), and the store must
+    file the answer under the request the caller sent, which is what a later identical
+    request looks up. A field sent as null counts as absent."""
+    params = getattr(ctx, "params", None)
+    if not isinstance(params, dict):
+        return ""
+    if "_g05_params_tag" in params:
+        return params["_g05_params_tag"]
+    chosen = {k: params[k] for k in _ANSWER_PARAMS if params.get(k) is not None}
+    tag = ""
+    if chosen:
+        blob = json.dumps(chosen, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+        tag = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    params["_g05_params_tag"] = tag
+    return tag
+
+
 def _apply_model_scope(text: str, ctx) -> str:
-    """Fold the model + verbosity tags into a cache-key source string. No-op when
-    both are empty (tenant scope + verbosity steering off) → keys stay byte-identical
-    to pre-feature. Used by BOTH L1 lookup and store so the key matches."""
+    """Fold the model, verbosity, system and parameter tags into a cache-key source
+    string. No-op when all are empty → keys stay byte-identical to pre-feature. Used by
+    BOTH L1 lookup and store so the key matches."""
     tag = _model_scope_tag(ctx)
     if tag:
         text = f"model={tag}\n{text}"
@@ -372,18 +479,23 @@ def _apply_model_scope(text: str, ctx) -> str:
     stag = _system_scope_tag(ctx)
     if stag:
         text = f"system={stag}\n{text}"
+    ptag = _params_scope_tag(ctx)
+    if ptag:
+        text = f"params={ptag}\n{text}"
     return text
 
 
 def _scope_value(ctx) -> str:
-    """Combined model+verbosity scope for L2 (colon-joined; "" when both are unscoped
-    → byte-identical to pre-feature). Shared by L2's lookup WHERE filter AND store
-    INSERT so a row's stored scope always matches what a later lookup searches for —
-    this is what makes verbosity/model isolation actually enforced on L2's READ path
+    """Combined model+verbosity+system+parameter scope for L2 (colon-joined; "" when
+    all are unscoped → byte-identical to pre-feature). Shared by L2's lookup WHERE filter
+    AND store INSERT so a row's stored scope always matches what a later lookup searches
+    for — this is what makes the isolation actually enforced on L2's READ path
     (unlike folding a tag into query_hash alone, which only dedupes the INSERT and is
     never consulted by SELECT)."""
+    ptag = _params_scope_tag(ctx)
     return ":".join(
-        p for p in (_model_scope_tag(ctx), _verbosity_scope_tag(ctx), _system_scope_tag(ctx)) if p
+        p for p in (_model_scope_tag(ctx), _verbosity_scope_tag(ctx), _system_scope_tag(ctx),
+                    f"params={ptag}" if ptag else "") if p
     )
 
 
@@ -497,20 +609,18 @@ class G05Cache:
         tokens_before = ctx.current_token_count
         normalised = _normalise(ctx.messages)
         ns = getattr(ctx, "redis_prefix", "")  # tenant namespace prefix
-        ttl_manager = self._get_ttl_manager(ns)  # I4: tenant-scoped TTL stats
-
-        # Get auto-TTL adjusted values
-        l1_base_ttl = cfg.get("l1_ttl_seconds", 3600)
-        l2_base_ttl = cfg.get("l2_ttl_seconds", 86400)
-        l1_ttl = await ttl_manager.get_recommended_ttl(l1_base_ttl, "L1") if ttl_manager else l1_base_ttl
-        l2_ttl = await ttl_manager.get_recommended_ttl(l2_base_ttl, "L2") if ttl_manager else l2_base_ttl
+        # I4: tenant-scoped TTL stats, counted here and read when an answer is stored.
+        ttl_manager = self._get_ttl_manager(ns) if _auto_ttl_enabled(cfg) else None
 
         # L1 — exact match
         try:
-            redis = _get_redis()
+            # The key, and the scope tags it memoises for L2, are fixed here, before Redis
+            # is touched: later stages rewrite tools, max_tokens and the messages, and the
+            # store must file the answer under the request as the caller sent it.
             key = _cache_key(_apply_model_scope(normalised, ctx), prefix=ns)
             # Store key on context for reuse in store_response (Phase 2 fix)
             ctx.params["_g05_l1_cache_key"] = key
+            redis = _get_redis()
             cached = await redis.get(key)
             if cached:
                 ctx.cache_hit = True
@@ -663,18 +773,20 @@ class G05Cache:
             return
 
         # Get auto-TTL adjusted values (I4: tenant-scoped TTL stats)
-        ttl_manager = self._get_ttl_manager(getattr(ctx, "redis_prefix", ""))
+        ttl_manager = (self._get_ttl_manager(getattr(ctx, "redis_prefix", ""))
+                       if _auto_ttl_enabled(cfg) else None)
         l1_base_ttl = cfg.get("l1_ttl_seconds", 3600)
         l2_base_ttl = cfg.get("l2_ttl_seconds", 86400)
-        l1_ttl = await ttl_manager.get_recommended_ttl(l1_base_ttl, "L1") if ttl_manager else l1_base_ttl
-        l2_ttl = await ttl_manager.get_recommended_ttl(l2_base_ttl, "L2") if ttl_manager else l2_base_ttl
+        l1_ttl = await ttl_manager.get_recommended_ttl(l1_base_ttl, "L1", cfg) if ttl_manager else l1_base_ttl
+        l2_ttl = await ttl_manager.get_recommended_ttl(l2_base_ttl, "L2", cfg) if ttl_manager else l2_base_ttl
 
         # Use stored key from lookup if available (Phase 2 fix: ensures consistency)
         key = ctx.params.get("_g05_l1_cache_key")
         if not key:
             # Fallback: recompute (should not happen in normal flow after fix).
-            # Mirror the lookup key exactly: tenant prefix + model scope.
-            normalised = _normalise(ctx.messages)
+            # Mirror the lookup key exactly: tenant prefix + model scope, on the messages
+            # as sent (later stages have rewritten ctx.messages by now).
+            normalised = _normalise(_request_messages(ctx))
             key = _cache_key(_apply_model_scope(normalised, ctx), prefix=getattr(ctx, "redis_prefix", ""))
             logger.warning("G05 store_response called without prior lookup key; recomputed")
 
@@ -825,6 +937,100 @@ async def _embed(text: str, model_name: str = _DEFAULT_L2_EMBEDDING_MODEL,
 _cache_l2_schema_ready = False
 _cache_l2_schema_lock = asyncio.Lock()
 
+# The HNSW index the lookup's ORDER BY uses (pgvector 0.5 or later). Without it every L2
+# lookup scanned all of the tenant's rows on the request path.
+_L2_INDEX = "idx_cache_l2_embedding"
+_L2_INDEX_VALID_SQL = ("SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid"
+                       " WHERE c.relname = $1")
+_l2_index_tasks: set = set()
+# pgvector 0.8 or later can keep scanning the index past rows the lookup's WHERE drops (another
+# tenant's, another model scope's, expired ones); without that, a tenant with few rows among
+# many can miss its cached answer. Off for the process once the server refuses it.
+_iterative_scan = True
+
+# The nearest row by distance - the shape the index serves - and whether it is close
+# enough. The threshold is not a WHERE filter: when the nearest row fails it, no other
+# row can pass, and the filter would only keep the index scan going.
+_L2_LOOKUP_SQL = """
+    SELECT response_json, 1 - (embedding <=> $1::vector) AS similarity,
+           1 - (embedding <=> $1::vector) >= $2 AS close_enough
+    FROM cache_l2
+    WHERE tenant_id = $3
+      AND model_scope = $4
+      AND expires_at > NOW()
+    ORDER BY embedding <=> $1::vector
+    LIMIT 1
+"""
+
+
+async def _l2_index_valid(pool) -> bool:
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetchval(_L2_INDEX_VALID_SQL, _L2_INDEX) is True
+    except Exception as exc:
+        logger.debug("G05 cache_l2 vector index check failed: %s", exc)
+        return False
+
+
+async def _build_l2_vector_index(pool) -> bool:
+    """Build the HNSW index the lookup orders by, CONCURRENTLY so stores keep writing while it
+    builds. A CONCURRENTLY build that died leaves an INVALID index, which IF NOT EXISTS would
+    keep (and the planner never use), so it is dropped and built again. True once the index
+    is ready; a failure (pgvector before 0.5, no rights on the table) is logged, not raised."""
+    try:
+        async with pool.acquire() as conn:
+            valid = await conn.fetchval(_L2_INDEX_VALID_SQL, _L2_INDEX)
+            if valid is True:
+                return True
+            if valid is False:
+                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_L2_INDEX}")
+            await conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_L2_INDEX} "
+                               "ON cache_l2 USING hnsw (embedding vector_cosine_ops)")
+        logger.info("G05 cache_l2 vector index ready")
+        return True
+    except Exception as exc:
+        if await _l2_index_valid(pool):          # another instance built it meanwhile
+            return True
+        logger.warning("G05 cache_l2 vector index could not be built, so each L2 lookup scans "
+                       "the tenant's rows: %s", exc)
+        return False
+
+
+def _spawn_l2_index_build(pool) -> None:
+    """Start the index build in the background, held until it finishes: on a large table it
+    takes a while, and the request that ran the schema step must not wait for it."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_build_l2_vector_index(pool))
+    _l2_index_tasks.add(task)
+    task.add_done_callback(_l2_index_tasks.discard)
+
+
+async def finish_l2_index_build(pool) -> bool:
+    """Wait for the index builds this process started, then whether the index is ready. For a
+    one-shot schema job run as the table's owner: a proxy on a restricted runtime role cannot
+    build the index (it does not own cache_l2), and a job that exited first would leave none."""
+    if _l2_index_tasks:
+        await asyncio.gather(*list(_l2_index_tasks), return_exceptions=True)
+    return await _l2_index_valid(pool)
+
+
+async def _allow_filtered_index_scan(conn) -> None:
+    """Let the HNSW scan run past rows the lookup's WHERE drops (pgvector 0.8 or later). Set on
+    this pooled connection, where it only ever affects HNSW scans."""
+    global _iterative_scan
+    if not _iterative_scan:
+        return
+    try:
+        await conn.execute("SET hnsw.iterative_scan = strict_order")
+    except Exception as exc:
+        _iterative_scan = False
+        logger.info("G05: this pgvector has no iterative index scans (%s), so a tenant with few "
+                    "cached rows among many can miss its answer; pgvector 0.8 or later "
+                    "(ALTER EXTENSION vector UPDATE) adds them", exc)
+
 
 async def _ensure_cache_l2_schema(pool) -> None:
     """Self-heal the ``cache_l2`` table so L2 works on both fresh and
@@ -836,13 +1042,18 @@ async def _ensure_cache_l2_schema(pool) -> None:
     requires, so each lookup/store threw ``column "tenant_id" does not exist``
     and L2 silently collapsed to L1-only. ``CREATE … IF NOT EXISTS`` covers fresh
     DBs; ``ALTER … ADD COLUMN IF NOT EXISTS`` migrates the persisted table. This
-    mirrors the create-on-use pattern in ``g07_pgvector_fallback.py``.
+    all happens on first use, not at import.
     """
     global _cache_l2_schema_ready
     if _cache_l2_schema_ready:
         return
     async with _cache_l2_schema_lock:
         if _cache_l2_schema_ready:
+            return
+        from cache.pg_pool import may_run_ddl
+        if not await may_run_ddl(pool, "cache_l2"):
+            # A restricted runtime role: the schema job, as the owner, keeps it current.
+            _cache_l2_schema_ready = True
             return
         async with pool.acquire() as conn:
             await conn.execute(
@@ -876,6 +1087,7 @@ async def _ensure_cache_l2_schema(pool) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_cache_l2_tenant_model "
                 "ON cache_l2 (tenant_id, model_scope)"
             )
+        _spawn_l2_index_build(pool)
         _cache_l2_schema_ready = True
         logger.info("G05 cache_l2 schema ensured (tenant_id + model_scope columns present)")
 
@@ -896,7 +1108,11 @@ async def _l2_lookup(ctx: "RequestContext", threshold: float, embedding_model: s
     # (and vice versa). Stored in the `model_scope` column (no migration needed — it's
     # a bare TEXT column; the DB column name predates verbosity scoping).
     scope_value = _scope_value(ctx)
-    query_text = _semantic_query_text(ctx.messages)
+    query_text = _semantic_query_text(_request_messages(ctx))
+    if not query_text:
+        # A user turn carries an image, audio or a file, or there is no user text:
+        # nothing the embedding can safely match on. L1 exact-match still applies.
+        return None, 0.0
 
     # M2: skip the semantic layer for over-window queries (truncation → collisions).
     cfg = (getattr(ctx, "config", {}) or {}).get("groups", {}).get("G5_cache", {})
@@ -916,20 +1132,12 @@ async def _l2_lookup(ctx: "RequestContext", threshold: float, embedding_model: s
     pool = await get_pg_pool(db_url)
     await _ensure_cache_l2_schema(pool)
     # I2: set app.tenant_id so RLS scopes this SELECT even if the WHERE were dropped.
+    # A row past its expires_at (or without one, so of unknown age) is never served:
+    # l2_ttl_seconds is enforced here, whether or not anything has deleted the row yet.
     async with tenant_conn(pool, tenant_id) as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT response_json, 1 - (embedding <=> $1::vector) AS similarity
-            FROM cache_l2
-            WHERE 1 - (embedding <=> $1::vector) >= $2
-              AND tenant_id = $3
-              AND model_scope = $4
-            ORDER BY similarity DESC
-            LIMIT 1
-            """,
-            embedding_str, threshold, tenant_id, scope_value,
-        )
-        if row:
+        await _allow_filtered_index_scan(conn)
+        row = await conn.fetchrow(_L2_LOOKUP_SQL, embedding_str, threshold, tenant_id, scope_value)
+        if row and row["close_enough"]:
             return json.loads(row["response_json"]), row["similarity"]
         return None, 0.0
 
@@ -945,7 +1153,10 @@ async def _l2_store(ctx: "RequestContext", response: Dict, ttl: int, embedding_m
         return
 
     tenant_id = getattr(ctx, "tenant_id", "default")
-    query_text = _semantic_query_text(ctx.messages)
+    # The request as sent, as the lookup embedded it; "" = the lookup skipped L2 too.
+    query_text = _semantic_query_text(_request_messages(ctx))
+    if not query_text:
+        return
 
     # M2: don't store an over-window query — its truncated embedding would later
     # false-match a different long query. (L1 exact-match still caches it.)
@@ -993,3 +1204,38 @@ async def _l2_store(ctx: "RequestContext", response: Dict, ttl: int, embedding_m
             tenant_id,
             scope_value,
         )
+        try:
+            await _purge_expired_l2(conn, tenant_id)
+        except Exception as exc:
+            logger.warning("G05 L2 expired-row purge failed: %s", exc)
+
+
+# Expired L2 rows are deleted by the store itself: the retention job that also deletes
+# them is off by default, so without this cache_l2 grew forever and every lookup scanned
+# the dead rows too. At most one bounded batch per tenant per interval per process, and
+# again on the next store while a backlog remains.
+_L2_PURGE_INTERVAL_S = 300.0
+_L2_PURGE_BATCH = 1000
+_l2_next_purge: Dict[str, float] = {}
+
+
+async def _purge_expired_l2(conn, tenant_id: str) -> None:
+    now = time.monotonic()
+    if now < _l2_next_purge.get(tenant_id, 0.0):
+        return
+    _l2_next_purge[tenant_id] = now + _L2_PURGE_INTERVAL_S
+    status = await conn.execute(
+        """
+        DELETE FROM cache_l2 WHERE id IN (
+            SELECT id FROM cache_l2
+            WHERE tenant_id = $1 AND (expires_at IS NULL OR expires_at <= NOW())
+            LIMIT $2)
+        """,
+        tenant_id, _L2_PURGE_BATCH,
+    )
+    try:
+        deleted = int(str(status).rsplit(" ", 1)[-1])
+    except ValueError:
+        deleted = 0
+    if deleted >= _L2_PURGE_BATCH:
+        _l2_next_purge[tenant_id] = now   # a backlog remains: purge again on the next store

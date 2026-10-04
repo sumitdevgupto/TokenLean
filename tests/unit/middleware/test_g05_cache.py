@@ -376,9 +376,12 @@ class TestG05CacheL2Schema:
     async def test_ensure_schema_runs_create_alter_index_ddl(self, monkeypatch):
         import middleware.g05_cache as g05
         monkeypatch.setattr(g05, "_cache_l2_schema_ready", False)
+        build = MagicMock()
+        monkeypatch.setattr(g05, "_spawn_l2_index_build", build)
         mock_pool, mock_conn = self._make_mock_pool()
 
         await g05._ensure_cache_l2_schema(mock_pool)
+        build.assert_called_once_with(mock_pool)      # the vector index, in the background
 
         # CREATE TABLE + ALTER tenant_id + INDEX tenant + ALTER model_scope + INDEX tenant_model = 5
         assert mock_conn.execute.await_count == 5
@@ -391,13 +394,18 @@ class TestG05CacheL2Schema:
     async def test_ensure_schema_runs_only_once_per_process(self, monkeypatch):
         import middleware.g05_cache as g05
         monkeypatch.setattr(g05, "_cache_l2_schema_ready", False)
+        build = MagicMock()
+        monkeypatch.setattr(g05, "_spawn_l2_index_build", build)
         mock_pool, mock_conn = self._make_mock_pool()
 
         await g05._ensure_cache_l2_schema(mock_pool)
+        first = (mock_conn.execute.await_count, mock_pool.acquire.call_count)
         await g05._ensure_cache_l2_schema(mock_pool)  # guard flag → no-op
 
+        assert build.call_count == 1
         assert mock_conn.execute.await_count == 5  # not 10
-        assert mock_pool.acquire.call_count == 1
+        # The second call touches nothing: no ownership probe, no DDL.
+        assert (mock_conn.execute.await_count, mock_pool.acquire.call_count) == first
 
 
 class TestSemanticQueryText:
@@ -443,10 +451,12 @@ class TestSemanticQueryText:
         text = _semantic_query_text(msgs)
         assert "first" in text and "second" in text and "ok" not in text
 
-    def test_falls_back_when_no_user_turns(self):
-        from middleware.g05_cache import _semantic_query_text, _normalise
+    def test_no_user_text_embeds_nothing(self):
+        """No user text → "" (L2 skipped), never the whole transcript: the system prompt
+        and the repr of the parts would embed near-identically across requests."""
+        from middleware.g05_cache import _semantic_query_text
         msgs = [self.BIG_SYS, {"role": "assistant", "content": "hello"}]
-        assert _semantic_query_text(msgs) == _normalise(msgs)
+        assert _semantic_query_text(msgs) == ""
 
 
 class TestSemanticCacheDisabled:
@@ -557,6 +567,23 @@ class TestG05CacheScope:
         ctx.tenant_id = "acme"
         ctx.config["tenants"] = {"acme": {"groups": {"G5_cache": {"cache_scope": "tenant+model"}}}}
         assert _resolve_cache_scope(ctx) == "tenant+model"  # global stays default tenant
+
+    @pytest.mark.parametrize("tenants", [
+        None, "off", {"acme": None}, {"acme": "off"}, {"acme": {"groups": "x"}},
+        {"acme": {"groups": {"G5_cache": "off"}}},
+    ])
+    def test_a_malformed_tenants_node_falls_back_to_the_global_scope(self, make_ctx, tenants):
+        """Operator YAML: `tenants:` with no children, or a block that is not a mapping, used
+        to raise AttributeError on every lookup and store for every tenant."""
+        from middleware.g05_cache import _resolve_cache_scope
+        ctx = make_ctx(); self._scope(ctx, "tenant+model")
+        ctx.tenant_id = "acme"
+        ctx.config["tenants"] = tenants
+        try:
+            scope = _resolve_cache_scope(ctx)
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(f"a malformed tenants node must not raise: {exc!r}")
+        assert scope == "tenant+model"
 
     def test_model_tag_empty_in_tenant_scope(self, make_ctx):
         from middleware.g05_cache import _model_scope_tag
@@ -793,3 +820,718 @@ class TestG05L2EmbedWindowSkip:
                 assert await _l2_lookup(ctx1, 0.85) == (None, 0.0)
                 assert await _l2_lookup(ctx2, 0.85) == (None, 0.0)
         mock_embed.assert_not_awaited()
+
+
+# ── Shared helpers for the tests below ───────────────────────────────────────
+def _image_turn(url):
+    return {"role": "user", "content": [
+        {"type": "text", "text": "Describe this image"},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]}
+
+
+def _tool(name):
+    return {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+
+
+def _l2_pool(execute_result="OK"):
+    """A pool whose single connection records its fetchrow/execute calls."""
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(return_value=execute_result)
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=conn)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=cm)
+    return pool, conn
+
+
+def _sql_calls(conn, marker):
+    return [c for c in conn.execute.await_args_list if marker in str(c.args[0])]
+
+
+class _L2Env:
+    """DATABASE_URL set, the embedding and the schema step stubbed, the pool given."""
+
+    def __init__(self, pool):
+        self._patches = [
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://test/db"}),
+            patch("middleware.g05_cache._embed", new_callable=AsyncMock, return_value=[0.1, 0.2]),
+            patch("middleware.g05_cache._ensure_cache_l2_schema", new_callable=AsyncMock),
+            patch("cache.pg_pool.get_pg_pool", new_callable=AsyncMock, return_value=pool),
+        ]
+
+    def __enter__(self):
+        entered = [p.__enter__() for p in self._patches]
+        return entered[1]          # the _embed mock
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.__exit__(*exc)
+        return False
+
+
+# ── L2 matches on user TEXT only (multimodal requests skip it) ───────────────
+class TestSemanticTextIsTextOnly:
+    """A user turn that carries anything but text gives the semantic tier nothing safe to
+    match on: two different images under the same words would embed alike, and one
+    caller would get the other image's description."""
+
+    @pytest.mark.parametrize("part", [
+        {"type": "image_url", "image_url": {"url": "https://cdn.example.com/p/1001.png"}},
+        {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        {"type": "file", "file": {"file_id": "file-1"}},
+        {"type": "text"},                        # malformed: no text
+        "a bare string part",
+    ])
+    def test_a_non_text_part_embeds_nothing(self, part):
+        from middleware.g05_cache import _semantic_query_text
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "Describe this"}, part]}]
+        assert _semantic_query_text(msgs) == ""
+
+    def test_a_user_turn_without_text_content_embeds_nothing(self):
+        from middleware.g05_cache import _semantic_query_text
+        assert _semantic_query_text([{"role": "user", "content": None}]) == ""
+        assert _semantic_query_text([{"role": "user"}]) == ""
+
+    @pytest.mark.parametrize("content", [
+        None, {"type": "image_url", "image_url": {"url": "https://x/1.png"}}, 42])
+    def test_such_a_turn_beside_a_text_turn_still_embeds_nothing(self, content):
+        """Refused, not skipped: the other turn's words alone would match a request that
+        never had this part."""
+        from middleware.g05_cache import _semantic_query_text
+        msgs = [{"role": "user", "content": "Describe this"}, {"role": "user", "content": content}]
+        assert _semantic_query_text(msgs) == ""
+
+    def test_one_image_turn_among_text_turns_embeds_nothing(self):
+        from middleware.g05_cache import _semantic_query_text
+        msgs = [{"role": "user", "content": "hello"}, _image_turn("https://x/1.png")]
+        assert _semantic_query_text(msgs) == ""
+
+    def test_text_only_parts_embed_like_a_string(self):
+        from middleware.g05_cache import _semantic_query_text
+        parts = [{"role": "user", "content": [{"type": "text", "text": "Capital of"},
+                                              {"type": "text", "text": "France?"}]}]
+        plain = [{"role": "user", "content": "Capital of France?"}]
+        assert _semantic_query_text(parts) == _semantic_query_text(plain) == "capital of france?"
+
+
+@pytest.mark.asyncio
+class TestMultimodalSkipsL2:
+    async def test_two_images_never_reach_the_embedding_or_the_table(self, make_ctx):
+        from middleware.g05_cache import _l2_lookup, _l2_store
+        pool, conn = _l2_pool()
+        with _L2Env(pool) as embed:
+            for url in ("https://cdn.example.com/p/1001.png", "https://cdn.example.com/p/1002.png"):
+                ctx = make_ctx([{"role": "system", "content": "s"}, _image_turn(url)])
+                assert await _l2_lookup(ctx, 0.9) == (None, 0.0)
+                await _l2_store(ctx, {"choices": [{"message": {"content": "a cat"}}]}, 3600)
+        embed.assert_not_awaited()
+        pool.acquire.assert_not_called()
+
+    @pytest.mark.parametrize("original", [
+        [_image_turn("https://x/1.png")],
+        [{"role": "user", "content": "fetch the logs"},
+         {"role": "assistant", "content": "done"},
+         {"role": "user", "content": "now the profile"}],
+    ], ids=["image-replaced-by-text", "history-compacted"])
+    async def test_the_store_decides_on_the_request_as_sent(self, make_ctx, original):
+        """A later stage replaces an image with text (G27) or compacts a multi-turn history
+        (G26, G10). The store must skip L2 as its lookup did, not file a single-turn text
+        question that a later text-only request would match."""
+        from middleware.g05_cache import _l2_store
+        pool, conn = _l2_pool()
+        ctx = make_ctx(original)
+        ctx.messages = [{"role": "user", "content": "describe a picture of a cat"}]
+        with _L2Env(pool) as embed:
+            await _l2_store(ctx, {"choices": [{"message": {"content": "x"}}]}, 3600)
+        embed.assert_not_awaited()
+        assert not _sql_calls(conn, "INSERT INTO cache_l2")
+
+    async def test_the_lookup_embeds_the_request_as_sent(self, make_ctx):
+        """Lookup and store read the same source, so no stage can make them disagree."""
+        from middleware.g05_cache import _l2_lookup
+        pool, conn = _l2_pool()
+        ctx = make_ctx([{"role": "user", "content": "What is the capital of France?"}])
+        ctx.messages = [{"role": "user", "content": "capital France?"}]
+        with _L2Env(pool) as embed:
+            await _l2_lookup(ctx, 0.9)
+        assert embed.await_args.args[0] == "what is the capital of france?"
+
+    async def test_the_store_embeds_the_text_the_lookup_embedded(self, make_ctx):
+        from middleware.g05_cache import _l2_lookup, _l2_store
+        pool, conn = _l2_pool()
+        ctx = make_ctx([{"role": "user", "content": "What is the capital of France?"}])
+        with _L2Env(pool) as embed:
+            await _l2_lookup(ctx, 0.9)
+            ctx.messages = [{"role": "user", "content": "capital France?"}]   # compressed later
+            await _l2_store(ctx, {"choices": [{"message": {"content": "Paris"}}]}, 3600)
+        assert [c.args[0] for c in embed.await_args_list] == ["what is the capital of france?"] * 2
+
+
+# ── Expired L2 rows are never served, and the store purges them ──────────────
+@pytest.mark.asyncio
+class TestExpiredL2Rows:
+    """l2_ttl_seconds is enforced on read, and expired rows are deleted with the retention
+    job off (the default). The SQL itself runs against a real Postgres in
+    tests/integration/test_g05_l2_pg.py."""
+
+    async def test_the_lookup_filters_on_expiry(self, make_ctx):
+        from middleware.g05_cache import _l2_lookup
+        pool, conn = _l2_pool()
+        with _L2Env(pool):
+            await _l2_lookup(make_ctx(), 0.9)
+        assert "AND expires_at > NOW()" in conn.fetchrow.await_args.args[0]
+
+    async def test_the_store_purges_this_tenants_expired_rows_once_per_interval(
+            self, make_ctx, monkeypatch):
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_l2_next_purge", {})
+        pool, conn = _l2_pool(execute_result="DELETE 3")
+        ctx = make_ctx()
+        ctx.tenant_id = "acme"
+        with _L2Env(pool):
+            await g05._l2_store(ctx, {"choices": []}, 3600)
+            await g05._l2_store(ctx, {"choices": []}, 3600)
+        assert len(_sql_calls(conn, "INSERT INTO cache_l2")) == 2
+        purges = _sql_calls(conn, "DELETE FROM cache_l2")
+        assert len(purges) == 1                     # the second store is inside the interval
+        assert purges[0].args[1:] == ("acme", g05._L2_PURGE_BATCH)
+        assert "expires_at <= NOW()" in purges[0].args[0]
+
+    async def test_a_full_batch_purges_again_on_the_next_store(self, make_ctx, monkeypatch):
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_l2_next_purge", {})
+        pool, conn = _l2_pool(execute_result=f"DELETE {g05._L2_PURGE_BATCH}")
+        with _L2Env(pool):
+            for _ in range(3):
+                await g05._l2_store(make_ctx(), {"choices": []}, 3600)
+        assert len(_sql_calls(conn, "DELETE FROM cache_l2")) == 3
+
+    async def test_each_tenant_has_its_own_interval(self, make_ctx, monkeypatch):
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_l2_next_purge", {})
+        pool, conn = _l2_pool(execute_result="DELETE 0")
+        with _L2Env(pool):
+            for tenant in ("acme", "globex", "acme"):
+                ctx = make_ctx()
+                ctx.tenant_id = tenant
+                await g05._l2_store(ctx, {"choices": []}, 3600)
+        assert [c.args[1] for c in _sql_calls(conn, "DELETE FROM cache_l2")] == ["acme", "globex"]
+
+    async def test_a_failed_purge_leaves_the_stored_row(self, make_ctx, monkeypatch, caplog):
+        import logging
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_l2_next_purge", {})
+        pool, conn = _l2_pool()
+
+        async def execute(sql, *args):
+            if "DELETE FROM cache_l2" in sql:
+                raise RuntimeError("permission denied for table cache_l2")
+            return "OK"
+
+        conn.execute = AsyncMock(side_effect=execute)
+        with _L2Env(pool), caplog.at_level(logging.WARNING, logger="middleware.g05_cache"):
+            await g05._l2_store(make_ctx(), {"choices": []}, 3600)
+        assert len(_sql_calls(conn, "INSERT INTO cache_l2")) == 1
+        assert any("purge failed" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+class TestL2VectorIndex:
+    """The lookup takes the NEAREST row by distance, which an HNSW index on embedding can
+    serve, and checks the threshold on that row only; the schema step builds the index in
+    the background. Without the index every lookup scanned all of the tenant's rows. The SQL
+    runs against a real Postgres in tests/integration/test_g05_l2_pg.py."""
+
+    async def test_the_lookup_orders_by_distance_and_filters_nothing_on_it(self, make_ctx):
+        from middleware.g05_cache import _l2_lookup
+        pool, conn = _l2_pool()
+        with _L2Env(pool):
+            await _l2_lookup(make_ctx(), 0.9)
+        sql, threshold = conn.fetchrow.await_args.args[0], conn.fetchrow.await_args.args[2]
+        where = sql.split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+        assert "ORDER BY embedding <=> $1::vector" in sql and "LIMIT 1" in sql
+        assert "<=>" not in where      # a distance filter would keep an index scan going
+        assert ">= $2 AS close_enough" in sql and threshold == 0.9
+
+    @pytest.mark.parametrize("close_enough,expected", [
+        (True, ({"a": 1}, 0.95)), (False, (None, 0.0))])
+    async def test_only_a_nearest_row_within_the_threshold_is_served(self, make_ctx,
+                                                                      close_enough, expected):
+        from middleware.g05_cache import _l2_lookup
+        pool, conn = _l2_pool()
+        conn.fetchrow = AsyncMock(return_value={"response_json": '{"a": 1}', "similarity": 0.95,
+                                                "close_enough": close_enough})
+        with _L2Env(pool):
+            assert await _l2_lookup(make_ctx(), 0.9) == expected
+
+    async def test_the_lookup_asks_for_an_iterative_index_scan(self, make_ctx, monkeypatch):
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_iterative_scan", True)
+        pool, conn = _l2_pool()
+        with _L2Env(pool):
+            await g05._l2_lookup(make_ctx(), 0.9)
+        assert _sql_calls(conn, "SET hnsw.iterative_scan = strict_order")
+
+    async def test_a_pgvector_without_iterative_scans_is_asked_once(self, make_ctx, monkeypatch):
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_iterative_scan", True)
+        pool, conn = _l2_pool()
+
+        async def execute(sql, *args):
+            if "hnsw.iterative_scan" in sql:
+                raise RuntimeError('unrecognized configuration parameter "hnsw.iterative_scan"')
+            return "OK"
+
+        conn.execute = AsyncMock(side_effect=execute)
+        with _L2Env(pool):
+            await g05._l2_lookup(make_ctx(), 0.9)
+            await g05._l2_lookup(make_ctx(), 0.9)
+        assert len(_sql_calls(conn, "hnsw.iterative_scan")) == 1
+        assert conn.fetchrow.await_count == 2            # both lookups still ran
+
+    async def test_the_schema_step_starts_the_index_build_without_waiting(self, monkeypatch):
+        import asyncio
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_cache_l2_schema_ready", False)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_build(pool):
+            started.set()
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(g05, "_build_l2_vector_index", slow_build)
+        pool, conn = _l2_pool()
+        with patch("cache.pg_pool.may_run_ddl", new_callable=AsyncMock, return_value=True):
+            await g05._ensure_cache_l2_schema(pool)        # returns; the build is still running
+        await asyncio.wait_for(started.wait(), 1)
+        assert len(g05._l2_index_tasks) == 1               # held until it finishes
+        release.set()
+        await asyncio.gather(*g05._l2_index_tasks)
+        assert not g05._l2_index_tasks
+
+    async def test_the_build_replaces_an_index_an_earlier_build_left_invalid(self):
+        import middleware.g05_cache as g05
+        pool, conn = _l2_pool()
+        conn.fetchval = AsyncMock(return_value=False)      # CONCURRENTLY died part-way
+        assert await g05._build_l2_vector_index(pool) is True
+        sqls = [str(c.args[0]) for c in conn.execute.await_args_list]
+        assert sqls[0] == "DROP INDEX CONCURRENTLY IF EXISTS idx_cache_l2_embedding"
+        assert sqls[1].startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_l2_embedding")
+        assert "USING hnsw (embedding vector_cosine_ops)" in sqls[1]
+
+    async def test_a_valid_index_is_left_alone(self):
+        import middleware.g05_cache as g05
+        pool, conn = _l2_pool()
+        conn.fetchval = AsyncMock(return_value=True)
+        assert await g05._build_l2_vector_index(pool) is True
+        assert conn.execute.await_count == 0
+
+    async def test_a_build_that_lost_a_race_to_another_instance_is_ready(self):
+        import middleware.g05_cache as g05
+        pool, conn = _l2_pool()
+        conn.fetchval = AsyncMock(side_effect=[None, True])    # missing, then built elsewhere
+        conn.execute = AsyncMock(side_effect=RuntimeError('relation "idx_cache_l2_embedding" '
+                                                          'already exists'))
+        assert await g05._build_l2_vector_index(pool) is True
+
+    async def test_a_failed_build_is_logged_not_raised(self, caplog):
+        import logging
+        import middleware.g05_cache as g05
+        pool, conn = _l2_pool()
+        conn.fetchval = AsyncMock(return_value=None)
+        conn.execute = AsyncMock(side_effect=RuntimeError('access method "hnsw" does not exist'))
+        with caplog.at_level(logging.WARNING, logger="middleware.g05_cache"):
+            assert await g05._build_l2_vector_index(pool) is False
+        assert "scans the tenant's rows" in caplog.text
+
+
+# ── The cache key covers the parameters that change the answer ───────────────
+_ANSWER_VARIANTS = [
+    ("response_format", {"type": "json_schema", "json_schema": {"name": "a", "schema": {}}},
+                        {"type": "json_schema", "json_schema": {"name": "b", "schema": {}}}),
+    ("tools", [_tool("search")], [_tool("delete_all")]),
+    ("tool_choice", "auto", "none"),
+    ("n", 1, 3),
+    ("max_tokens", 50, 1000),
+    ("temperature", 0, 0.9),
+    ("stop", ["\n"], ["END"]),
+    ("logprobs", False, True),
+    ("json_schema", {"type": "object"}, {"type": "array"}),
+    ("x_rag_collection", "handbook", "contracts"),
+    ("session_id", "s-1", "s-2"),
+]
+
+
+class TestAnswerParamsInTheKey:
+    MSGS = [{"role": "user", "content": "List three colours"}]
+
+    def _key(self, ctx):
+        from middleware.g05_cache import _normalise, _cache_key, _apply_model_scope
+        return _cache_key(_apply_model_scope(_normalise(self.MSGS), ctx))
+
+    @pytest.mark.parametrize("name,a,b", _ANSWER_VARIANTS, ids=[v[0] for v in _ANSWER_VARIANTS])
+    def test_different_values_get_different_keys_and_scopes(self, make_ctx, name, a, b):
+        from middleware.g05_cache import _scope_value
+        ca = make_ctx(messages=self.MSGS, params={name: a})
+        cb = make_ctx(messages=self.MSGS, params={name: b})
+        unset = make_ctx(messages=self.MSGS)
+        assert len({self._key(ca), self._key(cb), self._key(unset)}) == 3
+        assert len({_scope_value(ca), _scope_value(cb), _scope_value(unset)}) == 3
+
+    def test_neutral_fields_do_not_split_the_cache(self, make_ctx):
+        from middleware.g05_cache import _scope_value
+        base = make_ctx(messages=self.MSGS, params={"temperature": 0})
+        other = make_ctx(messages=self.MSGS, params={
+            "temperature": 0, "stream": True, "stream_options": {"include_usage": True},
+            "user": "u-9", "workflow_id": "wf-1", "x_team": "t", "x_no_cache": "false"})
+        assert self._key(base) == self._key(other)
+        assert _scope_value(base) == _scope_value(other)
+
+    def test_a_request_without_answer_params_keeps_its_key(self, make_ctx):
+        from middleware.g05_cache import _normalise, _apply_model_scope, _scope_value
+        ctx = make_ctx(messages=self.MSGS, params={"stream": True, "user": "u-1"})
+        assert _apply_model_scope(_normalise(self.MSGS), ctx) == _normalise(self.MSGS)
+        assert _scope_value(ctx) == ""
+
+    def test_key_order_and_null_values_do_not_matter(self, make_ctx):
+        from middleware.g05_cache import _params_scope_tag
+        a = make_ctx(params={"temperature": 0, "response_format": {
+            "type": "json_schema", "json_schema": {"name": "x", "strict": True}}})
+        b = make_ctx(params={"seed": None, "response_format": {
+            "json_schema": {"strict": True, "name": "x"}, "type": "json_schema"}, "temperature": 0})
+        assert _params_scope_tag(a) == _params_scope_tag(b) != ""
+
+    def test_the_tag_is_fixed_at_the_first_read(self, make_ctx):
+        from middleware.g05_cache import _params_scope_tag
+        ctx = make_ctx(params={"tools": [_tool("search"), _tool("fetch")], "max_tokens": 1000})
+        first = _params_scope_tag(ctx)
+        ctx.params["tools"] = [_tool("search")]      # G08 keeps the relevant tool
+        ctx.params["max_tokens"] = 200               # G11 tightens the budget
+        assert _params_scope_tag(ctx) == first
+
+
+@pytest.mark.asyncio
+class TestStoreFilesUnderTheLookupKey:
+    """G08/G16 filter `tools`, G11 sets `max_tokens` and Stage 3 rewrites the messages
+    between the lookup and the store. Both tiers must store under the key and scope the
+    lookup used, or the answer lands where no identical request will look."""
+
+    async def test_both_tiers_store_under_the_lookup_key(self, make_ctx, monkeypatch):
+        import middleware.g05_cache as g05
+        monkeypatch.setattr(g05, "_l2_next_purge", {})
+        tools = [_tool("search"), _tool("fetch")]
+        msgs = [{"role": "user", "content": "Find the invoice"}]
+        ctx = make_ctx(msgs, params={"tools": tools, "max_tokens": 1000})
+        redis = AsyncMock()
+        redis.get = AsyncMock(return_value=None)
+        pool, conn = _l2_pool()
+        with patch("middleware.g05_cache._get_redis", return_value=redis), _L2Env(pool):
+            cache = g05.G05Cache()
+            await cache.process_request(ctx)
+            ctx.params["tools"] = tools[:1]
+            ctx.params["max_tokens"] = 200
+            ctx.messages = [{"role": "user", "content": "invoice?"}]
+            await cache.store_response(ctx, {"choices": [{"message": {"content": "INV-1"}}]})
+        lookup_scope = conn.fetchrow.await_args.args[4]
+        assert redis.set.await_args.args[0] == redis.get.await_args.args[0]
+        assert _sql_calls(conn, "INSERT INTO cache_l2")[0].args[6] == lookup_scope != ""
+        # The rewrite would have mattered: the rewritten request has another scope.
+        rewritten = make_ctx(msgs, params={"tools": tools[:1], "max_tokens": 200})
+        assert g05._scope_value(rewritten) != lookup_scope
+
+    async def test_a_store_without_a_lookup_key_recomputes_it_from_the_request_as_sent(
+            self, make_ctx):
+        import middleware.g05_cache as g05
+        msgs = [{"role": "user", "content": "Find the invoice"}]
+        ctx = make_ctx(msgs)
+        ctx.messages = [{"role": "user", "content": "invoice?"}]     # rewritten by Stage 3
+        redis = AsyncMock()
+        with patch("middleware.g05_cache._get_redis", return_value=redis), \
+                patch("middleware.g05_cache._l2_store", new_callable=AsyncMock):
+            await g05.G05Cache().store_response(ctx, {"choices": [{"message": {"content": "x"}}]})
+        assert redis.set.await_args.args[0] == g05._cache_key(
+            g05._apply_model_scope(g05._normalise(msgs), make_ctx(msgs)))
+
+    async def test_the_key_is_fixed_even_when_redis_is_down_at_lookup(self, make_ctx):
+        import middleware.g05_cache as g05
+        ctx = make_ctx(params={"max_tokens": 1000})
+        with patch("middleware.g05_cache._get_redis", side_effect=ConnectionError("down")), \
+                patch("middleware.g05_cache._l2_lookup", new_callable=AsyncMock,
+                      return_value=(None, 0.0)):
+            await g05.G05Cache().process_request(ctx)
+        assert "_g05_l1_cache_key" in ctx.params, "the key must be fixed before Redis is touched"
+        assert ctx.params["_g05_l1_cache_key"] == g05._cache_key(g05._apply_model_scope(
+            g05._normalise(ctx.messages), make_ctx(params={"max_tokens": 1000})))
+
+
+# ── L1 keys on tool calls and the call a result answers ──────────────────────
+class TestToolCallsInTheL1Key:
+    @staticmethod
+    def _transcript(args, calls=None, results=None):
+        calls = calls or [("call_1", "search", args)]
+        results = results or [("call_1", "[]")]
+        return [
+            {"role": "user", "content": "find the files"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": cid, "type": "function", "function": {"name": name, "arguments": a}}
+                for cid, name, a in calls]},
+        ] + [{"role": "tool", "tool_call_id": cid, "content": out} for cid, out in results]
+
+    def test_different_tool_arguments_get_different_keys(self):
+        from middleware.g05_cache import _normalise
+        assert _normalise(self._transcript('{"q": "invoices"}')) != \
+            _normalise(self._transcript('{"q": "payroll"}'))
+
+    def test_the_same_transcript_gets_the_same_key(self):
+        from middleware.g05_cache import _normalise
+        assert _normalise(self._transcript('{"q": "x"}')) == _normalise(self._transcript('{"q": "x"}'))
+
+    def test_which_call_a_result_answers_is_part_of_the_key(self):
+        from middleware.g05_cache import _normalise
+        calls = [("call_1", "read", '{"f": "a"}'), ("call_2", "read", '{"f": "b"}')]
+        one = self._transcript(None, calls, [("call_1", "alpha"), ("call_2", "beta")])
+        two = self._transcript(None, calls, [("call_2", "alpha"), ("call_1", "beta")])
+        assert _normalise(one) != _normalise(two)
+
+    def test_arguments_keep_their_case(self):
+        from middleware.g05_cache import _normalise
+        assert _normalise(self._transcript('{"path": "/Data/A.txt"}')) != \
+            _normalise(self._transcript('{"path": "/data/a.txt"}'))
+
+    def test_legacy_function_call_and_name_are_keyed(self):
+        from middleware.g05_cache import _normalise
+
+        def legacy(name):
+            return [{"role": "user", "content": "weather?"},
+                    {"role": "assistant", "content": None,
+                     "function_call": {"name": name, "arguments": "{}"}},
+                    {"role": "function", "name": name, "content": "sunny"}]
+
+        assert _normalise(legacy("get_weather")) != _normalise(legacy("get_forecast"))
+
+    def test_a_plain_chat_keeps_its_old_key(self):
+        from middleware.g05_cache import _normalise
+        msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "Hi  there"}]
+        assert _normalise(msgs) == "system:s|user:hi there"
+
+
+# ── Every request field is classified: in the key, or neutral ────────────────
+class TestEveryParameterIsClassified:
+    """A field that reaches ctx.params either changes the answer (so it is in the cache
+    key) or is listed as neutral. A new one fails here until someone decides which."""
+
+    def test_the_two_sets_do_not_overlap(self):
+        from middleware.g05_cache import _ANSWER_PARAMS, _ANSWER_NEUTRAL_PARAMS
+        assert not (_ANSWER_PARAMS & _ANSWER_NEUTRAL_PARAMS)
+
+    def test_every_field_admitted_at_openai_ingress_is_classified(self):
+        from protocols.base import OPENAI_CHAT_PARAMS, TOKENLEAN_CLIENT_PARAMS
+        from middleware.g05_cache import _ANSWER_PARAMS, _ANSWER_NEUTRAL_PARAMS
+        admitted = OPENAI_CHAT_PARAMS | TOKENLEAN_CLIENT_PARAMS
+        assert not admitted - _ANSWER_PARAMS - _ANSWER_NEUTRAL_PARAMS
+
+    def test_every_field_the_other_adapters_produce_is_classified(self):
+        from protocols.anthropic_ingress import AnthropicProtocol
+        from protocols.gemini_ingress import GeminiProtocol
+        from middleware.g05_cache import _ANSWER_PARAMS, _ANSWER_NEUTRAL_PARAMS
+        _, _, anthropic = AnthropicProtocol().parse_request({
+            "model": "m", "max_tokens": 5, "temperature": 0, "top_p": 1, "top_k": 3,
+            "stream": False, "metadata": {"user_id": "u"}, "stop_sequences": ["x"],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+            "messages": [{"role": "user", "content": "hi"}]})
+        _, _, gemini = GeminiProtocol().parse_request({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 5, "temperature": 0, "topP": 1,
+                                 "stopSequences": ["x"]},
+            "tools": [{"functionDeclarations": [{"name": "t", "parameters": {}}]}]},
+            path_model="m")
+        produced = set(anthropic) | set(gemini)
+        assert {"tools", "max_tokens", "stop", "metadata"} <= produced   # the probe reached them
+        assert not produced - _ANSWER_PARAMS - _ANSWER_NEUTRAL_PARAMS
+
+    def test_every_x_field_the_proxy_reads_is_classified(self):
+        import re
+        from pathlib import Path
+        from middleware.g05_cache import _ANSWER_PARAMS, _ANSWER_NEUTRAL_PARAMS
+        src = Path(__file__).resolve().parents[3] / "src" / "proxy"
+        names = set()
+        for path in src.rglob("*.py"):
+            names |= set(re.findall(r"[\"'](x_[a-z0-9_]+)[\"']",
+                                    path.read_text(encoding="utf-8", errors="replace")))
+        assert "x_rag_collection" in names                          # the scan found the readers
+        assert not names - _ANSWER_PARAMS - _ANSWER_NEUTRAL_PARAMS
+
+
+# ── Adaptive TTL: recent hit rate, bounded, and switchable ───────────────────
+class _StatsRedis:
+    """Async Redis fake with the string and hash commands G05 uses; records each command."""
+
+    def __init__(self):
+        self.strings, self.hashes, self.expiry, self.calls = {}, {}, {}, []
+
+    async def get(self, key):
+        self.calls.append("get")
+        return self.strings.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.calls.append("set")
+        self.strings[key] = value
+        self.expiry[key] = ex
+
+    async def hincrby(self, key, field, amount=1):
+        self.calls.append("hincrby")
+        fields = self.hashes.setdefault(key, {})
+        fields[field] = fields.get(field, 0) + amount
+        return fields[field]
+
+    async def expire(self, key, seconds):
+        self.calls.append("expire")
+        self.expiry[key] = seconds
+        return True
+
+    async def hget(self, key, field):
+        self.calls.append("hget")
+        value = self.hashes.get(key, {}).get(field)
+        return None if value is None else str(value).encode()
+
+    async def hmget(self, key, fields):
+        self.calls.append("hmget")
+        stored = self.hashes.get(key, {})
+        return [None if f not in stored else str(stored[f]).encode() for f in fields]
+
+
+class TestAutoTTL:
+    """A tenant's cache TTLs follow its recent hit rate: above 80% they grow by a quarter and
+    below 20% they shrink by a quarter, within auto_ttl_min/max_multiplier of the configured
+    TTL. auto_ttl_enabled: false keeps the configured TTLs."""
+
+    @pytest.fixture(autouse=True)
+    def _clock(self, monkeypatch):
+        import middleware.g05_cache as g05
+        self.now = 1_000_000 * g05._TTL_STATS_WINDOW_S + 10
+        monkeypatch.setattr(g05, "_clock", lambda: self.now)
+
+    @staticmethod
+    async def _record(redis, level, hits=0, misses=0, prefix=""):
+        import middleware.g05_cache as g05
+        with patch("middleware.g05_cache._get_redis", return_value=redis):
+            manager = g05.G05Cache()._get_ttl_manager(prefix)
+            for _ in range(hits):
+                await manager.record_hit(level)
+            for _ in range(misses):
+                await manager.record_miss(level)
+
+    @staticmethod
+    async def _stored_ttls(ctx, redis):
+        import middleware.g05_cache as g05
+        with patch("middleware.g05_cache._get_redis", return_value=redis), \
+                patch("middleware.g05_cache._l2_store", new_callable=AsyncMock) as l2_store:
+            await g05.G05Cache().store_response(ctx, {"choices": [{"message": {"content": "x"}}]})
+        (key,) = redis.strings
+        return redis.expiry[key], l2_store.await_args.args[2]
+
+    async def test_a_high_hit_rate_extends_both_ttls_by_a_quarter(self, make_ctx):
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20)
+        await self._record(redis, "L2", hits=20)
+        assert await self._stored_ttls(make_ctx(), redis) == (4500, 108000)
+
+    async def test_each_tier_follows_its_own_hit_rate(self, make_ctx):
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20)
+        await self._record(redis, "L2", misses=20)
+        assert await self._stored_ttls(make_ctx(), redis) == (4500, 64800)
+
+    async def test_another_tenants_hit_rate_does_not_count(self, make_ctx):
+        ctx = make_ctx()
+        ctx.redis_prefix = "t:b:"
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20, prefix="t:a:")
+        assert (await self._stored_ttls(ctx, redis))[0] == 3600
+
+    async def test_fewer_than_ten_lookups_keep_the_configured_ttl(self, make_ctx):
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=9)
+        assert (await self._stored_ttls(make_ctx(), redis))[0] == 3600
+
+    @pytest.mark.parametrize("hits, misses", [(8, 2), (2, 8)])
+    async def test_exactly_80_or_20_percent_keeps_the_configured_ttl(self, make_ctx, hits,
+                                                                      misses):
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=hits, misses=misses)
+        assert (await self._stored_ttls(make_ctx(), redis))[0] == 3600
+
+    async def test_the_max_multiplier_bounds_the_extension(self, make_ctx):
+        ctx = make_ctx()
+        ctx.config["groups"]["G5_cache"]["auto_ttl_max_multiplier"] = 1.1
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20)
+        await self._record(redis, "L2", hits=20)
+        assert await self._stored_ttls(ctx, redis) == (3960, 95040)
+
+    async def test_the_min_multiplier_bounds_the_reduction(self, make_ctx):
+        ctx = make_ctx()
+        ctx.config["groups"]["G5_cache"]["auto_ttl_min_multiplier"] = 0.9
+        redis = _StatsRedis()
+        await self._record(redis, "L1", misses=20)
+        await self._record(redis, "L2", misses=20)
+        assert await self._stored_ttls(ctx, redis) == (3240, 77760)
+
+    async def test_a_reduced_ttl_is_never_zero(self, make_ctx):
+        ctx = make_ctx()
+        ctx.config["groups"]["G5_cache"]["l1_ttl_seconds"] = 1
+        redis = _StatsRedis()
+        await self._record(redis, "L1", misses=20)
+        assert (await self._stored_ttls(ctx, redis))[0] == 1
+
+    async def test_disabled_keeps_the_configured_ttls_and_touches_no_stats(self, make_ctx):
+        import middleware.g05_cache as g05
+        ctx = make_ctx()
+        ctx.config["groups"]["G5_cache"]["auto_ttl_enabled"] = False
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20)
+        await self._record(redis, "L2", hits=20)
+        redis.calls.clear()
+        with patch("middleware.g05_cache._get_redis", return_value=redis), \
+                patch("middleware.g05_cache._l2_lookup", new_callable=AsyncMock,
+                      return_value=(None, 0.0)):
+            await g05.G05Cache().process_request(ctx)
+        assert await self._stored_ttls(ctx, redis) == (3600, 86400)
+        assert set(redis.calls) == {"get", "set"}, redis.calls
+
+    async def test_a_lookup_reads_no_stats(self, make_ctx):
+        import middleware.g05_cache as g05
+        redis = _StatsRedis()
+        with patch("middleware.g05_cache._get_redis", return_value=redis), \
+                patch("middleware.g05_cache._l2_lookup", new_callable=AsyncMock,
+                      return_value=(None, 0.0)):
+            await g05.G05Cache().process_request(make_ctx())
+        assert "hincrby" in redis.calls                         # the misses were counted
+        assert not {"hget", "hmget"} & set(redis.calls), redis.calls
+
+    async def test_hits_older_than_the_previous_window_do_not_count(self, make_ctx):
+        import middleware.g05_cache as g05
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20)
+        self.now += 2 * g05._TTL_STATS_WINDOW_S
+        await self._record(redis, "L1", misses=20)
+        assert (await self._stored_ttls(make_ctx(), redis))[0] == 2700
+
+    async def test_hits_in_the_previous_window_still_count(self, make_ctx):
+        import middleware.g05_cache as g05
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=20)
+        self.now += g05._TTL_STATS_WINDOW_S
+        assert (await self._stored_ttls(make_ctx(), redis))[0] == 4500
+
+    async def test_the_stats_expire_after_two_windows(self):
+        import middleware.g05_cache as g05
+        redis = _StatsRedis()
+        await self._record(redis, "L1", hits=1, misses=1)
+        assert redis.hashes
+        assert all(redis.expiry.get(key) == 2 * g05._TTL_STATS_WINDOW_S for key in redis.hashes)

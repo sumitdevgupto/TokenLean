@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -336,7 +336,7 @@ Respond ONLY with JSON: {{"correct": true/false, "confidence": 0.0-1.0}}
         
         # Group by workload tag
         by_workload = {}
-        for case, result in zip(cases, results):
+        for case, result in zip(cases, results, strict=True):
             tag = case.workload_tag
             if tag not in by_workload:
                 by_workload[tag] = []

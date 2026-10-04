@@ -10,9 +10,8 @@ Technique: When a document upload event arrives (GCS object notification), trigg
 Features:
   - Fine-tuning pipeline trigger for stable domains (break-even detection)
   - RAG fallback orchestration (hybrid search → fallback to broader)
-  - Tika sidecar integration for document extraction
 """
-import json
+import asyncio
 import logging
 import os
 import time
@@ -24,7 +23,6 @@ GROUP = "G03"
 _GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "")
 _DOC_PIPELINE_JOB = os.getenv("DOC_PIPELINE_JOB_NAME", "token-opt-doc-pipeline")
 _DOC_PIPELINE_REGION = os.getenv("GCP_REGION", "us-central1")
-_TIKA_SIDECAR_URL = os.getenv("TIKA_SIDECAR_URL", "http://tika-svc:9998")
 
 # Fine-tuning configuration
 _FINETUNE_MIN_DOCS = int(os.getenv("FINETUNE_MIN_DOCS", "100"))  # Min docs to trigger FT
@@ -32,12 +30,28 @@ _FINETUNE_STABILITY_DAYS = int(os.getenv("FINETUNE_STABILITY_DAYS", "30"))  # Do
 # Cloud Run Job name — env-configurable so the trigger and the deploy agree (mirrors
 # DOC_PIPELINE_JOB_NAME). Default matches the name gcp-deploy.sh actually creates.
 _FINETUNE_JOB = os.getenv("FINETUNE_PIPELINE_JOB_NAME", "finetune-pipeline-job")
+# The Secret Manager secret a tenant's own provider key reaches the fine-tune Job through: a
+# version per run, and the Job is given only the version's NAME. An execution keeps its env
+# overrides, readable by anyone who can view the Job, so the key itself never goes there. The
+# Job destroys its version once the run has ended cleanly; a version older than a day (a run
+# ends within the hour) was left by a failed run, and the next trigger destroys it.
+_FINETUNE_KEY_SECRET = os.getenv("FINETUNE_KEY_SECRET", "finetune-tenant-key")
+_FINETUNE_KEY_MAX_AGE_SECONDS = 86400
 _RAG_FALLBACK_ENABLED = os.getenv("RAG_FALLBACK_ENABLED", "true").lower() == "true"
 
-# OOD Detection thresholds
-_OOD_SIMILARITY_THRESHOLD = float(os.getenv("OOD_SIMILARITY_THRESHOLD", "0.65"))
-_OOD_MAX_RETRIES = int(os.getenv("OOD_MAX_RETRIES", "3"))
-_RAG_FALLBACK_INDEX = os.getenv("RAG_FALLBACK_INDEX", "broad-domain-index")
+# The fallback chain, and how far each strategy lowers the similarity threshold
+# (G3_doc_pipeline.rag_fallback.similarity_threshold, default 0.85 -> 0.85/0.70/0.75).
+_FALLBACK_STRATEGIES = ("strict_hybrid", "relaxed_hybrid", "dense_only", "sparse_only")
+_FALLBACK_RELAXATION = {"strict_hybrid": 0.0, "relaxed_hybrid": 0.15, "dense_only": 0.10,
+                        "sparse_only": 0.25}
+
+
+def _embed_query(query: str, model_name: str) -> List[float]:
+    """Dense query vector. Blocking (and the first call loads the model): run it in a
+    thread. Shared loader: cached singleton + HF_HUB_OFFLINE guard, so the baked model
+    loads without an HF-CDN metadata call that hangs under VPC egress."""
+    from ml_models import get_sentence_transformer
+    return get_sentence_transformer(model_name).encode(query).tolist()
 
 
 async def trigger_doc_ingestion(
@@ -118,9 +132,10 @@ async def trigger_fine_tuning_pipeline(
     Tenant-isolated: the Job reads ONLY the tenant's collection (rag_<tenant>) filtered by
     tenant_id, exports under finetune-training/<tenant>/<domain>/, and tenant-prefixes its
     Redis keys. Because the Job is a separate process with no key resolver, the tenant's
-    BYOK provider key is resolved HERE (in-proxy, where the resolver lives) and passed as a
-    Job secret. Under strict-BYOK with no tenant key, this raises FineTuneByokError (→ 402)
-    rather than leaking the platform key.
+    BYOK provider key is resolved HERE (in-proxy, where the resolver lives), stored as a new
+    version of the fine-tune key secret, and the Job is given only that version's name. Under
+    strict-BYOK with no tenant key, this raises FineTuneByokError (→ 402) rather than leaking
+    the platform key.
     """
     from tenancy.context import TenantContext
 
@@ -142,10 +157,10 @@ async def trigger_fine_tuning_pipeline(
     from providers.key_resolver import ProviderKeyDecryptError, resolve_tenant_owned_key
     try:
         tenant_key = await resolve_tenant_owned_key(provider, tctx.tenant_id) or ""
-    except ProviderKeyDecryptError:
+    except ProviderKeyDecryptError as exc:
         # A stored key exists but is undecryptable → fail closed, never the platform key.
         _emit_finetune_metric(tctx.tenant_id, "refused_byok", provider)
-        raise FineTuneByokError(tctx.tenant_id, provider)
+        raise FineTuneByokError(tctx.tenant_id, provider) from exc
     except Exception as exc:
         # Transient resolver error (e.g. DB blip) → treat as "no tenant key" and let the
         # strict-BYOK gate below decide, rather than silently proceeding on a platform key.
@@ -177,17 +192,26 @@ async def trigger_fine_tuning_pipeline(
             run_v2.EnvVar(name="PROVIDER", value=provider),
             run_v2.EnvVar(name="BYOK_ENFORCE", value="true" if byok_enforce else "false"),
         ]
+        key_version = ""
         if tenant_key:
-            env.append(run_v2.EnvVar(name="TENANT_PROVIDER_KEY", value=tenant_key))
-        request = run_v2.RunJobRequest(
-            name=job_name,
-            overrides=run_v2.RunJobRequest.Overrides(
-                container_overrides=[
-                    run_v2.RunJobRequest.Overrides.ContainerOverride(env=env)
-                ]
-            ),
-        )
-        await client.run_job(request=request)
+            from google.cloud import secretmanager
+            secrets = secretmanager.SecretManagerServiceAsyncClient()
+            key_version = await _store_training_key(secrets, tenant_key)
+            env.append(run_v2.EnvVar(name="TENANT_PROVIDER_KEY_VERSION", value=key_version))
+        try:
+            request = run_v2.RunJobRequest(
+                name=job_name,
+                overrides=run_v2.RunJobRequest.Overrides(
+                    container_overrides=[
+                        run_v2.RunJobRequest.Overrides.ContainerOverride(env=env)
+                    ]
+                ),
+            )
+            await client.run_job(request=request)
+        except Exception:
+            if key_version:   # no Job will read it
+                await _destroy_key_version(secrets, key_version)
+            raise
         logger.info(
             "G03 triggered fine-tuning for tenant '%s' domain '%s' (%d docs) → collection %s",
             tctx.tenant_id, domain, doc_count, tctx.qdrant_collection,
@@ -200,14 +224,39 @@ async def trigger_fine_tuning_pipeline(
         return False
 
 
+async def _store_training_key(secrets, key: str) -> str:
+    """Add ``key`` as a new version of the fine-tune key secret and return the version's
+    name. Also destroys the versions failed runs left behind (older than a day)."""
+    parent = f"projects/{_GCP_PROJECT}/secrets/{_FINETUNE_KEY_SECRET}"
+    version = await secrets.add_secret_version(
+        request={"parent": parent, "payload": {"data": key.encode("utf-8")}})
+    try:
+        cutoff = time.time() - _FINETUNE_KEY_MAX_AGE_SECONDS
+        async for old in await secrets.list_secret_versions(
+                request={"parent": parent, "filter": "state:ENABLED"}):
+            if old.create_time.timestamp() < cutoff:
+                await secrets.destroy_secret_version(request={"name": old.name})
+    except Exception as exc:
+        logger.warning("G03: could not destroy old fine-tune key versions: %s", exc)
+    return version.name
+
+
+async def _destroy_key_version(secrets, name: str) -> None:
+    try:
+        await secrets.destroy_secret_version(request={"name": name})
+    except Exception as exc:
+        logger.warning("G03: could not destroy fine-tune key version %s: %s", name, exc)
+
+
 def _emit_finetune_metric(tenant_id: str, status: str, provider: str) -> None:
     """Increment the finetune-jobs counter. The Job runs out-of-process and can't push to
     the proxy registry, so submissions are counted here at trigger time."""
     try:
         from middleware.g18_observability import FINETUNE_JOBS_TOTAL
         FINETUNE_JOBS_TOTAL.labels(tenant_id=tenant_id, status=status, provider=provider).inc()
-    except Exception:
-        pass  # metrics are best-effort; never block a trigger on them
+    except Exception as exc:
+        # metrics are best-effort; never block a trigger on them
+        logger.debug("fine-tune job metric not recorded: %r", exc)
 
 
 def _finetune_byok_enforced(get_config=None) -> bool:
@@ -351,245 +400,77 @@ class RAGFallbackOrchestrator:
         self.fallback_enabled = _RAG_FALLBACK_ENABLED
     
     async def search_with_fallback(
-        self, 
-        query: str, 
+        self,
+        query: str,
         collection: str = "rag_docs",
         top_k: int = 5,
-        similarity_threshold: float = 0.85
+        similarity_threshold: float = 0.85,
+        cfg: Optional[Dict[str, Any]] = None,
     ) -> List[Dict]:
         """
-        Search with fallback strategy:
-        1. Strict hybrid search (dense + sparse, high threshold)
-        2. Relaxed hybrid search (lower threshold)
-        3. Dense-only search
-        4. Sparse-only search (BM25-style)
-        5. Return empty (no results found)
+        Search with fallback strategy, broadening until one finds something:
+        1. Strict hybrid search (dense, the similarity threshold)
+        2. Relaxed hybrid search (threshold - 0.15, twice the results)
+        3. Dense-only search (threshold - 0.10)
+        4. Sparse-only search (BM25-style) — not built: needs a sparse query vector
+        ``cfg`` is G3_doc_pipeline's block: its ``rag_fallback`` sets ``enabled``,
+        ``strategies``, ``similarity_threshold`` and ``top_k``.
         """
-        if not self.fallback_enabled:
-            return await self._strict_hybrid_search(query, collection, top_k, similarity_threshold)
-        
-        strategies = [
-            ("strict_hybrid", 0.85),
-            ("relaxed_hybrid", 0.70),
-            ("dense_only", 0.75),
-            ("sparse_only", 0.60),
-        ]
-        
-        for strategy, threshold in strategies:
-            results = await self._execute_search(strategy, query, collection, top_k, threshold)
-            if results:
-                logger.debug("RAG fallback: used strategy '%s' with %d results", strategy, len(results))
-                return results
-        
-        logger.debug("RAG fallback: no results found with any strategy")
-        return []
-    
-    async def _execute_search(
-        self, 
-        strategy: str, 
-        query: str, 
-        collection: str, 
-        top_k: int, 
-        threshold: float
-    ) -> List[Dict]:
-        """Execute search with specified strategy."""
+        fb = (cfg or {}).get("rag_fallback") or {}
+        enabled = fb.get("enabled", self.fallback_enabled)
+        base = float(fb.get("similarity_threshold", similarity_threshold))
+        top_k = int(fb.get("top_k", top_k))
+        names = list(fb.get("strategies") or _FALLBACK_STRATEGIES) if enabled else ["strict_hybrid"]
+        plan = [(name, base - _FALLBACK_RELAXATION[name]) for name in names
+                if name in _FALLBACK_RELAXATION]
+        model = (cfg or {}).get("dense_model") or "all-MiniLM-L6-v2"
+        return await self._search(plan, query, collection, top_k, model)
+
+    async def _search(self, plan, query: str, collection: str, top_k: int,
+                      model: str = "all-MiniLM-L6-v2") -> List[Dict]:
+        """Run ``plan`` ((strategy, threshold) pairs) in order; the first that finds
+        anything wins. One async client, closed whatever happens, and one embedding,
+        computed off the event loop, serve every strategy. A collection that does not
+        exist is not searched (no embedding either)."""
+        client = None
         try:
-            from qdrant_client import QdrantClient
+            from qdrant_client import AsyncQdrantClient
             from ml_models import qdrant_client_kwargs
 
-            client = QdrantClient(**qdrant_client_kwargs(url=self.qdrant_url))
-            
-            # Embed query — shared loader (cached singleton + HF_HUB_OFFLINE guard so the
-            # baked model loads without an HF-CDN metadata call that hangs under VPC egress).
-            from ml_models import get_sentence_transformer
-            model = get_sentence_transformer("all-MiniLM-L6-v2")
-            query_embedding = model.encode(query).tolist()
-            
-            if strategy == "strict_hybrid":
-                # Use Qdrant's hybrid search (requires proper setup)
-                results = client.search(
-                    collection_name=collection,
-                    query_vector=("dense", query_embedding),
-                    limit=top_k,
-                    score_threshold=threshold,
-                )
-            elif strategy == "relaxed_hybrid":
-                results = client.search(
-                    collection_name=collection,
-                    query_vector=("dense", query_embedding),
-                    limit=top_k * 2,  # Get more results for re-ranking
-                    score_threshold=threshold,
-                )
-            elif strategy == "dense_only":
-                results = client.search(
-                    collection_name=collection,
-                    query_vector=("dense", query_embedding),
-                    limit=top_k,
-                    score_threshold=threshold,
-                )
-            elif strategy == "sparse_only":
-                # Use sparse/BM25 search (simplified - would need sparse query)
-                results = []
-            else:
-                results = []
-            
-            return [{"text": r.payload.get("text", ""), "score": r.score} for r in results]
+            client = AsyncQdrantClient(**qdrant_client_kwargs(url=self.qdrant_url))
+            if not await client.collection_exists(collection):
+                return []
+            vector = await asyncio.to_thread(_embed_query, query, model)
+            for strategy, threshold in plan:
+                results = await self._execute_search(
+                    strategy, client, vector, collection, top_k, threshold)
+                if results:
+                    logger.debug("RAG fallback: used strategy '%s' with %d results",
+                                 strategy, len(results))
+                    return results
+            logger.debug("RAG fallback: no results found with any strategy")
+            return []
+        except Exception as exc:
+            logger.debug("RAG fallback search failed: %s", exc)
+            return []
+        finally:
+            if client is not None:
+                await client.close()
+
+    async def _execute_search(
+        self, strategy: str, client: Any, vector: List[float], collection: str,
+        top_k: int, threshold: float,
+    ) -> List[Dict]:
+        """One strategy's search over the shared client and query vector."""
+        if strategy not in ("strict_hybrid", "relaxed_hybrid", "dense_only"):
+            return []  # sparse_only needs a sparse query vector, which this path does not build
+        limit = top_k * 2 if strategy == "relaxed_hybrid" else top_k  # more, for re-ranking
+        try:
+            response = await client.query_points(
+                collection_name=collection, query=vector, using="dense", limit=limit,
+                score_threshold=threshold, with_payload=True)
+            return [{"text": (p.payload or {}).get("text", ""), "score": p.score}
+                    for p in response.points]
         except Exception as exc:
             logger.debug("Search strategy '%s' failed: %s", strategy, exc)
             return []
-    
-    async def _strict_hybrid_search(self, query, collection, top_k, threshold):
-        """Default strict hybrid search without fallback."""
-        return await self._execute_search("strict_hybrid", query, collection, top_k, threshold)
-    
-    async def detect_ood_and_fallback(
-        self,
-        query: str,
-        primary_collection: str,
-        fallback_collection: str = _RAG_FALLBACK_INDEX,
-        top_k: int = 5,
-    ) -> Dict:
-        """
-        Detect OOD (Out-of-Distribution) query and fallback to broader index.
-        
-        Returns:
-            {
-                "is_ood": bool,
-                "primary_results": List[Dict],
-                "fallback_results": List[Dict],
-                "confidence": float,  # 0-1, similarity to domain
-                "strategy_used": str,
-            }
-        """
-        # First try primary collection
-        primary_results = await self._strict_hybrid_search(
-            query, primary_collection, top_k, _OOD_SIMILARITY_THRESHOLD
-        )
-        
-        if primary_results:
-            # Calculate average confidence from primary results
-            avg_confidence = sum(r.get("score", 0) for r in primary_results) / len(primary_results)
-            
-            # If confidence is high enough, not OOD
-            if avg_confidence >= _OOD_SIMILARITY_THRESHOLD:
-                return {
-                    "is_ood": False,
-                    "primary_results": primary_results,
-                    "fallback_results": [],
-                    "confidence": avg_confidence,
-                    "strategy_used": "primary_strict",
-                }
-        
-        # Try fallback strategies
-        if _RAG_FALLBACK_ENABLED:
-            # Try relaxed search on primary
-            relaxed_results = await self._execute_search(
-                "relaxed_hybrid", query, primary_collection, top_k, _OOD_SIMILARITY_THRESHOLD * 0.8
-            )
-            
-            if relaxed_results:
-                avg_confidence = sum(r.get("score", 0) for r in relaxed_results) / len(relaxed_results)
-                return {
-                    "is_ood": False,
-                    "primary_results": relaxed_results,
-                    "fallback_results": [],
-                    "confidence": avg_confidence,
-                    "strategy_used": "primary_relaxed",
-                }
-            
-            # Fallback to broad domain index
-            fallback_results = await self._strict_hybrid_search(
-                query, fallback_collection, top_k, _OOD_SIMILARITY_THRESHOLD * 0.7
-            )
-            
-            if fallback_results:
-                return {
-                    "is_ood": True,  # Query was OOD for primary, found in fallback
-                    "primary_results": primary_results,
-                    "fallback_results": fallback_results,
-                    "confidence": max(r.get("score", 0) for r in fallback_results),
-                    "strategy_used": "fallback_broad_domain",
-                }
-        
-        # No results anywhere
-        return {
-            "is_ood": True,
-            "primary_results": primary_results,
-            "fallback_results": [],
-            "confidence": 0.0,
-            "strategy_used": "no_results",
-        }
-
-
-class TikaSidecarClient:
-    """Apache Tika sidecar client for document text extraction."""
-    
-    def __init__(self, base_url: str = _TIKA_SIDECAR_URL):
-        self.base_url = base_url.rstrip("/")
-    
-    async def extract_text(self, content: bytes, filename: str) -> str:
-        """Extract text using Tika sidecar HTTP endpoint."""
-        try:
-            import httpx
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.put(
-                    f"{self.base_url}/tika",
-                    content=content,
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "Accept": "text/plain",
-                        "X-Filename": filename,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.text
-        except Exception as exc:
-            logger.warning("Tika extraction failed: %s — falling back to unstructured", exc)
-            return ""
-    
-    async def extract_metadata(self, content: bytes, filename: str) -> Dict[str, Any]:
-        """Extract document metadata using Tika."""
-        try:
-            import httpx
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.put(
-                    f"{self.base_url}/tika",
-                    content=content,
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "Accept": "application/json",
-                        "X-Filename": filename,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as exc:
-            logger.debug("Tika metadata extraction failed: %s", exc)
-            return {}
-
-
-class G03DocPipeline:
-    """G03 middleware with fine-tuning trigger and RAG fallback support."""
-    
-    def __init__(self):
-        self.rag_orchestrator = RAGFallbackOrchestrator()
-        self.tika_client = TikaSidecarClient()
-
-    async def process_request(self, ctx: Any) -> Any:
-        """Hook for RAG fallback during request processing."""
-        cfg = ctx.config.get("groups", {}).get("G3_doc_pipeline", {})
-        if not cfg.get("enabled", False):
-            return ctx
-        
-        # Check if this is a RAG query that needs fallback
-        if hasattr(ctx, "rag_query") and ctx.rag_query:
-            results = await self.rag_orchestrator.search_with_fallback(
-                ctx.rag_query,
-                collection=cfg.get("collection", "rag_docs"),
-                top_k=cfg.get("top_k", 5),
-            )
-            ctx.rag_results = results
-        
-        return ctx

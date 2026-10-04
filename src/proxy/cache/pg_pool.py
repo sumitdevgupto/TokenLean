@@ -11,10 +11,13 @@ Shutdown:
     await close_pool()
 """
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 _pool_lock = asyncio.Lock()
@@ -40,8 +43,27 @@ async def tenant_conn(pool, tenant_id: str):
         finally:
             try:
                 await conn.execute("SELECT set_config('app.tenant_id', '', false)")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("app.tenant_id not reset on release: %r", exc)
+
+
+async def may_run_ddl(pool, table: str) -> bool:
+    """Whether this connection's role should run the startup schema steps for *table*.
+
+    True when the role owns the table (or is a member of its owner), or the table does not
+    exist yet, so this role would create it: a single-role deployment, as today. False for
+    a restricted runtime role (audit/enforcement.py) reading tables that a migration role
+    created: that role cannot alter them, and the schema job, run as their owner, keeps
+    them current. A probe that fails (a test double, a database error) answers True,
+    today's behaviour, and the schema step reports its own error."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT pg_has_role(current_user, relowner, 'USAGE') AS mine "
+                "FROM pg_class WHERE oid = to_regclass($1)", table)
+        return row is None or bool(row["mine"])
+    except Exception:
+        return True
 
 
 async def get_pg_pool(dsn: str) -> asyncpg.Pool:

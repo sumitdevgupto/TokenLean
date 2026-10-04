@@ -83,8 +83,52 @@ class TestG22Deduplication:
         ctx = _make_ctx(msgs, enabled=True, threshold=0.97)
         g22 = G22Deduplication()
         result = await g22.process_request(ctx)
-        assert len(result.messages) == 1
-        assert "[summarised: 3 similar turns]" in result.messages[0]["content"]
+        assert result.messages == [{"role": "user", "content": content}]
+
+    @pytest.mark.asyncio
+    async def test_a_double_sent_question_keeps_the_latest_word_for_word(self):
+        """The finding: the run used to become "[summarised: 2 similar turns]", so the model
+        received no question and no order number while a saving was recorded."""
+        msgs = [
+            {"role": "system", "content": "You are a support assistant."},
+            {"role": "user", "content": "Can you check order 1234?"},
+            {"role": "user", "content": "Can you check order 1234??", "name": "alice"},
+        ]
+        ctx = _make_ctx(msgs, enabled=True, threshold=0.92)
+        result = await G22Deduplication().process_request(ctx)
+        assert result.messages == [msgs[0], msgs[2]]
+
+    @pytest.mark.asyncio
+    async def test_a_run_followed_by_a_different_turn_keeps_its_last_member(self):
+        msgs = [
+            {"role": "assistant", "content": "The deployment finished without errors."},
+            {"role": "assistant", "content": "The deployment finished without errors!"},
+            {"role": "assistant", "content": "Next, run the database migration script."},
+        ]
+        ctx = _make_ctx(msgs, enabled=True, threshold=0.9)
+        result = await G22Deduplication().process_request(ctx)
+        assert result.messages == [msgs[1], msgs[2]]
+
+    @pytest.mark.asyncio
+    async def test_the_saving_is_recorded_in_tokens(self):
+        from savings.calculator import count_messages_tokens
+        content = "What is the capital of France?"
+        msgs = [{"role": "user", "content": content}] * 3
+        ctx = _make_ctx(msgs, enabled=True, threshold=0.97)
+        result = await G22Deduplication().process_request(ctx)
+        steps = [s for s in result.savings.step_savings if s.group == "G22"]
+        assert len(steps) == 1
+        assert steps[0].tokens_before == count_messages_tokens(msgs, "gpt-4o")
+        assert steps[0].tokens_after == count_messages_tokens(msgs[:1], "gpt-4o")
+
+    @pytest.mark.asyncio
+    async def test_nothing_dropped_records_no_step(self):
+        msgs = [{"role": "user", "content": "Tell me about Python."},
+                {"role": "user", "content": "Explain quantum mechanics in detail."}]
+        ctx = _make_ctx(msgs, enabled=True, threshold=0.97)
+        result = await G22Deduplication().process_request(ctx)
+        assert result.messages == msgs
+        assert not [s for s in result.savings.step_savings if s.group == "G22"]
 
     @pytest.mark.asyncio
     async def test_unique_turns_preserved(self):
@@ -166,6 +210,35 @@ class TestG22Deduplication:
         assert len(result.messages) == 2
 
 
+# The first request's use_embeddings latched for the process: a tenant overlay or a reload
+# that changed it, or the model, was ignored until restart.
+class TestTheModelFollowsEachRequestsConfig:
+
+    def test_use_embeddings_is_read_per_request(self, monkeypatch):
+        import middleware.g22_deduplication as g22_mod
+        loads = []
+        monkeypatch.setattr(g22_mod, "_get_model", lambda cfg: loads.append(cfg["embedding_model"]) or "model")
+        g22 = G22Deduplication()
+        assert g22._get_embedding_model({"use_embeddings": False, "embedding_model": "m1"}) is None
+        assert g22._get_embedding_model({"use_embeddings": True, "embedding_model": "m1"}) == "model"
+        assert g22._get_embedding_model({"use_embeddings": False, "embedding_model": "m1"}) is None
+
+    def test_each_model_is_loaded_once_even_when_it_fails(self, monkeypatch):
+        import middleware.g22_deduplication as g22_mod
+        loads = []
+        monkeypatch.setattr(g22_mod, "_get_model",
+                            lambda cfg: loads.append(cfg["embedding_model"]) or None)
+        g22 = G22Deduplication()
+        for name in ("m1", "m1", "m2", "m1", "m2"):
+            assert g22._get_embedding_model({"use_embeddings": True, "embedding_model": name}) is None
+        assert loads == ["m1", "m2"]
+
+    def test_an_injected_model_is_used_unless_embeddings_are_off(self):
+        g22 = G22Deduplication(embedding_model="injected")
+        assert g22._get_embedding_model({}) == "injected"
+        assert g22._get_embedding_model({"use_embeddings": False}) is None
+
+
 # ---------------------------------------------------------------------------
 # T24 — Per-tenant threshold parameterisation
 # ---------------------------------------------------------------------------
@@ -222,8 +295,7 @@ class TestPerTenantThreshold:
             tenant_thresholds={"nova-med": 0.50},
         )
         result = await G22Deduplication().process_request(ctx)
-        assert len(result.messages) == 1
-        assert "summarised" in result.messages[0]["content"]
+        assert result.messages == [_DUPE_MSGS[-1]]
 
     async def test_tenant_threshold_overrides_global_preserves(self):
         """Tenant-specific high threshold preserves turns that global would collapse."""

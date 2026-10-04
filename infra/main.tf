@@ -9,6 +9,11 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
+    # The Redis VM's CA and certificate (redis_tls).
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   # Remote state (GCS). Bucket + prefix are supplied at init time via
@@ -33,7 +38,6 @@ resource "google_project_service" "apis" {
     "sqladmin.googleapis.com",
     "storage.googleapis.com",
     "secretmanager.googleapis.com",
-    "cloudtasks.googleapis.com",
     "artifactregistry.googleapis.com",
     # compute: GCE docker-Redis VM (redis_backend=docker) + Cloud Run Direct VPC egress
     "compute.googleapis.com",
@@ -75,9 +79,25 @@ resource "google_storage_bucket" "config" {
 
   versioning { enabled = true }
 
+  # Prune old exports only. The live objects under config/ (config.yaml, local-keys.json,
+  # bypass and tool rules) are uploaded on deploy and never refreshed, so an unscoped age
+  # rule deleted them 90 days after each deploy.
   lifecycle_rule {
     action { type = "Delete" }
-    condition { age = 90 }
+    condition {
+      age            = 90
+      matches_prefix = ["backups/"]
+    }
+  }
+
+  # Keep version history bounded: a superseded version goes 30 days after it stopped
+  # being current. The live version of an object is never matched.
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition {
+      with_state                 = "ARCHIVED"
+      days_since_noncurrent_time = 30
+    }
   }
 }
 
@@ -133,6 +153,21 @@ resource "google_sql_database_instance" "main" {
     database_flags {
       name  = "max_connections"
       value = "100"
+    }
+
+    # usage_events (the billing source of record), audit_events, tenant configuration and
+    # keys live here: daily backups plus write-ahead logs, so a bad migration or a stray
+    # DELETE can be undone to the minute. Recovery is to a new instance (gcloud sql
+    # instances clone --point-in-time).
+    backup_configuration {
+      enabled                        = var.db_backups
+      start_time                     = var.db_backup_start_time
+      point_in_time_recovery_enabled = var.db_backups && var.db_point_in_time_recovery
+      transaction_log_retention_days = var.db_transaction_log_days
+      backup_retention_settings {
+        retained_backups = var.db_backup_retained_count
+        retention_unit   = "COUNT"
+      }
     }
   }
 
@@ -296,6 +331,18 @@ resource "google_secret_manager_secret" "langfuse_nextauth_secret" {
   depends_on = [google_project_service.apis]
 }
 
+# A tenant's own provider key on its way to the fine-tune Job. The proxy adds a version per run
+# and gives the Job only the version's name, since an execution keeps its env overrides where
+# anyone who can view the Job reads them; the Job destroys its version once the run has ended.
+# Terraform never adds a version.
+resource "google_secret_manager_secret" "finetune_tenant_key" {
+  secret_id = "finetune-tenant-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
 # NOTE: OpenMeter was removed from the stack (2026-07-02) — it needs a full
 # ClickHouse + Kafka backend; billing is computed from the usage_events table
 # (below) without it.
@@ -429,6 +476,9 @@ EOSQL
 }
 
 # ─── F2: audit_events Cloud SQL table migration + INSERT-only role ───────────
+# Nothing connects as proxy_audit_role. The database-level protection is a separate
+# restricted runtime role (src/proxy/audit/enforcement.py); without it the application
+# writes audit_events as token_opt_app, which owns the table.
 resource "null_resource" "audit_events_schema_migration" {
   # Disabled on the private-IP path (applied via the in-VPC migration job instead).
   count = var.private_cloud_sql ? 0 : 1
@@ -536,8 +586,8 @@ resource "null_resource" "rls_policies_migration" {
   ]
 }
 
-# NOTE: SLA alert rules (sla_alert_rules → alert_rules.yaml) moved to
-# infra/commercial.tf (open-core split, item 11/35) — SLA alerting is PAID.
+# NOTE: SLA alerting is PAID (open-core split, item 11/35). A build that has its rule file
+# gets it loaded through prometheus_alert_groups, like every *rules.yaml here.
 
 # ─── Service Accounts ────────────────────────────────────────────────────────
 resource "google_service_account" "proxy_sa" {
@@ -545,9 +595,10 @@ resource "google_service_account" "proxy_sa" {
   display_name = "Token Optimisation Proxy"
 }
 
-# Item 7 (opt-in): least-privilege secret access. Default keeps the project-wide
-# secretmanager.secretAccessor grant; when var.least_privilege_secret_iam = true the
-# broad grant is dropped and the proxy SA is bound to ONLY the secrets it reads.
+# Item 7: least-privilege secret access, on by default: the proxy SA is bound to ONLY the
+# secrets it reads. var.least_privilege_secret_iam = false restores the project-wide
+# secretmanager.secretAccessor grant (and storage.objectAdmin, below), which reaches every
+# secret in the project, the operator's secret backups included.
 #
 # NOTE: three commercial secrets are created by scripts/commercial/deploy-commercial-gcp.sh
 # (gcloud secrets create), NOT by Terraform, so they cannot be referenced here by resource
@@ -569,15 +620,20 @@ locals {
     google_secret_manager_secret.routellm_openai_key.secret_id,
     google_secret_manager_secret.langfuse_public_key.secret_id,
     google_secret_manager_secret.langfuse_secret_key.secret_id,
-    google_secret_manager_secret.langfuse_nextauth_secret.secret_id,
-    # grafana-svc + token-proxy also run as the proxy SA and mount these
-    # (grafana: GF_SECURITY_ADMIN_PASSWORD; proxy: METRICS_SCRAPE_TOKEN) — without
-    # them the Cloud Run deploy fails with "Permission denied on secret".
-    google_secret_manager_secret.grafana_admin_password.secret_id,
+    # token-proxy mounts the /metrics scrape token (METRICS_SCRAPE_TOKEN) — without it the
+    # Cloud Run deploy fails with "Permission denied on secret".
     google_secret_manager_secret.metrics_scrape_token.secret_id,
-    # qdrant-svc + token-proxy + docs-seed-job all run as the proxy SA and mount
-    # the Qdrant app-layer key (QDRANT__SERVICE__API_KEY resp. QDRANT_API_KEY).
+    # ... and the token Alertmanager presents to /admin/alert-webhook (ALERT_WEBHOOK_TOKEN).
+    google_secret_manager_secret.alert_webhook_token.secret_id,
+    # token-proxy + docs-seed-job run as the proxy SA and mount the Qdrant app-layer key
+    # (QDRANT_API_KEY). Qdrant itself runs as qdrant_sa.
     google_secret_manager_secret.qdrant_api_key.secret_id,
+    # finetune-pipeline-job (the proxy SA) reads a tenant's key from the version it is given.
+    google_secret_manager_secret.finetune_tenant_key.secret_id,
+    # token-proxy and finetune-pipeline-job mount the Redis password (REDIS_PASSWORD) and the
+    # CA that signs Redis's certificate (REDIS_CA_CERT). Never the VM's TLS key.
+    google_secret_manager_secret.redis_auth.secret_id,
+    google_secret_manager_secret.redis_ca.secret_id,
   ], [for s in google_secret_manager_secret.llm_key_extra : s.secret_id]) : []
 }
 
@@ -595,7 +651,26 @@ resource "google_secret_manager_secret_iam_member" "proxy_per_secret_accessor" {
   member    = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
-# Item 7 (opt-in): narrow storage from project-wide objectAdmin to the config bucket only.
+# The proxy adds a version of the fine-tune key secret per run and destroys old ones, and
+# finetune-pipeline-job (also the proxy SA) destroys its own: version rights on that one
+# secret, and on no other.
+resource "google_secret_manager_secret_iam_member" "proxy_finetune_key_versions" {
+  secret_id = google_secret_manager_secret.finetune_tenant_key.secret_id
+  role      = "roles/secretmanager.secretVersionManager"
+  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Each proxy instance asks for the API-key secret's latest version name every few seconds and
+# reloads its key cache when it changed, so a key revoked or suspended elsewhere stops working
+# within seconds (src/proxy/auth/api_key_manager.py). secretAccessor cannot read version
+# metadata; viewer on this one secret can, and reads no secret value. In either IAM mode.
+resource "google_secret_manager_secret_iam_member" "proxy_api_keys_versions" {
+  secret_id = google_secret_manager_secret.proxy_api_keys.secret_id
+  role      = "roles/secretmanager.viewer"
+  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# Item 7 (on by default): narrow storage from project-wide objectAdmin to the config bucket.
 resource "google_project_iam_member" "proxy_storage_admin" {
   count   = var.least_privilege_secret_iam ? 0 : 1
   project = var.project_id
@@ -611,6 +686,75 @@ resource "google_storage_bucket_iam_member" "proxy_config_bucket" {
   bucket = local.bucket_name
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
+# ─── The other services: an account each ─────────────────────────────────────
+# Qdrant, Prometheus and Alertmanager (below), and Grafana and Langfuse (deployed by
+# gcp-deploy.sh, which reads these two accounts from the outputs), are third-party images;
+# Grafana is public. Each runs as its own account holding only what that service uses, so a
+# compromise of one cannot use the proxy SA's provider keys, KMS key, Cloud SQL access or
+# project-wide run.invoker. They are created whether or not their service is enabled (an
+# account costs nothing), so the deploy can always read the two it needs. The LLMLingua and
+# Tika sidecars have accounts of their own too, created by gcp-deploy.sh with no roles.
+resource "google_service_account" "qdrant_sa" {
+  account_id   = "token-opt-qdrant-sa"
+  display_name = "TokenLean Qdrant"
+}
+
+resource "google_service_account" "prometheus_sa" {
+  account_id   = "token-opt-prometheus-sa"
+  display_name = "TokenLean Prometheus"
+}
+
+resource "google_service_account" "alertmanager_sa" {
+  account_id   = "token-opt-alertmanager-sa"
+  display_name = "TokenLean Alertmanager"
+}
+
+resource "google_service_account" "grafana_sa" {
+  account_id   = "token-opt-grafana-sa"
+  display_name = "TokenLean Grafana"
+}
+
+resource "google_service_account" "langfuse_sa" {
+  account_id   = "token-opt-langfuse-sa"
+  display_name = "TokenLean Langfuse"
+}
+
+# Grafana mounts its admin password and the DB password (for its Langfuse datasource);
+# Langfuse mounts its NextAuth secret and the DB password. It also mounts langfuse-salt,
+# which gcp-deploy.sh creates and binds for it.
+resource "google_secret_manager_secret_iam_member" "grafana_secret_accessor" {
+  for_each = toset([
+    google_secret_manager_secret.grafana_admin_password.secret_id,
+    google_secret_manager_secret.db_password.secret_id,
+  ])
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.grafana_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "langfuse_secret_accessor" {
+  for_each = toset([
+    google_secret_manager_secret.langfuse_nextauth_secret.secret_id,
+    google_secret_manager_secret.db_password.secret_id,
+  ])
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.langfuse_sa.email}"
+}
+
+# Both reach Cloud SQL through the Cloud Run connector (--add-cloudsql-instances).
+resource "google_project_iam_member" "grafana_cloudsql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.grafana_sa.email}"
+}
+
+resource "google_project_iam_member" "langfuse_cloudsql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.langfuse_sa.email}"
 }
 
 # ─── Per-tenant document ingestion — SHARED scaffolding ──────────────────────
@@ -714,8 +858,8 @@ resource "google_project_iam_member" "proxy_run_invoker" {
 # The `vector` extension is needed REGARDLESS of the G07 backend: the G05 L2 semantic
 # cache stores its embeddings in pgvector on Cloud SQL even when Qdrant serves G07
 # (missing it → `G05 L2 pgvector error: type "vector" does not exist` on every request,
-# L2 cache silently dead). G07's PGVectorRAG fallback additionally needs it when
-# enable_qdrant=false.
+# L2 cache silently dead). G07's pgvector search (use_pgvector_fallback) additionally
+# needs it when enable_qdrant=false.
 resource "null_resource" "pgvector_extension" {
   # local-exec path applies only on the public-IP deploy — on the private-IP path the
   # in-VPC migration job (run-migrations-job.sh) applies pgvector.sql unconditionally.
@@ -769,6 +913,11 @@ resource "google_redis_instance" "cache" {
   region         = var.region
 
   redis_version = "REDIS_7_0"
+  # Its AUTH string is generated here once AUTH is on (secret redis-auth below).
+  auth_enabled = var.redis_auth_enforced
+  # TLS on port 6378, with a certificate from a CA of the instance's own (secret redis-ca
+  # below). Switching it recreates the instance: Redis starts empty.
+  transit_encryption_mode = var.redis_tls ? "SERVER_AUTHENTICATION" : "DISABLED"
 
   labels = {
     environment = var.environment
@@ -778,19 +927,165 @@ resource "google_redis_instance" "cache" {
   depends_on = [google_project_service.redis_api]
 }
 
+# ─── The Redis password ───────────────────────────────────────────────────────
+# Without one, any host in the VPC could read and write every tenant's cached prompts and
+# answers, sessions and counters. token-proxy and finetune-pipeline-job get it as
+# REDIS_PASSWORD, mounted from this secret, never inside REDIS_URL, a plain env var that anyone
+# who can view the service reads. They send it as the `default` user's, which a Redis with no
+# password yet accepts too, so on the VM backend the password ships to them before
+# redis_auth_enforced makes Redis require it. Memorystore generates its own, once AUTH is on.
+resource "random_password" "redis_auth" {
+  length  = 48
+  special = false # plain in redis.conf and in AUTH
+}
+
+resource "google_secret_manager_secret" "redis_auth" {
+  secret_id = "redis-auth"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "redis_auth" {
+  count       = var.redis_backend == "docker" || var.redis_auth_enforced ? 1 : 0
+  secret      = google_secret_manager_secret.redis_auth.id
+  secret_data = var.redis_backend == "memorystore" ? one(google_redis_instance.cache[*].auth_string) : random_password.redis_auth.result
+}
+
+# ─── Redis TLS ────────────────────────────────────────────────────────────────
+# Without it every tenant's cached prompts and answers, sessions, counters and the password
+# itself crossed the VPC in clear. With redis_tls the clients get a rediss:// URL (output
+# redis_url) and, as REDIS_CA_CERT, the CA that signs Redis's certificate, and trust that CA
+# only: Memorystore's own, or the one made here for the VM, whose key stays in this state.
+resource "google_secret_manager_secret" "redis_ca" {
+  secret_id = "redis-ca"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "redis_ca" {
+  count       = var.redis_tls ? 1 : 0
+  secret      = google_secret_manager_secret.redis_ca.id
+  secret_data = var.redis_backend == "memorystore" ? join("", google_redis_instance.cache[0].server_ca_certs[*].cert) : tls_self_signed_cert.redis_ca[0].cert_pem
+}
+
+resource "tls_private_key" "redis_ca" {
+  count       = var.redis_backend == "docker" && var.redis_tls ? 1 : 0
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P256"
+}
+
+resource "tls_self_signed_cert" "redis_ca" {
+  count             = var.redis_backend == "docker" && var.redis_tls ? 1 : 0
+  private_key_pem   = tls_private_key.redis_ca[0].private_key_pem
+  is_ca_certificate = true
+  # Ten years: the clients trust this CA, so a new one reaches them only with a deploy.
+  validity_period_hours = 87600
+  allowed_uses          = ["cert_signing", "crl_signing"]
+  subject {
+    common_name = "token-opt Redis CA"
+  }
+}
+
+resource "tls_private_key" "redis_server" {
+  count       = var.redis_backend == "docker" && var.redis_tls ? 1 : 0
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P256"
+}
+
+resource "tls_cert_request" "redis_server" {
+  count           = var.redis_backend == "docker" && var.redis_tls ? 1 : 0
+  private_key_pem = tls_private_key.redis_server[0].private_key_pem
+  subject {
+    common_name = "token-opt-redis-vm"
+  }
+}
+
+# Five years, renewed by the first apply in its last 90 days; the deploy then restarts the VM
+# onto the new certificate (it compares the secret version the VM serves with the latest).
+resource "tls_locally_signed_cert" "redis_server" {
+  count                 = var.redis_backend == "docker" && var.redis_tls ? 1 : 0
+  cert_request_pem      = tls_cert_request.redis_server[0].cert_request_pem
+  ca_private_key_pem    = tls_private_key.redis_ca[0].private_key_pem
+  ca_cert_pem           = tls_self_signed_cert.redis_ca[0].cert_pem
+  validity_period_hours = 43800
+  early_renewal_hours   = 2160
+  allowed_uses          = ["digital_signature", "key_encipherment", "server_auth"]
+}
+
+# The VM's certificate, the CA's, then its key, read by the VM alone at boot.
+resource "google_secret_manager_secret" "redis_tls_server" {
+  count     = var.redis_backend == "docker" ? 1 : 0
+  secret_id = "redis-tls-server"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "redis_tls_server" {
+  count       = var.redis_backend == "docker" && var.redis_tls ? 1 : 0
+  secret      = google_secret_manager_secret.redis_tls_server[0].id
+  secret_data = "${tls_locally_signed_cert.redis_server[0].cert_pem}${tls_self_signed_cert.redis_ca[0].cert_pem}${tls_private_key.redis_server[0].private_key_pem}"
+}
+
 # ─── Docker-Redis on a GCE Container-Optimized-OS VM (redis_backend = docker) ──
 # Cheaper alternative to Memorystore (~$8/mo vs ~$40). Cloud Run reaches it over
 # the VPC via Direct VPC egress (default network). An ephemeral external IP is
 # attached solely so COS can pull the redis image; port 6379 is exposed ONLY to
 # internal source ranges by the firewall rule below. Not HA / not persistent —
 # fine for cache/rate-limit/state at low scale; use redis_backend=memorystore for HA.
+#
+# The password and the TLS key must not sit in the metadata (whoever can view the instance
+# reads it), so at every boot redis-vm-startup.sh reads them from their secrets with the VM's
+# own service account and writes the files the container mounts; the container restarts until
+# the config exists. The script applies redis_auth_enforced and redis_tls at boot, and reports
+# what Redis runs in guest attributes; gcp-deploy.sh restarts the VM when that differs.
+resource "google_service_account" "redis_vm" {
+  count        = var.redis_backend == "docker" ? 1 : 0
+  account_id   = "token-opt-redis-vm"
+  display_name = "Redis VM (reads its own password and TLS key)"
+}
+
+resource "google_secret_manager_secret_iam_member" "redis_vm_reads_password" {
+  count     = var.redis_backend == "docker" ? 1 : 0
+  secret_id = google_secret_manager_secret.redis_auth.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.redis_vm[0].email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "redis_vm_reads_tls_key" {
+  count     = var.redis_backend == "docker" ? 1 : 0
+  secret_id = google_secret_manager_secret.redis_tls_server[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.redis_vm[0].email}"
+}
+
+# The container's logs (google-logging-enabled) are written as the VM's service account.
+resource "google_project_iam_member" "redis_vm_log_writer" {
+  count   = var.redis_backend == "docker" ? 1 : 0
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.redis_vm[0].email}"
+}
+
 resource "google_compute_instance" "redis" {
   count        = var.redis_backend == "docker" ? 1 : 0
   name         = "token-opt-redis-vm"
   machine_type = var.redis_vm_machine_type
   zone         = "${var.region}-a"
+  # A new service account needs the VM stopped; it keeps its internal IP (REDIS_URL).
+  allow_stopping_for_update = true
 
   tags = ["token-opt-redis"]
+
+  service_account {
+    email  = google_service_account.redis_vm[0].email
+    scopes = ["cloud-platform"]
+  }
 
   boot_disk {
     initialize_params {
@@ -804,16 +1099,35 @@ resource "google_compute_instance" "redis" {
     access_config {} # ephemeral external IP for image pull only
   }
 
+  # redis:7.2 is the last BSD-3-Clause Redis (7.4+ is RSALv2/SSPLv1; see THIRD_PARTY_LICENSES.md).
+  # The VM reads this declaration at boot: after an apply that changes it, reset the VM once.
   metadata = {
     gce-container-declaration = <<-EOT
       spec:
         containers:
           - name: redis
-            image: redis:7-alpine
-            args: ["redis-server", "--appendonly", "no", "--save", ""]
+            image: redis:7.2-alpine
+            args: ["redis-server", "/etc/redis/redis.conf"]
+            volumeMounts:
+              - name: conf
+                mountPath: /etc/redis
+                readOnly: true
+        volumes:
+          - name: conf
+            hostPath:
+              path: /var/lib/token-opt-redis
         restartPolicy: Always
     EOT
     google-logging-enabled    = "true"
+    # The startup script reports in guest attributes whether Redis requires the password and
+    # serves TLS (with which version of its certificate).
+    enable-guest-attributes = "TRUE"
+    # Run by bash on the VM: no carriage returns, whatever the checkout.
+    startup-script      = replace(file("${path.module}/redis-vm-startup.sh"), "\r", "")
+    redis-auth-enforced = var.redis_auth_enforced ? "true" : "false"
+    redis-auth-secret   = google_secret_manager_secret.redis_auth.id
+    redis-tls           = var.redis_tls ? "true" : "false"
+    redis-tls-secret    = google_secret_manager_secret.redis_tls_server[0].id
   }
 
   labels = {
@@ -822,10 +1136,13 @@ resource "google_compute_instance" "redis" {
     container-vm = "cos-stable"
   }
 
-  depends_on = [google_project_service.apis]
+  # Its first boot finds both secrets: the startup script reads them only at boot.
+  depends_on = [google_project_service.apis, google_secret_manager_secret_version.redis_auth,
+  google_secret_manager_secret_version.redis_tls_server]
 }
 
-# Allow Redis (6379) only from internal source ranges (VPC + Direct VPC egress).
+# Allow Redis (6379, TLS once redis_tls is on) only from internal source ranges (VPC + Direct
+# VPC egress).
 resource "google_compute_firewall" "redis_internal" {
   count   = var.redis_backend == "docker" ? 1 : 0
   name    = "token-opt-redis-internal"
@@ -869,6 +1186,47 @@ resource "google_secret_manager_secret_version" "qdrant_api_key" {
   secret_data = random_password.qdrant_api_key.result
 }
 
+# Qdrant keeps its collections in the container's own filesystem, so a new revision or a
+# restart starts it empty. Every ingest writes the changed collection's snapshot here
+# (<collection>.<UTC time>.snapshot, src/doc-pipeline/pipeline.py) and the service restores
+# the newest of each before it serves (qdrant-restore.sh). An erase deletes the tenant's
+# snapshots, and a deleted object is gone at once (no soft delete): a soft-deleted snapshot
+# could otherwise be restored, and with it an erased tenant's documents.
+resource "google_storage_bucket" "qdrant_snapshots" {
+  count                       = var.enable_qdrant ? 1 : 0
+  name                        = "${var.project_id}-qdrant-snapshots"
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  # Derived data (re-ingesting rebuilds it): no reason to block a teardown.
+  force_destroy = true
+  soft_delete_policy {
+    retention_duration_seconds = 0
+  }
+  labels = {
+    environment = var.environment
+    component   = "token-opt"
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# Qdrant reads the snapshots it restores, through the read-only volume.
+resource "google_storage_bucket_iam_member" "qdrant_reads_snapshots" {
+  count  = var.enable_qdrant ? 1 : 0
+  bucket = google_storage_bucket.qdrant_snapshots[0].name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.qdrant_sa.email}"
+}
+
+# doc-pipeline-job (an ingest writes a snapshot and deletes older ones) and token-proxy (an
+# erase deletes a tenant's) both run as the proxy's account.
+resource "google_storage_bucket_iam_member" "proxy_writes_qdrant_snapshots" {
+  count  = var.enable_qdrant ? 1 : 0
+  bucket = google_storage_bucket.qdrant_snapshots[0].name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.proxy_sa.email}"
+}
+
 resource "google_cloud_run_v2_service" "qdrant" {
   count    = var.enable_qdrant ? 1 : 0
   name     = "token-opt-qdrant"
@@ -883,13 +1241,52 @@ resource "google_cloud_run_v2_service" "qdrant" {
   ingress = "INGRESS_TRAFFIC_ALL"
 
   template {
-    service_account = google_service_account.proxy_sa.email
+    service_account = google_service_account.qdrant_sa.email
+    # Second generation: the snapshot bucket is mounted as a volume.
+    execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
+
+    # Exactly one instance, always running. The collections live in the container's own
+    # filesystem: scaling to zero when idle erased every tenant's ingested documents, and
+    # a second instance under load held documents the first did not. A new revision (any
+    # change to this service) or a Cloud Run restart starts it empty but for what it
+    # restores from the snapshot bucket. The idle instance is billed, paused projects included.
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 1
+    }
+
+    volumes {
+      name = "snapshots"
+      gcs {
+        bucket    = google_storage_bucket.qdrant_snapshots[0].name
+        read_only = true
+      }
+    }
 
     containers {
       image = var.qdrant_image
+      # Restores the newest snapshot of each collection, then starts Qdrant as the image does:
+      # Qdrant serves only once they are restored. Run by bash: no carriage returns.
+      command = ["bash", "-c", replace(file("${path.module}/qdrant-restore.sh"), "\r", "")]
 
       ports {
         container_port = 6333
+      }
+
+      volume_mounts {
+        name       = "snapshots"
+        mount_path = "/snapshots"
+      }
+
+      # Restoring takes as long as the snapshots are big: up to ten minutes before Cloud Run
+      # gives up on the instance.
+      startup_probe {
+        tcp_socket {
+          port = 6333
+        }
+        period_seconds    = 10
+        timeout_seconds   = 5
+        failure_threshold = 60
       }
 
       # App-layer auth (layer 2 behind Cloud Run IAM) — Qdrant rejects requests
@@ -914,7 +1311,19 @@ resource "google_cloud_run_v2_service" "qdrant" {
     }
   }
 
-  depends_on = [google_project_service.apis, google_secret_manager_secret_version.qdrant_api_key]
+  depends_on = [
+    google_project_service.apis,
+    google_secret_manager_secret_version.qdrant_api_key,
+    google_secret_manager_secret_iam_member.qdrant_api_key_accessor,
+    google_storage_bucket_iam_member.qdrant_reads_snapshots,
+  ]
+}
+
+# Qdrant's own account reads its API key and its snapshots, nothing else.
+resource "google_secret_manager_secret_iam_member" "qdrant_api_key_accessor" {
+  secret_id = google_secret_manager_secret.qdrant_api_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.qdrant_sa.email}"
 }
 
 # ─── RouteLLM Sidecar Service Account ───────────────────────────────────────
@@ -923,24 +1332,13 @@ resource "google_service_account" "routellm_sa" {
   display_name = "RouteLLM Sidecar"
 }
 
+# The sidecar's only grant. It calls no Cloud Run service, so it holds no run.invoker, and
+# the proxy SA needs no right to act as it: `gcloud run deploy --service-account=...` is
+# run by the operator's identity, which needs iam.serviceAccountUser here (DEPLOYMENT.md).
 resource "google_secret_manager_secret_iam_member" "routellm_secret_accessor" {
   secret_id = google_secret_manager_secret.routellm_openai_key.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.routellm_sa.email}"
-}
-
-resource "google_project_iam_member" "routellm_run_invoker" {
-  project = var.project_id
-  role    = "roles/run.invoker"
-  member  = "serviceAccount:${google_service_account.routellm_sa.email}"
-}
-
-# Allow the proxy service account to act-as the routellm service account
-# Required for: gcloud run deploy --service-account=routellm-sidecar-sa
-resource "google_service_account_iam_member" "proxy_sa_acts_as_routellm_sa" {
-  service_account_id = google_service_account.routellm_sa.name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.proxy_sa.email}"
 }
 
 # ─── Prometheus OSS (Cloud Run v2) ─────────────────────────────────────────
@@ -953,7 +1351,7 @@ locals {
     proxy_host           = local.prom_proxy_host
     environment          = var.environment
     alertmanager_host    = local.prom_alertmanager_host
-    metrics_scrape_token = var.metrics_scrape_token
+    metrics_scrape_token = local.metrics_scrape_token
   })
 }
 
@@ -970,10 +1368,20 @@ resource "google_secret_manager_secret_version" "prometheus_config" {
   secret_data = local.prometheus_config
 }
 
-# H2: bearer token guarding the proxy's /metrics endpoint. The proxy reads it via
-# --set-secrets METRICS_SCRAPE_TOKEN; Prometheus presents it in its scrape config
-# (rendered from var.metrics_scrape_token above). A version is only created when a
-# token is configured — otherwise gcp-deploy.sh leaves /metrics open.
+# H2: bearer token guarding the proxy's /metrics endpoint, which refuses every scrape
+# without one. The proxy reads it via --set-secrets METRICS_SCRAPE_TOKEN; Prometheus
+# presents it in its scrape config (rendered from local.metrics_scrape_token above).
+# Generated unless var.metrics_scrape_token sets one: a version used to be created only
+# then, and gcp-deploy.sh left /metrics open without it.
+resource "random_password" "metrics_scrape_token" {
+  length  = 48
+  special = false # sent as a bearer token
+}
+
+locals {
+  metrics_scrape_token = var.metrics_scrape_token != "" ? var.metrics_scrape_token : random_password.metrics_scrape_token.result
+}
+
 resource "google_secret_manager_secret" "metrics_scrape_token" {
   secret_id = "token-opt-metrics-scrape-token"
   replication {
@@ -983,9 +1391,14 @@ resource "google_secret_manager_secret" "metrics_scrape_token" {
 }
 
 resource "google_secret_manager_secret_version" "metrics_scrape_token" {
-  count       = var.metrics_scrape_token != "" ? 1 : 0
   secret      = google_secret_manager_secret.metrics_scrape_token.id
-  secret_data = var.metrics_scrape_token
+  secret_data = local.metrics_scrape_token
+}
+
+# The version had a count; a token set before keeps its version rather than a replacement.
+moved {
+  from = google_secret_manager_secret_version.metrics_scrape_token[0]
+  to   = google_secret_manager_secret_version.metrics_scrape_token
 }
 
 resource "google_secret_manager_secret" "prometheus_alerts" {
@@ -996,9 +1409,20 @@ resource "google_secret_manager_secret" "prometheus_alerts" {
   depends_on = [google_project_service.apis]
 }
 
+locals {
+  # Prometheus loads ONE rules file (prometheus.yml.tmpl rule_files), from this secret: the
+  # groups of prometheus-alerts.yml plus those of any *rules.yaml a build adds beside it, so
+  # no rule file can sit here unloaded.
+  prometheus_alert_groups = concat(
+    yamldecode(file("${path.module}/prometheus-alerts.yml")).groups,
+    flatten([for f in sort(fileset(path.module, "*rules.yaml")) :
+    yamldecode(file("${path.module}/${f}")).groups]),
+  )
+}
+
 resource "google_secret_manager_secret_version" "prometheus_alerts" {
   secret      = google_secret_manager_secret.prometheus_alerts.id
-  secret_data = file("${path.module}/prometheus-alerts.yml")
+  secret_data = yamlencode({ groups = local.prometheus_alert_groups })
 }
 
 resource "google_cloud_run_v2_service" "prometheus" {
@@ -1008,7 +1432,7 @@ resource "google_cloud_run_v2_service" "prometheus" {
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
   template {
-    service_account = google_service_account.proxy_sa.email
+    service_account = google_service_account.prometheus_sa.email
 
     containers {
       image = "prom/prometheus:v2.53.0"
@@ -1072,7 +1496,6 @@ resource "google_cloud_run_v2_service" "prometheus" {
     google_project_service.apis,
     google_secret_manager_secret_version.prometheus_config,
     google_secret_manager_secret_version.prometheus_alerts,
-    google_project_iam_member.proxy_secret_accessor,
     google_secret_manager_secret_iam_member.prometheus_config_accessor,
     google_secret_manager_secret_iam_member.prometheus_alerts_accessor,
   ]
@@ -1088,8 +1511,44 @@ resource "google_secret_manager_secret" "alertmanager_config" {
   depends_on = [google_project_service.apis]
 }
 
+# The token Alertmanager presents to the proxy's /admin/alert-webhook, which otherwise takes
+# only an admin key: it posted with no credentials and every alert was refused. The proxy
+# reads it as ALERT_WEBHOOK_TOKEN (gcp-deploy.sh mounts it); it opens that endpoint only.
+resource "random_password" "alert_webhook_token" {
+  length  = 48
+  special = false # sent as a bearer token
+}
+
+resource "google_secret_manager_secret" "alert_webhook_token" {
+  secret_id = "token-opt-alert-webhook-token"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "alert_webhook_token" {
+  secret      = google_secret_manager_secret.alert_webhook_token.id
+  secret_data = random_password.alert_webhook_token.result
+}
+
+locals {
+  # Where Alertmanager sends alerts: alert_webhook_url, else the proxy's webhook once
+  # proxy_service_url is known (gcp-deploy.sh sets it after the first deploy), else nowhere.
+  alert_webhook_target = var.alert_webhook_url != "" ? var.alert_webhook_url : (
+  var.proxy_service_url != "" ? "${var.proxy_service_url}/admin/alert-webhook" : "")
+}
+
+check "alertmanager_has_a_receiver" {
+  assert {
+    condition     = !var.enable_self_hosted_observability || local.alert_webhook_target != ""
+    error_message = "Alertmanager has nowhere to send alerts: set proxy_service_url (gcp-deploy.sh does after the first deploy) or alert_webhook_url."
+  }
+}
+
 resource "google_secret_manager_secret_version" "alertmanager_config" {
-  secret      = google_secret_manager_secret.alertmanager_config.id
+  secret = google_secret_manager_secret.alertmanager_config.id
+  # The proxy's token goes only to the proxy, never to an alert_webhook_url of your own.
   secret_data = <<EOF
 global:
   resolve_timeout: ${var.alertmanager_resolve_timeout}
@@ -1103,9 +1562,17 @@ route:
 
 receivers:
   - name: 'default'
+%{if local.alert_webhook_target != ""~}
     webhook_configs:
-      - url: '${var.alert_webhook_url != "" ? var.alert_webhook_url : (var.proxy_service_url != "" ? "${var.proxy_service_url}/admin/alert-webhook" : "http://localhost:8000/admin/alert-webhook")}'
+      - url: '${local.alert_webhook_target}'
         send_resolved: true
+%{if var.alert_webhook_url == ""~}
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: '${random_password.alert_webhook_token.result}'
+%{endif~}
+%{endif~}
 EOF
 }
 
@@ -1116,7 +1583,7 @@ resource "google_cloud_run_v2_service" "alertmanager" {
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
   template {
-    service_account = google_service_account.proxy_sa.email
+    service_account = google_service_account.alertmanager_sa.email
 
     containers {
       image = "prom/alertmanager:v0.27.0"
@@ -1155,7 +1622,7 @@ resource "google_cloud_run_v2_service" "alertmanager" {
   depends_on = [
     google_project_service.apis,
     google_secret_manager_secret_version.alertmanager_config,
-    google_project_iam_member.proxy_secret_accessor,
+    google_secret_manager_secret_iam_member.alertmanager_config_accessor,
   ]
 }
 
@@ -1165,7 +1632,7 @@ resource "google_cloud_run_v2_service_iam_member" "prometheus_grafana_invoker" {
   location = var.region
   name     = google_cloud_run_v2_service.prometheus[0].name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.proxy_sa.email}"
+  member   = "serviceAccount:${google_service_account.grafana_sa.email}"
 }
 
 # Allow Prometheus to invoke Alertmanager
@@ -1174,26 +1641,27 @@ resource "google_cloud_run_v2_service_iam_member" "alertmanager_prometheus_invok
   location = var.region
   name     = google_cloud_run_v2_service.alertmanager[0].name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.proxy_sa.email}"
+  member   = "serviceAccount:${google_service_account.prometheus_sa.email}"
 }
 
-# Secret-level IAM bindings for Prometheus secret volume mounts
+# Secret-level IAM bindings for the Prometheus and Alertmanager secret volume mounts, each
+# to that service's own account.
 resource "google_secret_manager_secret_iam_member" "prometheus_config_accessor" {
   secret_id = google_secret_manager_secret.prometheus_config.secret_id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+  member    = "serviceAccount:${google_service_account.prometheus_sa.email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "prometheus_alerts_accessor" {
   secret_id = google_secret_manager_secret.prometheus_alerts.secret_id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+  member    = "serviceAccount:${google_service_account.prometheus_sa.email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "alertmanager_config_accessor" {
   secret_id = google_secret_manager_secret.alertmanager_config.secret_id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.proxy_sa.email}"
+  member    = "serviceAccount:${google_service_account.alertmanager_sa.email}"
 }
 
 # Note: Cloud Run v2 service deployment is done via gcp-deploy.sh script

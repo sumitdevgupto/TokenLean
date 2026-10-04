@@ -28,7 +28,104 @@ from typing import Any, Dict, Iterable, List
 
 from protocols.base import (
     IngressProtocol, StreamTranslator, sse_line, finalize_fanout, safe_json_dumps,
+    UnsupportedRequestField,
 )
+
+# generationConfig fields carried as an OpenAI param one to one: (JSON name, proto name, param).
+_GEN_DIRECT = (
+    ("topK", "top_k", "top_k"),
+    ("candidateCount", "candidate_count", "n"),
+    ("seed", "seed", "seed"),
+    ("presencePenalty", "presence_penalty", "presence_penalty"),
+    ("frequencyPenalty", "frequency_penalty", "frequency_penalty"),
+)
+# Every generationConfig field this route carries, in both spellings. Any other set field
+# is refused: dropping it would answer a different request than the one sent.
+_GEN_CARRIED = frozenset({
+    "maxOutputTokens", "max_output_tokens", "temperature", "topP", "top_p",
+    "stopSequences", "stop_sequences", "responseMimeType", "response_mime_type",
+    "responseSchema", "response_schema", "responseJsonSchema", "response_json_schema",
+    "thinkingConfig", "thinking_config",
+} | {name for pair in _GEN_DIRECT for name in pair[:2]})
+
+
+def _field(d: Dict[str, Any], json_name: str, proto_name: str) -> Any:
+    """A Gemini field by its JSON (camelCase) or protobuf (snake_case) name."""
+    return d[json_name] if json_name in d else d.get(proto_name)
+
+
+def _json_schema(schema: Any) -> Any:
+    """A Gemini response schema as JSON Schema: Gemini spells types in upper case
+    (``OBJECT``, ``STRING``); JSON Schema in lower case."""
+    if isinstance(schema, dict):
+        return {k: (v.lower() if k == "type" and isinstance(v, str) else _json_schema(v))
+                for k, v in schema.items()}
+    if isinstance(schema, list):
+        return [_json_schema(v) for v in schema]
+    return schema
+
+
+def _response_format(gen: Dict[str, Any]) -> Any:
+    """``responseMimeType`` (+ a schema) as an OpenAI ``response_format``, or None."""
+    mime = _field(gen, "responseMimeType", "response_mime_type")
+    raw = _field(gen, "responseJsonSchema", "response_json_schema")
+    schema = raw if raw is not None else _json_schema(_field(gen, "responseSchema", "response_schema"))
+    if mime in (None, "text/plain") and schema is None:
+        return None
+    if mime != "application/json":
+        raise UnsupportedRequestField(
+            "generationConfig.responseMimeType: only application/json and text/plain (with no "
+            "schema) are supported")
+    if schema is None:
+        return {"type": "json_object"}
+    return {"type": "json_schema", "json_schema": {"name": "response", "schema": schema}}
+
+
+def _thinking_config(cfg: Any) -> Dict[str, Any]:
+    if not isinstance(cfg, dict) or set(cfg) - {"thinkingBudget", "thinking_budget",
+                                                 "includeThoughts", "include_thoughts"}:
+        raise UnsupportedRequestField(
+            "generationConfig.thinkingConfig: only thinkingBudget and includeThoughts are supported")
+    out = {}
+    budget = _field(cfg, "thinkingBudget", "thinking_budget")
+    if budget is not None:
+        out["thinking_budget"] = budget
+    include = _field(cfg, "includeThoughts", "include_thoughts")
+    if include is not None:
+        out["include_thoughts"] = include
+    return out
+
+
+def _apply_tool_config(tool_config: Any, params: Dict[str, Any]) -> None:
+    """``toolConfig.functionCallingConfig`` as an OpenAI ``tool_choice``. ``ANY`` with
+    ``allowedFunctionNames`` keeps only those tools: the model must call one of them."""
+    fcc = _field(tool_config, "functionCallingConfig", "function_calling_config") \
+        if isinstance(tool_config, dict) else None
+    if not isinstance(fcc, dict):
+        return
+    mode = str(fcc.get("mode") or "AUTO").upper()
+    allowed = _field(fcc, "allowedFunctionNames", "allowed_function_names") or []
+    tools = params.get("tools") or []
+    if mode not in ("AUTO", "ANY", "NONE") or (allowed and mode != "ANY"):
+        raise UnsupportedRequestField(
+            "toolConfig.functionCallingConfig: mode must be AUTO, ANY or NONE, and "
+            "allowedFunctionNames needs ANY")
+    if mode == "ANY" and not tools:
+        raise UnsupportedRequestField("toolConfig.functionCallingConfig: ANY needs tools")
+    if not tools:
+        return
+    if allowed:
+        declared = {t["function"]["name"] for t in tools}
+        if not isinstance(allowed, list) or set(allowed) - declared:
+            raise UnsupportedRequestField(
+                "toolConfig.functionCallingConfig.allowedFunctionNames names a function the "
+                "request's tools do not declare")
+        params["tools"] = [t for t in tools if t["function"]["name"] in allowed]
+        if len(params["tools"]) == 1:
+            params["tool_choice"] = {"type": "function",
+                                     "function": {"name": params["tools"][0]["function"]["name"]}}
+            return
+    params["tool_choice"] = {"AUTO": "auto", "ANY": "required", "NONE": "none"}[mode]
 
 # OpenAI finish_reason → Gemini finishReason.
 _FINISH_REASON = {
@@ -174,20 +271,34 @@ class GeminiProtocol(IngressProtocol):
         params: Dict[str, Any] = {}
         gen = body.get("generationConfig") or body.get("generation_config") or {}
         if isinstance(gen, dict):
+            unknown = sorted(k for k, v in gen.items() if k not in _GEN_CARRIED and v is not None)
+            if unknown:
+                raise UnsupportedRequestField(
+                    f"generationConfig.{unknown[0]} is not supported by this proxy")
             if gen.get("maxOutputTokens") is not None:
                 params["max_tokens"] = gen["maxOutputTokens"]
             elif gen.get("max_output_tokens") is not None:
                 params["max_tokens"] = gen["max_output_tokens"]
             if "temperature" in gen:
                 params["temperature"] = gen["temperature"]
-            if gen.get("topP") is not None:
-                params["top_p"] = gen["topP"]
-            if gen.get("stopSequences"):
-                params["stop"] = gen["stopSequences"]
+            if _field(gen, "topP", "top_p") is not None:
+                params["top_p"] = _field(gen, "topP", "top_p")
+            if _field(gen, "stopSequences", "stop_sequences"):
+                params["stop"] = _field(gen, "stopSequences", "stop_sequences")
+            for json_name, proto_name, param in _GEN_DIRECT:
+                if _field(gen, json_name, proto_name) is not None:
+                    params[param] = _field(gen, json_name, proto_name)
+            fmt = _response_format(gen)
+            if fmt is not None:
+                params["response_format"] = fmt
+            thinking = _field(gen, "thinkingConfig", "thinking_config")
+            if thinking is not None:
+                params["thinking_config"] = _thinking_config(thinking)
         tools = body.get("tools")
         fns = _gemini_tools_to_openai(tools)
         if fns:
             params["tools"] = fns
+        _apply_tool_config(body.get("toolConfig") or body.get("tool_config"), params)
         return messages, model, params
 
     def serialise_response(self, resp):
@@ -254,14 +365,16 @@ class _GeminiStream(StreamTranslator):
     Text deltas stream live as incremental candidate frames. Streamed ``tool_calls``
     deltas (name / argument fragments, keyed by index) are accumulated — Gemini has no
     incremental functionCall-args frame — and flushed as ``functionCall`` parts in the
-    terminal frame (on ``finish_reason`` or in ``finish()``), mirroring the Anthropic
-    stream's tool-call accumulation."""
+    terminal frame, mirroring the Anthropic stream's tool-call accumulation. The terminal
+    frame goes out in ``finish()``, not on the ``finish_reason`` chunk: litellm sends the
+    usage in its own chunk after that one, and the frame carried zero tokens."""
 
     def __init__(self) -> None:
         self._model = ""
         self._prompt_tokens = 0
         self._completion_tokens = 0
-        self._final_emitted = False
+        self._finish_reason = "STOP"
+        self._final_text = ""          # text that came on the finish_reason chunk
         # index → {"name","args"} accumulated across tool_call deltas.
         self._tool_calls: Dict[int, Dict[str, str]] = {}
 
@@ -303,23 +416,11 @@ class _GeminiStream(StreamTranslator):
         if not has_text and not finish and not tool_deltas:
             return
         if finish:
-            # Emit BOTH the finish chunk's own text (Gemini parts may legally hold text
-            # alongside a functionCall) AND any accumulated tool calls — don't let the
-            # tool parts shadow the narration.
-            parts = ([{"text": text}] if has_text else []) + self._tool_call_parts()
-            if not parts:
-                parts = [{"text": ""}]
-            frame: Dict[str, Any] = {"candidates": [{
-                "content": {"role": "model", "parts": parts},
-                "finishReason": _FINISH_REASON.get(finish, "STOP"),
-                "index": 0,
-            }], "usageMetadata": {
-                "promptTokenCount": self._prompt_tokens,
-                "candidatesTokenCount": self._completion_tokens,
-                "totalTokenCount": self._prompt_tokens + self._completion_tokens,
-            }}
-            self._final_emitted = True
-            yield sse_line(frame)
+            # Held for the terminal frame in finish(), with its text: Gemini parts may hold
+            # text alongside a functionCall, and the tool parts must not shadow narration.
+            self._finish_reason = _FINISH_REASON.get(finish, "STOP")
+            if has_text:
+                self._final_text += text
         elif has_text:
             yield sse_line({"candidates": [{
                 "content": {"role": "model", "parts": [{"text": text}]},
@@ -332,12 +433,11 @@ class _GeminiStream(StreamTranslator):
         yield sse_line({"error": {"code": 502, "message": message, "status": "UNAVAILABLE"}})
 
     def finish(self) -> Iterable[str]:
-        if self._final_emitted:
-            return
-        parts = self._tool_call_parts() or [{"text": ""}]
+        parts = (([{"text": self._final_text}] if self._final_text else [])
+                 + self._tool_call_parts()) or [{"text": ""}]
         yield sse_line({"candidates": [{
             "content": {"role": "model", "parts": parts},
-            "finishReason": "STOP", "index": 0,
+            "finishReason": self._finish_reason, "index": 0,
         }], "usageMetadata": {
             "promptTokenCount": self._prompt_tokens,
             "candidatesTokenCount": self._completion_tokens,

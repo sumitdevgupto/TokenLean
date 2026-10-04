@@ -23,7 +23,7 @@
 #   - Terraform remote state object (gs://<project>-tf-state/<prefix>/default.tfstate)
 #   - config GCS bucket (token-opt-config-*)
 #   - Secret Manager secrets (tokenlean-backup-* + any token-opt/llm-key/routellm/db)
-#   - Service accounts (token-opt-proxy-sa, routellm-sidecar-sa, token-opt-ingest-push-sa)
+#   - Service accounts (every one Terraform creates: SERVICE_ACCOUNTS below)
 #   - Artifact Registry repo (implies --delete-images)
 #
 #   ★ WHY --full EXISTS: the default teardown deletes live infra via `gcloud`
@@ -72,11 +72,19 @@ NUKE=false                              # --nuke → --full PLUS tf-state + Clou
 SHOW_STATUS=true                        # --no-status → skip the consolidated post-teardown status view
 TF_STATE_PREFIX="token-opt"             # backend prefix (matches gcp-deploy.sh -backend-config prefix=)
 ARTIFACT_REPO="token-opt"               # Artifact Registry repo id (matches infra artifact_registry_repo default)
-# Service accounts created by the deploy (deleted only in --full).
+# Service accounts created by the deploy (deleted only in --full). Every account Terraform
+# creates must be here: --full also wipes the Terraform state, and the next apply fails on an
+# account that still exists. Those absent from a project are skipped.
 SERVICE_ACCOUNTS=(
   "token-opt-proxy-sa"
   "routellm-sidecar-sa"
   "token-opt-ingest-push-sa"
+  "token-opt-redis-vm"
+  "token-opt-qdrant-sa"
+  "token-opt-prometheus-sa"
+  "token-opt-alertmanager-sa"
+  "token-opt-grafana-sa"
+  "token-opt-langfuse-sa"
 )
 
 # ─── Never block on a gcloud prompt ──────────────────────────────────────────

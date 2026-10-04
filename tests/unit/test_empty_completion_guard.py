@@ -139,7 +139,10 @@ async def test_detection_runs_even_when_observability_is_disabled():
     """An honesty signal a deployment can switch off is not a signal. G18's own enable
     gate must not gate the thing that refuses to cache an empty answer."""
     ctx = _ctx(config={"groups": {"G18_observability": {"enabled": False}}})
-    await G18Observability().record(ctx, _response(""))
+    # The call is priced ahead of the gate too (the cost is not observability); this stub
+    # context carries no savings record, and pricing is not what this test is about.
+    with patch("middleware.g18_observability.price_response", return_value={}):
+        await G18Observability().record(ctx, _response(""))
     assert ctx.empty_completion is not None
     assert ctx.no_cache is True
 

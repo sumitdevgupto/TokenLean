@@ -11,7 +11,6 @@ Features:
   - Confidence scoring: ML-based confidence in bypass match quality
   - Rule effectiveness tracking: Hit rates per rule for optimization
 """
-import hashlib
 import json
 import logging
 import os
@@ -22,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from middleware import RequestContext
-from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G04"
@@ -91,9 +89,11 @@ async def _load_rules_from_db(tenant_id: Optional[str] = None) -> List[Dict[str,
         return []
 
     try:
-        import asyncpg
-        conn = await asyncpg.connect(db_url)
-        try:
+        # The shared pool: a connection of its own per call was a Postgres backend fork
+        # competing with the billing and usage writes for max_connections.
+        from cache.pg_pool import get_pg_pool
+        pool = await get_pg_pool(db_url)
+        async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT rule_id, name, category, keywords, patterns,
@@ -104,21 +104,19 @@ async def _load_rules_from_db(tenant_id: Optional[str] = None) -> List[Dict[str,
                 """,
                 tenant_id,
             )
-            rules = []
-            for row in rows:
-                rules.append({
-                    "rule_id": row["rule_id"],
-                    "name": row["name"],
-                    "category": row["category"],
-                    "keywords": row["keywords"] if isinstance(row["keywords"], list) else json.loads(row["keywords"]),
-                    "patterns": row["patterns"] if isinstance(row["patterns"], list) else json.loads(row["patterns"]),
-                    "backend_url": row["backend_url"],
-                    "static_response": row["static_response"],
-                    "confidence_threshold": row["confidence_threshold"],
-                })
-            return rules
-        finally:
-            await conn.close()
+        rules = []
+        for row in rows:
+            rules.append({
+                "rule_id": row["rule_id"],
+                "name": row["name"],
+                "category": row["category"],
+                "keywords": row["keywords"] if isinstance(row["keywords"], list) else json.loads(row["keywords"]),
+                "patterns": row["patterns"] if isinstance(row["patterns"], list) else json.loads(row["patterns"]),
+                "backend_url": row["backend_url"],
+                "static_response": row["static_response"],
+                "confidence_threshold": row["confidence_threshold"],
+            })
+        return rules
     except Exception as exc:
         logger.debug("Database-first rule loading failed (falling back to config): %s", exc)
         return []
@@ -130,19 +128,22 @@ async def _record_bypass_stat(rule_id: str, matched: bool, confidence: float, te
     try:
         redis = _get_redis()
         key = f"{_BYPASS_STATS_PREFIX}{tenant_id}:{rule_id}"
-        
+        # One round trip for the lot: these run for every rule on every request.
+        pipe = redis.pipeline(transaction=False)
+
         # Increment counters
-        await redis.hincrby(key, "checks", 1)
+        pipe.hincrby(key, "checks", 1)
         if matched:
-            await redis.hincrby(key, "hits", 1)
-            await redis.hset(key, "last_hit", str(time.time()))
-        
+            pipe.hincrby(key, "hits", 1)
+            pipe.hset(key, "last_hit", str(time.time()))
+
         # Store confidence histogram (binned)
         conf_bin = int(confidence * 10) / 10  # Round to 0.1
-        await redis.zincrby(f"{key}:conf_dist", 1, conf_bin)
-        
+        pipe.zincrby(f"{key}:conf_dist", 1, conf_bin)
+
         # Set expiry on stats (30 days)
-        await redis.expire(key, 30 * 86400)
+        pipe.expire(key, 30 * 86400)
+        await pipe.execute()
     except Exception as exc:
         logger.debug("Bypass stat recording failed: %s", exc)
 
@@ -167,14 +168,20 @@ class G04Bypass:
         pattern_weight = cfg.get("pattern_weight", 0.6)
         db_cache_ttl = cfg.get("db_cache_ttl_seconds", self._db_cache_ttl)
 
-        # Database-first resolution (if enabled)
-        if cfg.get("database_first", True) and (now - self._last_db_load.get(tenant_id, 0)) > db_cache_ttl:
-            db_rules = await _load_rules_from_db(tenant_id)
-            if db_rules:
-                self._rules[tenant_id] = [BypassRule(r, default_confidence, keyword_weight, pattern_weight) for r in db_rules]
-                self._rules_loaded_from[tenant_id] = "database"
+        # Database-first resolution (if enabled). The answer is kept for the TTL either way:
+        # database rules are used until it expires (the config rules used to replace them on
+        # the very next request), and so is "nothing there" (an empty or missing
+        # bypass_rules table, or an error), which used to be asked again on every request.
+        if cfg.get("database_first", True):
+            if (now - self._last_db_load.get(tenant_id, 0)) > db_cache_ttl:
                 self._last_db_load[tenant_id] = now
-                logger.debug("G04 loaded %d rules from database for tenant=%s", len(self._rules[tenant_id]), tenant_id)
+                db_rules = await _load_rules_from_db(tenant_id)
+                if db_rules:
+                    self._rules[tenant_id] = [BypassRule(r, default_confidence, keyword_weight, pattern_weight) for r in db_rules]
+                    self._rules_loaded_from[tenant_id] = "database"
+                    logger.debug("G04 loaded %d rules from database for tenant=%s", len(self._rules[tenant_id]), tenant_id)
+                    return self._rules[tenant_id]
+            elif self._rules_loaded_from.get(tenant_id) == "database":
                 return self._rules[tenant_id]
 
         # Fallback to config file rules

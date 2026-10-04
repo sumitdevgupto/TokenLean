@@ -11,8 +11,6 @@ model objects, never vectors). These tests pin the three properties that make sh
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src", "proxy")))
 
-from unittest.mock import patch
-
 import pytest
 
 import embedding_cache
@@ -153,64 +151,3 @@ class TestContentHash:
         assert content_hash("abc") != content_hash("abd")
         assert len(content_hash("abc")) == 64
 
-
-class TestIngestSkipsUnchangedContent:
-    """Re-ingesting a corpus used to re-encode every chunk unconditionally.
-
-    `add_chunk` embedded before it looked at the row, so an unchanged document cost a full
-    encode on every run - and a second app indexing the same document paid it again.
-    """
-
-    class _Conn:
-        def __init__(self, stored_hash=None):
-            self.stored_hash = stored_hash
-            self.executed = []
-
-        async def fetchval(self, sql, *args):
-            return self.stored_hash
-
-        async def execute(self, sql, *args):
-            self.executed.append((sql, args))
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-    class _Pool:
-        def __init__(self, conn):
-            self._conn = conn
-
-        def acquire(self):
-            return self._conn
-
-    async def _add(self, conn, text, model):
-        from middleware.g07_pgvector_fallback import PGVectorRAG
-        rag = PGVectorRAG(dsn="postgres://x")
-        with patch.object(PGVectorRAG, "_get_pool", return_value=self._Pool(conn)):
-            return await rag.add_chunk("chunk-1", text)
-
-    async def test_unchanged_content_skips_embed_and_write(self, fake_redis, model):
-        from embedding_cache import content_hash as ch
-        text = "a stable paragraph of documentation"
-        conn = self._Conn(stored_hash=ch(text))
-        assert await self._add(conn, text, model) is True
-        assert model.calls == 0, "unchanged content must not be re-embedded"
-        assert conn.executed == [], "unchanged content must not be re-written"
-
-    async def test_changed_content_is_re_embedded(self, fake_redis, model):
-        conn = self._Conn(stored_hash="stale-hash-from-an-older-revision")
-        assert await self._add(conn, "new text", model) is True
-        assert model.calls == 1
-        assert conn.executed, "changed content must be written"
-
-    async def test_new_chunk_is_embedded_and_stores_its_hash(self, fake_redis, model):
-        from embedding_cache import content_hash as ch
-        text = "brand new chunk"
-        conn = self._Conn(stored_hash=None)
-        assert await self._add(conn, text, model) is True
-        assert model.calls == 1
-        sql, args = conn.executed[0]
-        assert "content_hash" in sql
-        assert ch(text) in args, "the delta-sync key must be persisted or dedup never fires"

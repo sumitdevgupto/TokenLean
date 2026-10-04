@@ -24,13 +24,26 @@ Design invariants (see the plan `check-g6-routing-logic-zany-leaf.md`):
   value can only make a matcher *fail to match* — never crash, never
   match-everything.
 
+* **Time-limited patterns.** Rule regexes are tenant-authored and run on the event
+  loop every tenant shares, so one catastrophic pattern (``(a|aa)+c`` on a run of
+  "a"s backtracks exponentially) could freeze a worker. Searches use the ``regex``
+  module, which the proxy pins, with one time budget (``MATCH_BUDGET_SECONDS``) for
+  all of a request's pattern searches; a search that runs out counts as no match.
+
 Reference: G06 in AGENTS.md. This module is intentionally dependency-free
-(stdlib only) so the commercial portal dry-run tester and the run-readiness
-probe can import it without pulling in the middleware stack.
+(stdlib only, plus ``regex`` when it is installed) so the commercial portal dry-run
+tester and the run-readiness probe can import it without pulling in the middleware
+stack. Without ``regex`` the stdlib engine is used, with no time limit.
 """
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:  # time-limited searches; pinned in src/proxy/requirements.txt
+    import regex as _engine
+except ImportError:  # pragma: no cover - tooling without the proxy's dependencies
+    _engine = None
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +71,12 @@ VALID_TIERS = ("simple", "medium", "complex")
 MAX_RULES = 100
 MAX_PATTERN_LEN = 512          # per-pattern char cap → ReDoS surface bound
 MAX_MATCH_TEXT_CHARS = 20_000  # truncate the joined prompt before regex
+# All of one request's rule-pattern searches together; an ordinary search over 20k
+# chars takes well under a millisecond, so only a runaway pattern ever reaches this.
+MATCH_BUDGET_SECONDS = 0.05
 _PATTERN_CACHE_CAP = 4096
+_TIMEOUT_LOG_EVERY_SECONDS = 60.0
+_last_timeout_log: Dict[str, float] = {}
 
 # Compiled-pattern cache. None is a VALID cached value (invalid/over-long regex),
 # so a distinct sentinel marks a true cache miss.
@@ -70,11 +88,13 @@ __all__ = [
     "VALID_TIERS",
     "MAX_RULES",
     "MAX_PATTERN_LEN",
+    "MATCH_BUDGET_SECONDS",
     "normalize_rules",
     "rule_matches",
     "evaluate_rules",
     "match_for_ctx",
     "effective_cfg",
+    "has_nested_quantifier",
 ]
 
 
@@ -102,14 +122,104 @@ def _compile_pattern(pattern: str) -> Optional["re.Pattern"]:
         )
     else:
         try:
-            compiled = re.compile(pattern, re.IGNORECASE)
-        except re.error as exc:
+            if _engine is not None:
+                compiled = _engine.compile(pattern, _engine.IGNORECASE)
+            else:
+                compiled = re.compile(pattern, re.IGNORECASE)
+        except Exception as exc:  # re.error / regex.error: an unusable pattern never matches
             logger.warning("G06 rules: invalid regex %r skipped: %s", pattern[:80], exc)
             compiled = None
     if len(_PATTERN_CACHE) >= _PATTERN_CACHE_CAP:
         _PATTERN_CACHE.clear()
     _PATTERN_CACHE[pattern] = compiled
     return compiled
+
+
+class _Budget:
+    """What is left of one request's pattern-search time. The first search that runs out
+    spends all of it, so every later pattern counts as no match without running."""
+
+    __slots__ = ("deadline",)
+
+    def __init__(self, seconds: float = MATCH_BUDGET_SECONDS) -> None:
+        self.deadline = time.perf_counter() + seconds
+
+    def remaining(self) -> float:
+        return self.deadline - time.perf_counter()
+
+    def spend(self) -> None:
+        self.deadline = float("-inf")
+
+
+def _search(rx, pattern: str, text: str, budget: "_Budget",
+            on_timeout: Optional[Callable[[str], None]]) -> Optional[bool]:
+    """``rx.search(text)`` within what is left of the request's budget: True/False, or
+    None when the budget ran out (then the pattern counts as no match)."""
+    if _engine is None:
+        return rx.search(text) is not None
+    remaining = budget.remaining()
+    try:
+        if remaining <= 0:
+            raise TimeoutError
+        return rx.search(text, timeout=remaining) is not None
+    except TimeoutError:
+        budget.spend()
+        now = time.monotonic()
+        if now - _last_timeout_log.get(pattern, float("-inf")) >= _TIMEOUT_LOG_EVERY_SECONDS:
+            _last_timeout_log[pattern] = now
+            logger.warning("G06 rules: pattern %r ran out of its %d ms budget on a %d-char "
+                           "prompt and counts as no match", pattern[:80],
+                           int(MATCH_BUDGET_SECONDS * 1000), len(text))
+        if on_timeout is not None:
+            try:
+                on_timeout(pattern)
+            except Exception as exc:  # noqa: BLE001 — a metrics hook never breaks routing
+                logger.debug("G06 rules: timeout hook failed: %s", exc)
+        return None
+
+
+def has_nested_quantifier(pattern: str) -> bool:
+    """True when an unbounded repeat (``*``, ``+``, ``{n,}``) contains another repeat
+    that can run more than once — ``(a+)+``, ``(\\w+\\s?)*``: the classic shape whose
+    backtracking grows exponentially. The portal refuses it on save; the engine still
+    runs any pattern, time-limited, which also covers what this does not catch (such as
+    ``(a|aa)+``). Fixed counts (``(\\w+\\s){3}``) and optional items (``(a\\s?)+``) pass.
+    An unparseable pattern returns False (compiling it reports the real error)."""
+    try:
+        from re import _parser as parser  # the stdlib's own regex parser (3.11+)
+    except ImportError:  # pragma: no cover - older Pythons
+        import sre_parse as parser
+    try:
+        parsed = parser.parse(pattern)
+    except Exception:
+        return False
+    repeats = {"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"}
+    unbounded = getattr(parser, "MAXREPEAT", 2 ** 32 - 1)
+
+    def walk(items, inside_unbounded: bool) -> bool:
+        for op, av in items:
+            name = str(op)
+            if name in repeats:
+                lo, hi, sub = av
+                if inside_unbounded and lo != hi and hi != 1:
+                    return True
+                if walk(sub, inside_unbounded or hi == unbounded):
+                    return True
+            elif name == "SUBPATTERN":
+                if walk(av[-1], inside_unbounded):
+                    return True
+            elif name == "BRANCH":
+                if any(walk(alt, inside_unbounded) for alt in av[1]):
+                    return True
+            elif name in ("ASSERT", "ASSERT_NOT"):
+                if walk(av[1], inside_unbounded):
+                    return True
+            elif name == "ATOMIC_GROUP":
+                if walk(av, inside_unbounded):
+                    return True
+        return False
+
+    return walk(parsed, False)
 
 
 def _priority(rule: Dict[str, Any]) -> int:
@@ -149,6 +259,8 @@ def rule_matches(
     has_tools: bool,
     params: Dict[str, Any],
     user_id: str,
+    budget: Optional[_Budget] = None,
+    on_timeout: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
     """Evaluate one rule's ``match`` block against the request primitives.
 
@@ -156,6 +268,9 @@ def rule_matches(
     Returns ``(matched, failed_field)`` — ``failed_field`` names the first matcher
     that failed (for the dry-run explain trace) and is ``""`` on a full match.
     Pure function on primitives so the portal tester can call it directly.
+    ``budget`` caps the pattern searches (shared across a request's rules by
+    ``evaluate_rules``); unset, this rule gets ``MATCH_BUDGET_SECONDS`` of its own.
+    ``on_timeout(pattern)`` hears of each pattern stopped by the budget.
     """
     match = rule.get("match")
     if not isinstance(match, dict) or not match:
@@ -170,17 +285,24 @@ def rule_matches(
         if not any(isinstance(k, str) and k and k.lower() in low for k in keywords):
             return False, "keywords"
 
-    # Content — patterns: any-of regex search over the (truncated) prompt text.
+    # Content — patterns: any-of regex search over the (truncated) prompt text, within
+    # the request's time budget; a pattern that runs out of it counts as no match.
     patterns = match.get("patterns")
     if patterns:
-        hit = False
+        if budget is None:
+            budget = _Budget()
+        hit, timed_out = False, False
         for pat in patterns:
             rx = _compile_pattern(pat)
-            if rx is not None and rx.search(text):
+            if rx is None:
+                continue
+            found = _search(rx, pat, text, budget, on_timeout)
+            if found:
                 hit = True
                 break
+            timed_out = timed_out or found is None
         if not hit:
-            return False, "patterns"
+            return False, "patterns (timed out)" if timed_out else "patterns"
 
     # Size — token-count bounds (0/absent = no bound).
     min_tok = _as_int(match.get("min_prompt_tokens"), 0)
@@ -227,14 +349,18 @@ def evaluate_rules(
     params: Dict[str, Any],
     user_id: str,
     explain: bool = False,
+    on_timeout: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """First-match-wins evaluation over an already-normalized rule list.
 
     Returns ``(matched_rule_or_None, trace)``. ``trace`` is populated only when
     ``explain`` is true (one ``{id, matched, failed_on}`` row per rule up to and
-    including the match) — used by the portal dry-run tester.
+    including the match) — used by the portal dry-run tester. All the rules' pattern
+    searches share one ``MATCH_BUDGET_SECONDS`` budget, so no rule count can stretch
+    the time a request holds the event loop.
     """
     trace: List[Dict[str, Any]] = []
+    budget = _Budget()
     for rule in rules:
         matched, failed = rule_matches(
             rule,
@@ -244,6 +370,8 @@ def evaluate_rules(
             has_tools=has_tools,
             params=params,
             user_id=user_id,
+            budget=budget,
+            on_timeout=on_timeout,
         )
         if explain:
             trace.append(
@@ -269,13 +397,20 @@ def _match_text(messages: List[Dict[str, Any]]) -> str:
     return text[:MAX_MATCH_TEXT_CHARS]
 
 
-def match_for_ctx(ctx, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def match_for_ctx(ctx, cfg: Dict[str, Any],
+                  on_timeout: Optional[Callable[[str], None]] = None) -> Optional[Dict[str, Any]]:
     """Adapter: extract the request primitives from ``ctx`` and return the first
-    matching rule (or ``None``). Cheap no-op when there are no rules."""
+    matching rule (or ``None``). Cheap no-op when there are no rules. ``on_timeout``
+    is told of each pattern that ran out of the time budget."""
     rules = normalize_rules(cfg)
     if not rules:
         return None
     params = ctx.params if isinstance(getattr(ctx, "params", None), dict) else {}
+    # Every X-* header is a routing hint a rule may match, but ctx.params keeps only
+    # TokenLean's own (it is persisted), so the rest arrive in ctx.routing_headers. A header
+    # wins over a body field of the same name, as when headers were copied into params.
+    headers = getattr(ctx, "routing_headers", None)
+    hints = {**params, **headers} if isinstance(headers, dict) else params
     try:
         prompt_tokens = int(ctx.current_token_count)
     except Exception:  # pragma: no cover - token estimate must never break routing
@@ -286,8 +421,9 @@ def match_for_ctx(ctx, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         prompt_tokens=prompt_tokens,
         model=getattr(ctx, "model", "") or "",
         has_tools=bool(params.get("tools")),
-        params=params,
+        params=hints,
         user_id=getattr(ctx, "user_id", "") or "",
+        on_timeout=on_timeout,
     )
     return rule
 

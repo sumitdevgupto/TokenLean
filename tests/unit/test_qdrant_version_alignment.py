@@ -14,21 +14,27 @@ proxy was pinned `>=1.12,<1.13`, GCP shipped server v1.9.0 and local dev v1.12.6
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).parent.parent.parent
 
 # Every HUMAN-MAINTAINED requirements file that pins qdrant-client. All must carry
-# the SAME range spec. The proxy's spec lives in requirements.in — requirements.txt
-# is its COMPILED lockfile (exact ==pin), checked separately below.
+# the SAME range spec. Each image's spec lives in its requirements.in — the
+# requirements.txt beside it is its COMPILED lockfile (exact ==pin), checked separately below.
 # Split by tree: the OSS gate builds via `git archive HEAD`, so anything gitignored
 # is simply absent there and must be checked only when it is actually present.
 CLIENT_PIN_FILES = [
     "src/proxy/requirements.in",
+    "src/doc-pipeline/requirements.in",
+    "src/finetune-pipeline/requirements.in",
+]
+
+# Compiled lockfiles — each carries the exact resolved pin (e.g. ==1.12.2).
+COMPILED_LOCKFILES = [
+    "src/proxy/requirements.txt",
     "src/doc-pipeline/requirements.txt",
     "src/finetune-pipeline/requirements.txt",
 ]
-
-# Compiled lockfile — carries the exact resolved pin (e.g. ==1.12.2).
-COMPILED_LOCKFILE = "src/proxy/requirements.txt"
 
 # Gitignored (commercial repo) — present in a full working tree, absent in the OSS tree.
 OPTIONAL_CLIENT_PIN_FILES = [
@@ -124,19 +130,20 @@ def test_client_pin_tracks_the_server_minor():
         )
 
 
-def test_compiled_lockfile_pin_matches_server():
+@pytest.mark.parametrize("lockfile", COMPILED_LOCKFILES)
+def test_compiled_lockfile_pin_matches_server(lockfile):
     """The pin that actually SHIPS (compiled requirements.txt) must sit inside the
     server's minor window too — this is the line a Dependabot lockfile bump edits."""
     match = re.search(
-        r"^qdrant-client==(\d+)\.(\d+)", _read(COMPILED_LOCKFILE), re.MULTILINE
+        r"^qdrant-client==(\d+)\.(\d+)", _read(lockfile), re.MULTILINE
     )
-    assert match, f"{COMPILED_LOCKFILE} no longer pins qdrant-client exactly"
+    assert match, f"{lockfile} no longer pins qdrant-client exactly"
     client = (int(match.group(1)), int(match.group(2)))
 
     for rel, server in _server_versions().items():
         assert client[0] == server[0] and abs(client[1] - server[1]) <= 1, (
             f"compiled qdrant-client pin {client[0]}.{client[1]} in "
-            f"{COMPILED_LOCKFILE} is incompatible with the server "
+            f"{lockfile} is incompatible with the server "
             f"{server[0]}.{server[1]} declared in {rel} — regenerate via "
             "scripts/compile-requirements.sh after fixing requirements.in"
         )

@@ -67,15 +67,22 @@ def get_client() -> Optional[Any]:
         return None
 
 
+# What a G29/G31 action leaves in the text: only `mask` replaces the PII it found.
+_PII_LEFT_IN_TEXT = frozenset({"flag", "block"})
+
+
 def _should_capture_content(ctx: "RequestContext") -> bool:
-    """Per-tenant toggle for writing raw prompt/response content into traces (I1).
+    """Whether a trace may carry the request's raw prompt and response (I1).
 
     All tenants share one Langfuse project, so raw ``input``/``output`` would be
-    visible to anyone with project access. Tenants that require content isolation
-    set ``capture_trace_content: false`` under their G18_observability config
-    (per-tenant override wins); token counts and savings metadata are still
-    recorded. Default True keeps the current behaviour for existing deployments.
+    visible to anyone with project access. Off unless ``capture_trace_content`` is true
+    under G18_observability (a tenant's override wins); token counts and savings metadata
+    are recorded either way. Even when on, a request whose PII G29 or G31 found and left in
+    the text (``flag``, or a ``block``) is traced without its content.
     """
+    if (getattr(ctx, "pii_action", None) in _PII_LEFT_IN_TEXT
+            or getattr(ctx, "context_trust_pii_action", None) in _PII_LEFT_IN_TEXT):
+        return False
     try:
         base = ctx.config.get("groups", {}).get("G18_observability", {})
         tenant_cfg = (
@@ -84,9 +91,9 @@ def _should_capture_content(ctx: "RequestContext") -> bool:
             .get("groups", {})
             .get("G18_observability", {})
         )
-        return bool(tenant_cfg.get("capture_trace_content", base.get("capture_trace_content", True)))
+        return bool(tenant_cfg.get("capture_trace_content", base.get("capture_trace_content", False)))
     except Exception:
-        return True
+        return False
 
 
 def start_trace(ctx: "RequestContext") -> Optional[Any]:
@@ -130,6 +137,15 @@ def start_trace(ctx: "RequestContext") -> Optional[Any]:
         return None
 
 
+def _measurements_only(payload: Any) -> Optional[Dict[str, Any]]:
+    """A span payload's numbers and flags (token counts, ratios, hit/miss), without any
+    text, list or nested object that could carry the request's content."""
+    if not isinstance(payload, dict):
+        return None
+    return {k: v for k, v in payload.items()
+            if v is None or isinstance(v, (bool, int, float))}
+
+
 def add_span(
     ctx: "RequestContext",
     name: str,
@@ -142,10 +158,10 @@ def add_span(
     trace = getattr(ctx, "langfuse_trace", None)
     if not trace:
         return None
-    # I1: redact raw payloads when this tenant opts out of content capture.
+    # I1: without content capture a span keeps its measurements, never its text.
     if not _should_capture_content(ctx):
-        span_input = None
-        output = None
+        span_input = _measurements_only(span_input)
+        output = _measurements_only(output)
     try:
         return trace.span(
             name=name,

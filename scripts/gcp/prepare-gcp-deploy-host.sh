@@ -97,7 +97,13 @@ if [[ -f "${REPO_ROOT}/.env.gcp" ]]; then
   source "${REPO_ROOT}/.env.gcp" 2>/dev/null || true
   set +a
 fi
-PROJECT_ID="${GCP_PROJECT_ID:-token-optimisation}"
+# No fallback project: the maintainer's id used to stand in, and gcloud was set to it.
+PROJECT_ID="${GCP_PROJECT_ID:-}"
+if [[ "$PROJECT_ID" == "your-gcp-project-id" ]]; then
+  bad ".env.gcp still has the template's placeholder GCP_PROJECT_ID"
+  fail "Set GCP_PROJECT_ID in .env.gcp to your project id"
+  PROJECT_ID=""
+fi
 REGION="${GCP_REGION:-asia-south1}"
 
 # ─── Helper: is a command on PATH? ───────────────────────────────────────────
@@ -158,7 +164,9 @@ if have cloud-sql-proxy; then
   ok "cloud-sql-proxy present ($(cloud-sql-proxy --version 2>/dev/null | head -1))"
 elif [[ "$NO_INSTALL" == false ]]; then
   info "Installing cloud-sql-proxy ${CSP_VERSION}…"
-  _csp="/tmp/cloud-sql-proxy.$$"
+  # Downloaded into a directory only this run can write, since sudo installs it from there:
+  # at a guessable /tmp path another user of the host could swap in their own binary.
+  _csp_dir="$(mktemp -d)"; _csp="${_csp_dir}/cloud-sql-proxy"
   if curl -fsSL -o "$_csp" "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/${CSP_VERSION}/cloud-sql-proxy.linux.amd64"; then
     chmod +x "$_csp" && $SUDO mv "$_csp" /usr/local/bin/cloud-sql-proxy \
       && ok "cloud-sql-proxy installed" \
@@ -167,6 +175,7 @@ elif [[ "$NO_INSTALL" == false ]]; then
     bad "cloud-sql-proxy download failed"
     fail "Install cloud-sql-proxy: curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/${CSP_VERSION}/cloud-sql-proxy.linux.amd64 && chmod +x cloud-sql-proxy && sudo mv cloud-sql-proxy /usr/local/bin/"
   fi
+  rm -rf "$_csp_dir"
 else
   bad "cloud-sql-proxy missing"
   fail "Install cloud-sql-proxy (see https://cloud.google.com/sql/docs/postgres/sql-proxy#install)"
@@ -250,10 +259,10 @@ elif [[ "$NO_INSTALL" == false && "$APT" == true ]]; then
     # release codename — the common cause of `E: Unable to locate package terraform`).
     warn "apt repo install failed — falling back to direct binary download…"
     _tfver="1.9.8"
-    if curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${_tfver}/terraform_${_tfver}_linux_amd64.zip" 2>/dev/null; then
+    _tf_dir="$(mktemp -d)"    # sudo installs from here: a directory only this run can write
+    if curl -fsSL -o "${_tf_dir}/terraform.zip" "https://releases.hashicorp.com/terraform/${_tfver}/terraform_${_tfver}_linux_amd64.zip" 2>/dev/null; then
       ( command -v unzip &>/dev/null || $SUDO apt-get install -y -qq unzip >/dev/null 2>&1 )
-      if unzip -o -q /tmp/terraform.zip -d /tmp && $SUDO mv /tmp/terraform /usr/local/bin/terraform && $SUDO chmod +x /usr/local/bin/terraform; then
-        rm -f /tmp/terraform.zip
+      if unzip -o -q "${_tf_dir}/terraform.zip" -d "$_tf_dir" && $SUDO mv "${_tf_dir}/terraform" /usr/local/bin/terraform && $SUDO chmod +x /usr/local/bin/terraform; then
         have terraform && ok "terraform installed (binary ${_tfver})" \
           || { bad "terraform still not on PATH after binary install"; fail "Install terraform manually: https://developer.hashicorp.com/terraform/install#linux"; }
       else
@@ -262,6 +271,7 @@ elif [[ "$NO_INSTALL" == false && "$APT" == true ]]; then
     else
       bad "terraform binary download failed"; fail "Install terraform manually: https://developer.hashicorp.com/terraform/install#linux"
     fi
+    rm -rf "$_tf_dir"
   fi
 else
   bad "terraform missing"; fail "Install terraform: https://developer.hashicorp.com/terraform/install#linux"
@@ -321,12 +331,23 @@ if [[ -n "$GCLOUD" ]]; then
 
   # ── Project pinned (non-interactive — just set it) ──
   CUR_PROJECT="$("$GCLOUD" config get-value project 2>/dev/null)"
-  if [[ "$CUR_PROJECT" != "$PROJECT_ID" && "$NO_AUTH" == false ]]; then
+  if [[ -z "$PROJECT_ID" ]]; then
+    # No project in .env.gcp: keep the one gcloud already uses, rather than set a guess.
+    if [[ -n "$CUR_PROJECT" ]]; then
+      PROJECT_ID="$CUR_PROJECT"
+      warn "No GCP_PROJECT_ID in .env.gcp — using gcloud's project, ${PROJECT_ID}"
+    else
+      bad "no GCP project set"
+      fail "Set GCP_PROJECT_ID in .env.gcp, or:  gcloud config set project <your-project-id>"
+    fi
+  elif [[ "$CUR_PROJECT" != "$PROJECT_ID" && "$NO_AUTH" == false ]]; then
     info "Setting gcloud project → ${PROJECT_ID}…"
     "$GCLOUD" config set project "$PROJECT_ID" >/dev/null 2>&1 || true
     CUR_PROJECT="$("$GCLOUD" config get-value project 2>/dev/null)"
   fi
-  if [[ "$CUR_PROJECT" == "$PROJECT_ID" ]]; then
+  if [[ -z "$PROJECT_ID" ]]; then
+    :   # reported just above
+  elif [[ "$CUR_PROJECT" == "$PROJECT_ID" ]]; then
     ok "gcloud project set to ${PROJECT_ID}"
   elif [[ -n "$CUR_PROJECT" ]]; then
     warn "gcloud project is '${CUR_PROJECT}', expected '${PROJECT_ID}' (from .env.gcp)"

@@ -297,3 +297,92 @@ class TestG29PhiOptIn:
         out = await G29PiiRedaction().process_request(ctx)
         assert out.security_blocked is True
         assert out.security_block_response["choices"][0]["finish_reason"] == "content_filter"
+
+
+# ── Response tool-call arguments ─────────────────────────────────────────────
+# The request side masks tool-call arguments; the response side only ever touched content,
+# so the client's tool received "[PII:EMAIL:1]" as the address, and PII the model wrote into
+# a tool call was never masked.
+def _tool_call_response(arguments, legacy=False):
+    msg = {"role": "assistant", "content": None}
+    if legacy:
+        msg["function_call"] = {"name": "send_email", "arguments": arguments}
+    else:
+        msg["tool_calls"] = [{"id": "c1", "type": "function",
+                              "function": {"name": "send_email", "arguments": arguments}}]
+    return {"choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}]}
+
+
+def _arguments(out, legacy=False):
+    msg = out["choices"][0]["message"]
+    return (msg["function_call"] if legacy else msg["tool_calls"][0]["function"])["arguments"]
+
+
+async def _masked_request_with_a_tool_call():
+    import json as _json
+    mw = G29PiiRedaction()
+    ctx = _ctx([{"role": "user", "content": "email her"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c0", "type": "function", "function": {
+                        "name": "lookup", "arguments": _json.dumps({"to": EMAIL})}}]},
+                {"role": "tool", "tool_call_id": "c0", "content": "found"}], mode="mask")
+    await mw.process_request(ctx)
+    assert ctx.pii_vault, "the request side masked nothing"
+    return mw, ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True], ids=["tool_calls", "function_call"])
+async def test_the_callers_pii_is_restored_in_tool_call_arguments(legacy):
+    import json as _json
+    mw, ctx = await _masked_request_with_a_tool_call()
+    placeholder = next(iter(ctx.pii_vault))
+    out = await mw.process_response(
+        ctx, _tool_call_response(_json.dumps({"to": placeholder, "subject": "Hi"}), legacy))
+    assert _json.loads(_arguments(out, legacy)) == {"to": EMAIL, "subject": "Hi"}
+
+
+@pytest.mark.asyncio
+async def test_pii_the_model_writes_into_tool_call_arguments_is_masked():
+    import json as _json
+    mw = G29PiiRedaction()
+    ctx = _ctx([{"role": "user", "content": "no pii here"}], mode="mask")
+    await mw.process_request(ctx)
+    out = await mw.process_response(
+        ctx, _tool_call_response(_json.dumps({"ssn": "123-45-6789"})))
+    args = _json.loads(_arguments(out))
+    assert args == {"ssn": "[US_SSN]"}
+    assert ctx.pii_redactions == 1
+
+
+@pytest.mark.asyncio
+async def test_flag_mode_counts_pii_in_tool_call_arguments_without_changing_them():
+    mw = G29PiiRedaction()
+    ctx = _ctx([{"role": "user", "content": "hi"}], mode="flag")
+    await mw.process_request(ctx)
+    raw = '{"to":"bob@z.com"}'           # the model's own spelling, kept when nothing changes
+    out = await mw.process_response(ctx, _tool_call_response(raw))
+    assert _arguments(out) == raw
+    assert ctx.pii_redactions == 1
+
+
+@pytest.mark.asyncio
+async def test_a_restored_value_is_escaped_inside_the_json():
+    import json as _json
+    mw, ctx = await _masked_request_with_a_tool_call()
+    placeholder = next(iter(ctx.pii_vault))
+    ctx.pii_vault[placeholder] = 'Bob "the builder" <bob@z.com>'
+    out = await mw.process_response(ctx, _tool_call_response(_json.dumps({"to": placeholder})))
+    try:
+        args = _json.loads(_arguments(out))
+    except ValueError:
+        pytest.fail(f"the arguments are no longer JSON: {_arguments(out)!r}")
+    assert args == {"to": 'Bob "the builder" <bob@z.com>'}
+
+
+@pytest.mark.asyncio
+async def test_arguments_that_are_not_json_are_handled_as_text():
+    mw, ctx = await _masked_request_with_a_tool_call()
+    placeholder = next(iter(ctx.pii_vault))
+    out = await mw.process_response(ctx, _tool_call_response(f"to={placeholder}"))
+    assert _arguments(out) == f"to={EMAIL}"

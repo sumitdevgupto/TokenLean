@@ -32,6 +32,13 @@ C dominates B whenever F < P, which is always. At N=1 every floor loses, because
 first request pays a cache WRITE (w >= 1.0) on a bigger span — which is why N is
 measured rather than assumed, and why this ships off.
 
+But C is only on the table for a consumer that can aim at the floor: G01, with a
+compressor that has a rate dial and lands above the floor. G08 and G19 can only take a
+shrink or refuse it, and a refusal keeps the span whole — so for them, and for G01 once C
+has failed, the alternative to A is B. Weighing A against an unreachable C refuses shrinks
+that are cheaper than the preserving they fall back to (read x0.50 above: 19,140 refused
+in favour of 31,682). ``can_floor`` says which arm the consumer can actually reach.
+
 Nothing here knows a provider's name. The floor, the multipliers and the definition of
 "the span the provider measures its floor over" all come from the adapter (Gate 3).
 """
@@ -40,7 +47,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence
 
 from savings.calculator import count_messages_tokens, count_tools_tokens
 
@@ -145,16 +152,19 @@ def compress_is_cheaper(
     read_mult: float,
     write_mult: float,
     reuse: int,
+    can_floor: bool = True,
 ) -> bool:
-    """True when compressing the span freely (arm A) is the cheapest of the three arms.
+    """True when compressing the span freely (arm A) is cheaper than the alternative the
+    consumer can actually reach.
 
     Pure function, no ctx, no config — so the whole economic decision is one testable
     expression rather than a rule of thumb spread across three middleware files.
 
-    Arm A costs ``N * span_after``; the best cacheable alternative costs
-    ``w*F + (N-1)*r*F`` (arm C, which is never worse than arm B since F <= span_before).
-    Compressing wins when A is at least as cheap, and also whenever the compression did
-    not actually cross the floor — there is nothing to protect then.
+    Arm A costs ``N * span_after``. The alternative is arm C, ``w*F + (N-1)*r*F``, when
+    the consumer can compress down to the floor (``can_floor``), and otherwise arm B,
+    ``w*P + (N-1)*r*P`` with P = ``span_before``: a take-or-refuse consumer keeps the span
+    whole when it refuses. Compressing wins when A is at least as cheap, and also whenever
+    the compression did not actually cross the floor — there is nothing to protect then.
     """
     if floor <= 0 or reuse < 1:
         return True
@@ -164,7 +174,8 @@ def compress_is_cheaper(
     if span_after >= floor:
         # Still cacheable after compression — the best possible outcome, take it.
         return True
-    cacheable_cost = write_mult * floor + (reuse - 1) * read_mult * floor
+    kept = floor if can_floor else span_before
+    cacheable_cost = write_mult * kept + (reuse - 1) * read_mult * kept
     compressed_cost = reuse * span_after
     return compressed_cost <= cacheable_cost
 
@@ -181,9 +192,14 @@ def snapshot_is_stale(ctx: Any) -> bool:
     return bool(getattr(ctx, "cache_floor_stale_snapshot", False))
 
 
-def allows_shrink(ctx: Any, span_before: int, span_after: int, group: str = "") -> bool:
+def allows_shrink(ctx: Any, span_before: int, span_after: int, group: str = "",
+                  can_floor: bool = False) -> bool:
     """Consumer entry point: may this group take the span from ``span_before`` to
     ``span_after``? Inert (always True) unless a reservation is active.
+
+    ``can_floor`` is True only for a consumer that will try to land the span ON the floor
+    when refused (G01 with a rate dial). Everyone else keeps the span whole on a refusal,
+    so they are weighed against preserving it — see :func:`compress_is_cheaper`.
 
     Carries the structural backstop for a STALE snapshot. A reservation is only ever
     taken when the span was already at or above the floor, so a live span that measures
@@ -215,7 +231,7 @@ def allows_shrink(ctx: Any, span_before: int, span_after: int, group: str = "") 
             )
         return False
     return compress_is_cheaper(
-        span_before, span_after, fl.floor, fl.read_mult, fl.write_mult, fl.reuse
+        span_before, span_after, fl.floor, fl.read_mult, fl.write_mult, fl.reuse, can_floor
     )
 
 

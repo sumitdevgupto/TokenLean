@@ -71,6 +71,17 @@ class TestREADMEGroups:
             "README hero should no longer describe a slot as reserved - all 28 ship"
         )
 
+    @pytest.mark.parametrize("doc", [
+        "DEPLOYMENT.md", "docs/client-onboarding.md", "docs/deployment-gcp.md",
+        "docs/deployment-local.md", "docs/request-flow-diagram.md", "docs/config-reference.md",
+        "src/proxy/main.py", "src/proxy/middleware/pipeline.py"])
+    def test_no_guide_calls_g26_reserved(self, doc):
+        """The four guides and the API description still said "G26 reserved" months after it
+        shipped. The reserved slot is G27 (multimodal): no image transform ships."""
+        import re
+        text = _read(README_PATH.parent / doc)
+        assert not re.search(r"G26[^.\n]{0,40}reserved", text), doc
+
 
 # ── Open-core barricade: no commercial-only marketing in the public README ────
 

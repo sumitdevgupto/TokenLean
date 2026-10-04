@@ -215,6 +215,34 @@ class TestUsageMeterC2Reliability:
         mock_http.post.assert_not_called()        # but NOT pushed to the billing sink
 
 
+class TestTheImpersonatorIsRecorded:
+    """An admin key acting as another tenant writes that tenant's row, naming the key's own
+    tenant, so operator traffic can be told apart from the tenant's."""
+
+    def test_the_event_names_the_impersonating_key_s_tenant(self):
+        ctx = _make_ctx()
+        ctx.impersonator_tenant_id = "ops"
+        assert UsageMeter(db_pool=None)._build_event(ctx, {}).impersonated_by == "ops"
+        assert UsageMeter(db_pool=None)._build_event(_make_ctx(), {}).impersonated_by == ""
+
+    @pytest.mark.asyncio
+    async def test_the_row_stores_it(self):
+        import re as _re
+        mock_conn = AsyncMock()
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        ctx = _make_ctx()
+        ctx.impersonator_tenant_id = "ops"
+        await UsageMeter(db_pool=mock_pool).record(ctx, {}, billable=False)
+        sql, *params = mock_conn.execute.call_args[0]
+        cols = [c.strip() for c in _re.search(r"INSERT INTO usage_events\s*\((.*?)\)\s*VALUES",
+                                               sql, _re.S).group(1).split(",") if c.strip()]
+        assert "impersonated_by" in cols
+        assert params[cols.index("impersonated_by")] == "ops"
+        assert params[cols.index("billable")] is False
+
+
 class TestUsageMeterRecord:
     @pytest.mark.asyncio
     async def test_postgres_insert_called_with_correct_values(self):

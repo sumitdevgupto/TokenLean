@@ -1,25 +1,34 @@
 """
 G23 · Streaming Output Compression
 Stage: After Response
-Saving: 10-25% on repetitive output re-used as context in subsequent turns
+Saving: none (a measurement)
 
 Identifies high-frequency repeated n-gram patterns in the LLM response text
 (e.g. repeated JSON keys, boilerplate disclaimers, duplicate list items) and
-collapses subsequent occurrences with a compact back-reference token.
+counts how many output tokens collapsing the repeats would remove.
 
-The compressed content is stored under response["x_compressed_content"] so
-the original response is unchanged for the client, but G10 memory and any
-downstream agent turn can load the shorter version instead.
+It measures and changes nothing: the client receives the whole answer, and nothing
+reuses a shorter copy on later turns. It used to put that copy in the response
+(``x_compressed_content``, cached with it by G05) and book it as a saving.
 """
 import logging
 import re
 from collections import Counter
 from typing import Any, Dict, Optional, Tuple
 
+from prometheus_client import Counter as PromCounter
+
 from middleware import RequestContext
 
 logger = logging.getLogger(__name__)
 GROUP = "G23"
+
+COMPRESSIBLE_OUTPUT_TOKENS = PromCounter(
+    "token_opt_g23_compressible_output_tokens_total",
+    "Output tokens that collapsing repeated phrases would remove (measured by G23; nothing "
+    "is removed, the client receives the whole answer)",
+    ["tenant_id"],
+)
 
 _NGRAM_SIZE = 5  # words per n-gram
 _MIN_REPEAT = 3  # minimum repetitions to trigger compression
@@ -81,65 +90,34 @@ def _estimate_tokens_from_chars(char_count: int) -> int:
     return max(0, char_count // 4)
 
 
+def measure_output(ctx: Any, text: Optional[str]) -> int:
+    """Count, for this tenant, the output tokens collapsing ``text``'s repeated phrases
+    would remove, and return that count. A measurement only: no savings step (no token was
+    saved) and nothing changed. Used for both served and streamed answers."""
+    cfg = ctx.config.get("groups", {}).get("G23_streaming_compression", {})
+    if not cfg.get("enabled", False) or not text or not isinstance(text, str):
+        return 0
+    _, chars = _compress_text(text, min_repeat=cfg.get("min_repeat", _MIN_REPEAT),
+                              ngram_size=cfg.get("ngram_size", _NGRAM_SIZE))
+    tokens = _estimate_tokens_from_chars(chars)
+    if tokens:
+        COMPRESSIBLE_OUTPUT_TOKENS.labels(
+            tenant_id=getattr(ctx, "tenant_id", "default") or "default").inc(tokens)
+        logger.debug("[%s] G23: ~%d output tokens repeat earlier phrases",
+                     getattr(ctx, "request_id", "?"), tokens)
+    return tokens
+
+
 class G23StreamingCompression:
     """
-    Post-LLM response compression.  Operates on the assistant's reply text,
-    collapses repeated n-gram blocks, and stores the compressed version as
-    ``response["x_compressed_content"]`` for use by downstream memory / agents.
+    Post-LLM measurement: how much of the assistant's reply repeats itself
+    (``measure_output``). The response is returned exactly as it came.
     """
 
     async def process_response(
         self, ctx: RequestContext, response: Dict[str, Any]
     ) -> Dict[str, Any]:
-        cfg = ctx.config.get("groups", {}).get("G23_streaming_compression", {})
-        if not cfg.get("enabled", False):
-            return response
-
-        min_repeat = cfg.get("min_repeat", _MIN_REPEAT)
-        ngram_size = cfg.get("ngram_size", _NGRAM_SIZE)
-
-        # Extract content from first choice
-        choices = response.get("choices", [])
-        if not choices:
-            return response
-
-        message = choices[0].get("message") or {}
-        original_content: Optional[str] = message.get("content")
-        if not original_content or not isinstance(original_content, str):
-            return response
-
-        compressed, chars_saved = _compress_text(
-            original_content,
-            min_repeat=min_repeat,
-            ngram_size=ngram_size,
-        )
-
-        if chars_saved == 0:
-            return response
-
-        tokens_saved = _estimate_tokens_from_chars(chars_saved)
-        original_tokens = _estimate_tokens_from_chars(len(original_content))
-        compressed_tokens = original_tokens - tokens_saved
-
-        # Store compressed version as extension field — client always gets original
-        response["x_compressed_content"] = compressed
-        response["x_compression_ratio"] = round(
-            len(compressed) / len(original_content), 3
-        )
-
-        ctx.savings.add_step(
-            GROUP,
-            f"G23: output compressed {chars_saved} chars → ~{tokens_saved} tokens saved",
-            original_tokens,
-            compressed_tokens,
-        )
-
-        logger.debug(
-            "[%s] G23 compressed %d → %d chars (%d tokens saved)",
-            ctx.request_id,
-            len(original_content),
-            len(compressed),
-            tokens_saved,
-        )
-
+        choices = response.get("choices") or []
+        if choices:
+            measure_output(ctx, (choices[0].get("message") or {}).get("content"))
         return response

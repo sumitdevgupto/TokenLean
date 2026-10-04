@@ -3,9 +3,11 @@ G18 · Observability & Token FinOps
 Stage: Across the Loop
 Saving: 15-40% indirect — surfaces waste all other groups fix
 """
+import asyncio
+import hashlib
 import json
 import logging
-import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -15,6 +17,8 @@ from prometheus_client import Counter, Gauge, Histogram
 from middleware import RequestContext
 from middleware import langfuse_tracing
 from middleware.g06_routing import record_routing_step
+from protocols.base import CALLER_CACHE_MARKERS
+from providers import get_adapter
 from savings.calculator import (
     effective_token_cost,
     estimate_cost,
@@ -29,25 +33,45 @@ GROUP = "G18"
 
 
 _OTHER_LABEL = "other"
+_PASS_THROUGH = "*"
+# Label dimensions whose value any caller chooses (X-Feature). Without an allowlist such a
+# value is folded to "other": a fresh one per request minted a new, never-evicted series on
+# every counter. `team` is the trusted gateway value (ctx.team), so it passes through.
+_CALLER_CHOSEN_DIMENSIONS = frozenset({"feature"})
 
 
 def _allowed_label_values(ctx: RequestContext, dimension: str) -> Optional[set]:
-    """Operator allowlist for a metric label dimension (team|feature), or None.
+    """Operator allowlist for a metric label dimension (team|feature), or None to pass the
+    value through.
 
-    Read from ``groups.G18_observability.label_values.<dimension>`` (a list; per-tenant via
-    the operator overlay). None / absent = no allowlist configured → keep today's behaviour
-    (the raw value passes) so a deployment that never sets it is unchanged. An empty LIST is
-    a real, stricter choice: only "default" survives, everything else folds to "other".
+    Read from ``groups.G18_observability.label_values.<dimension>`` (per-tenant via the
+    operator overlay): a list keeps "default" and the listed values, folding everything
+    else to "other", and "*" passes every value through. Unset, a caller-chosen dimension
+    (``feature``) keeps only "default" and ``team`` passes through.
     """
+    unset = set() if dimension in _CALLER_CHOSEN_DIMENSIONS else None
     try:
         cfg = (ctx.config.get("groups", {}) or {}).get("G18_observability", {}) or {}
         lv = cfg.get("label_values")
         if not isinstance(lv, dict) or dimension not in lv:
-            return None
+            return unset
         vals = lv.get(dimension)
-        return {str(v) for v in vals} if isinstance(vals, (list, tuple, set)) else None
+        if vals == _PASS_THROUGH:
+            return None
+        return {str(v) for v in vals} if isinstance(vals, (list, tuple, set)) else unset
     except Exception:
-        return None
+        return unset
+
+
+_UNSAFE_SEGMENT_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _path_segment(value: Any) -> str:
+    """One path segment from a possibly caller-chosen id: no separator survives, and it is
+    never '.' or '..'; an id with nothing usable left becomes a short hash of itself."""
+    text = str(value)
+    segment = _UNSAFE_SEGMENT_CHARS.sub("_", text)[:128].strip(".")
+    return segment or hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def _bounded_label(value: str, allowed: Optional[set]) -> str:
@@ -294,6 +318,13 @@ STAGE_DURATION_MS = Histogram(
     ["stage", "tenant_id"],
     buckets=_STAGE_BUCKETS_MS,
 )
+RESPONSE_STAGE_ERRORS = Counter(
+    "token_opt_response_stage_errors_total",
+    "Response stages that raised after the provider had answered. A safety stage (G29, "
+    "G30, G32) withholds the answer and the request ends in a 500; any other stage is "
+    "skipped and the answer is served with the edits it had completed",
+    ["stage"],
+)
 HTTP_REQUESTS = Counter(
     "token_opt_http_requests_total",
     "HTTP requests by outcome status, counting every exit path including "
@@ -375,6 +406,23 @@ CONTEXT_TRUST_EVENTS_TOTAL = Counter(
     "content injected by retrieval (G07) / memory (G10) into system/tool roles. `action` is "
     "flag, block or strip; `category` is the PII-free attack class.",
     ["tenant_id", "category", "action"],
+)
+CONTEXT_TRUST_MANAGED_RECORDED_TOTAL = Counter(
+    "token_opt_context_trust_managed_recorded_total",
+    "G31 managed-rule matches while those rules run record-only (before enforcement is "
+    "switched on): one increment per request per matching rule, with nothing done about "
+    "it. `rule_id` comes from the managed rule set, so its values are bounded.",
+    ["tenant_id", "rule_id"],
+)
+TOOL_PRUNING_CANDIDATES = Gauge(
+    "token_opt_tool_pruning_candidates",
+    "G08's daily pruning: registry tools the tenant's requests carried all through the "
+    "inactivity window that the model did not call in it. Report only while "
+    "pruning.dry_run_first is on; marked pruned (dropped from requests) once it is off.",
+    ["tenant_id"],
+    # One worker runs each day's pass (a Redis day lock), not always the same one: under
+    # multiprocess, report the value set last rather than a stale one from another worker.
+    multiprocess_mode="mostrecent",
 )
 CONTEXT_BUDGET_COMPACTIONS_TOTAL = Counter(
     "token_opt_context_budget_compactions_total",
@@ -465,10 +513,253 @@ def apply_cache_usage_to_savings(ctx, usage_info: Dict[str, Any]) -> None:
     savings.cache_write_tokens = usage_info.get("cache_write_tokens")
 
 
+# Streamed calls are priced in main._stream_response (the response pipeline does not run
+# for them), through the same price_response and emit_usage_metrics as G18.record.
+STREAM_USAGE_ESTIMATED = Counter(
+    "token_opt_stream_usage_estimated_total",
+    "Streamed calls priced from an estimate because the provider sent no usage chunk "
+    "(the client disconnected first, or the provider does not report stream usage)",
+    ["tenant_id"],
+)
+STREAM_ACCOUNTING_ERRORS = Counter(
+    "token_opt_stream_accounting_errors_total",
+    "Streamed calls that could not be priced (logged at warning); their cost is missing",
+    ["tenant_id"],
+)
+
+
+def _baseline_cost(ctx, completion_tokens: int, usage: Dict[str, Any]) -> float:
+    """The caller's own request sent straight to the model it asked for: the whole prompt
+    (x) and this call's completion, at that model's list price.
+
+    A provider prompt-cache discount belongs in it whenever that request would have been
+    cached without the proxy: its provider caches repeated prompts on its own, or the
+    caller marked the prompt for caching. The baseline then carries the cache reads and
+    writes this call reported, at the requested provider's rates, so the discount is not
+    reported as the proxy's saving. Otherwise (a provider that caches only a marked
+    prompt, and the caller marked nothing) the discount exists because of the proxy
+    (G21's marker, or routing to a provider that caches) and stays in the saving.
+    ``usage`` is ``resolve_cache_usage``'s result. Never raises: a failure prices the
+    baseline at list price, as before.
+    """
+    savings = ctx.savings
+    requested = savings.model_requested
+    read = usage.get("cached_tokens", 0) or 0
+    written = usage.get("cache_write_tokens") or 0
+    if read or written:
+        try:
+            config = getattr(ctx, "config", None) or {}
+            adapter = get_adapter(requested, config.get("providers", []))
+            params = getattr(ctx, "params", None) or {}
+            if not adapter.prompt_cache_needs_marker() or params.get(CALLER_CACHE_MARKERS):
+                return estimate_cost_with_cache(
+                    savings.baseline_tokens, read, completion_tokens, requested,
+                    float(adapter.cache_read_cost_multiplier(config)),
+                    cache_write_tokens=written,
+                    cache_write_multiplier=float(adapter.cache_write_cost_multiplier(config)),
+                    cache_write_1h_tokens=usage.get("cache_write_1h_tokens") or 0,
+                    cache_write_1h_multiplier=float(adapter.cache_write_1h_cost_multiplier(config)),
+                )
+        except Exception as exc:
+            logger.debug("[%s] G18: cache-aware baseline failed: %s",
+                         getattr(ctx, "request_id", "?"), exc)
+    return estimate_cost(savings.baseline_tokens, completion_tokens, requested)
+
+
+def price_response(ctx, response: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Set ``ctx.savings``' token and cost fields from the served call's response.
+
+    The one pricing path for non-streamed calls (G18.record) and streamed ones
+    (main._stream_response), so the two can never price the same usage differently. A
+    response with no ``usage.prompt_tokens`` means the provider reported no usage: the
+    proxy's own prompt count (y) is used and ``provider_prompt_tokens`` stays None. Returns
+    the figures the Prometheus counters need (``emit_usage_metrics``).
+    """
+    if cfg is None:
+        cfg = ((getattr(ctx, "config", None) or {}).get("groups", {})
+               .get("G18_observability", {})) or {}
+    usage = (response or {}).get("usage") or {}
+    provider_prompt = usage.get("prompt_tokens")  # z — None when usage absent
+    prompt_tokens = provider_prompt if provider_prompt is not None else ctx.savings.proxy_optimised_tokens
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+
+    # Provider-normalised cached + reasoning tokens (multi-provider): the adapter knows
+    # each provider's usage field names (OpenAI prompt_tokens_details.cached_tokens,
+    # Anthropic cache_read_input_tokens, Gemini cached_content_token_count, etc.). The
+    # base/default reads the OpenAI shape, so this is a no-op for OpenAI and for the
+    # legacy adapter-less path below.
+    _u = resolve_cache_usage(ctx, response)
+    cache_read_tokens = _u.get("cached_tokens", 0) or 0
+    reasoning_tokens = _u.get("reasoning_tokens", 0) or 0
+    apply_cache_usage_to_savings(ctx, _u)
+    model = ctx.routed_model
+
+    # Update savings record.
+    # G18 is the single source of truth for cost: baseline and actual MUST be
+    # computed on the same basis (both include the same completion tokens) or the
+    # comparison is meaningless. Baseline = un-optimised counterfactual (full prompt
+    # at the originally-requested model); actual = optimised prompt at the routed
+    # model — so this still credits G06 routing without the input-only asymmetry that
+    # made "actual" appear ~200x "baseline". Do NOT let upstream stages (e.g. G06)
+    # pre-seed these fields with an input-only estimate; G18 always recomputes both.
+    ctx.savings.provider_prompt_tokens = provider_prompt  # z (None if usage absent)
+    ctx.savings.final_tokens_sent = prompt_tokens          # z when present, else y estimate
+    ctx.savings.response_tokens = completion_tokens
+    # Actual cost credits the provider's cached-input discount on the
+    # response-reported cached tokens (G21 P1). Provider-agnostic: the per-provider
+    # multiplier comes from the adapter (Gate 3 — no provider strings here). With
+    # cache_read_tokens == 0 this is identical to estimate_cost().
+    cache_read_multiplier = _u.get("cache_read_multiplier", 1.0)
+    cache_write_tokens = _u.get("cache_write_tokens") or 0
+    cache_write_1h_tokens = _u.get("cache_write_1h_tokens") or 0
+    cache_write_multiplier = _u.get("cache_write_multiplier", 1.0)
+    cache_write_1h_multiplier = _u.get("cache_write_1h_multiplier", 1.0)
+    # B3: discount-aware price book (reporting-only) — optional reasoning surcharge
+    # and a provider-native batch discount, both config-gated (default 1.0 = no-op,
+    # so cost_actual is unchanged unless a deployment opts in). The batch discount
+    # only applies when the request was served via the native batch lane.
+    reasoning_rate_multiplier = cfg.get("reasoning_rate_multiplier", 1.0)
+    batch_discount = (
+        cfg.get("batch_discount_multiplier", 1.0)
+        if (getattr(ctx, "params", None) or {}).get("_native_batch")
+        else 1.0
+    )
+    _cache_cost_kwargs = dict(
+        cache_write_tokens=cache_write_tokens,
+        cache_write_multiplier=cache_write_multiplier,
+        cache_write_1h_tokens=cache_write_1h_tokens,
+        cache_write_1h_multiplier=cache_write_1h_multiplier,
+    )
+    ctx.savings.cost_actual_usd = estimate_cost_with_cache(
+        prompt_tokens, cache_read_tokens, completion_tokens, model, cache_read_multiplier,
+        batch_discount=batch_discount,
+        reasoning_tokens=reasoning_tokens,
+        reasoning_rate_multiplier=reasoning_rate_multiplier,
+        **_cache_cost_kwargs,
+    )
+    # Every OTHER provider call this request paid for. A cascade that escalates sends
+    # the prompt two or three times and only the last response reaches this method, so
+    # pricing that one alone under-stated what the request cost — in the direction
+    # that flattered the savings figure. The served call is the last one that is not a
+    # side call, already priced above (with its cache/reasoning/batch adjustments); the
+    # tier probes before it and every side call (judge, schema extraction, summariser,
+    # repair re-ask — wherever it fell) are added at plain list price. Nothing else →
+    # nothing added, so the ordinary single-call path is byte-identical.
+    _calls = list(getattr(ctx, "provider_calls", None) or [])
+    _main = [_c for _c in _calls if not _c.get("side")]
+    _extra = _main[:-1] + [_c for _c in _calls if _c.get("side")]
+    if _extra:
+        for _c in _extra:
+            ctx.savings.cost_actual_usd += estimate_cost(
+                int(_c.get("prompt_tokens") or 0),
+                int(_c.get("completion_tokens") or 0),
+                _c.get("model") or model,
+            )
+        # y (final_tokens_sent) deliberately stays the FINAL call's prompt so it stays
+        # comparable with every past measurement; this is the total actually sent.
+        ctx.savings.provider_call_count = len(_calls)
+        ctx.savings.provider_call_prompt_tokens = sum(
+            int(_c.get("prompt_tokens") or 0) for _c in _calls
+        )
+    # Decompose the same total so a cost line can answer "how much of this was cache?".
+    # Only recorded when the provider actually reported a count — an unreported half
+    # stays None so it reads as unknown rather than as a genuine zero.
+    if _u.get("cache_read_tokens") is not None or _u.get("cache_write_tokens") is not None:
+        _read_usd, _write_usd = cache_cost_split(
+            prompt_tokens, cache_read_tokens, model, cache_read_multiplier,
+            batch_discount=batch_discount, **_cache_cost_kwargs,
+        )
+        if _u.get("cache_read_tokens") is not None:
+            ctx.savings.cost_cache_read_usd = _read_usd
+        if _u.get("cache_write_tokens") is not None:
+            ctx.savings.cost_cache_write_usd = _write_usd
+    ctx.savings.cost_baseline_usd = _baseline_cost(ctx, completion_tokens, _u)
+
+    # ET metric
+    et = effective_token_cost(prompt_tokens, cache_read_tokens, completion_tokens)
+    ctx.savings.effective_token_et = round(et, 2)
+    return {
+        "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens, "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens, "et": et,
+    }
+
+
+def price_billed_call(ctx, response: Dict[str, Any]) -> None:
+    """Price the served call as G18.record does: what the provider billed
+    (``ctx.provider_response``), else ``response``. For a request whose response stages
+    failed before G18 priced it; pricing again gives the same figures. G13 prices a batched
+    request's answer with it too, since no response stage sees one. Whether G18 is enabled
+    does not matter: that switches its metrics, export and tracing, not the cost."""
+    cfg = ((getattr(ctx, "config", None) or {}).get("groups", {})
+           .get("G18_observability", {})) or {}
+    price_response(ctx, getattr(ctx, "provider_response", None) or response, cfg)
+
+
+def emit_usage_metrics(ctx, priced: Dict[str, Any]) -> None:
+    """G18's Prometheus token, cost and savings counters for one request that
+    ``price_response`` priced — streamed or not, so budget alerts see both."""
+    # Labels. `team`/`feature` used to be the raw x_team/x_feature params — any caller
+    # value, so each distinct one minted a new (never-evicted) child series on every
+    # counter below (unbounded cardinality → proxy memory + scrape size grow forever).
+    # Now: team is the TRUSTED team (ctx.team — a gateway key's X-Team, else "default");
+    # feature is bounded to an operator allowlist, everything else folded to "other".
+    params = getattr(ctx, "params", None) or {}
+    team = _bounded_label(getattr(ctx, "team", "") or "default", _allowed_label_values(ctx, "team"))
+    feature = _bounded_label(params.get("x_feature", "default"),
+                             _allowed_label_values(ctx, "feature"))
+    model = ctx.routed_model
+    tenant_id = ctx.tenant_id
+    prompt_tokens = priced["prompt_tokens"]
+    completion_tokens = priced["completion_tokens"]
+    reasoning_tokens = priced["reasoning_tokens"]
+    cache_read_tokens = priced["cache_read_tokens"]
+    cache_write_tokens = priced["cache_write_tokens"]
+
+    REQUESTS_TOTAL.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc()
+    PROMPT_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(prompt_tokens)
+    COMPLETION_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(completion_tokens)
+    if reasoning_tokens > 0:
+        REASONING_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(reasoning_tokens)
+    # Pair the requested outcome with the billed reasoning tokens above, so
+    # "we turned reasoning off" is always checkable against what was actually
+    # billed rather than taken on trust (backlog #42).
+    _rmode = getattr(ctx, "reasoning_mode", None)
+    if _rmode:
+        REASONING_MODE.labels(mode=_rmode, model=model, tenant_id=tenant_id).inc()
+    if cache_read_tokens > 0:
+        CACHE_READ_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_read_tokens)
+    if cache_write_tokens > 0:
+        CACHE_WRITE_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_write_tokens)
+    EFFECTIVE_TOKENS.labels(model=model, tenant_id=tenant_id).inc(priced["et"])
+    COST_USD.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(ctx.savings.cost_actual_usd)
+    if ctx.savings.cache_hit:
+        level = ctx.savings.cache_level or "UNKNOWN"
+        CACHE_HITS.labels(level=level, tenant_id=tenant_id).inc()
+    SAVINGS_PCT.labels(tenant_id=tenant_id).observe(ctx.savings.total_pct_saving)
+
+    inp_cost, _ = get_cost_per_1k(model)
+    for step in ctx.savings.step_savings:
+        if step.absolute_saving > 0:
+            GROUP_TOKENS_SAVED.labels(group=step.group, tenant_id=tenant_id).inc(step.absolute_saving)
+            group_usd = round(step.absolute_saving / 1000.0 * inp_cost, 8)
+            USD_SAVED.labels(group=step.group, model=model, tenant_id=tenant_id).inc(group_usd)
+
+    workflow_id = params.get("workflow_id") or params.get("x_workflow_id")
+    if workflow_id:
+        turn_count = params.get("_token_budget", {}).get("workflow_turn", 0)
+        # Observed per tenant, NOT labelled by the caller-chosen workflow_id.
+        if turn_count:
+            WORKFLOW_TURN_COUNT.labels(tenant_id=tenant_id).observe(turn_count)
+
+
 class G18Observability:
-    def __init__(self, usage_meter=None, audit_logger=None):
-        self._usage_meter = usage_meter
-        self._audit_logger = audit_logger
+    # Billing is main._record_outcome's (one usage_events row per outcome), and the audit log
+    # records configuration changes and security events. G18 does neither: its usage-meter
+    # and per-request audit branches were never given a meter or a logger, so they were
+    # removed (2026-10-01).
+    def __init__(self):
+        self._export_backends: Dict[str, Any] = {}
 
     async def record(self, ctx: RequestContext, response: Dict[str, Any]) -> None:
         # BEFORE the enable gate, and before G05 stores the response one stage later:
@@ -481,160 +772,24 @@ class G18Observability:
         # routing ledger back into the plan-time claim this replaced. Idempotent.
         record_routing_step(ctx)
 
+        # Before the gate too: the cost is not observability. The spend counter, the spend
+        # cap and the billing row read it, and a tenant may switch G18 off in the portal.
+        # Price what the provider billed, not what the caller receives: a G30 or G11 block
+        # replaces a paid answer with a zero-usage refusal, which priced it at $0 with a
+        # 100% saving and left the spend cap uncharged. Everything else below still reads
+        # the response as served.
         cfg = ctx.config.get("groups", {}).get("G18_observability", {})
+        priced = price_response(ctx, getattr(ctx, "provider_response", None) or response, cfg)
         if not cfg.get("enabled", False):
             return
 
-        usage = response.get("usage", {})
-        provider_prompt = usage.get("prompt_tokens")  # z — None when usage absent
-        prompt_tokens = provider_prompt if provider_prompt is not None else ctx.savings.proxy_optimised_tokens
-        completion_tokens = usage.get("completion_tokens", 0)
-
-        # Provider-normalised cached + reasoning tokens (multi-provider): the adapter knows
-        # each provider's usage field names (OpenAI prompt_tokens_details.cached_tokens,
-        # Anthropic cache_read_input_tokens, Gemini cached_content_token_count, etc.). The
-        # base/default reads the OpenAI shape, so this is a no-op for OpenAI and for the
-        # legacy adapter-less path below.
-        _u = resolve_cache_usage(ctx, response)
-        cache_read_tokens = _u.get("cached_tokens", 0) or 0
-        reasoning_tokens = _u.get("reasoning_tokens", 0) or 0
-        apply_cache_usage_to_savings(ctx, _u)
-
-        # Labels. `team`/`feature` used to be the raw x_team/x_feature params — any caller
-        # value, so each distinct one minted a new (never-evicted) child series on every
-        # counter below (unbounded cardinality → proxy memory + scrape size grow forever).
-        # Now: team is the TRUSTED team (ctx.team — a gateway key's X-Team, else "default");
-        # feature is bounded to an operator allowlist, everything else folded to "other".
-        team = _bounded_label(getattr(ctx, "team", "") or "default", _allowed_label_values(ctx, "team"))
-        feature = _bounded_label(ctx.params.get("x_feature", "default"),
-                                 _allowed_label_values(ctx, "feature"))
-        model = ctx.routed_model
-        tenant_id = ctx.tenant_id
-
-        # Update savings record.
-        # G18 is the single source of truth for cost: baseline and actual MUST be
-        # computed on the same basis (both include the same completion tokens) or the
-        # comparison is meaningless. Baseline = un-optimised counterfactual (full prompt
-        # at the originally-requested model); actual = optimised prompt at the routed
-        # model — so this still credits G06 routing without the input-only asymmetry that
-        # made "actual" appear ~200x "baseline". Do NOT let upstream stages (e.g. G06)
-        # pre-seed these fields with an input-only estimate; G18 always recomputes both.
-        ctx.savings.provider_prompt_tokens = provider_prompt  # z (None if usage absent)
-        ctx.savings.final_tokens_sent = prompt_tokens          # z when present, else y estimate
-        ctx.savings.response_tokens = completion_tokens
-        # Actual cost credits the provider's cached-input discount on the
-        # response-reported cached tokens (G21 P1). Provider-agnostic: the per-provider
-        # multiplier comes from the adapter (Gate 3 — no provider strings here). With
-        # cache_read_tokens == 0 this is identical to estimate_cost().
-        cache_read_multiplier = _u.get("cache_read_multiplier", 1.0)
-        cache_write_tokens = _u.get("cache_write_tokens") or 0
-        cache_write_1h_tokens = _u.get("cache_write_1h_tokens") or 0
-        cache_write_multiplier = _u.get("cache_write_multiplier", 1.0)
-        cache_write_1h_multiplier = _u.get("cache_write_1h_multiplier", 1.0)
-        # B3: discount-aware price book (reporting-only) — optional reasoning surcharge
-        # and a provider-native batch discount, both config-gated (default 1.0 = no-op,
-        # so cost_actual is unchanged unless a deployment opts in). The batch discount
-        # only applies when the request was served via the native batch lane.
-        reasoning_rate_multiplier = cfg.get("reasoning_rate_multiplier", 1.0)
-        batch_discount = (
-            cfg.get("batch_discount_multiplier", 1.0)
-            if ctx.params.get("_native_batch")
-            else 1.0
-        )
-        _cache_cost_kwargs = dict(
-            cache_write_tokens=cache_write_tokens,
-            cache_write_multiplier=cache_write_multiplier,
-            cache_write_1h_tokens=cache_write_1h_tokens,
-            cache_write_1h_multiplier=cache_write_1h_multiplier,
-        )
-        ctx.savings.cost_actual_usd = estimate_cost_with_cache(
-            prompt_tokens, cache_read_tokens, completion_tokens, model, cache_read_multiplier,
-            batch_discount=batch_discount,
-            reasoning_tokens=reasoning_tokens,
-            reasoning_rate_multiplier=reasoning_rate_multiplier,
-            **_cache_cost_kwargs,
-        )
-        # Every OTHER provider call this request paid for. A cascade that escalates sends
-        # the prompt two or three times and only the last response reaches this method, so
-        # pricing that one alone under-stated what the request cost — in the direction
-        # that flattered the savings figure. The final entry is the served call already
-        # priced above (with its cache/reasoning/batch adjustments); the ones before it are
-        # the tier probes and llm_judge calls, added at plain list price. Empty list →
-        # nothing added, so the ordinary single-call path is byte-identical.
-        _calls = list(getattr(ctx, "provider_calls", None) or [])
-        if len(_calls) > 1:
-            for _c in _calls[:-1]:
-                ctx.savings.cost_actual_usd += estimate_cost(
-                    int(_c.get("prompt_tokens") or 0),
-                    int(_c.get("completion_tokens") or 0),
-                    _c.get("model") or model,
-                )
-            # y (final_tokens_sent) deliberately stays the FINAL call's prompt so it stays
-            # comparable with every past measurement; this is the total actually sent.
-            ctx.savings.provider_call_count = len(_calls)
-            ctx.savings.provider_call_prompt_tokens = sum(
-                int(_c.get("prompt_tokens") or 0) for _c in _calls
-            )
-        # Decompose the same total so a cost line can answer "how much of this was cache?".
-        # Only recorded when the provider actually reported a count — an unreported half
-        # stays None so it reads as unknown rather than as a genuine zero.
-        if _u.get("cache_read_tokens") is not None or _u.get("cache_write_tokens") is not None:
-            _read_usd, _write_usd = cache_cost_split(
-                prompt_tokens, cache_read_tokens, model, cache_read_multiplier,
-                batch_discount=batch_discount, **_cache_cost_kwargs,
-            )
-            if _u.get("cache_read_tokens") is not None:
-                ctx.savings.cost_cache_read_usd = _read_usd
-            if _u.get("cache_write_tokens") is not None:
-                ctx.savings.cost_cache_write_usd = _write_usd
-        ctx.savings.cost_baseline_usd = estimate_cost(
-            ctx.savings.baseline_tokens, completion_tokens, ctx.savings.model_requested
-        )
-
-        # ET metric
-        et = effective_token_cost(prompt_tokens, cache_read_tokens, completion_tokens)
-        ctx.savings.effective_token_et = round(et, 2)
+        reasoning_tokens = priced["reasoning_tokens"]
         metadata = ctx.savings.to_langfuse_metadata()
         metadata["warnings"] = ctx.params.get("_token_opt_warnings", [])
         metadata["reasoning_tokens"] = reasoning_tokens
 
-        # ── Prometheus metrics ──
         if cfg.get("prometheus_enabled", True):
-            REQUESTS_TOTAL.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc()
-            PROMPT_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(prompt_tokens)
-            COMPLETION_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(completion_tokens)
-            if reasoning_tokens > 0:
-                REASONING_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(reasoning_tokens)
-            # Pair the requested outcome with the billed reasoning tokens above, so
-            # "we turned reasoning off" is always checkable against what was actually
-            # billed rather than taken on trust (backlog #42).
-            _rmode = getattr(ctx, "reasoning_mode", None)
-            if _rmode:
-                REASONING_MODE.labels(mode=_rmode, model=model, tenant_id=tenant_id).inc()
-            if cache_read_tokens > 0:
-                CACHE_READ_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_read_tokens)
-            if cache_write_tokens > 0:
-                CACHE_WRITE_TOKENS.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(cache_write_tokens)
-            EFFECTIVE_TOKENS.labels(model=model, tenant_id=tenant_id).inc(et)
-            COST_USD.labels(model=model, team=team, feature=feature, tenant_id=tenant_id).inc(ctx.savings.cost_actual_usd)
-            if ctx.savings.cache_hit:
-                level = ctx.savings.cache_level or "UNKNOWN"
-                CACHE_HITS.labels(level=level, tenant_id=tenant_id).inc()
-            SAVINGS_PCT.labels(tenant_id=tenant_id).observe(ctx.savings.total_pct_saving)
-
-            inp_cost, _ = get_cost_per_1k(model)
-            for step in ctx.savings.step_savings:
-                if step.absolute_saving > 0:
-                    GROUP_TOKENS_SAVED.labels(group=step.group, tenant_id=tenant_id).inc(step.absolute_saving)
-                    group_usd = round(step.absolute_saving / 1000.0 * inp_cost, 8)
-                    USD_SAVED.labels(group=step.group, model=model, tenant_id=tenant_id).inc(group_usd)
-
-            workflow_id = ctx.params.get("workflow_id") or ctx.params.get("x_workflow_id")
-            if workflow_id:
-                turn_count = ctx.params.get("_token_budget", {}).get("workflow_turn", 0)
-                # Observed per tenant, NOT labelled by the caller-chosen workflow_id.
-                if turn_count:
-                    WORKFLOW_TURN_COUNT.labels(tenant_id=tenant_id).observe(turn_count)
+            emit_usage_metrics(ctx, priced)
 
         # ── Turn Efficiency KPI ──
         if cfg.get("turn_efficiency_enabled", True):
@@ -649,22 +804,6 @@ class G18Observability:
 
         # ── Langfuse trace ──
         await _emit_trace(ctx, response)
-
-        # ── Usage metering (billing) ──
-        billing_cfg = ctx.config.get("billing", {})
-        if billing_cfg.get("enabled", False) and getattr(self, "_usage_meter", None):
-            try:
-                await self._usage_meter.record(ctx, response)
-            except Exception as _exc:
-                logger.warning("G18: billing record failed: %s", _exc)
-
-        # ── Audit logging (F3) ──
-        audit_cfg = ctx.config.get("audit", {})
-        if audit_cfg.get("enabled", False) and getattr(self, "_audit_logger", None):
-            try:
-                await self._audit_logger.log(ctx, response)
-            except Exception as _exc:
-                logger.warning("G18: audit log failed: %s", _exc)
 
         logger.info(
             "[%s] G18 saved=%dt (%.1f%%) cost_saving=$%.6f reasoning_tokens=%d",
@@ -737,8 +876,12 @@ class G18Observability:
         bucket = cfg.get("jsonl_gcs_bucket", "")
         prefix = cfg.get("jsonl_gcs_prefix", "token-usage-logs")
 
-        from storage import get_storage_backend
-        backend = get_storage_backend(bucket=bucket)
+        # One backend per bucket for the process: a GCS backend holds its client, and
+        # building one runs credential discovery.
+        if bucket not in self._export_backends:
+            from storage import get_storage_backend
+            self._export_backends[bucket] = get_storage_backend(bucket=bucket)
+        backend = self._export_backends[bucket]
         if backend is None:
             return
 
@@ -749,12 +892,16 @@ class G18Observability:
         )
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         # I7: partition exported usage logs by tenant so per-tenant data isn't
-        # co-mingled under one GCS prefix.
-        tenant_seg = getattr(ctx, "tenant_id", "default") or "default"
-        path = f"{prefix}/{tenant_seg}/{workflow_id}/{ts}.json"
+        # co-mingled under one GCS prefix. Each part is one path segment: the workflow id is
+        # the caller's, and '../other-tenant/x' resolved inside the root, into another
+        # tenant's partition.
+        tenant_seg = _path_segment(getattr(ctx, "tenant_id", "default") or "default")
+        path = f"{prefix}/{tenant_seg}/{_path_segment(workflow_id)}/{ts}.json"
 
         try:
-            backend.write(path, json.dumps(metadata) + "\n")
+            # A blocking upload (or file write): off the event loop, which it stalled for
+            # every request on the worker.
+            await asyncio.to_thread(backend.write, path, json.dumps(metadata) + "\n")
             logger.debug("[%s] G18 JSONL exported to %s", ctx.request_id, path)
         except Exception as exc:
             logger.warning("G18 JSONL export failed: %s", exc)

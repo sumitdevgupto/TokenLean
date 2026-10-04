@@ -44,14 +44,16 @@ class TestEndpointBranch:
     def test_single_process_path_is_the_default(self):
         # The unit suite has no PROMETHEUS_MULTIPROC_DIR (a session fixture in
         # conftest guarantees it), so this is today's behaviour, unchanged.
-        with patch.object(main, "_METRICS_SCRAPE_TOKEN", ""):
+        with patch.object(main, "_METRICS_SCRAPE_TOKEN", ""), \
+                patch.object(main, "_METRICS_ALLOW_UNAUTHENTICATED", True):
             r = _client.get("/metrics")
         assert r.status_code == 200
         assert "token_opt_requests_total" in r.text
 
     def test_multiproc_branch_taken_when_env_var_set(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
-        with patch.object(main, "_METRICS_SCRAPE_TOKEN", ""):
+        with patch.object(main, "_METRICS_SCRAPE_TOKEN", ""), \
+                patch.object(main, "_METRICS_ALLOW_UNAUTHENTICATED", True):
             r = _client.get("/metrics")
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/plain")

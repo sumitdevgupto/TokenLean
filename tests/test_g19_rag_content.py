@@ -58,7 +58,7 @@ def _make_ctx(messages, config=None):
                     "min_length_to_compress": 30,
                     "compression_strategies": {
                         "json": {"remove_empty": True, "dedupe_keys": False},
-                        "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
+                        "code": {"strip_comments": True, "strip_whitespace": True},
                         "logs": {"dedupe_lines": True, "truncate_long_lines": 200},
                     },
                 }
@@ -156,10 +156,10 @@ async def test_rag_isolated_compression():
     compressed = result["choices"][0]["message"]["content"]
     parsed = json.loads(compressed)
 
-    # Empty/null fields removed
+    # Empty list/object fields removed; null is a value and is kept
     assert "embedding" not in parsed["chunks"][0]
     assert "tags" not in parsed["chunks"][0]
-    assert "created_by" not in parsed["chunks"][0]
+    assert parsed["chunks"][0]["created_by"] is None
     assert "extra" not in parsed["chunks"][0]
 
     # Key fields preserved

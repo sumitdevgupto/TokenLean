@@ -48,8 +48,11 @@ fi
 echo "Found $TEMPLATE_COUNT templates to optimize"
 echo ""
 
-# Create DSPy optimizer script
-cat > /tmp/dspy_optimizer.py << 'PYTHON_EOF'
+# Create DSPy optimizer script, in a directory only this run can write: it is executed below,
+# and at a fixed /tmp path another user of the host could have put their own code there.
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+cat > "$WORK_DIR/dspy_optimizer.py" << 'PYTHON_EOF'
 import json
 import sys
 import yaml
@@ -217,7 +220,7 @@ echo "  Epochs: $OPTIMIZER_EPOCHS"
 echo "  Max demos: $MAX_DEMOS"
 echo ""
 
-python3 /tmp/dspy_optimizer.py \
+python3 "$WORK_DIR/dspy_optimizer.py" \
     --templates-dir "$TEMPLATES_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --epochs "$OPTIMIZER_EPOCHS" \

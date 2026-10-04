@@ -23,15 +23,18 @@ and the pipeline returns early; `main.py` serves the agent's answer through
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os
 import re
+import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from middleware import RequestContext
+from providers import without_cache_markers
 
 logger = logging.getLogger(__name__)
 GROUP = "F2"
@@ -43,6 +46,16 @@ GROUP = "F2"
 MAX_AGENT_TIMEOUT_SECONDS = 300
 
 _BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata", "localhost"}
+# Names that reach only this host's private network: the reserved suffixes below, and a name
+# of one label, such as a compose or Kubernetes service ("langfuse", "qdrant").
+_INTERNAL_SUFFIXES = (".internal", ".local", ".localdomain", ".home.arpa", ".svc")
+# An IPv4 address spelled as a number ("2852039166", "0xa9fea9fe", "0251.0376.0251.0376",
+# "127.1"): the resolver accepts these, the ``ipaddress`` module does not.
+_NUMERIC_HOST_RE = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+)){0,3}")
+
+# Each refused (tenant, agent, api_key_env) warns once; the cap bounds the set.
+_WARNED_KEY_ENV: set = set()
+_MAX_WARNED_KEY_ENV = 1024
 
 try:  # Prometheus is always present in the proxy image; degrade gracefully in bare tests.
     from prometheus_client import Counter as _Counter
@@ -78,6 +91,50 @@ def _orchestration_cfg(config: Dict[str, Any], tenant_id: str) -> Dict[str, Any]
     return base
 
 
+def _operator_agents(tenant_id: str) -> List[Any]:
+    """The agents the operator's own config defines for ``tenant_id`` (global
+    ``orchestration.agents`` or the static ``tenants.<id>.orchestration.agents``), never
+    the tenant overrides ctx.config also carries. None readable → none (fail closed)."""
+    try:
+        from config_loader import get_config  # the operator's file, never tenant overrides
+        return _orchestration_cfg(get_config(), tenant_id).get("agents") or []
+    except Exception:
+        return []
+
+
+def _operator_defines(agent: Dict[str, Any], tenant_id: str) -> bool:
+    """Whether the operator's own config defines ``agent`` (the same ``id`` and ``url``)."""
+    return any(isinstance(op, dict) and op.get("id") == agent.get("id")
+               and op.get("url") == agent.get("url") for op in _operator_agents(tenant_id))
+
+
+def _agent_key_env(agent: Dict[str, Any], tenant_id: str, request_id: str = "") -> str:
+    """The environment variable holding ``agent``'s API key, or ``""`` for none.
+
+    ``api_key_env`` names a SERVER environment variable, so only an operator may choose
+    one. It is honoured only when the operator's own config — global
+    ``orchestration.agents`` or the static ``tenants.<id>.orchestration.agents`` — defines
+    an agent with the same ``id``, ``url`` and ``api_key_env``. ctx.config also carries
+    tenant overrides written through the portal, and an agent found only there could name
+    any server secret and have it sent to its own url; it is dispatched without a key.
+    """
+    name = agent.get("api_key_env")
+    if not name:
+        return ""
+    for op in _operator_agents(tenant_id):
+        if (isinstance(op, dict) and op.get("api_key_env") == name
+                and op.get("id") == agent.get("id") and op.get("url") == agent.get("url")):
+            return str(name)
+    marker = (str(tenant_id), str(agent.get("id")), str(name)[:128])
+    if marker not in _WARNED_KEY_ENV and len(_WARNED_KEY_ENV) < _MAX_WARNED_KEY_ENV:
+        _WARNED_KEY_ENV.add(marker)
+        logger.warning(
+            "[%s] F2: agent %r of tenant %r names api_key_env %r, but only agents defined "
+            "in the operator config may read a server environment variable — dispatching "
+            "without a key", request_id, marker[1], marker[0], marker[2])
+    return ""
+
+
 def _last_user_text(messages: List[Dict[str, Any]]) -> str:
     """The most recent user turn's text (what the intent is classified from)."""
     for msg in reversed(messages or []):
@@ -93,7 +150,15 @@ def _last_user_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
-def validate_outbound_url(url: str) -> None:
+def _internal_address(addr: Any) -> bool:
+    """Whether an address is anything but a public unicast one (private, loopback,
+    link-local, shared, reserved, unspecified, multicast). An IPv4-mapped IPv6 address is
+    never global to ``ipaddress`` (3.13 judges the mapped address instead), so
+    ``[::ffff:169.254.169.254]`` is refused too."""
+    return not addr.is_global or addr.is_multicast
+
+
+def validate_outbound_url(url: str, *, internal_names_ok: bool = False) -> None:
     """Raise ValueError if `url` could route the proxy's own server-side request to an
     internal/private/link-local/reserved network or the cloud metadata service (SSRF).
 
@@ -101,30 +166,57 @@ def validate_outbound_url(url: str) -> None:
     save time) or static config — so this proxy process must never be tricked into calling
     its own cloud metadata endpoint or internal infrastructure on a tenant's behalf.
 
-    Deliberately does NOT resolve hostnames via DNS: this runs on every dispatch (the
-    request path), and a live DNS lookup there would add network latency to every agent
-    call and make tests depend on real DNS resolution. Instead it rejects (a) disallowed
-    scheme, (b) a handful of known-dangerous literal hostnames, and (c) a literal IP
-    address (e.g. the exact `http://169.254.169.254/...` metadata-service exploit) that
-    resolves to a private/loopback/link-local/reserved/multicast network. A hostname that
-    DNS-rebinds to an internal address after registration is a known residual gap —
-    deployments with a stricter threat model should also enforce an egress allowlist at
-    the network layer."""
+    Checks the URL as written (no DNS lookup: the portal and webhooks call it on save):
+    (a) the scheme, (b) the metadata and loopback names, (c) an IPv4 address spelled as a
+    number ("2852039166" is 169.254.169.254), (d) a literal address that is not public,
+    IPv4-mapped IPv6 included, and (e) unless ``internal_names_ok``, a name that only an
+    internal network resolves: a single label (a compose or Kubernetes service) or an
+    internal suffix (.internal, .local, .svc). A trailing dot changes nothing. An agent the
+    operator's own config defines may name a host on the operator's network
+    (``internal_names_ok``); F2 resolves a tenant's agent host before calling it
+    (``check_resolved_host``)."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"agent url scheme must be http/https, got {parsed.scheme!r}")
-    host = parsed.hostname
+    host = (parsed.hostname or "").rstrip(".")          # .hostname is lowercased already
     if not host:
         raise ValueError("agent url has no host")
-    if host.lower() in _BLOCKED_HOSTNAMES:
+    if host in _BLOCKED_HOSTNAMES or host.endswith(".localhost"):
         raise ValueError(f"agent url host {host!r} is not allowed")
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return  # a hostname, not a literal IP — DNS-rebind protection is out of scope here
-    if (addr.is_private or addr.is_loopback or addr.is_link_local
-            or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+        if _NUMERIC_HOST_RE.fullmatch(host):
+            raise ValueError(
+                f"agent url host {host!r} is an IP address in a non-standard form") from None
+        if not internal_names_ok and ("." not in host or host.endswith(_INTERNAL_SUFFIXES)):
+            raise ValueError(f"agent url host {host!r} names an internal host") from None
+        return
+    if _internal_address(addr):
         raise ValueError(f"agent url host {host!r} is a disallowed address ({addr})")
+
+
+async def _host_addresses(host: str) -> List[str]:
+    """Every address ``host`` resolves to, off the event loop."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    return [info[4][0] for info in infos]
+
+
+async def check_resolved_host(url: str) -> None:
+    """Raise ValueError if the URL's host resolves to an address that is not public. Run
+    before a tenant's agent is called: a public-looking name can point anywhere. It narrows
+    DNS rebinding without closing it (the call resolves the name again); deployments with
+    a stricter threat model should also enforce an egress allowlist at the network layer."""
+    host = (urlparse(url).hostname or "").rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return                                  # a literal: validate_outbound_url judged it
+    except ValueError:
+        pass
+    for raw in await _host_addresses(host):
+        addr = ipaddress.ip_address(raw)                # a scoped "fe80::1%eth0" parses too
+        if _internal_address(addr):
+            raise ValueError(f"agent url host {host!r} resolves to a disallowed address ({addr})")
 
 
 def classify_intent(
@@ -224,9 +316,16 @@ class IntentOrchestration:
         url = agent.get("url")
         if not url:
             raise ValueError(f"agent '{agent.get('id')}' has no url")
-        validate_outbound_url(url)
+        # An agent the operator's config defines may live on the operator's network (the
+        # template's own example is a compose service); a tenant's may not, by name or by
+        # what its name resolves to.
+        operator_agent = _operator_defines(agent, ctx.tenant_id)
+        validate_outbound_url(url, internal_names_ok=operator_agent)
+        if not operator_agent:
+            await check_resolved_host(url)
         # Keyless agents are allowed; litellm still wants a non-empty key placeholder.
-        api_key = os.environ.get(agent.get("api_key_env", ""), "") or "no-key"
+        key_env = _agent_key_env(agent, ctx.tenant_id, ctx.request_id)
+        api_key = (os.environ.get(key_env, "") if key_env else "") or "no-key"
         model = agent.get("model") or ctx.model
 
         params: Dict[str, Any] = {}
@@ -239,7 +338,9 @@ class IntentOrchestration:
         started = time.perf_counter()
         resp = await litellm.acompletion(
             model=model,
-            messages=ctx.messages,
+            # An agent is an OpenAI-compatible URL, not a provider that caches by marker,
+            # and litellm passes a custom endpoint the caller's cache markers as they are.
+            messages=without_cache_markers(ctx.messages),
             base_url=url,
             custom_llm_provider="openai",  # litellm transport for any OpenAI-compatible host
             api_key=api_key,

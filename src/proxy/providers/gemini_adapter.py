@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from providers import ProviderAdapter, REASONING_OFF, REASONING_TIERS, register_adapter
 

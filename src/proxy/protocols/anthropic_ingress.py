@@ -6,7 +6,10 @@ content_block_delta → message_stop). ``tool_use``/``tool_result`` round-trip
 structurally in both directions (non-streaming and streaming): inbound ``tool_use``
 blocks become the assistant's own OpenAI ``tool_calls`` (ids preserved) and
 ``tool_result`` blocks become ``role:"tool"`` messages matched to the prior call;
-outbound ``tool_calls`` become ``tool_use`` blocks.
+outbound ``tool_calls`` become ``tool_use`` blocks. A prompt-cache marker
+(``cache_control``) the caller placed travels with what it marks — a system block, a
+content block, a tool call, a tool result, a tool, or the request itself — so Anthropic
+caches the prompt where the caller asked (see ``_with_marker``).
 
 Malformed tool history (by design): an orphaned ``tool_result`` — one whose
 ``tool_use_id`` matches no prior ``tool_use`` — degrades to text rather than emit a
@@ -23,7 +26,8 @@ import json
 from typing import Any, Dict, Iterable, List
 
 from protocols.base import (
-    IngressProtocol, StreamTranslator, finalize_fanout, safe_json_dumps,
+    CALLER_CACHE_MARKERS, IngressProtocol, StreamTranslator, cache_marker,
+    carries_cache_markers, finalize_fanout, safe_json_dumps, UnsupportedRequestField,
 )
 
 # OpenAI finish_reason → Anthropic stop_reason.
@@ -41,13 +45,24 @@ _ERROR_TYPE = {
 }
 
 
+def _with_marker(item: Dict[str, Any], marker: Any) -> Dict[str, Any]:
+    """``item`` carrying the prompt-cache ``marker``, when there is one. litellm turns a
+    ``cache_control`` on an OpenAI part, message, tool call or tool back into an Anthropic
+    cache breakpoint at the same place."""
+    if marker is not None:
+        item["cache_control"] = marker
+    return item
+
+
 def _content_to_openai(content: Any) -> Any:
     """Anthropic text/image content (string or block list) → OpenAI content.
 
-    All-text block lists collapse to a plain string; a list containing images is kept
-    as OpenAI multimodal parts. Tool blocks are extracted and fanned out separately by
-    ``_message_to_openai`` before this is called — by the time a block list reaches
-    here it never contains ``tool_use``/``tool_result`` entries."""
+    All-text block lists collapse to a plain string; a list containing images, or a block
+    the caller marked for prompt caching, is kept as OpenAI parts, each marker on its own
+    part: a marker is a cache breakpoint at a block boundary, which one string cannot
+    hold. Tool blocks are extracted and fanned out separately by ``_message_to_openai``
+    before this is called — by the time a block list reaches here it never contains
+    ``tool_use``/``tool_result`` entries."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -58,18 +73,20 @@ def _content_to_openai(content: Any) -> Any:
         if not isinstance(block, dict):
             continue
         btype = block.get("type")
+        marker = cache_marker(block)
         if btype == "text":
-            parts.append({"type": "text", "text": block.get("text", "")})
+            parts.append(_with_marker({"type": "text", "text": block.get("text", "")}, marker))
         elif btype == "image":
             src = block.get("source") or {}
             if src.get("type") == "base64":
                 url = f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"
-                parts.append({"type": "image_url", "image_url": {"url": url}})
+                parts.append(_with_marker({"type": "image_url", "image_url": {"url": url}}, marker))
                 has_image = True
             elif src.get("type") == "url":
-                parts.append({"type": "image_url", "image_url": {"url": src.get("url", "")}})
+                parts.append(_with_marker(
+                    {"type": "image_url", "image_url": {"url": src.get("url", "")}}, marker))
                 has_image = True
-    if not has_image:
+    if not has_image and not any("cache_control" in p for p in parts):
         return "".join(p["text"] for p in parts if p.get("type") == "text")
     return parts
 
@@ -84,11 +101,25 @@ def _flatten_text(content: Any) -> str:
 
 
 def _tool_to_openai(tool: Dict[str, Any]) -> Dict[str, Any]:
-    return {"type": "function", "function": {
+    return _with_marker({"type": "function", "function": {
         "name": tool.get("name", ""),
         "description": tool.get("description", ""),
         "parameters": tool.get("input_schema", {}) or {},
-    }}
+    }}, cache_marker(tool))
+
+
+def _tool_result_marker(block: Dict[str, Any]) -> Any:
+    """The marker for a ``tool_result`` block: its own, else the last one inside its
+    content. The result reaches OpenAI as one string, so a marker inside it can only mark
+    the whole result: the breakpoint moves to the result's end, never before it."""
+    marker = cache_marker(block)
+    if marker is not None:
+        return marker
+    inner = block.get("content")
+    for part in inner if isinstance(inner, list) else ():
+        if cache_marker(part) is not None:
+            marker = cache_marker(part)
+    return marker
 
 
 class _ToolState:
@@ -130,25 +161,31 @@ def _message_to_openai(role: str, content: Any, state: "_ToolState") -> List[Dic
         if btype == "tool_use":
             name, tool_id = block.get("name", ""), block.get("id", "")
             if role == "assistant" and name and tool_id:
-                tool_calls.append({"id": tool_id, "type": "function", "function": {
-                    "name": name, "arguments": safe_json_dumps(block.get("input", {}))}})
+                tool_calls.append(_with_marker({"id": tool_id, "type": "function", "function": {
+                    "name": name, "arguments": safe_json_dumps(block.get("input", {}))}},
+                    cache_marker(block)))
                 new_ids.append(tool_id)
             else:
                 # Malformed (no name/id) or a tool_use outside an assistant turn — Anthropic
                 # never sends the latter, but degrade defensively rather than drop silently.
-                residual.append({"type": "text",
-                                 "text": f"[tool_use {name}]: {safe_json_dumps(block.get('input', {}))}"})
+                residual.append(_with_marker({
+                    "type": "text",
+                    "text": f"[tool_use {name}]: {safe_json_dumps(block.get('input', {}))}"},
+                    cache_marker(block)))
         elif btype == "tool_result":
             tool_use_id = block.get("tool_use_id", "")
             result_text = _flatten_text(block.get("content"))
+            marker = _tool_result_marker(block)
             # Match only ids from PRIOR messages (already emitted as an assistant tool_calls
             # message). A tool_result sharing a turn with its tool_use is malformed — matching
             # it would emit a role:"tool" BEFORE the assistant message that declares the id
             # (an ordering violation providers reject), so degrade it to text instead.
             if tool_use_id and tool_use_id in state.seen_tool_ids:
-                tool_msgs.append({"role": "tool", "tool_call_id": tool_use_id, "content": result_text})
+                tool_msgs.append(_with_marker(
+                    {"role": "tool", "tool_call_id": tool_use_id, "content": result_text}, marker))
             else:
-                residual.append({"type": "text", "text": f"[tool_result {tool_use_id}]: {result_text}"})
+                residual.append(_with_marker(
+                    {"type": "text", "text": f"[tool_result {tool_use_id}]: {result_text}"}, marker))
         else:
             residual.append(block)  # text / image — let _content_to_openai collapse it
 
@@ -165,9 +202,14 @@ class AnthropicProtocol(IngressProtocol):
     def parse_request(self, body, headers=None, path_model=""):
         messages: List[Dict[str, Any]] = []
         system = body.get("system")
-        sys_text = system if isinstance(system, str) else _flatten_text(system)
-        if sys_text:
-            messages.append({"role": "system", "content": sys_text})
+        if isinstance(system, list) and any(cache_marker(b) is not None for b in system):
+            # A marked system prompt keeps its blocks as parts, so each breakpoint stays
+            # where the caller put it; unmarked, it is one string as before.
+            messages.append({"role": "system", "content": _content_to_openai(system)})
+        else:
+            sys_text = system if isinstance(system, str) else _flatten_text(system)
+            if sys_text:
+                messages.append({"role": "system", "content": sys_text})
         state = _ToolState()
         for m in body.get("messages", []) or []:
             if not isinstance(m, dict):
@@ -187,6 +229,12 @@ class AnthropicProtocol(IngressProtocol):
             params["tools"] = [_tool_to_openai(t) for t in body["tools"] if isinstance(t, dict)]
         if body.get("tool_choice"):
             params["tool_choice"] = _map_tool_choice(body["tool_choice"])
+            if body["tool_choice"].get("disable_parallel_tool_use") is True:
+                params["parallel_tool_calls"] = False
+        if cache_marker(body) is not None:
+            params["cache_control"] = cache_marker(body)  # Anthropic's automatic caching
+        if carries_cache_markers(body):
+            params[CALLER_CACHE_MARKERS] = True
         return messages, model, params
 
     def serialise_response(self, resp):
@@ -231,15 +279,20 @@ class AnthropicProtocol(IngressProtocol):
 
 
 def _map_tool_choice(tc: Any) -> Any:
+    """Anthropic's four tool_choice types, each to its OpenAI equivalent. Anything else is
+    refused: mapping it to "auto" let the model call tools a client had forbidden."""
     if isinstance(tc, dict):
         t = tc.get("type")
         if t == "auto":
             return "auto"
         if t == "any":
             return "required"
+        if t == "none":
+            return "none"
         if t == "tool" and tc.get("name"):
             return {"type": "function", "function": {"name": tc["name"]}}
-    return "auto"
+    raise UnsupportedRequestField(
+        "tool_choice must be an object of type auto, any, none, or tool with a name")
 
 
 def _event(etype: str, data: Dict[str, Any]) -> str:
@@ -336,7 +389,10 @@ class _AnthropicStream(StreamTranslator):
             yield _event("content_block_stop", {"type": "content_block_stop",
                          "index": block_index})
             block_index += 1
+        # Both counts: message_start went out with the first chunk, before litellm's usage
+        # chunk, so its input_tokens is 0; by now the usage has arrived.
         yield _event("message_delta", {"type": "message_delta",
                      "delta": {"stop_reason": self._stop_reason, "stop_sequence": None},
-                     "usage": {"output_tokens": self._output_tokens}})
+                     "usage": {"input_tokens": self._input_tokens,
+                               "output_tokens": self._output_tokens}})
         yield _event("message_stop", {"type": "message_stop"})

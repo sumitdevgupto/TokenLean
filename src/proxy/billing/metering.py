@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from billing.models import UsageEvent
 from protocols.base import DEFAULT_PROTOCOL_NAME
@@ -127,6 +127,8 @@ class UsageMeter:
             # Free trial: flag rows served while the tenant's trial is active so invoicing
             # can exclude them. Read from the tenant-merged ctx.config at write time.
             trial=(((getattr(ctx, "config", None) or {}).get("trial") or {}).get("status") == "active"),
+            # The admin key's own tenant when it sent this request as tenant_id.
+            impersonated_by=getattr(ctx, "impersonator_tenant_id", None) or "",
             # #34 — provider prompt-cache accounting. Passed through as-is so a None
             # (provider reported nothing) persists as SQL NULL rather than a 0 that would
             # read as "this call did no cache work".
@@ -150,10 +152,10 @@ class UsageMeter:
                  group_savings, status_code, billable, total_duration_ms, llm_duration_ms,
                  agent_id, trial,
                  cache_read_tokens, cache_write_tokens,
-                 cost_cache_read_usd, cost_cache_write_usd)
+                 cost_cache_read_usd, cost_cache_write_usd, impersonated_by)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                     $16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25::jsonb,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
+                    $25::jsonb,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
             ON CONFLICT (request_id) DO NOTHING
         """
         try:
@@ -177,6 +179,7 @@ class UsageMeter:
                     event.agent_id, event.trial,
                     event.cache_read_tokens, event.cache_write_tokens,
                     event.cost_cache_read_usd, event.cost_cache_write_usd,
+                    event.impersonated_by,
                 )
         except Exception as exc:
             logger.warning("UsageMeter: Postgres insert failed: %s", exc)

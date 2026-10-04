@@ -115,6 +115,44 @@ def test_breaker_half_open_probe_then_close():
     assert cb.state is BreakerState.CLOSED and cb.failures == 0
 
 
+def test_breaker_half_open_admits_one_probe_at_a_time():
+    # Every caller after the first was admitted while the probe was in flight, so all of
+    # them hit a provider that might still be failing.
+    clk = FakeClock()
+    cb = CircuitBreaker(failure_threshold=1, cooldown_seconds=30, _clock=clk)
+    cb.record_failure()
+    clk.advance(30)
+    assert [cb.allow_request() for _ in range(5)] == [True, False, False, False, False]
+    assert cb.state is BreakerState.HALF_OPEN
+    cb.record_success()
+    assert [cb.allow_request() for _ in range(3)] == [True, True, True]
+
+
+def test_breaker_a_probe_that_never_reports_frees_its_slot_after_the_cooldown():
+    # A 4xx is not a health signal, so nothing records that probe's outcome; without a
+    # limit the breaker would refuse everyone (or, before the fix, admit everyone) for good.
+    clk = FakeClock()
+    cb = CircuitBreaker(failure_threshold=1, cooldown_seconds=30, _clock=clk)
+    cb.record_failure()
+    clk.advance(30)
+    assert cb.allow_request() is True
+    clk.advance(29)
+    assert cb.allow_request() is False
+    clk.advance(1)
+    assert [cb.allow_request() for _ in range(3)] == [True, False, False]
+
+
+def test_breaker_a_failed_probe_ends_the_probe():
+    clk = FakeClock()
+    cb = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, _clock=clk)
+    cb.record_failure()
+    clk.advance(10)
+    assert cb.allow_request() is True
+    cb.record_failure()
+    clk.advance(10)
+    assert cb.allow_request() is True        # the next window's probe, not a stale one
+
+
 def test_breaker_half_open_probe_failure_reopens():
     clk = FakeClock()
     cb = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, _clock=clk)
@@ -412,6 +450,43 @@ def test_fallback_nonretryable_error_continues_chain():
     assert [a.outcome for a in sink] == ["error", "error", "success"]
 
 
+def test_an_attempt_says_whether_the_failure_was_the_providers():
+    """G06's least_latency passes over a model whose call failed on the provider's side
+    (5xx, timeout, connection): the signal the breakers take. A 429 or a key the provider
+    refused says nothing about the model, and the table is shared by every tenant."""
+    store = ResilienceStore(clock=FakeClock())
+    sink = []
+    targets = [_target("openai", "a", exc=_Err(503)), _target("openai", "b", exc=_Err(429)),
+               _target("anthropic", "c", exc=_Err(401)), _target("gemini", "d", result={"ok": 4})]
+    asyncio.run(call_with_resilience(
+        targets, store, _cfg(num_retries=0), attempts_sink=sink, sleep=_noop_sleep,
+    ))
+    assert [(a.model, a.outcome, a.transient) for a in sink] == [
+        ("a", "error", True), ("b", "error", False), ("c", "error", False),
+        ("d", "success", False)]
+
+
+@pytest.mark.parametrize("cancelled_at", [0, 1])
+def test_a_cancelled_attempt_ends_the_chain(cancelled_at):
+    """A request cancelled (the client gone, a shutdown) while a fallback was being tried
+    was recorded as that target's error and the chain went on to the next target, ending in
+    a 502 for a request nobody was waiting for, after more upstream calls."""
+    store = ResilienceStore(clock=FakeClock())
+    calls, sink = [], []
+    outcomes = [_Err(503), _Err(503)]
+    outcomes[cancelled_at] = asyncio.CancelledError()
+    targets = [_target("openai", "a", exc=outcomes[0], calls=calls),
+               _target("anthropic", "b", exc=outcomes[1], calls=calls),
+               _target("gemini", "c", result={"ok": 3}, calls=calls)]
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(call_with_resilience(
+            targets, store, _cfg(num_retries=2), attempts_sink=sink, sleep=_noop_sleep,
+        ))
+    assert calls[-1] == (("openai", "a"), ("anthropic", "b"))[cancelled_at]
+    assert ("gemini", "c") not in calls
+    assert all(a.outcome == "error" and a.error != "CancelledError" for a in sink)
+
+
 def test_primary_nonretryable_still_fails_fast():
     """Counterpart to C3: a caller/config error on the PRIMARY (400 bad request)
     would fail on every provider — fail fast, no failover."""
@@ -587,3 +662,40 @@ def test_model_failures_lock_model_while_fallback_keeps_provider_open():
     # …but the provider breaker never opened (fallback successes reset it).
     assert store.breaker_state("openai", cfg) is BreakerState.CLOSED
     assert store.allow_model("openai", "gpt-4o-mini", cfg) is True
+
+
+# ── How long a provider call may wait ─────────────────────────────────────────────────
+# No provider call set a timeout, so litellm's own fallback applied: a provider that took
+# the connection and then stalled held the request for 10 minutes, long past any client's
+# patience, and the breaker and failover never got to act.
+_PROVIDERS = [{"name": "openai", "model_prefixes": ["gpt-"]},
+              {"name": "anthropic", "model_prefixes": ["claude"],
+               "resilience": {"request_timeout_seconds": 90}}]
+
+
+def test_a_provider_call_waits_300_seconds_by_default():
+    assert ResilienceConfig.resolve({}).request_timeout_seconds == 300.0
+    assert ResilienceConfig.resolve({"resilience": {"enabled": True}}).request_timeout_seconds == 300.0
+
+
+def test_the_timeout_is_configurable_and_a_provider_may_override_it():
+    config = {"resilience": {"request_timeout_seconds": 45}, "providers": _PROVIDERS}
+    assert ResilienceConfig.resolve(config).request_timeout_seconds == 45.0
+    assert ResilienceConfig.resolve(config, "openai").request_timeout_seconds == 45.0
+    assert ResilienceConfig.resolve(config, "anthropic").request_timeout_seconds == 90.0
+
+
+@pytest.mark.parametrize("bad", [0, -5, "soon", None, float("inf"), float("nan"), [30]])
+def test_a_value_that_is_not_a_positive_number_of_seconds_means_the_default(bad):
+    config = {"resilience": {"request_timeout_seconds": bad}}
+    assert ResilienceConfig.resolve(config).request_timeout_seconds == 300.0
+
+
+def test_request_timeout_for_finds_the_model_s_provider():
+    from providers.resilience import request_timeout_for
+    config = {"resilience": {"request_timeout_seconds": 45}, "providers": _PROVIDERS}
+    assert request_timeout_for(config, "claude-haiku-4-5") == 90.0
+    assert request_timeout_for(config, "gpt-4o-mini") == 45.0
+    assert request_timeout_for(config, "unknown-model") == 45.0
+    assert request_timeout_for({}, "gpt-4o-mini") == 300.0
+    assert request_timeout_for(None, "gpt-4o-mini") == 300.0

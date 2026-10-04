@@ -2,9 +2,9 @@
 
 Loads pre-computed DSPy/Opik optimised system-prompt templates from Redis at
 startup (keys: ``{prefix}tok_opt:g20:tpl:{sha256_prefix}``).  On each request
-the system prompt is fingerprinted (SHA-256 of the first 512 chars); when a
+the system prompt is fingerprinted (SHA-256 of the whole prompt); when a
 match is found the system message is swapped to the optimised version.  Falls
-back to the original prompt on any error or cache miss.
+back to the original prompt on any error, cache miss, or non-text content.
 
 Reference: G20 in token_optimization_playbook_v7.md
 """
@@ -14,6 +14,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from middleware import cache_floor
+from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,12 @@ _SHA_PREFIX_LEN = 16  # first 16 hex chars used as fingerprint key
 
 
 def _fp(text: str) -> str:
-    """Return short SHA-256 fingerprint of text (first _SHA_PREFIX_LEN chars)."""
-    return hashlib.sha256(text[:512].encode("utf-8")).hexdigest()[:_SHA_PREFIX_LEN]
+    """Short SHA-256 fingerprint (first _SHA_PREFIX_LEN hex chars) of the WHOLE prompt,
+    surrounding whitespace aside. It covered the first 512 chars only, so a template made
+    from one prompt replaced every prompt that merely shared its start (a per-user tail
+    and all). The template writer (pitch-test-plan seed_g20_redis) imports this.
+    """
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:_SHA_PREFIX_LEN]
 
 
 class G20PromptOptimizer:
@@ -67,8 +72,8 @@ class G20PromptOptimizer:
 
         idx = system_msgs[0]
         original_content = messages[idx].get("content", "")
-        if not original_content:
-            return ctx
+        if not original_content or not isinstance(original_content, str):
+            return ctx  # a multimodal (list) prompt is never swapped
 
         fp = _fp(original_content)
         optimised = await self._load_template(ctx, fp)
@@ -76,8 +81,10 @@ class G20PromptOptimizer:
             logger.debug("G20: no template for fingerprint %s — keeping original", fp)
             return ctx
 
-        original_tokens = len(original_content.split())
-        optimised_tokens = len(optimised.split())
+        original_tokens = count_messages_tokens(
+            [{"role": "system", "content": original_content}], ctx.model)
+        optimised_tokens = count_messages_tokens(
+            [{"role": "system", "content": optimised}], ctx.model)
 
         # Snapshot the list BEFORE the in-place swap: `messages` is `ctx.messages`, so
         # the assignment below mutates it and an "original" captured afterwards would

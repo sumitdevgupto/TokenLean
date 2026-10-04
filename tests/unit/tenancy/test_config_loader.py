@@ -94,6 +94,18 @@ class TestTenantConfigLoaderOverrides:
         asyncio.run(loader.load(ctx))
         assert "custom" not in ctx.config
 
+    def test_the_tenant_settings_are_kept_as_the_tenant_chose_them(self):
+        """Once merged, a tenant setting cannot be told apart from the platform's; G06
+        needs to know which tier picks were the tenant's."""
+        picks = {"groups": {"G6_routing": {"tiers": {"simple": ["gpt-4.1-nano"]}}}}
+        loader = self._loader(row={"config_overrides": json.dumps(picks)})
+        ctx = _Ctx({"groups": {"G6_routing": {"tiers": {"simple": ["gpt-4o-mini"],
+                                                        "medium": ["gpt-4o"]}}}})
+        asyncio.run(loader.load(ctx))
+        assert getattr(ctx, "tenant_config_overrides", None) == picks
+        assert ctx.config["groups"]["G6_routing"]["tiers"] == {
+            "simple": ["gpt-4.1-nano"], "medium": ["gpt-4o"]}
+
 
 class TestTenantConfigLoaderCaching:
     def test_cache_avoids_second_db_call(self):

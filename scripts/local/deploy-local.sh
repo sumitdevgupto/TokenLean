@@ -65,6 +65,10 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
   success "Loaded env file"
 fi
+# docker-compose.yml requires the stack's own credentials (the Redis password, the Qdrant API
+# key, the Langfuse and Grafana admin passwords): any .env lacks is generated into it.
+source "${SCRIPT_DIR}/fill-local-env.sh"
+fill_local_env "$ENV_FILE"
 
 # ─── Validate required env vars ───────────────────────────────────────────────
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then

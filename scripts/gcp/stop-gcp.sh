@@ -16,8 +16,10 @@
 #          itself already runs with --save "" (non-persistent), so there was never
 #          any Redis *data* to preserve on the VM either way.
 #   2. Stops Cloud SQL instance (stops compute; ~$2/month storage remains)
-#   3. Cloud Run (proxy, Qdrant, sidecars): already scales to zero — no action needed
-#      Qdrant data persists on Cloud Run storage between scale-to-zero cycles.
+#   3. Cloud Run (proxy, sidecars): already scales to zero — no action needed. Qdrant keeps
+#      its one instance running (billed at the idle rate): its documents live in that
+#      instance's own storage. A restart restores tenant collections from the snapshots each
+#      ingest writes to the qdrant-snapshots bucket.
 #
 # To resume: run scripts/gcp/start-gcp.sh
 # =============================================================================
@@ -167,8 +169,8 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║     Infrastructure PAUSED — MINIMUM COST             ║${NC}"
 echo -e "${GREEN}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║${NC} Cloud Run:      \$0 (scales to zero — proxy, Qdrant, sidecars)"
-echo -e "${GREEN}║${NC} Qdrant data:    persists (Cloud Run storage, no billing at zero scale)"
+echo -e "${GREEN}║${NC} Cloud Run:      \$0 (scales to zero — proxy, sidecars)"
+echo -e "${GREEN}║${NC} Qdrant:         one instance kept running (idle rate) so its documents survive"
 echo -e "${GREEN}║${NC} Memorystore:    \$0 (deleted, backup in GCS)"
 echo -e "${GREEN}║${NC} Cloud SQL:      ~\$2/month storage only"
 echo -e "${GREEN}║${NC} GCS Storage:    ~\$0.02/GB/month (backup)"

@@ -75,12 +75,27 @@ async def emit_event(tenant_id: str, event: str, payload: Dict[str, Any]) -> Non
         logger.debug("event dispatch failed (%s): %s", event, exc)
 
 
+# Scheduled deliveries still running: held here (the loop keeps only a weak reference to a
+# task) so the proxy's shutdown can wait for them (main._drain_after_response).
+_PENDING: set = set()
+
+
+def pending_tasks() -> set:
+    """The scheduled deliveries that have not finished yet."""
+    return set(_PENDING)
+
+
 def schedule_event(tenant_id: str, event: str, payload: Dict[str, Any]) -> None:
     """Fire-and-forget :func:`emit_event`. No-op when no dispatcher is installed (OSS) or
     when there is no running loop. Never blocks or raises on the caller's path."""
     if not dispatcher_installed():
         return
+    coro = emit_event(tenant_id, event, payload)
     try:
-        asyncio.create_task(emit_event(tenant_id, event, payload))
+        task = asyncio.create_task(coro)
     except RuntimeError:  # no running loop (not the async request path) — skip
+        coro.close()
         logger.debug("event %s skipped: no running loop", event)
+        return
+    _PENDING.add(task)
+    task.add_done_callback(_PENDING.discard)

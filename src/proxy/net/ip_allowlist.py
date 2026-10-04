@@ -8,15 +8,19 @@ re-validate the key to learn the tenant.
 
 Two allowlist sources, union'd:
   * ``global_cidrs`` — from ``config.yaml`` ``ip_allowlist.global_cidrs``; applies to
-    ALL tenants (e.g. an office / VPN egress that must always work).
+    ALL tenants (e.g. an office / VPN egress that must always work) while
+    ``ip_allowlist.enabled`` is on.
   * ``tenant_cidrs`` — per-tenant, stamped into the key metadata by the commercial
-    admin lifecycle (``api_key_manager.set_ip_allowlist``); ``companies.ip_allowlist``
-    is the source-of-record.
+    admin lifecycle (``api_key_manager.set_ip_allowlist``), which is its only record;
+    enforced whether ``ip_allowlist.enabled`` is on or off.
 
 Semantics (see ``ip_allowed``): a request is allowed iff its source IP falls in
 ``global_cidrs ∪ tenant_cidrs``. If BOTH lists are empty the tenant is
 unrestricted (allow). A tenant with its own non-empty list is bound to
 ``its_own ∪ global``. IPv4 and IPv6 safe.
+
+The source IP comes from ``net/client_ip.py``, which counts trusted proxy hops from the
+right of ``X-Forwarded-For`` (its left-most entry is whatever the client wrote).
 
 This module imports only the stdlib — no commercial module, keeping the open-core
 barricade green (``verify-oss-gates.sh`` Gate 7).
@@ -29,22 +33,6 @@ import logging
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
-
-
-def client_ip_from_request(request, trust_xff: bool = True) -> str:
-    """Best-effort client IP for a Starlette/FastAPI ``request``.
-
-    When ``trust_xff`` is True the first ``X-Forwarded-For`` hop wins (Cloud Run and
-    most proxies front the app and set this to the real client). Otherwise the direct
-    socket peer is used. Mirrors ``portal_auth._client_ip`` (that helper lives in a
-    commercial module core cannot import, so the logic is duplicated here on purpose).
-    Returns ``"unknown"`` when no IP can be determined.
-    """
-    if trust_xff:
-        xff = request.headers.get("x-forwarded-for", "")
-        if xff:
-            return xff.split(",")[0].strip()
-    return request.client.host if getattr(request, "client", None) else "unknown"
 
 
 def _parse_networks(cidrs: List[str]) -> List[ipaddress._BaseNetwork]:
@@ -75,6 +63,8 @@ def ip_allowed(ip: str, global_cidrs: Optional[List[str]],
     except ValueError:
         logger.warning("ip_allowlist: undeterminable/invalid client ip %r → denied", ip)
         return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped  # ::ffff:10.1.2.3 is 10.1.2.3 and must match IPv4 ranges
     for net in _parse_networks(list(global_cidrs) + list(tenant_cidrs)):
         # Only compare same-family (ip_address in ip_network raises across families).
         if addr.version == net.version and addr in net:

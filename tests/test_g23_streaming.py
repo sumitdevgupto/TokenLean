@@ -90,34 +90,53 @@ class TestCompressText:
 class TestG23Middleware:
     @pytest.mark.asyncio
     async def test_disabled_config_noop(self):
+        from middleware.g23_streaming_compression import COMPRESSIBLE_OUTPUT_TOKENS
         ctx = _make_ctx(enabled=False)
+        ctx.tenant_id = "g23-disabled"
+        counter = COMPRESSIBLE_OUTPUT_TOKENS.labels(tenant_id="g23-disabled")
+        before = counter._value.get()
         g23 = G23StreamingCompression()
         content = "This is the repeated pattern. " * 10
         response = _make_response(content)
         result = await g23.process_response(ctx, response)
         assert "x_compressed_content" not in result
         assert len(ctx.savings.step_savings) == 0
+        assert counter._value.get() == before  # nothing measured either
 
     @pytest.mark.asyncio
-    async def test_repeated_content_adds_extension_field(self):
+    async def test_the_answer_reaches_the_client_as_it_came(self):
+        # The compressed copy went into the body as x_compressed_content (and so into the
+        # G05 cache), doubling the answer for a field nothing read.
+        import copy
         ctx = _make_ctx(enabled=True, min_repeat=3)
-        phrase = "connection timeout to payment gateway occurred"
-        content = " ".join([phrase] * 5)
+        content = " ".join(["connection timeout to payment gateway occurred"] * 5)
         response = _make_response(content)
-        g23 = G23StreamingCompression()
-        result = await g23.process_response(ctx, response)
-        assert "x_compressed_content" in result
+        sent = copy.deepcopy(response)
+        result = await G23StreamingCompression().process_response(ctx, response)
+        assert result == sent
 
     @pytest.mark.asyncio
-    async def test_compressed_content_shorter_than_original(self):
+    async def test_no_savings_step_is_recorded(self):
+        # The client receives the whole answer and nothing replays the compressed copy, so
+        # no token was saved: a step here fed group savings and USD_SAVED with phantoms.
         ctx = _make_ctx(enabled=True, min_repeat=3)
-        phrase = "the service encountered an unexpected error"
-        content = " ".join([phrase] * 6)
-        response = _make_response(content)
-        g23 = G23StreamingCompression()
-        result = await g23.process_response(ctx, response)
-        if "x_compressed_content" in result:
-            assert len(result["x_compressed_content"]) < len(content)
+        content = " ".join(["the service encountered an unexpected error"] * 6)
+        await G23StreamingCompression().process_response(ctx, _make_response(content))
+        assert [s for s in ctx.savings.step_savings if s.group == "G23"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_repetition_is_measured(self):
+        from middleware.g23_streaming_compression import (
+            COMPRESSIBLE_OUTPUT_TOKENS, _estimate_tokens_from_chars)
+        ctx = _make_ctx(enabled=True, min_repeat=3)
+        ctx.tenant_id = "g23-measured"
+        content = " ".join(["the distributed system experienced high latency"] * 5)
+        _, chars = _compress_text(content, min_repeat=3, ngram_size=5)
+        counter = COMPRESSIBLE_OUTPUT_TOKENS.labels(tenant_id="g23-measured")
+        before = counter._value.get()
+        await G23StreamingCompression().process_response(ctx, _make_response(content))
+        assert chars > 0
+        assert counter._value.get() - before == _estimate_tokens_from_chars(chars)
 
     @pytest.mark.asyncio
     async def test_original_response_content_unchanged(self):
@@ -129,18 +148,6 @@ class TestG23Middleware:
         result = await g23.process_response(ctx, response)
         # Original content is never modified
         assert result["choices"][0]["message"]["content"] == content
-
-    @pytest.mark.asyncio
-    async def test_savings_recorded_when_compression_occurs(self):
-        ctx = _make_ctx(enabled=True, min_repeat=3)
-        phrase = "the distributed system experienced high latency"
-        content = " ".join([phrase] * 5)
-        response = _make_response(content)
-        g23 = G23StreamingCompression()
-        await g23.process_response(ctx, response)
-        if any("G23" in s.group for s in ctx.savings.step_savings):
-            step = next(s for s in ctx.savings.step_savings if s.group == "G23")
-            assert step.absolute_saving >= 0
 
     @pytest.mark.asyncio
     async def test_no_choices_returns_response_unchanged(self):
@@ -157,17 +164,6 @@ class TestG23Middleware:
         g23 = G23StreamingCompression()
         result = await g23.process_response(ctx, response)
         assert "x_compressed_content" not in result
-
-    @pytest.mark.asyncio
-    async def test_compression_ratio_field_added(self):
-        ctx = _make_ctx(enabled=True, min_repeat=3)
-        phrase = "the checkout service failed with a timeout error"
-        content = " ".join([phrase] * 5)
-        response = _make_response(content)
-        g23 = G23StreamingCompression()
-        result = await g23.process_response(ctx, response)
-        if "x_compressed_content" in result:
-            assert 0.0 < result["x_compression_ratio"] <= 1.0
 
     @pytest.mark.asyncio
     async def test_tool_call_response_no_content_unchanged(self):

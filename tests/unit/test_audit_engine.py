@@ -90,8 +90,21 @@ class _SecCtx:
         self.context_trust_pii_action = kw.get("context_trust_pii_action")
         self.context_trust_pii_entities = kw.get("context_trust_pii_entities", [])
         self.context_trust_pii_redactions = kw.get("context_trust_pii_redactions", 0)
+        self.context_trust_managed_recorded = kw.get("context_trust_managed_recorded", [])
         self.empty_completion = kw.get("empty_completion")
         self.routed_model = kw.get("routed_model", "o4-mini")
+
+
+async def test_security_events_record_a_managed_rule_match_that_changed_nothing():
+    """G31 runs the managed rules record-only until enforcement is on: the row names the
+    rules (ids from the managed set, never content) and says nothing was done."""
+    conn = _Conn()
+    await AuditLogger(_Pool(conn)).log_security_events(
+        _SecCtx(context_trust_managed_recorded=["managed.grandma_exploit"]))
+    assert len(conn.calls) == 1
+    _, args = conn.calls[0]
+    assert args[3] == "context_trust.managed_recorded"
+    assert "managed.grandma_exploit" in args[5] and '"mode": "record"' in args[5]
 
 
 async def test_security_events_guardrail_flag_row():

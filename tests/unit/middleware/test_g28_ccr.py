@@ -252,6 +252,15 @@ class TestHeadroomStatsIsTenantScoped:
         assert globex["local_store_size"] == 5
         assert len(_local_store) == 7, "sanity: the process really does hold both tenants"
 
+    async def test_the_default_tenant_counts_only_its_own_blocks(self, fake_redis):
+        # Its prefix is "", and startswith("") matched every tenant's keys.
+        from middleware.g28_ccr import dispatch_mcp_tool
+        await dispatch_mcp_tool("headroom_compress", {"text": "default one"}, 60, prefix="")
+        for i in range(3):
+            await dispatch_mcp_tool("headroom_compress", {"text": f"acme {i}"}, 60, prefix="t:acme:")
+        default = await dispatch_mcp_tool("headroom_stats", {}, 60, prefix="")
+        assert default["local_store_size"] == 1
+
     async def test_hit_miss_counters_do_not_leak_across_tenants(self, fake_redis):
         from middleware.g28_ccr import dispatch_mcp_tool
         stored = await dispatch_mcp_tool("headroom_compress", {"text": "acme secret"}, 60,

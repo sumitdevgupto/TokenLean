@@ -66,11 +66,18 @@ def load_eval_dataset(path: str) -> List[Dict[str, Any]]:
     return samples
 
 
+def _redis_login() -> Dict[str, str]:
+    """REDIS_PASSWORD (the local Redis requires one: docker-compose.yml) as the `default`
+    user's, as the proxy sends it; credentials in the URL win."""
+    password = os.getenv("REDIS_PASSWORD") or ""
+    return {"username": "default", "password": password} if password else {}
+
+
 def get_current_template(redis_url: str, template_id: str) -> Optional[Dict[str, Any]]:
     """Fetch current template from Redis G2 registry."""
     try:
         import redis
-        r = redis.from_url(redis_url)
+        r = redis.from_url(redis_url, **_redis_login())
         key = f"tok_opt:template:meta:{template_id}"
         data = r.get(key)
         if data:
@@ -92,7 +99,7 @@ def push_optimized_template(
     """Push optimized template to Redis G2 registry."""
     try:
         import redis
-        r = redis.from_url(redis_url)
+        r = redis.from_url(redis_url, **_redis_login())
 
         # Store optimized prompt
         key = f"tok_opt:template:optimized:{template_id}"

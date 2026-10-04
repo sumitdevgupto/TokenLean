@@ -107,3 +107,18 @@ class TestGetLLMProviderKey:
                 from auth.api_key_manager import get_llm_provider_key
                 result = get_llm_provider_key("openai")
         assert result == "sk-secret-key"
+
+
+def test_tests_cannot_reach_the_real_secret_manager():
+    """A test that reaches a Secret Manager call it did not patch used to call Google with the
+    developer's own credentials. The suite's conftest swaps both client classes for a
+    stand-in that refuses, and the key fetch then reports no secret, as it does without
+    credentials."""
+    from google.cloud import secretmanager
+    for name in ("SecretManagerServiceClient", "SecretManagerServiceAsyncClient"):
+        client_class = getattr(secretmanager, name)
+        assert getattr(client_class, "is_test_stand_in", False), name
+        with pytest.raises(RuntimeError, match="real Secret Manager"):
+            client_class()
+    from auth.api_key_manager import _fetch_secret
+    assert _fetch_secret("llm-key-openai") is None

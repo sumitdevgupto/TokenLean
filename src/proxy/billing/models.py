@@ -1,6 +1,6 @@
 """Billing domain models and Postgres DDL."""
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from protocols.base import DEFAULT_PROTOCOL_NAME
@@ -72,6 +72,9 @@ class UsageEvent:
     # Persisted for usage visibility but EXCLUDED from invoices (a trial-only period bills
     # $0). Set at write time from ctx.config so it is robust to a later trial-state edit.
     trial: bool = False
+    # The tenant of the admin key that sent this request as tenant_id (X-Tenant-ID), empty
+    # for the tenant's own traffic. Such a row is never billable (main._record_outcome).
+    impersonated_by: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -114,6 +117,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     llm_duration_ms INTEGER     NOT NULL DEFAULT 0,
     agent_id        TEXT        NOT NULL DEFAULT '',
     trial           BOOLEAN     NOT NULL DEFAULT false,
+    impersonated_by TEXT        NOT NULL DEFAULT '',
     cache_read_tokens  INTEGER,
     cache_write_tokens INTEGER,
     cost_cache_read_usd  NUMERIC(12,6),
@@ -164,6 +168,9 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT
 -- Free trial: flags a served 2xx made during an active trial; EXCLUDED from invoices
 -- (invoice/usage-agg SQL filters `AND NOT COALESCE(trial, false)`) but kept for visibility.
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS trial BOOLEAN NOT NULL DEFAULT false;
+-- The tenant of an admin key that sent the request as this tenant (X-Tenant-ID); such a row
+-- is never billable. Empty for the tenant's own traffic.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS impersonated_by TEXT NOT NULL DEFAULT '';
 -- #34: provider prompt-cache accounting. Deliberately NULLABLE with no DEFAULT — a row
 -- written before this shipped, or by a provider that reports no cache counts, must stay
 -- distinguishable from one that genuinely saw zero cache activity.
@@ -176,3 +183,13 @@ CREATE INDEX IF NOT EXISTS usage_events_tenant_user_idx ON usage_events (tenant_
 CREATE INDEX IF NOT EXISTS usage_events_tenant_ts_status_idx
     ON usage_events (tenant_id, timestamp DESC) INCLUDE (status_code, total_duration_ms, billable);
 """.replace("__PROTO_DEFAULT__", DEFAULT_PROTOCOL_NAME)
+
+
+async def ensure_usage_events_schema(pg_pool) -> None:
+    """Apply USAGE_EVENTS_DDL (idempotent). Skipped for a restricted runtime role, whose
+    tables the schema job keeps current as their owner (audit/enforcement.py)."""
+    from cache.pg_pool import may_run_ddl
+    if not await may_run_ddl(pg_pool, "usage_events"):
+        return
+    async with pg_pool.acquire() as conn:
+        await conn.execute(USAGE_EVENTS_DDL)

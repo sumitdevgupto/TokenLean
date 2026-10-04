@@ -2,15 +2,47 @@ import os
 import re
 import threading
 import logging
-from typing import Any, Dict
+import time
+from typing import Any, Callable, Dict, List
 
 import yaml
+from prometheus_client import Counter
 
 logger = logging.getLogger(__name__)
+
+# A reload that failed or was refused; the running config stayed.
+CONFIG_RELOAD_FAILURES = Counter(
+    "token_opt_config_reload_failures_total",
+    "Config reloads that failed or were refused, keeping the running config",
+)
 
 _config: Dict[str, Any] = {}
 _lock = threading.RLock()
 _RELOAD_INTERVAL = int(os.getenv("CONFIG_RELOAD_INTERVAL_SECONDS", "60"))
+# Steps applied to every freshly loaded config before it goes live (register_post_load).
+_post_load: List[Callable[[Dict[str, Any]], Any]] = []
+
+
+def register_post_load(step: Callable[[Dict[str, Any]], Any]) -> None:
+    """Run ``step(config)`` on every config load, before the new config goes live.
+
+    A reload replaces the whole config, so anything merged into the live dict afterwards
+    vanished at the next reload and came back only when its own loop ran again. A post-load
+    step is applied to each new config before the swap, so its changes are never missing.
+    Registering the same step again has no effect. A step that raises is logged and skipped;
+    the new config still goes live."""
+    if step not in _post_load:
+        _post_load.append(step)
+
+# A required load (startup, the invoicing job) is retried to ride out a transient storage
+# error, then gives up: 3 attempts, 1s then 2s apart.
+_REQUIRED_LOAD_ATTEMPTS = 3
+_REQUIRED_LOAD_BACKOFF_SECONDS = 1.0
+_sleep = time.sleep
+
+
+class ConfigLoadError(RuntimeError):
+    """The config could not be loaded by a caller that cannot run without one."""
 
 # Matches ${VAR} and ${VAR:-default} (shell-style) inside config string values.
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -55,12 +87,29 @@ def _load_from_file(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+_GROUP_KEY = re.compile(r"^[Gg]\d+_")   # G05_cache, g22_deduplication, ...
+
+
+def _merge_groups(groups: Dict[str, Any], fragment: Dict[str, Any]) -> None:
+    """A params file's ``groups:`` changes only the keys it names in each group."""
+    for group, settings in fragment.items():
+        if settings is None:            # `G5_cache:` with nothing under it
+            continue
+        current = groups.get(group)
+        if isinstance(settings, dict) and isinstance(current, dict):
+            current.update(settings)
+        else:
+            groups[group] = settings
+
+
 def merge_params_dir(base: Dict[str, Any], params_dir: str) -> Dict[str, Any]:
     """Merge all *.yaml files from ``params_dir`` into ``base`` config.
 
     Files are loaded in alphabetical order so later files win on key conflicts.
     Non-YAML files are silently skipped.  A missing directory logs a warning
-    and returns ``base`` unchanged.
+    and returns ``base`` unchanged. A section merges key by key; under ``groups:`` each
+    group does, so a file names only the settings it changes. A group set at the top level
+    is reported: every group reads ``groups.<name>``, so nothing would see it.
     """
     import copy
     if not params_dir or not os.path.isdir(params_dir):
@@ -77,6 +126,14 @@ def merge_params_dir(base: Dict[str, Any], params_dir: str) -> Dict[str, Any]:
             with open(fpath, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             for k, v in data.items():
+                if k == "groups" and isinstance(v, dict):
+                    if not isinstance(result.get("groups"), dict):
+                        result["groups"] = {}
+                    _merge_groups(result["groups"], v)
+                    continue
+                if _GROUP_KEY.match(str(k)) or k in (result.get("groups") or {}):
+                    logger.warning("params file %s sets %r at the top level, where nothing "
+                                   "reads it: put group settings under groups:", fname, k)
                 if isinstance(v, dict) and isinstance(result.get(k), dict):
                     result[k].update(v)
                 else:
@@ -87,31 +144,91 @@ def merge_params_dir(base: Dict[str, Any], params_dir: str) -> Dict[str, Any]:
     return result
 
 
-def load_config() -> Dict[str, Any]:
-    global _config
-    gcs_bucket = os.getenv("CONFIG_GCS_BUCKET", "")
-    gcs_blob = os.getenv("CONFIG_GCS_BLOB", "config/config.yaml")
-    local_path = os.getenv("CONFIG_LOCAL_PATH", "config/config.yaml")
-
+def _uses_gcs() -> bool:
     storage_backend = os.getenv("STORAGE_BACKEND", "gcs").lower().strip()
-    try:
-        raw = (
-            _load_from_gcs(gcs_bucket, gcs_blob)
-            if gcs_bucket and storage_backend != "local"
-            else _load_from_file(local_path)
-        )
-        # Merge any per-feature param files from params_dir
-        params_dir = raw.get("params_dir", "")
-        if params_dir:
-            raw = merge_params_dir(raw, params_dir)
-        # Resolve ${VAR} / ${VAR:-default} placeholders from the environment so all
-        # tunable defaults live in config.yaml + .env, never hardcoded in the proxy.
-        raw = expand_env_vars(raw)
-        with _lock:
-            _config = raw
-        logger.info("Config loaded successfully")
-    except Exception as exc:
-        logger.error("Config load failed: %s — using last known good", exc)
+    return bool(os.getenv("CONFIG_GCS_BUCKET", "")) and storage_backend != "local"
+
+
+def _config_source() -> str:
+    if _uses_gcs():
+        return (f"gs://{os.getenv('CONFIG_GCS_BUCKET', '')}/"
+                f"{os.getenv('CONFIG_GCS_BLOB', 'config/config.yaml')}")
+    return os.getenv("CONFIG_LOCAL_PATH", "config/config.yaml")
+
+
+def _refuse_a_shrunken_reload(new: Dict[str, Any]) -> None:
+    """Refuse a reload that has no section the running config has. A partly written file
+    parses to a mapping missing its later sections, and swapping it in turned controls off
+    without an error (no rate_limit means no rate limit or spend cap; no providers, no
+    routing). The running config stays; removing a section on purpose takes a restart."""
+    with _lock:
+        running = set(_config)
+    dropped = sorted(running - set(new))
+    if dropped:
+        raise ValueError(f"the new config has no {', '.join(dropped)} section, which the "
+                         "running one has (a partly written file?); restart the proxy to "
+                         "apply a config without it")
+
+
+def _load_once(reload: bool = False) -> Dict[str, Any]:
+    global _config
+    raw = (
+        _load_from_gcs(os.getenv("CONFIG_GCS_BUCKET", ""),
+                       os.getenv("CONFIG_GCS_BLOB", "config/config.yaml"))
+        if _uses_gcs()
+        else _load_from_file(os.getenv("CONFIG_LOCAL_PATH", "config/config.yaml"))
+    )
+    if not isinstance(raw, dict):  # an empty or truncated file parses to None or a scalar
+        raise ValueError(f"config root must be a mapping, got {type(raw).__name__}")
+    # Merge any per-feature param files from params_dir
+    params_dir = raw.get("params_dir", "")
+    if params_dir:
+        raw = merge_params_dir(raw, params_dir)
+    # Resolve ${VAR} / ${VAR:-default} placeholders from the environment so all
+    # tunable defaults live in config.yaml + .env, never hardcoded in the proxy.
+    raw = expand_env_vars(raw)
+    if reload:
+        _refuse_a_shrunken_reload(raw)
+    for step in list(_post_load):
+        try:
+            step(raw)
+        except Exception as exc:
+            logger.warning("Config post-load step %s failed: %s",
+                           getattr(step, "__qualname__", step), exc)
+    with _lock:
+        _config = raw
+    logger.info("Config loaded successfully")
+    return _config
+
+
+def load_config(required: bool = False) -> Dict[str, Any]:
+    """Load the config (GCS object or local file) into the module cache and return it.
+
+    ``required=True`` is for callers that cannot run without a config — startup and the
+    invoicing job: a failure is retried, then raises :class:`ConfigLoadError`. Otherwise
+    (hot reload) a failure keeps the last known good config. On a fresh process that is
+    ``{}`` — no rate card, no spend cap, no provider tiers — which is why startup must
+    never fall back to it. A reload is also refused, keeping the running config, when it
+    lacks a section the running config has (_refuse_a_shrunken_reload).
+    """
+    attempts = _REQUIRED_LOAD_ATTEMPTS if required else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return _load_once(reload=not required)
+        except Exception as exc:
+            source = _config_source()
+            if attempt < attempts:
+                logger.warning("Config load from %s failed (attempt %d/%d): %s — retrying",
+                               source, attempt, attempts, exc)
+                _sleep(_REQUIRED_LOAD_BACKOFF_SECONDS * 2 ** (attempt - 1))
+                continue
+            if required:
+                hint = "" if _uses_gcs() else (
+                    " (for a local deployment, copy config/config.yaml.template to it)")
+                raise ConfigLoadError(
+                    f"could not load config from {source}: {exc}{hint}") from exc
+            logger.error("Config load from %s failed: %s — using last known good", source, exc)
+            CONFIG_RELOAD_FAILURES.inc()
     return _config
 
 

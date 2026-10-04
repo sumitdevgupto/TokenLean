@@ -251,6 +251,44 @@ class TestEveryProviderCallIsPriced:
         # y stays the FINAL call's prompt, so it remains comparable with past mints.
         assert ctx.savings.final_tokens_sent == 100
 
+    async def test_a_side_call_after_the_served_call_is_not_taken_for_it(self, make_ctx):
+        """G11's repair re-ask is made AFTER the served call. Treating the last entry as the
+        served call priced the served call twice and the repair not at all."""
+        from middleware import record_provider_call
+        from savings.calculator import estimate_cost
+
+        served = self._resp(prompt=100, completion=50)
+        base = make_ctx(model="gpt-4o")
+        record_provider_call(base, "gpt-4o", served)
+        await self._record(base, served)
+
+        ctx = make_ctx(model="gpt-4o")
+        record_provider_call(ctx, "gpt-4o", served)
+        record_provider_call(ctx, "gpt-4o-mini", self._resp(prompt=300, completion=20), side=True)
+        await self._record(ctx, served)
+
+        repair = estimate_cost(300, 20, "gpt-4o-mini")
+        assert ctx.savings.cost_actual_usd == pytest.approx(base.savings.cost_actual_usd + repair)
+        meta = ctx.savings.to_langfuse_metadata()
+        assert meta["provider_call_count"] == 2
+        assert meta["provider_call_prompt_tokens"] == 400
+
+    async def test_a_side_call_counts_when_the_served_call_was_not_recorded(self, make_ctx):
+        """A side call is added even when no served provider call was recorded."""
+        from middleware import record_provider_call
+        from savings.calculator import estimate_cost
+
+        served = self._resp(prompt=100, completion=50)
+        base = make_ctx(model="gpt-4o")
+        await self._record(base, served)
+
+        ctx = make_ctx(model="gpt-4o")
+        record_provider_call(ctx, "gpt-4o-mini", self._resp(prompt=300, completion=20), side=True)
+        await self._record(ctx, served)
+
+        summary = estimate_cost(300, 20, "gpt-4o-mini")
+        assert ctx.savings.cost_actual_usd == pytest.approx(base.savings.cost_actual_usd + summary)
+
     async def test_g18_records_the_routing_step_even_when_disabled(self, make_ctx):
         """Turning observability off must not turn the routing ledger back into the
         plan-time claim this replaced."""
@@ -263,3 +301,14 @@ class TestEveryProviderCallIsPriced:
 
         await G18Observability().record(ctx, self._resp())
         assert len(_g06_steps(ctx)) == 1
+
+
+def test_a_provider_call_that_cannot_be_recorded_is_logged(make_ctx, caplog):
+    """The request is still served, but its cost now misses that call: it must not vanish
+    without a word."""
+    from middleware import record_provider_call
+    ctx = make_ctx(model="gpt-4o")
+    with caplog.at_level("WARNING", logger="middleware"):
+        record_provider_call(ctx, "gpt-4o", {"usage": {"prompt_tokens": "lots"}})
+    assert ctx.provider_calls == []
+    assert "cost is understated" in caplog.text

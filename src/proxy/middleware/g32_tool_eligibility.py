@@ -119,11 +119,12 @@ class StreamToolGate:
         self.denied.append(name or "<unnamed>")
         return False
 
-    def _keep(self, entry: Any) -> bool:
-        """Whether one ``tool_calls`` delta entry may be relayed."""
+    def _keep(self, choice_idx: Any, entry: Any) -> bool:
+        """Whether one ``tool_calls`` delta entry may be relayed. A call is known by its
+        choice AND its index: with n>1 every choice numbers its calls from 0."""
         if not isinstance(entry, dict):
             return True                       # not ours to interpret
-        idx = entry.get("index", 0)
+        idx = (choice_idx, entry.get("index", 0))
         if idx in self._verdicts:
             return self._verdicts[idx]
         fn = entry.get("function")
@@ -154,7 +155,8 @@ class StreamToolGate:
             calls = delta.get("tool_calls")
             if not isinstance(calls, list) or not calls:
                 continue
-            kept = [c for c in calls if self._keep(c)]
+            choice_idx = choice.get("index", 0)
+            kept = [c for c in calls if self._keep(choice_idx, c)]
             if len(kept) == len(calls):
                 continue
             touched = True
@@ -517,5 +519,5 @@ class G32ToolEligibility:
                 "denied": denied,
                 "stripped": stripped,
             }
-        except Exception:  # a non-dict response must never break on annotation
-            pass
+        except Exception as exc:  # a non-dict response must never break on annotation
+            logger.debug("tool-eligibility annotation not added: %r", exc)

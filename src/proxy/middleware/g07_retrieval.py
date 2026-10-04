@@ -16,12 +16,12 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from middleware import RequestContext
 from middleware import langfuse_tracing
 from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
-from savings.calculator import count_messages_tokens, estimate_tokens
+from savings.calculator import count_messages_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G07"
@@ -180,19 +180,35 @@ def _resolve_collection(ctx, cfg: Dict) -> str:
     return tenant_collection
 
 
+def _request_top_k(ctx: Any, cfg: Dict) -> int:
+    """The caller's x_rag_top_k (the X-Rag-Top-K header) when it is a whole number of at
+    least 1, capped at max_top_k (default 50); otherwise the configured top_k. It sizes every
+    vector-store prefetch for the request: a non-number used to make the request a 500, and
+    nothing bounded a large one. The operator's own top_k is used as configured."""
+    configured = int(cfg.get("top_k", 3))
+    asked = ctx.params.get("x_rag_top_k")
+    if asked is None:
+        return configured
+    try:
+        value = int(str(asked))      # "2.5" and "True" fail too
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.debug("[%s] G07 ignoring x_rag_top_k=%r", getattr(ctx, "request_id", "?"), asked)
+        return configured
+    return min(value, int(cfg.get("max_top_k", 50)))
+
+
 class G07Retrieval:
     """Retrieval with JIT toggle, pgvector fallback, and chunk guard."""
     
     def __init__(self):
-        self._chunk_guard: Optional[ChunkGuard] = None
         self._rag_fallback = RAGFallbackOrchestrator(_QDRANT_URL)
-    
+
     def _get_chunk_guard(self, cfg: Dict) -> ChunkGuard:
-        if self._chunk_guard is None:
-            max_chunk = cfg.get("max_chunk_tokens", 1000)
-            max_total = cfg.get("max_total_context_tokens", 4000)
-            self._chunk_guard = ChunkGuard(max_chunk, max_total)
-        return self._chunk_guard
+        # Built per request from this request's config (a tenant overlay or a reload may
+        # change the limits); one built once kept the first request's limits for everyone.
+        return ChunkGuard(cfg.get("max_chunk_tokens", 1000), cfg.get("max_total_context_tokens", 4000))
     
     async def process_request(self, ctx: RequestContext) -> RequestContext:
         cfg = ctx.config.get("groups", {}).get("G7_retrieval", {})
@@ -228,7 +244,7 @@ class G07Retrieval:
             return ctx
 
         tokens_before = ctx.current_token_count
-        top_k: int = int(ctx.params.get("x_rag_top_k", cfg.get("top_k", 3)))
+        top_k: int = _request_top_k(ctx, cfg)
         top_k_after_rerank: int = cfg.get("top_k_after_rerank", 1)
         sim_threshold: float = cfg.get("similarity_threshold", 0.85)
 
@@ -260,6 +276,7 @@ class G07Retrieval:
                         collection=collection,
                         top_k=top_k,
                         similarity_threshold=sim_threshold,
+                        cfg=(ctx.config.get("groups", {}) or {}).get("G3_doc_pipeline"),
                     )
                     fallback_used = bool(chunks)
 
@@ -293,8 +310,8 @@ class G07Retrieval:
             try:
                 from middleware.quality_metrics import record_retrieval
                 record_retrieval(getattr(ctx, "tenant_id", "default"), len(ranked), _max_age)
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("retrieval metric not recorded: %r", err)
 
             if ranked:
                 context_text = "\n\n".join(c["text"] for c in ranked)
@@ -354,9 +371,14 @@ def _extract_rag_query(messages: List[Dict]) -> Optional[str]:
 
 
 def _inject_context(messages: List[Dict], context: str) -> List[Dict]:
-    """Prepend retrieved context as a system message before the last user turn."""
-    injected = [{"role": "system", "content": f"[Retrieved context]\n{context}"}]
-    return injected + messages
+    """Retrieved context as a system message just before the last user turn. Not first: it
+    changes with every query, and ahead of the caller's own system prompt it stopped the
+    provider caching that prompt (G21 keeps it out of the cacheable prefix). Still a system
+    message, which G31 scans as untrusted context."""
+    from middleware import insert_before_last_user
+    from providers import RETRIEVED_CONTEXT_MARKER
+    return insert_before_last_user(
+        messages, [{"role": "system", "content": f"{RETRIEVED_CONTEXT_MARKER}\n{context}"}])
 
 
 async def _embed_dense(text: str) -> List[float]:
@@ -402,7 +424,9 @@ async def _hybrid_search(
     query: str, top_k: int, top_k_final: int,
     qdrant_url: str, collection: str, cfg: Dict,
 ) -> List[Dict]:
-    """Hybrid dense + sparse (SPLADE/BM25) via Qdrant prefetch + RRF fusion."""
+    """Hybrid dense + sparse (SPLADE/BM25) via Qdrant prefetch + RRF fusion. The client
+    is closed whatever happens (a failed search used to leave its connection pool open)."""
+    client = None
     try:
         from qdrant_client import AsyncQdrantClient
         from qdrant_client.models import (
@@ -490,7 +514,6 @@ async def _hybrid_search(
                 with_payload=True,
             )
 
-        await client.close()
         # `source` is carried through (seeded + ingested points both stamp it) so callers
         # that need provenance — e.g. the docs-chat citations via retrieve() — can use it.
         # The request-path caller ignores it, so this is a no-op for existing behaviour.
@@ -507,6 +530,9 @@ async def _hybrid_search(
     except Exception as exc:
         logger.warning("G07 Qdrant search failed: %s", exc)
         return []
+    finally:
+        if client is not None:
+            await client.close()
 
 
 def _chunk_age_seconds(chunk: Dict, now: Optional[datetime] = None) -> Optional[float]:
@@ -584,7 +610,7 @@ async def _rerank(
 
         scores = await asyncio.to_thread(_predict)
         ranked = sorted(
-            zip(chunks, scores), key=lambda x: x[1], reverse=True
+            zip(chunks, scores, strict=True), key=lambda x: x[1], reverse=True
         )
         return [c for c, s in ranked[:top_k] if s >= threshold]
     except Exception as exc:

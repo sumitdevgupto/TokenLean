@@ -1,0 +1,26 @@
+{
+  "about": "X-Forwarded-For parser cases for src/proxy/net/client_ip.py, also run against any forwarder that re-implements the parser because it cannot import the proxy. xff = every header line; hops = trusted_proxy_hops.",
+  "cases": [
+    {"name": "no header: the socket peer", "xff": [], "peer": "9.9.9.9", "hops": 1, "expect": "9.9.9.9"},
+    {"name": "one entry, appended by the trusted proxy", "xff": ["1.1.1.1"], "peer": "9.9.9.9", "hops": 1, "expect": "1.1.1.1"},
+    {"name": "a spoofed left-most entry is ignored", "xff": ["203.0.113.9, 8.8.8.8"], "peer": "9.9.9.9", "hops": 1, "expect": "8.8.8.8"},
+    {"name": "client-written garbage to the left is ignored", "xff": ["a, <script>, 8.8.8.8"], "peer": "9.9.9.9", "hops": 1, "expect": "8.8.8.8"},
+    {"name": "two trusted proxies", "xff": ["203.0.113.9, 8.8.8.8"], "peer": "9.9.9.9", "hops": 2, "expect": "203.0.113.9"},
+    {"name": "fewer entries than trusted proxies: the socket peer", "xff": ["8.8.8.8"], "peer": "9.9.9.9", "hops": 2, "expect": "9.9.9.9"},
+    {"name": "two header lines: the socket peer", "xff": ["1.1.1.1", "2.2.2.2"], "peer": "9.9.9.9", "hops": 1, "expect": "9.9.9.9"},
+    {"name": "no trusted proxy: the header is ignored", "xff": ["1.1.1.1"], "peer": "9.9.9.9", "hops": 0, "expect": "9.9.9.9"},
+    {"name": "a garbage trusted entry is invalid, never the one to its left", "xff": ["1.1.1.1, unknown"], "peer": "9.9.9.9", "hops": 1, "expect": "invalid"},
+    {"name": "empty entries are dropped", "xff": ["1.1.1.1, , "], "peer": "9.9.9.9", "hops": 1, "expect": "1.1.1.1"},
+    {"name": "whitespace is trimmed", "xff": ["  1.1.1.1 ,   8.8.8.8  "], "peer": "9.9.9.9", "hops": 1, "expect": "8.8.8.8"},
+    {"name": "an empty header line: the socket peer", "xff": [""], "peer": "9.9.9.9", "hops": 1, "expect": "9.9.9.9"},
+    {"name": "bracketed IPv6 with a port", "xff": ["[2001:db8::1]:443"], "peer": "9.9.9.9", "hops": 1, "expect": "2001:db8::1"},
+    {"name": "bare IPv6", "xff": ["2001:db8::1"], "peer": "9.9.9.9", "hops": 1, "expect": "2001:db8::1"},
+    {"name": "IPv6 is canonicalised", "xff": ["2001:DB8:0:0::0001"], "peer": "9.9.9.9", "hops": 1, "expect": "2001:db8::1"},
+    {"name": "IPv4 with a port", "xff": ["8.8.8.8:1234"], "peer": "9.9.9.9", "hops": 1, "expect": "8.8.8.8"},
+    {"name": "IPv4-mapped IPv6 becomes IPv4", "xff": ["::ffff:8.8.8.8"], "peer": "9.9.9.9", "hops": 1, "expect": "8.8.8.8"},
+    {"name": "an unclosed bracket is invalid", "xff": ["[2001:db8::1"], "peer": "9.9.9.9", "hops": 1, "expect": "invalid"},
+    {"name": "an IPv4-mapped socket peer becomes IPv4", "xff": [], "peer": "::ffff:9.9.9.9", "hops": 1, "expect": "9.9.9.9"},
+    {"name": "no peer and no header", "xff": [], "peer": null, "hops": 1, "expect": "unknown"},
+    {"name": "a non-IP socket peer (a test client) is kept as it is", "xff": [], "peer": "testclient", "hops": 1, "expect": "testclient"}
+  ]
+}

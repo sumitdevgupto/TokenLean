@@ -27,32 +27,163 @@ _CACHE_LOADED_AT: float = 0.0
 # cache" — used on the event-loop thread where blocking is forbidden);
 # persist_fn(store) writes the FULL store. Both are sync callables; writes always
 # run on worker threads (asyncio.to_thread), so persist_fn may block.
+# Optional transact_fn(mutation) runs one lifecycle change atomically: it reads the
+# current store, calls mutation(store) -> (changed, result), writes the store when
+# changed, and returns (result, store_after). A store shared by several instances must
+# install it: the process-local write lock cannot serialise their writes.
+# Optional on_change(tenant_id) is called after every lifecycle write, so the other
+# instances can re-read that tenant now rather than at their next cache refresh.
 _BACKEND_LOAD = None
 _BACKEND_PERSIST = None
+_BACKEND_TRANSACT = None
+_BACKEND_ON_CHANGE = None
 
 
-def install_key_store_backend(load_fn, persist_fn, name: str = "external") -> None:
-    global _BACKEND_LOAD, _BACKEND_PERSIST
+def install_key_store_backend(load_fn, persist_fn, name: str = "external",
+                              transact_fn=None, on_change=None) -> None:
+    global _BACKEND_LOAD, _BACKEND_PERSIST, _BACKEND_TRANSACT, _BACKEND_ON_CHANGE
     _BACKEND_LOAD, _BACKEND_PERSIST = load_fn, persist_fn
+    _BACKEND_TRANSACT, _BACKEND_ON_CHANGE = transact_fn, on_change
     logger.info("key-store backend installed: %s", name)
 
 
 def reset_key_store_backend() -> None:
     """Restore the OSS blob backend (used by tests)."""
-    global _BACKEND_LOAD, _BACKEND_PERSIST
-    _BACKEND_LOAD = _BACKEND_PERSIST = None
+    global _BACKEND_LOAD, _BACKEND_PERSIST, _BACKEND_TRANSACT, _BACKEND_ON_CHANGE
+    _BACKEND_LOAD = _BACKEND_PERSIST = _BACKEND_TRANSACT = _BACKEND_ON_CHANGE = None
 
 
 def replace_cache(store: dict) -> None:
-    """Swap the in-process validate cache (background refresher for the PG backend)."""
-    global _KEY_CACHE, _CACHE_LOADED_AT
+    """Swap the in-process validate cache (background refresher for the PG backend). The
+    store is current, so no check of the blob store is due yet either."""
+    global _KEY_CACHE, _CACHE_LOADED_AT, _last_version_check
     _KEY_CACHE = store
-    _CACHE_LOADED_AT = time.monotonic()
+    _CACHE_LOADED_AT = _last_version_check = time.monotonic()
+
+
+def replace_tenants_in_cache(tenant_ids, entries: dict) -> None:
+    """Swap only these tenants' keys in the validate cache for ``entries``, their current
+    rows (another instance changed them). Every other tenant's keys are left as they are."""
+    global _KEY_CACHE
+    tenant_ids = set(tenant_ids)
+    kept = {h: e for h, e in _KEY_CACHE.items()
+            if not (isinstance(e, dict) and e.get("tenant_id") in tenant_ids)}
+    kept.update(entries)
+    _KEY_CACHE = kept
 # Reload-on-miss throttle: a key just issued on another instance/worker may not be in
 # this process's TTL cache yet. On a miss we force one reload, but no more often than
 # this interval so a bad-key flood can't hammer Secret Manager.
 _last_forced_reload: float = 0.0
 _FORCED_RELOAD_MIN_INTERVAL = int(os.getenv("KEY_FORCED_RELOAD_MIN_INTERVAL_SECONDS", "5"))
+# A lookup that has to reload runs in a worker thread (main._validate_key): concurrent
+# lookups queue on this lock and share one fetch (waiting at most _LOCK_WAIT_SECONDS, so a
+# hung fetch cannot pin worker threads), and _last_load_attempt keeps a failing store
+# (Secret Manager down) from being retried more than once per interval while a stale
+# cache can still answer.
+_LOAD_LOCK = threading.Lock()
+_LOCK_WAIT_SECONDS = 5.0
+_last_load_attempt: float = 0.0
+# Has the blob store changed since the cache was loaded? A lookup asks at most this often:
+# the local key file by its identity (a stat), Secret Manager by the name of the keys
+# secret's latest version (a metadata call: secretmanager.versions.get, which Terraform
+# grants the proxy on that secret). A changed store is reloaded at once, so a key revoked or
+# suspended through another instance stops working here within the interval, not at the
+# cache TTL, which stays as the backstop. An installed backend (Postgres) has its own refresher.
+_FILE_CHECK_SECONDS = float(os.getenv("KEY_FILE_CHECK_SECONDS", "1"))
+_SECRET_CHECK_SECONDS = float(os.getenv("KEY_SECRET_CHECK_SECONDS", "5"))
+_VERSION_LOCK = threading.Lock()
+_cache_version = None                # the store version the cache was loaded from (None: unknown)
+_last_version_check: float = 0.0
+_version_check_failing = False
+
+
+def key_store_backend_installed() -> bool:
+    """Whether a host installed a key-store backend (Postgres): its load never blocks on
+    the event loop, and its own refresher keeps the cache warm."""
+    return _BACKEND_LOAD is not None
+
+
+def key_cached_and_fresh(api_key: str) -> bool:
+    """Whether ``api_key`` can be validated from the cache with no reload and no store check
+    (either may block, so main runs any other lookup in a worker thread)."""
+    now = time.monotonic()
+    return (bool(_KEY_CACHE) and now - _CACHE_LOADED_AT <= _CACHE_TTL_SECONDS
+            and not _version_check_due(now)
+            and hashlib.sha256(api_key.encode("utf-8")).hexdigest() in _KEY_CACHE)
+
+
+def _store_version():
+    """The blob store's version now: the key file's identity, or the name of the keys
+    secret's latest version. None when it cannot be told (no file, a failed call)."""
+    global _version_check_failing
+    if _using_local_backend():
+        try:
+            st = os.stat(_LOCAL_PROXY_KEYS_FILE)
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size, st.st_ino
+    try:
+        from google.cloud import secretmanager
+
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{_GCP_PROJECT}/secrets/{_PROXY_KEYS_SECRET}/versions/latest"
+        version = client.get_secret_version(request={"name": name}).name
+    except Exception as exc:
+        if not _version_check_failing:
+            logger.warning("Secret Manager version check failed [%s], so a revoked key keeps "
+                           "working on other instances until their cache TTL: %s",
+                           _PROXY_KEYS_SECRET, exc)
+        _version_check_failing = True
+        return None
+    _version_check_failing = False
+    return version
+
+
+def _version_check_due(now: float) -> bool:
+    """Whether a lookup at ``now`` must first ask the blob store whether it changed."""
+    if _BACKEND_LOAD is not None or not _KEY_CACHE:
+        return False
+    interval = _FILE_CHECK_SECONDS if _using_local_backend() else _SECRET_CHECK_SECONDS
+    return now - _last_version_check >= interval
+
+
+def _check_store_version(asked_at: float) -> None:
+    """Reload the cache now if the blob store changed since it was loaded. One check at a
+    time: a lookup queued behind another's uses its answer."""
+    global _last_version_check
+    if not _VERSION_LOCK.acquire(timeout=_LOCK_WAIT_SECONDS):
+        return                                   # answer from the cache as it is
+    try:
+        if _last_version_check >= asked_at:
+            return
+        _last_version_check = time.monotonic()
+        version = _store_version()
+        if version is not None and version != _cache_version:
+            _reload(asked_at, lambda: _cache_version != version)
+    finally:
+        _VERSION_LOCK.release()
+
+
+def _reload(asked_at: float, still_needed, *, miss: bool = False) -> None:
+    """Reload the key cache, one reload at a time. Under the lock the caller's need is
+    checked again: a reload another lookup finished meanwhile is used, not repeated, and
+    neither is one attempted after this lookup began (``asked_at``), which may have failed:
+    a failing store is not retried back to back. A reload for a miss is also throttled to
+    one per _FORCED_RELOAD_MIN_INTERVAL."""
+    global _last_forced_reload, _last_load_attempt
+    if not _LOAD_LOCK.acquire(timeout=_LOCK_WAIT_SECONDS):
+        return                                   # answer from the cache as it is
+    try:
+        if not still_needed() or _last_load_attempt >= asked_at:
+            return
+        if miss:
+            if asked_at - _last_forced_reload < _FORCED_RELOAD_MIN_INTERVAL:
+                return
+            _last_forced_reload = asked_at
+        _last_load_attempt = time.monotonic()
+        _load_key_cache()
+    finally:
+        _LOAD_LOCK.release()
 
 
 def _fetch_secret(secret_name: str) -> Optional[str]:
@@ -69,7 +200,7 @@ def _fetch_secret(secret_name: str) -> Optional[str]:
 
 
 def _load_key_cache() -> None:
-    global _KEY_CACHE, _CACHE_LOADED_AT
+    global _KEY_CACHE, _CACHE_LOADED_AT, _cache_version, _last_version_check
 
     # Installed backend (e.g. Postgres) takes precedence. load_fn returning None
     # means "no fresh data right now" (loop-thread guard) — keep the current cache;
@@ -88,23 +219,29 @@ def _load_key_cache() -> None:
     # Local dev: read keys from a local JSON file (generated by
     # scripts/local/deploy-local.sh) instead of Secret Manager.
     # STORAGE_BACKEND=local forces file-based auth even if LOCAL_PROXY_KEYS_FILE is unset.
+    # The store's version is read BEFORE its data: a write in between is then seen as a
+    # change at the next check, never taken for the version the cache holds.
     storage_backend = os.getenv("STORAGE_BACKEND", "gcs").lower().strip()
     if _LOCAL_PROXY_KEYS_FILE or storage_backend == "local":
+        version = _store_version()
         try:
             with open(_LOCAL_PROXY_KEYS_FILE, "r", encoding="utf-8") as f:
                 _KEY_CACHE = json.load(f)
             _CACHE_LOADED_AT = time.monotonic()
+            _cache_version, _last_version_check = version, _CACHE_LOADED_AT
         except FileNotFoundError:
             logger.warning("Local proxy keys file not found: %s", _LOCAL_PROXY_KEYS_FILE)
         except json.JSONDecodeError as exc:
             logger.error("Invalid local proxy keys JSON [%s]: %s", _LOCAL_PROXY_KEYS_FILE, exc)
         return
 
+    version = _store_version()
     raw = _fetch_secret(_PROXY_KEYS_SECRET)
     if raw:
         try:
             _KEY_CACHE = json.loads(raw)
             _CACHE_LOADED_AT = time.monotonic()
+            _cache_version, _last_version_check = version, _CACHE_LOADED_AT
         except json.JSONDecodeError as exc:
             logger.error("Invalid proxy keys JSON: %s", exc)
 
@@ -125,10 +262,20 @@ def validate_proxy_key(api_key: str) -> Tuple[bool, Optional[str], Optional[dict
     Proxy admins add keys via gcp-deploy.sh / admin CLI.
     Developers never see LLM provider keys — only their proxy key.
     """
-    global _CACHE_LOADED_AT, _last_forced_reload
     now = time.monotonic()
-    if not _KEY_CACHE or (now - _CACHE_LOADED_AT) > _CACHE_TTL_SECONDS:
-        _load_key_cache()
+
+    def _cold_or_stale() -> bool:
+        return not _KEY_CACHE or (time.monotonic() - _CACHE_LOADED_AT) > _CACHE_TTL_SECONDS
+
+    # Cold, or past its TTL (a failed reload is not retried within the interval: the stale
+    # cache answers meanwhile).
+    if not _KEY_CACHE or ((now - _CACHE_LOADED_AT) > _CACHE_TTL_SECONDS
+                          and now - _last_load_attempt >= _FORCED_RELOAD_MIN_INTERVAL):
+        _reload(now, _cold_or_stale)
+    # Changed since it was loaded (a revoke or suspend through another instance)? Asked at
+    # most once per check interval.
+    if _version_check_due(now):
+        _check_store_version(now)
 
     key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     entry = _KEY_CACHE.get(key_hash)
@@ -136,9 +283,8 @@ def validate_proxy_key(api_key: str) -> Tuple[bool, Optional[str], Optional[dict
     # Reload-on-miss: a freshly issued key (e.g. self-serve signup on another instance)
     # may not be in this process's TTL cache yet. On a miss, force one throttled reload
     # and re-check so new keys work within seconds everywhere, not after the full TTL.
-    if entry is None and (now - _last_forced_reload) >= _FORCED_RELOAD_MIN_INTERVAL:
-        _last_forced_reload = now
-        _load_key_cache()
+    if entry is None:
+        _reload(now, lambda: key_hash not in _KEY_CACHE, miss=True)
         entry = _KEY_CACHE.get(key_hash)
 
     if entry is None:
@@ -209,11 +355,11 @@ def is_contract_inactive(metadata: Optional[dict]) -> bool:
 def get_ip_allowlist(metadata: Optional[dict]) -> List[str]:
     """Return the per-tenant source-IP CIDR allowlist stamped in the key metadata.
 
-    Written by the commercial admin lifecycle via ``set_ip_allowlist``; read at
-    ``_authenticate`` alongside the global allowlist from ``config.yaml``. An empty
-    list means "no per-tenant restriction" (the tenant is governed only by the
-    global allowlist, if any). ``companies.ip_allowlist`` is the source-of-record;
-    this is the derived per-request enforcement copy.
+    Written by the commercial admin lifecycle via ``set_ip_allowlist`` (and carried to the
+    tenant's later keys); read at ``_authenticate`` alongside the global allowlist from
+    ``config.yaml``. An empty list means "no per-tenant restriction" (the tenant is
+    governed only by the global allowlist, if any). The key metadata is the list's only
+    record: what is enforced is what is stored.
     """
     if isinstance(metadata, dict):
         val = metadata.get("ip_allowlist")
@@ -259,8 +405,10 @@ def get_llm_provider_key(provider: str) -> Optional[str]:
 # pipeline.py never import these; the barricade holds.
 #
 # Store shape is unchanged: { sha256(raw_key): {tenant_id, tier, created_at, admin?, suspended?} }.
-# Every mutation is a fresh load-modify-persist under a lock (never trusts the TTL cache),
-# and refreshes the in-process cache so a running proxy sees the change immediately.
+# Every mutation goes through _mutate_store: a fresh load-modify-persist under a lock (never
+# trusts the TTL cache), or one backend transaction when the backend installs a transact
+# hook. Either way it refreshes the in-process cache so a running proxy sees the change
+# immediately.
 
 _KEY_PREFIX = "tok-"
 _STORE_WRITE_LOCK = threading.Lock()
@@ -334,6 +482,60 @@ def _persist_store(store: dict) -> None:
     _CACHE_LOADED_AT = time.monotonic()
 
 
+def _mutate_store(mutation, tenant_id: str):
+    """Apply ``mutation(store) -> (changed, result)`` to the current full store, persist
+    it when ``changed``, refresh the cache and return ``result``.
+
+    With a transact hook the change is one backend transaction whose read happens inside
+    it, so a write from another instance is never overwritten by a stale snapshot. An
+    exception from ``mutation`` propagates and nothing is written. The process lock is
+    held on both paths, so one process never queues more than one write on the backend.
+    A successful call is then announced for ``tenant_id`` (see ``_announce_change``).
+    """
+    global _KEY_CACHE, _CACHE_LOADED_AT
+    with _STORE_WRITE_LOCK:
+        if _BACKEND_TRANSACT is not None:
+            result, store = _BACKEND_TRANSACT(mutation)
+            _KEY_CACHE = store
+            _CACHE_LOADED_AT = time.monotonic()
+        else:
+            store = _load_full_store()
+            changed, result = mutation(store)
+            if changed:
+                _persist_store(store)
+    _announce_change(tenant_id)
+    return result
+
+
+def _announce_change(tenant_id: str) -> None:
+    """Pass a tenant whose keys were just written to the on_change hook, if one is
+    installed. A write that changed nothing is announced too; that costs the other
+    instances one tenant re-read. Best-effort: the write has already committed, and the
+    other instances still catch up at their next full cache refresh."""
+    if _BACKEND_ON_CHANGE is None:
+        return
+    try:
+        _BACKEND_ON_CHANGE(tenant_id)
+    except Exception as exc:
+        logger.warning("key-store change announcement failed tenant=%s: %s", tenant_id, exc)
+
+
+def _tenant_allowlist(store: dict, tenant_id: str) -> List[str]:
+    """The tenant's source-IP allowlist as its keys carry it: the newest non-empty list among
+    them (set_ip_allowlist stamps every key alike, so they only differ when a key was issued
+    before keys inherited the list, and the intent then was the restriction)."""
+    lists = [(e.get("created_at") or "", e.get("ip_allowlist")) for e in store.values()
+             if isinstance(e, dict) and e.get("tenant_id") == tenant_id
+             and isinstance(e.get("ip_allowlist"), list) and e.get("ip_allowlist")]
+    return [str(c) for c in max(lists, key=lambda pair: pair[0])[1]] if lists else []
+
+
+def get_tenant_ip_allowlist(tenant_id: str) -> List[str]:
+    """The allowlist enforced for ``tenant_id``, read from the key store (a fresh read: run
+    it on a worker thread where the backend may block)."""
+    return _tenant_allowlist(_load_full_store(), (tenant_id or "").strip())
+
+
 def create_key(
     tenant_id: str,
     tier: str = "free",
@@ -372,12 +574,19 @@ def create_key(
         metadata["admin"] = True
     if gateway:
         metadata["gateway"] = True
-    with _STORE_WRITE_LOCK:
-        store = _load_full_store()
+
+    def add(store):
         if key_hash in store:
             raise ValueError("key already exists")
+        # The tenant's source-IP restriction applies to every key it holds: a key issued
+        # after the CIDRs were set would otherwise be an unrestricted way in.
+        cidrs = _tenant_allowlist(store, tenant_id)
+        if cidrs:
+            metadata["ip_allowlist"] = cidrs
         store[key_hash] = metadata
-        _persist_store(store)
+        return True, None
+
+    _mutate_store(add, tenant_id)
     logger.info(
         "Created proxy key tenant=%s tier=%s admin=%s", tenant_id, metadata["tier"], admin
     )
@@ -396,9 +605,9 @@ def set_suspended(tenant_id: str, suspended: bool = True) -> int:
     per-request enforcement copy rides the key metadata that core reads here.
     """
     tenant_id = (tenant_id or "").strip()
-    changed = 0
-    with _STORE_WRITE_LOCK:
-        store = _load_full_store()
+
+    def apply(store):
+        changed = 0
         for entry in store.values():
             if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id:
                 if bool(entry.get("suspended")) != bool(suspended):
@@ -407,8 +616,9 @@ def set_suspended(tenant_id: str, suspended: bool = True) -> int:
                     else:
                         entry.pop("suspended", None)
                     changed += 1
-        if changed:
-            _persist_store(store)
+        return bool(changed), changed
+
+    changed = _mutate_store(apply, tenant_id)
     logger.info(
         "%s %d key(s) tenant=%s", "Suspended" if suspended else "Unsuspended", changed, tenant_id
     )
@@ -427,9 +637,9 @@ def set_contract_active(tenant_id: str, active: bool = True) -> int:
     """
     tenant_id = (tenant_id or "").strip()
     want_inactive = not active
-    changed = 0
-    with _STORE_WRITE_LOCK:
-        store = _load_full_store()
+
+    def apply(store):
+        changed = 0
         for entry in store.values():
             if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id:
                 if bool(entry.get("contract_inactive")) != want_inactive:
@@ -438,8 +648,9 @@ def set_contract_active(tenant_id: str, active: bool = True) -> int:
                     else:
                         entry.pop("contract_inactive", None)
                     changed += 1
-        if changed:
-            _persist_store(store)
+        return bool(changed), changed
+
+    changed = _mutate_store(apply, tenant_id)
     logger.info(
         "Contract %s %d key(s) tenant=%s",
         "deactivated" if want_inactive else "activated", changed, tenant_id,
@@ -458,9 +669,9 @@ def set_ip_allowlist(tenant_id: str, cidrs: List[str]) -> int:
     """
     tenant_id = (tenant_id or "").strip()
     new_val = [str(c) for c in (cidrs or [])]
-    changed = 0
-    with _STORE_WRITE_LOCK:
-        store = _load_full_store()
+
+    def apply(store):
+        changed = 0
         for entry in store.values():
             if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id:
                 cur = entry.get("ip_allowlist") or []
@@ -470,8 +681,9 @@ def set_ip_allowlist(tenant_id: str, cidrs: List[str]) -> int:
                     else:
                         entry.pop("ip_allowlist", None)
                     changed += 1
-        if changed:
-            _persist_store(store)
+        return bool(changed), changed
+
+    changed = _mutate_store(apply, tenant_id)
     logger.info("Set ip_allowlist (%d cidr) on %d key(s) tenant=%s",
                 len(new_val), changed, tenant_id)
     return changed
@@ -484,24 +696,25 @@ def delete_tenant_keys(tenant_id: str) -> int:
     endpoint (``api/gdpr.py``) for right-to-erasure. Irreversible.
     """
     tenant_id = (tenant_id or "").strip()
-    with _STORE_WRITE_LOCK:
-        store = _load_full_store()
+
+    def remove(store):
         to_remove = [
             h for h, e in store.items()
             if isinstance(e, dict) and e.get("tenant_id") == tenant_id
         ]
         for h in to_remove:
             del store[h]
-        if to_remove:
-            _persist_store(store)
-    logger.info("Deleted %d key(s) tenant=%s", len(to_remove), tenant_id)
-    return len(to_remove)
+        return bool(to_remove), len(to_remove)
+
+    removed = _mutate_store(remove, tenant_id)
+    logger.info("Deleted %d key(s) tenant=%s", removed, tenant_id)
+    return removed
 
 
 def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
     """Atomically issue a fresh key and revoke ALL existing keys for a tenant (WS24).
 
-    Single load-modify-persist under the store lock, so there is never a window with
+    One atomic store write (``_mutate_store``), so there is never a window with
     zero valid keys nor one where both old and new coexist across a crash. The new key
     inherits tier/admin/gateway from the newest existing key; a suspended tenant stays
     suspended (rotation must not be a self-unsuspend loophole).
@@ -511,8 +724,8 @@ def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
     tenant_id = (tenant_id or "").strip()
     if not tenant_id:
         raise ValueError("tenant_id is required")
-    with _STORE_WRITE_LOCK:
-        store = _load_full_store()
+
+    def rotate(store):
         old = {
             h: e for h, e in store.items()
             if isinstance(e, dict) and e.get("tenant_id") == tenant_id
@@ -530,8 +743,12 @@ def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
         # Carry over extra metadata (owner_domain etc.) so rotation doesn't drop
         # the per-tenant X-User-ID allowlist or other stamped fields.
         for k, v in newest.items():
-            if k not in metadata and k not in ("admin", "suspended", "gateway"):
+            if k not in metadata and k not in ("admin", "suspended", "gateway", "ip_allowlist"):
                 metadata[k] = v
+        # The tenant's source-IP restriction, even if the newest key was issued without it.
+        cidrs = _tenant_allowlist(old, tenant_id)
+        if cidrs:
+            metadata["ip_allowlist"] = cidrs
         if newest.get("admin"):
             metadata["admin"] = True
         # Trust flags are carried explicitly, never as a generic extra: a rotated gateway key
@@ -543,22 +760,27 @@ def rotate_tenant_keys(tenant_id: str) -> Tuple[str, str, dict, int]:
         for h in old:
             del store[h]
         store[key_hash] = metadata
-        _persist_store(store)
-    logger.info("Rotated proxy key tenant=%s (revoked %d)", tenant_id, len(old))
-    return raw, key_hash, metadata, len(old)
+        return True, (raw, key_hash, metadata, len(old))
+
+    raw, key_hash, metadata, revoked = _mutate_store(rotate, tenant_id)
+    logger.info("Rotated proxy key tenant=%s (revoked %d)", tenant_id, revoked)
+    return raw, key_hash, metadata, revoked
 
 
 def list_tenants() -> List[dict]:
     """Aggregate the key store by tenant for the management console.
 
     Returns ``[{tenant_id, tier, admin, suspended, contract_inactive, key_count,
-    created_at}]`` sorted by tenant_id — NEVER any raw key or hash. Legacy
-    string-format entries group under their user_id with tier ``"legacy"``.
-    ``contract_inactive`` is the metadata-derived enforcement copy; the admin router
-    joins the authoritative ``companies.contract_status`` on top for display.
+    created_at, ip_allowlist, ip_allowlist_mixed}]`` sorted by tenant_id — NEVER any raw
+    key or hash. Legacy string-format entries group under their user_id with tier
+    ``"legacy"``. ``contract_inactive`` is the metadata-derived enforcement copy; the admin
+    router joins the authoritative per-tenant contract status on top for display.
+    ``ip_allowlist`` is what the keys enforce (:func:`_tenant_allowlist`), and
+    ``ip_allowlist_mixed`` says the tenant's keys do not all carry the same list.
     """
     store = _load_full_store()
     tenants: dict = {}
+    key_lists: dict = {}
     for entry in store.values():
         if isinstance(entry, dict):
             tid = entry.get("tenant_id", "default")
@@ -567,6 +789,11 @@ def list_tenants() -> List[dict]:
                 "admin": False, "suspended": False, "contract_inactive": False,
                 "key_count": 0, "created_at": entry.get("created_at"),
             })
+            cidrs = entry.get("ip_allowlist")
+            cidrs = [str(c) for c in cidrs] if isinstance(cidrs, list) else []
+            key_lists.setdefault(tid, set()).add(tuple(cidrs))
+            if cidrs and (entry.get("created_at") or "") >= agg.get("_cidrs_at", ""):
+                agg["_cidrs_at"], agg["ip_allowlist"] = entry.get("created_at") or "", cidrs
             agg["key_count"] += 1
             agg["admin"] = agg["admin"] or bool(entry.get("admin"))
             agg["suspended"] = agg["suspended"] or bool(entry.get("suspended"))
@@ -582,4 +809,8 @@ def list_tenants() -> List[dict]:
                 "key_count": 0, "created_at": None,
             })
             agg["key_count"] += 1
+    for tid, agg in tenants.items():
+        agg.pop("_cidrs_at", None)
+        agg.setdefault("ip_allowlist", [])            # as _tenant_allowlist chooses it
+        agg["ip_allowlist_mixed"] = len(key_lists.get(tid, ())) > 1
     return sorted(tenants.values(), key=lambda t: t["tenant_id"])

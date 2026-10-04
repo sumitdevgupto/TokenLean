@@ -33,6 +33,7 @@ NO per-request state — every count/vault is a local threaded through return va
 
 Reference: #2 in the TokenLean vs OmniRoute commercial-gap roadmap.
 """
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -173,20 +174,16 @@ class G29PiiRedaction:
             if not isinstance(msg, dict):
                 continue
             content = msg.get("content")
-            if not isinstance(content, str) or not content:
-                continue
-            matches = detector.detect(content)
-            if matches:
-                _count(counts, [m.entity_type for m in matches])
-                if mode == "mask":
-                    # Mask model-generated PII (irreversible — it isn't the caller's own
-                    # data to restore). Vault placeholders are not PII-shaped, so this
-                    # never re-masks a restored token.
-                    content = mask_matches(content, matches, reversible=False).text
-            if mode == "mask" and vault:
-                # Restore the caller's own request PII that the model echoed back.
-                content = unmask_text(content, vault)
-            msg["content"] = content
+            if isinstance(content, str) and content:
+                msg["content"] = self._respond_text(content, detector, mode, vault, counts)
+            # The request side masked tool-call arguments too; the model's calls come back
+            # with those placeholders, and may carry PII it wrote itself.
+            calls = [tc.get("function") for tc in msg.get("tool_calls") or []
+                     if isinstance(tc, dict)] + [msg.get("function_call")]
+            for fn in calls:
+                if isinstance(fn, dict) and isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                    fn["arguments"] = self._respond_arguments(
+                        fn["arguments"], detector, mode, vault, counts)
 
         total = sum(counts.values())
         if total:
@@ -197,6 +194,43 @@ class G29PiiRedaction:
         return response
 
     # ── Helpers ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _respond_text(text: str, detector: PiiDetector, mode: str,
+                      vault: Optional[Dict[str, str]], counts: Dict[str, int]) -> str:
+        """One response text: PII the model wrote is counted and, in mask mode, masked
+        irreversibly (it is not the caller's own data to restore); then the caller's own
+        placeholders are restored. Vault placeholders are not PII-shaped, so a restored
+        token is never masked again."""
+        matches = detector.detect(text)
+        if matches:
+            _count(counts, [m.entity_type for m in matches])
+            if mode == "mask":
+                text = mask_matches(text, matches, reversible=False).text
+        if mode == "mask" and vault:
+            text = unmask_text(text, vault)
+        return text
+
+    def _respond_arguments(self, arguments: str, detector: PiiDetector, mode: str,
+                           vault: Optional[Dict[str, str]], counts: Dict[str, int]) -> str:
+        """Tool-call arguments: value by value when they are JSON, so a restored value is
+        escaped as JSON (as text otherwise). Unchanged arguments keep their own spelling."""
+        try:
+            parsed = json.loads(arguments)
+        except ValueError:
+            return self._respond_text(arguments, detector, mode, vault, counts)
+
+        def walk(value: Any) -> Any:
+            if isinstance(value, str):
+                return self._respond_text(value, detector, mode, vault, counts)
+            if isinstance(value, list):
+                return [walk(v) for v in value]
+            if isinstance(value, dict):
+                return {k: walk(v) for k, v in value.items()}
+            return value
+
+        new = walk(parsed)
+        return arguments if new == parsed else json.dumps(new, ensure_ascii=False)
+
     def _apply_to_message(
         self, msg: Dict[str, Any], detector: PiiDetector, do_mask: bool,
         reversible: bool, counts: Dict[str, int], vault: Dict[str, str],

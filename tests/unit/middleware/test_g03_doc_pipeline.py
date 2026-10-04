@@ -341,21 +341,6 @@ class TestG03TriggerPipelines:
         assert "TENANT_PROVIDER_KEY" not in env  # no key shipped at all — no platform-key leak
         assert env["BYOK_ENFORCE"] == "false"
 
-    async def test_trigger_fine_tuning_ships_genuine_tenant_key(self):
-        """When the tenant OWNS a key, it is shipped as TENANT_PROVIDER_KEY with enforcement."""
-        from middleware import g03_doc_pipeline
-
-        async def _tenant_key(provider, tenant_id):
-            return "sk-genuinely-the-tenants-own-key"
-
-        with patch("providers.key_resolver.resolve_tenant_owned_key", _tenant_key), \
-             patch.object(g03_doc_pipeline, "_finetune_byok_enforced", lambda gc=None: False):
-            ok, env = await self._run_trigger("NOVA-STG-01", "support", 150)
-
-        assert ok is True
-        assert env["TENANT_PROVIDER_KEY"] == "sk-genuinely-the-tenants-own-key"
-        assert env["BYOK_ENFORCE"] == "true"  # enforce in the Job whenever we have a real key
-
     async def test_trigger_fine_tuning_refuses_on_undecryptable_key(self):
         """A stored-but-undecryptable tenant key fails closed (402), never platform fallback."""
         from middleware import g03_doc_pipeline
@@ -384,311 +369,237 @@ class TestG03TriggerPipelines:
         assert after >= before + 1
 
 
-@pytest.mark.asyncio
-class TestRAGFallbackOrchestrator:
-    async def test_fallback_disabled_uses_strict_only(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
+# ── A tenant's own key never rides on the Job execution ──────────────────────────────
+# The trigger passed the key as a plain env override, and an execution keeps its overrides:
+# anyone who could view the Job's executions could read the key. Now the key goes into one
+# Secret Manager secret, a version per run, and the Job is given only the version's name.
+from datetime import datetime, timezone  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
-        orchestrator = RAGFallbackOrchestrator()
-        orchestrator.fallback_enabled = False
-        orchestrator._execute_search = AsyncMock(return_value=[{"text": "hit", "score": 0.9}])
+_KEY = "sk-genuinely-the-tenants-own-key"
+_KEY_SECRET = "projects/tl-test/secrets/finetune-tenant-key"
 
-        results = await orchestrator.search_with_fallback("query")
 
-        assert results == [{"text": "hit", "score": 0.9}]
-        orchestrator._execute_search.assert_awaited_once_with(
-            "strict_hybrid", "query", "rag_docs", 5, 0.85
-        )
+class FakeSecretManager:
+    """Stands in for Secret Manager's async client: the versions of the key secret, each with
+    its data, its creation time and its state."""
 
-    async def test_fallback_escalates_through_strategies_until_results_found(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
+    def __init__(self, fail_add=False, fail_list=False, existing_ages=()):
+        self.fail_add, self.fail_list = fail_add, fail_list
+        self.versions = {}
+        for age in existing_ages:
+            self._add(_KEY_SECRET, b"a key from an earlier run", time.time() - age)
 
-        orchestrator = RAGFallbackOrchestrator()
-        orchestrator.fallback_enabled = True
+    def _add(self, parent, data, created):
+        name = f"{parent}/versions/{len(self.versions) + 1}"
+        self.versions[name] = {"data": data, "created": created, "state": "ENABLED"}
+        return name
 
-        async def fake_execute(strategy, query, collection, top_k, threshold):
-            if strategy == "dense_only":
-                return [{"text": "dense hit", "score": 0.8}]
-            return []
+    async def add_secret_version(self, request):
+        if self.fail_add:
+            raise PermissionError("secretmanager.versions.add denied")
+        return SimpleNamespace(name=self._add(request["parent"], request["payload"]["data"],
+                                              time.time()))
 
-        orchestrator._execute_search = AsyncMock(side_effect=fake_execute)
+    async def list_secret_versions(self, request):
+        if self.fail_list:
+            raise PermissionError("secretmanager.versions.list denied")
+        assert request["filter"] == "state:ENABLED"
+        found = [SimpleNamespace(name=name, create_time=datetime.fromtimestamp(v["created"], timezone.utc))
+                 for name, v in self.versions.items()
+                 if v["state"] == "ENABLED" and name.startswith(request["parent"] + "/")]
 
-        results = await orchestrator.search_with_fallback("query")
+        async def pages():
+            for version in found:
+                yield version
+        return pages()
 
-        assert results == [{"text": "dense hit", "score": 0.8}]
-        called_strategies = [c.args[0] for c in orchestrator._execute_search.call_args_list]
-        assert called_strategies == ["strict_hybrid", "relaxed_hybrid", "dense_only"]
+    async def destroy_secret_version(self, request):
+        self.versions[request["name"]]["state"] = "DESTROYED"
 
-    async def test_fallback_returns_empty_when_no_strategy_finds_results(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
 
-        orchestrator = RAGFallbackOrchestrator()
-        orchestrator.fallback_enabled = True
-        orchestrator._execute_search = AsyncMock(return_value=[])
+async def _trigger(secrets, key=_KEY, run_job_error=None):
+    """Run the fine-tune trigger for a tenant whose own key is ``key`` (None: no key of its
+    own), with Cloud Run and Secret Manager faked. Returns (ok, the RunJob request or None)."""
+    import contextlib
+    from middleware import g03_doc_pipeline
 
-        results = await orchestrator.search_with_fallback("query")
+    mock_client = MagicMock()
+    mock_client.run_job = AsyncMock(side_effect=run_job_error)
+    mod = TestG03TriggerPipelines._fake_run_v2(mock_client)
 
-        assert results == []
-        assert orchestrator._execute_search.call_count == 4
+    async def _tenant_key(provider, tenant_id):
+        return key
 
-    async def test_fallback_short_circuits_on_first_strategy_hit(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.dict(sys.modules, {"google.cloud.run_v2": mod}))
+        import google.cloud as _gc
+        stack.enter_context(patch.object(_gc, "run_v2", mod, create=True))
+        stack.enter_context(patch("google.cloud.secretmanager.SecretManagerServiceAsyncClient",
+                                  lambda *a, **k: secrets))
+        stack.enter_context(patch("providers.key_resolver.resolve_tenant_owned_key", _tenant_key))
+        stack.enter_context(patch.object(g03_doc_pipeline, "_finetune_byok_enforced",
+                                         lambda gc=None: False))
+        stack.enter_context(patch.object(g03_doc_pipeline, "_GCP_PROJECT", "tl-test"))
+        ok = await g03_doc_pipeline.trigger_fine_tuning_pipeline("NOVA-STG-01", "support", 150)
+    call = mock_client.run_job.call_args
+    return ok, (call.kwargs["request"] if call else None)
 
-        orchestrator = RAGFallbackOrchestrator()
-        orchestrator.fallback_enabled = True
-        orchestrator._execute_search = AsyncMock(return_value=[{"text": "strict hit", "score": 0.95}])
 
-        results = await orchestrator.search_with_fallback("query")
-
-        assert results == [{"text": "strict hit", "score": 0.95}]
-        orchestrator._execute_search.assert_awaited_once()
-
-    async def test_execute_search_returns_results_from_qdrant(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
-
-        orchestrator = RAGFallbackOrchestrator()
-
-        mock_point = MagicMock()
-        mock_point.payload = {"text": "doc chunk"}
-        mock_point.score = 0.91
-
-        mock_qdrant_client = MagicMock()
-        mock_qdrant_client.search.return_value = [mock_point]
-
-        mock_embedding = MagicMock()
-        mock_embedding.tolist.return_value = [0.1, 0.2, 0.3]
-        mock_st_model = MagicMock()
-        mock_st_model.encode.return_value = mock_embedding
-
-        with patch("qdrant_client.QdrantClient", return_value=mock_qdrant_client), \
-             patch("sentence_transformers.SentenceTransformer", return_value=mock_st_model):
-            results = await orchestrator._execute_search(
-                "strict_hybrid", "query", "rag_docs", 5, 0.85
-            )
-
-        assert results == [{"text": "doc chunk", "score": 0.91}]
-
-    async def test_execute_search_sparse_only_returns_empty(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
-
-        orchestrator = RAGFallbackOrchestrator()
-
-        mock_embedding = MagicMock()
-        mock_embedding.tolist.return_value = [0.1, 0.2, 0.3]
-        mock_st_model = MagicMock()
-        mock_st_model.encode.return_value = mock_embedding
-
-        with patch("qdrant_client.QdrantClient", return_value=MagicMock()), \
-             patch("sentence_transformers.SentenceTransformer", return_value=mock_st_model):
-            results = await orchestrator._execute_search(
-                "sparse_only", "query", "rag_docs", 5, 0.60
-            )
-
-        assert results == []
-
-    async def test_execute_search_exception_returns_empty(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
-
-        orchestrator = RAGFallbackOrchestrator()
-
-        with patch("qdrant_client.QdrantClient", side_effect=Exception("connection refused")):
-            results = await orchestrator._execute_search(
-                "strict_hybrid", "query", "rag_docs", 5, 0.85
-            )
-
-        assert results == []
+def _env(request):
+    return {e["name"]: e["value"] for e in request["overrides"]["container_overrides"][0]["env"]}
 
 
 @pytest.mark.asyncio
-class TestDetectOodAndFallback:
-    async def test_high_confidence_primary_is_not_ood(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
+class TestTheTenantKeyNeverRidesOnTheExecution:
 
-        orchestrator = RAGFallbackOrchestrator()
-        orchestrator._execute_search = AsyncMock(
-            return_value=[{"text": "primary hit", "score": 0.95}]
-        )
+    async def test_the_job_is_given_only_the_name_of_a_version_holding_the_key(self):
+        secrets = FakeSecretManager()
+        ok, request = await _trigger(secrets)
+        assert ok is True
+        holding = [name for name, v in secrets.versions.items() if v["data"] == _KEY.encode()]
+        assert len(holding) == 1 and holding[0].startswith(_KEY_SECRET + "/versions/")
+        env = _env(request)
+        assert env["TENANT_PROVIDER_KEY_VERSION"] == holding[0]
+        assert "TENANT_PROVIDER_KEY" not in env
+        assert _KEY not in repr(request)
+        assert env["BYOK_ENFORCE"] == "true"   # enforced in the Job whenever the key is the tenant's
+        assert secrets.versions[holding[0]]["state"] == "ENABLED"   # the Job destroys it
 
-        result = await orchestrator.detect_ood_and_fallback("query", "primary-index")
+    async def test_a_job_that_cannot_start_leaves_no_key_behind(self):
+        secrets = FakeSecretManager()
+        ok, _ = await _trigger(secrets, run_job_error=RuntimeError("run.jobs.run denied"))
+        assert ok is False
+        assert [v["state"] for v in secrets.versions.values()] == ["DESTROYED"]
 
-        assert result["is_ood"] is False
-        assert result["strategy_used"] == "primary_strict"
-        assert result["confidence"] == pytest.approx(0.95)
-        assert result["fallback_results"] == []
+    async def test_no_job_starts_when_the_key_cannot_be_stored(self):
+        from middleware.g18_observability import FINETUNE_JOBS_TOTAL
+        errors = FINETUNE_JOBS_TOTAL.labels(tenant_id="NOVA-STG-01", status="trigger_error",
+                                            provider="openai")
+        before = errors._value.get()
+        ok, request = await _trigger(FakeSecretManager(fail_add=True))
+        assert ok is False and request is None
+        assert errors._value.get() == before + 1
 
-    async def test_low_confidence_primary_falls_back_to_relaxed(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
+    async def test_versions_left_from_a_day_ago_are_destroyed(self):
+        secrets = FakeSecretManager(existing_ages=(2 * 86400, 3600))
+        ok, _ = await _trigger(secrets)
+        assert ok is True
+        # two days old; an hour old (a run still going); this run's
+        assert [v["state"] for v in secrets.versions.values()] == ["DESTROYED", "ENABLED", "ENABLED"]
 
-        orchestrator = RAGFallbackOrchestrator()
+    async def test_a_failed_clean_up_does_not_stop_the_run(self):
+        secrets = FakeSecretManager(fail_list=True)
+        ok, request = await _trigger(secrets)
+        assert ok is True and "TENANT_PROVIDER_KEY_VERSION" in _env(request)
 
-        async def fake_execute(strategy, query, collection, top_k, threshold):
-            if strategy == "strict_hybrid":
-                return [{"text": "weak primary", "score": 0.1}]
-            if strategy == "relaxed_hybrid":
-                return [{"text": "relaxed hit", "score": 0.7}]
-            return []
+    async def test_without_a_key_of_its_own_secret_manager_is_untouched(self):
+        secrets = FakeSecretManager()
+        ok, request = await _trigger(secrets, key=None)
+        assert ok is True
+        assert secrets.versions == {}
+        assert "TENANT_PROVIDER_KEY_VERSION" not in _env(request)
 
-        orchestrator._execute_search = AsyncMock(side_effect=fake_execute)
 
-        result = await orchestrator.detect_ood_and_fallback("query", "primary-index")
+class _FakeQdrant:
+    """qdrant_client.AsyncQdrantClient: finds one chunk at or below `hit_at`."""
+    instances = []
+    collections = {"rag_docs"}
+    hit_at = 0.0
+    fail = False
 
-        assert result["is_ood"] is False
-        assert result["strategy_used"] == "primary_relaxed"
-        assert result["primary_results"] == [{"text": "relaxed hit", "score": 0.7}]
+    def __init__(self, **kwargs):
+        self.queries, self.closed = [], False
+        _FakeQdrant.instances.append(self)
 
-    async def test_no_primary_results_falls_back_to_broad_domain(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator, _RAG_FALLBACK_INDEX
+    async def collection_exists(self, name):
+        return name in _FakeQdrant.collections
 
-        orchestrator = RAGFallbackOrchestrator()
+    async def query_points(self, collection_name, query, using, limit, score_threshold,
+                           with_payload):
+        if _FakeQdrant.fail:
+            raise ConnectionError("qdrant down")
+        self.queries.append((using, limit, round(score_threshold, 2)))
+        point = type("P", (), {"payload": {"text": "chunk"}, "score": 0.8})()
+        return type("R", (), {"points": [point] if score_threshold <= _FakeQdrant.hit_at else []})()
 
-        async def fake_execute(strategy, query, collection, top_k, threshold):
-            if collection == _RAG_FALLBACK_INDEX:
-                return [{"text": "broad domain hit", "score": 0.5}]
-            return []
+    async def close(self):
+        self.closed = True
 
-        async def fake_strict_hybrid(query, collection, top_k, threshold):
-            return await fake_execute("strict_hybrid", query, collection, top_k, threshold)
 
-        orchestrator._execute_search = AsyncMock(side_effect=fake_execute)
-        orchestrator._strict_hybrid_search = AsyncMock(side_effect=fake_strict_hybrid)
+class _FakeModel:
+    def __init__(self):
+        self.threads = []
 
-        result = await orchestrator.detect_ood_and_fallback("query", "primary-index")
+    def encode(self, text):
+        import threading
+        self.threads.append(threading.get_ident())
+        return type("V", (), {"tolist": lambda self: [0.1, 0.2]})()
 
-        assert result["is_ood"] is True
-        assert result["strategy_used"] == "fallback_broad_domain"
-        assert result["fallback_results"] == [{"text": "broad domain hit", "score": 0.5}]
-        assert result["confidence"] == pytest.approx(0.5)
 
-    async def test_no_results_anywhere_returns_no_results(self):
-        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
-
-        orchestrator = RAGFallbackOrchestrator()
-        orchestrator._execute_search = AsyncMock(return_value=[])
-        orchestrator._strict_hybrid_search = AsyncMock(return_value=[])
-
-        result = await orchestrator.detect_ood_and_fallback("query", "primary-index")
-
-        assert result["is_ood"] is True
-        assert result["strategy_used"] == "no_results"
-        assert result["confidence"] == 0.0
-        assert result["primary_results"] == []
-        assert result["fallback_results"] == []
+@pytest.fixture
+def qdrant(monkeypatch):
+    import qdrant_client
+    import ml_models
+    model = _FakeModel()
+    _FakeQdrant.instances, _FakeQdrant.collections = [], {"rag_docs"}
+    _FakeQdrant.hit_at, _FakeQdrant.fail = 0.0, False
+    monkeypatch.setattr(qdrant_client, "AsyncQdrantClient", _FakeQdrant)
+    monkeypatch.setattr(ml_models, "get_sentence_transformer", lambda name: model)
+    return model
 
 
 @pytest.mark.asyncio
-class TestTikaSidecarClient:
-    async def test_extract_text_success(self):
-        from middleware.g03_doc_pipeline import TikaSidecarClient
+class TestRAGFallbackOrchestrator:
+    """One fallback search = one async Qdrant client (always closed) and one embedding,
+    computed off the event loop, shared by every strategy."""
 
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        mock_resp.text = "Extracted document text"
+    def _orch(self, enabled=True):
+        from middleware.g03_doc_pipeline import RAGFallbackOrchestrator
+        orchestrator = RAGFallbackOrchestrator()
+        orchestrator.fallback_enabled = enabled
+        return orchestrator
 
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.put = AsyncMock(return_value=mock_resp)
+    async def test_fallback_disabled_uses_strict_only(self, qdrant):
+        assert await self._orch(enabled=False).search_with_fallback("query") == []
+        assert _FakeQdrant.instances[0].queries == [("dense", 5, 0.85)]
 
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            text = await TikaSidecarClient().extract_text(b"binary content", "doc.pdf")
+    async def test_escalates_until_a_strategy_finds_results(self, qdrant):
+        _FakeQdrant.hit_at = 0.70                                  # relaxed_hybrid's threshold
+        results = await self._orch().search_with_fallback("query")
+        assert results == [{"text": "chunk", "score": 0.8}]
+        assert _FakeQdrant.instances[0].queries == [("dense", 5, 0.85), ("dense", 10, 0.7)]
 
-        assert text == "Extracted document text"
+    async def test_nothing_found_tries_each_searchable_strategy_once(self, qdrant):
+        assert await self._orch().search_with_fallback("query") == []
+        # sparse_only needs a sparse query vector this path does not build: no search.
+        assert [q[2] for q in _FakeQdrant.instances[0].queries] == [0.85, 0.7, 0.75]
 
-    async def test_extract_text_failure_returns_empty_string(self):
-        from middleware.g03_doc_pipeline import TikaSidecarClient
+    async def test_the_query_is_embedded_once_and_off_the_event_loop(self, qdrant):
+        import threading
+        await self._orch().search_with_fallback("query")
+        assert len(qdrant.threads) == 1
+        assert qdrant.threads[0] != threading.get_ident()
 
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.put = AsyncMock(side_effect=Exception("connection refused"))
+    async def test_the_client_is_closed_even_when_a_search_fails(self, qdrant):
+        _FakeQdrant.fail = True
+        assert await self._orch().search_with_fallback("query") == []
+        assert len(_FakeQdrant.instances) == 1 and _FakeQdrant.instances[0].closed
 
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            text = await TikaSidecarClient().extract_text(b"binary content", "doc.pdf")
+    async def test_a_missing_collection_is_not_searched(self, qdrant):
+        assert await self._orch().search_with_fallback("query", collection="rag_nobody") == []
+        client = _FakeQdrant.instances[0]
+        assert client.queries == [] and client.closed and qdrant.threads == []
 
-        assert text == ""
+    async def test_the_g3_rag_fallback_settings_are_read(self, qdrant):
+        cfg = {"rag_fallback": {"strategies": ["dense_only"], "similarity_threshold": 0.9,
+                                "top_k": 3}}
+        await self._orch().search_with_fallback("query", cfg=cfg)
+        assert _FakeQdrant.instances[0].queries == [("dense", 3, 0.8)]
 
-    async def test_extract_metadata_success(self):
-        from middleware.g03_doc_pipeline import TikaSidecarClient
-
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        mock_resp.json.return_value = {"Content-Type": "application/pdf", "Author": "Acme"}
-
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.put = AsyncMock(return_value=mock_resp)
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            meta = await TikaSidecarClient().extract_metadata(b"binary content", "doc.pdf")
-
-        assert meta == {"Content-Type": "application/pdf", "Author": "Acme"}
-
-    async def test_extract_metadata_failure_returns_empty_dict(self):
-        from middleware.g03_doc_pipeline import TikaSidecarClient
-
-        mock_client = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.put = AsyncMock(side_effect=Exception("connection refused"))
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            meta = await TikaSidecarClient().extract_metadata(b"binary content", "doc.pdf")
-
-        assert meta == {}
-
-
-@pytest.mark.asyncio
-class TestG03DocPipelineMiddleware:
-    async def test_disabled_passes_through_unchanged(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["groups"]["G3_doc_pipeline"] = {"enabled": False}
-
-        from middleware.g03_doc_pipeline import G03DocPipeline
-        result = await G03DocPipeline().process_request(ctx)
-
-        assert result is ctx
-        assert not hasattr(result, "rag_results")
-
-    async def test_missing_config_section_treated_as_disabled(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["groups"].pop("G3_doc_pipeline", None)
-
-        from middleware.g03_doc_pipeline import G03DocPipeline
-        result = await G03DocPipeline().process_request(ctx)
-
-        assert result is ctx
-
-    async def test_enabled_without_rag_query_passes_through(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["groups"]["G3_doc_pipeline"] = {"enabled": True}
-
-        from middleware.g03_doc_pipeline import G03DocPipeline
-        result = await G03DocPipeline().process_request(ctx)
-
-        assert not hasattr(result, "rag_results")
-
-    async def test_enabled_with_rag_query_populates_rag_results(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["groups"]["G3_doc_pipeline"] = {
-            "enabled": True,
-            "collection": "rag_docs",
-            "top_k": 3,
-        }
-        ctx.rag_query = "What is our refund policy?"
-
-        from middleware.g03_doc_pipeline import G03DocPipeline
-        mw = G03DocPipeline()
-        mw.rag_orchestrator.search_with_fallback = AsyncMock(
-            return_value=[{"text": "refund policy chunk", "score": 0.9}]
-        )
-
-        result = await mw.process_request(ctx)
-
-        assert result.rag_results == [{"text": "refund policy chunk", "score": 0.9}]
-        mw.rag_orchestrator.search_with_fallback.assert_awaited_once_with(
-            "What is our refund policy?", collection="rag_docs", top_k=3
-        )
+    async def test_rag_fallback_enabled_false_uses_strict_only(self, qdrant):
+        await self._orch().search_with_fallback("query", cfg={"rag_fallback": {"enabled": False}})
+        assert _FakeQdrant.instances[0].queries == [("dense", 5, 0.85)]
 
 
 @pytest.mark.asyncio

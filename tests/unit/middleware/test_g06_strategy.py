@@ -23,9 +23,11 @@ class _Ctx:
 def _reset_strategy_state():
     g6._RR_COUNTERS.clear()
     g6._MODEL_LATENCY_EWMA.clear()
+    g6._MODEL_FAILED_AT.clear()
     yield
     g6._RR_COUNTERS.clear()
     g6._MODEL_LATENCY_EWMA.clear()
+    g6._MODEL_FAILED_AT.clear()
 
 
 TIER = ["gpt-4o-mini", "gpt-4o", "gpt-4-5"]
@@ -163,6 +165,53 @@ def test_least_latency_bootstraps_unmeasured_then_converges():
     # Measure only the first as slow; an unmeasured model (EWMA 0) is preferred next.
     g6.record_model_latency("gpt-4o-mini", 800)
     assert g6._select_from_tier(TIER, {"strategy": "least_latency"}, _Ctx()) == "gpt-4o"
+
+
+def _least_latency():
+    return g6._select_from_tier(TIER, {"strategy": "least_latency"}, _Ctx())
+
+
+# Only successes are measured, so a model whose every call failed stayed unmeasured (EWMA 0),
+# sorted as the fastest and was picked again on every request, each paying a failed call
+# and the failover.
+def test_least_latency_passes_over_a_model_that_just_failed():
+    g6.record_model_latency("gpt-4o", 300)
+    g6.record_model_latency("gpt-4-5", 900)
+    assert _least_latency() == "gpt-4o-mini"          # unmeasured: bootstrapped
+    g6.record_model_failure("gpt-4o-mini")
+    assert _least_latency() == "gpt-4o"
+
+
+def test_a_failed_model_is_tried_again_after_the_hold(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(g6, "_clock", lambda: now[0])
+    g6.record_model_latency("gpt-4o", 300)
+    g6.record_model_latency("gpt-4-5", 900)
+    g6.record_model_failure("gpt-4o-mini")
+    now[0] = 1000.0 + g6._FAILED_MODEL_HOLD_S - 1
+    assert _least_latency() == "gpt-4o"
+    now[0] = 1000.0 + g6._FAILED_MODEL_HOLD_S
+    assert _least_latency() == "gpt-4o-mini"
+
+
+def test_a_success_clears_the_failure():
+    g6.record_model_latency("gpt-4o", 300)
+    g6.record_model_latency("gpt-4-5", 900)
+    g6.record_model_failure("gpt-4o-mini")
+    g6.record_model_latency("gpt-4o-mini", 100)
+    assert _least_latency() == "gpt-4o-mini"
+
+
+def test_when_every_model_just_failed_the_fastest_is_still_tried():
+    for model, ms in zip(TIER, (500, 200, 900), strict=True):
+        g6.record_model_latency(model, ms)
+        g6.record_model_failure(model)
+    assert _least_latency() == "gpt-4o"
+
+
+def test_record_model_failure_ignores_a_blank_model():
+    g6.record_model_failure("")
+    assert g6._MODEL_FAILED_AT == {}
 
 
 def test_record_model_latency_is_ewma_and_ignores_bad_input():

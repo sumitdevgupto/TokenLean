@@ -62,7 +62,8 @@ def test_schedule_security_audit_dispatches_an_empty_completion_on_its_own():
     logger.log_security_events = MagicMock(return_value=None)
     created = []
     with patch.object(main_mod, "_audit_logger", logger), \
-            patch.object(main_mod.asyncio, "create_task", side_effect=created.append):
+            patch.object(main_mod, "_after_response",
+                         side_effect=lambda coro, what: created.append(coro)):
         main_mod._schedule_security_audit(ctx)
 
     assert created, (
@@ -79,9 +80,27 @@ def test_schedule_security_audit_still_skips_a_clean_request():
     logger = MagicMock()
     created = []
     with patch.object(main_mod, "_audit_logger", logger), \
-            patch.object(main_mod.asyncio, "create_task", side_effect=created.append):
+            patch.object(main_mod, "_after_response",
+                         side_effect=lambda coro, what: created.append(coro)):
         main_mod._schedule_security_audit(_audit_ctx())
     assert created == []
+
+
+def test_schedule_security_audit_dispatches_a_record_only_managed_match_on_its_own():
+    """G31's record-only managed-rule matches change nothing on the request, so no other
+    signal fires with them; the gate must dispatch them by themselves."""
+    import main as main_mod
+
+    ctx = _audit_ctx(context_trust_managed_recorded=["managed.grandma_exploit"])
+    logger = MagicMock()
+    logger.log_security_events = MagicMock(return_value=None)
+    created = []
+    with patch.object(main_mod, "_audit_logger", logger), \
+            patch.object(main_mod, "_after_response",
+                         side_effect=lambda coro, what: created.append(coro)):
+        main_mod._schedule_security_audit(ctx)
+    assert created
+    logger.log_security_events.assert_called_once_with(ctx)
 
 
 # -- 23.45 - a cached empty answer is refused on READ --------------------------

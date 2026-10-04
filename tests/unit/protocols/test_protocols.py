@@ -211,6 +211,36 @@ def test_gemini_stream_frames_carry_final_usage():
     assert frames[-1]["usageMetadata"]["totalTokenCount"] == 5
 
 
+# litellm sends the usage in its own chunk AFTER the finish chunk. The terminal frame went out
+# on the finish chunk, so every streamed Gemini call reported 0 tokens.
+_FINISH_THEN_USAGE = [
+    {"model": "gemini-2.5-flash", "choices": [{"delta": {"content": "Hi"}}]},
+    {"choices": [{"delta": {"content": " there"}, "finish_reason": "length"}]},
+    {"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 2}},
+]
+
+
+def test_gemini_terminal_frame_carries_usage_that_arrives_after_the_finish():
+    body = _drain(GeminiProtocol().stream_translator(), _FINISH_THEN_USAGE)
+    frames = [json.loads(line[len("data: "):]) for line in body.strip().split("\n\n") if line.startswith("data: ")]
+    terminal = [f for f in frames if "finishReason" in f["candidates"][0]]
+    assert terminal == [frames[-1]]                       # exactly one, and last
+    assert frames[-1]["candidates"][0]["finishReason"] == "MAX_TOKENS"
+    assert frames[-1]["candidates"][0]["content"]["parts"] == [{"text": " there"}]
+    assert frames[-1]["usageMetadata"] == {
+        "promptTokenCount": 4, "candidatesTokenCount": 2, "totalTokenCount": 6}
+
+
+def test_anthropic_message_delta_carries_both_counts():
+    # message_start goes out with the first chunk, before any usage is known, so the input
+    # count was 0 for good; the closing message_delta now carries it.
+    body = _drain(AnthropicProtocol().stream_translator(), _FINISH_THEN_USAGE)
+    delta = next(json.loads(e.split("data: ", 1)[1]) for e in body.split("\n\n")
+                 if e.startswith("event: message_delta"))
+    assert delta["usage"] == {"input_tokens": 4, "output_tokens": 2}
+    assert delta["delta"]["stop_reason"] == "max_tokens"
+
+
 def test_stream_error_paths_emit_protocol_shaped_error():
     a = "".join(AnthropicProtocol().stream_translator().error("boom"))
     assert "event: error" in a and "api_error" in a

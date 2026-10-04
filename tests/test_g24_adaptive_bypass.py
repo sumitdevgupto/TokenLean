@@ -166,6 +166,44 @@ class TestG24AdaptiveBypass:
         assert "G01" not in ctx.skip_groups
 
     @pytest.mark.asyncio
+    async def test_an_untagged_request_does_not_match_a_dataset_scoped_rule(
+            self, sample_context, rules_file):
+        """Production traffic carries no dataset tag: a rule learned from a benchmark
+        dataset used to skip G01 for every tenant's matching request."""
+        sample_context.config["groups"]["G24_adaptive_bypass"]["rules_file"] = rules_file
+        sample_context.params.pop("x_dataset")
+        ctx = await G24AdaptiveBypass().process_request(sample_context)
+        assert "G01" not in ctx.skip_groups
+
+    @pytest.mark.asyncio
+    async def test_an_empty_rule_set_is_kept_for_the_interval(self, sample_context, monkeypatch):
+        """No rules (a missing or empty GCS object) was re-fetched on every pass: on GCP two
+        blocking downloads per request."""
+        import threading
+        import middleware.g24_adaptive_bypass as mod
+        downloads = []
+
+        class _Blob:
+            def download_as_text(self):
+                downloads.append(threading.get_ident())
+                return "adaptive_bypass: {enabled: true, rules: []}"
+
+        class _Client:
+            def bucket(self, name):
+                return type("B", (), {"blob": lambda self, n: _Blob()})()
+
+        import google.cloud.storage as gcs
+        monkeypatch.setattr(gcs, "Client", _Client)
+        monkeypatch.setattr(mod.os.path, "exists", lambda p: False)
+        monkeypatch.setenv("CONFIG_GCS_BUCKET", "cfg-bucket")
+        sample_context.config["groups"]["G24_adaptive_bypass"]["rules_file"] = "config/rules.yaml"
+        g24 = G24AdaptiveBypass()
+        await g24.process_request(sample_context)
+        await g24.process_request(sample_context)
+        assert len(downloads) == 1
+        assert downloads[0] != threading.get_ident()      # not on the event loop
+
+    @pytest.mark.asyncio
     async def test_tenant_filter(self, sample_context, bypass_rules, rules_file):
         """Rule with tenant filter only matches specified tenants."""
         # Add tenant restriction to rule

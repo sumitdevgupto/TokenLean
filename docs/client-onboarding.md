@@ -3,7 +3,7 @@
 ## What is this?
 
 A transparent proxy (run locally or GCP-hosted) that intercepts your LLM calls and automatically
-applies 28 token optimisation techniques (G0–G28, G26 reserved — 27 implemented), reducing cost and
+applies 28 token optimisation techniques (G0–G28, G27 reserved — 27 implemented), reducing cost and
 latency without changing your code.
 
 ## Getting your proxy key
@@ -163,10 +163,14 @@ Every response includes a `_token_opt` object:
 ```
 
 > **Fair-disclosure note on `cost_*_usd`.** Cost figures are a **config-priced estimate** — token
-> counts multiplied by the static `pricing:` table in `config.yaml`. They do **not** model provider
-> discounts, prompt-cache/batch credits, or reasoning surcharges, and `baseline_tokens` is a
+> counts multiplied by the static `pricing:` table in `config.yaml`. They do **not** model negotiated
+> provider discounts, batch credits, or reasoning surcharges, and `baseline_tokens` is a
 > counterfactual ("what you would have sent unoptimised"). Treat them as **directional, not
-> invoice-grade**. Token counts (`baseline_tokens` / `final_tokens_sent` / `*_abs_saving`) are exact.
+> invoice-grade**. A provider's prompt-cache discount is priced from the cached tokens it reports;
+> the baseline gets the same discount whenever the provider would have given it without the proxy
+> (it caches repeated prompts on its own, or the caller marked the prompt for caching), so
+> `cost_saving_usd` counts a cache discount only where the proxy made it possible. Token counts
+> (`baseline_tokens` / `final_tokens_sent` / `*_abs_saving`) are exact.
 
 ## Consuming the headers in your FinOps pipeline
 
@@ -184,6 +188,7 @@ unchanged to Anthropic and Gemini clients.
 | `x-tokenlean-cost-saved-usd` | `0.002217` | headline $ saved (alias of the legacy `x-savings-usd`) |
 | `x-tokenlean-latency-ms` | `812.4` | end-to-end proxy latency, to chart cost against latency |
 | `x-tokenlean-request-id` | `a1b2…` | join key to your traces/logs |
+| `x-trace-id` | `4bf92f35…` | the call's OpenTelemetry trace in the proxy's own tracing, when the operator exports it (`tracing.propagate_trace_id_header`, on by default); sent on streamed answers and refusals too |
 
 Pick **one** capture point — whichever your org already runs. No application or SDK change is
 required for the first two:
@@ -207,9 +212,11 @@ required for the first two:
   answer     = resp.parse()                          # the usual ChatCompletion object
   ```
 
-> **Two caveats.** (1) **Streamed** responses (`stream=True`) do not carry the full header set — they
-> do not pass through the response-finaliser; use the non-streaming path for FinOps reporting, or
-> read `_token_opt` server-side. (2) The savings/cost values are the same **disclosed estimate** as
+> **Two caveats.** (1) **Streamed** responses (`stream=True`) from a live model call do not carry the
+> full header set — they do not pass through the response-finaliser; use the non-streaming path for
+> FinOps reporting, or read `_token_opt` server-side. A streamed answer served without a model call
+> (a cache hit, a G04 bypass, a guardrail block) is complete before it is sent, so it does carry the
+> headers. (2) The savings/cost values are the same **disclosed estimate** as
 > `_token_opt` above — a value metric, **never the billed amount** (billing is request-count). Label
 > them as such on your dashboard so no one reconciles them against the invoice.
 

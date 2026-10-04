@@ -1,1 +1,1 @@
-# Audit logging package — immutable INSERT-only event log.
+# Audit logging package — the audit_events log (log.py says what writes and changes it).

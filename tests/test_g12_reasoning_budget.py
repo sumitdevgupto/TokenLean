@@ -63,8 +63,10 @@ class TestG12OSeries:
 
     @pytest.mark.asyncio
     async def test_o1_reasoning_effort_uses_effort_map(self):
+        # The tenant's own setting: a platform default is capped at the provider's (medium).
         ctx = _make_ctx(model="o1", provider_adapter=OpenAIAdapter())
         ctx.config["groups"]["G12_reasoning"]["default_effort"] = "high"
+        ctx.tenant_config_overrides = {"groups": {"G12_reasoning": {"default_effort": "high"}}}
         ctx = await G12ReasoningBudget().process_request(ctx)
         assert ctx.params["reasoning_effort"] == "high"
 
@@ -98,6 +100,7 @@ class TestG12Claude:
     @pytest.mark.asyncio
     async def test_claude_sonnet_gets_thinking_injected(self):
         ctx = _make_ctx(model="claude-sonnet-4-5", provider_adapter=AnthropicAdapter())
+        ctx.params["reasoning_effort"] = "medium"   # the request asks for reasoning
         ctx = await G12ReasoningBudget().process_request(ctx)
         assert ctx.params.get("thinking", {}).get("type") == "enabled"
         assert ctx.params["thinking"]["budget_tokens"] == 5000  # from effort_map.medium
@@ -106,6 +109,7 @@ class TestG12Claude:
     async def test_claude_thinking_budget_from_effort_map(self):
         ctx = _make_ctx(model="claude-3-opus", provider_adapter=AnthropicAdapter())
         ctx.config["groups"]["G12_reasoning"]["effort_map"]["medium"]["anthropic_tokens"] = 12000
+        ctx.params["reasoning_effort"] = "medium"   # the request asks for reasoning
         ctx = await G12ReasoningBudget().process_request(ctx)
         assert ctx.params["thinking"]["budget_tokens"] == 12000
 
@@ -119,6 +123,7 @@ class TestG12Claude:
     @pytest.mark.asyncio
     async def test_claude_thinking_saves_step(self):
         ctx = _make_ctx(model="claude-sonnet-4-5", provider_adapter=AnthropicAdapter())
+        ctx.params["reasoning_effort"] = "medium"   # the request asks for reasoning
         ctx = await G12ReasoningBudget().process_request(ctx)
         assert any(s.group == "G12" for s in ctx.savings.step_savings)
 

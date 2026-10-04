@@ -32,6 +32,9 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
   success "Loaded env file"
 fi
+# docker-compose.yml requires the stack's own credentials: any .env lacks is generated.
+source "${SCRIPT_DIR}/fill-local-env.sh"
+fill_local_env "$ENV_FILE"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

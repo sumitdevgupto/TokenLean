@@ -84,6 +84,9 @@ class TenantConfigLoader:
 
         merged = deep_merge(copy.deepcopy(ctx.config), overrides)
         ctx.config = merged
+        # Kept as the tenant chose them: once merged, a tenant setting cannot be told apart
+        # from the platform's (G06 lets the tenant's tier picks win).
+        ctx.tenant_config_overrides = overrides
         logger.debug(
             "TenantConfigLoader: applied %d override key(s) for tenant %s",
             len(overrides),

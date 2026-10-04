@@ -72,27 +72,35 @@ def main():
     # Generate the key
     key, key_hash, metadata = generate_key(args.tenant, args.tier, admin=args.admin)
     
-    # Load existing keys file or create new one
+    # Load the existing store. One that exists but cannot be read is NEVER treated as
+    # empty: writing it back would keep only the new key and wipe every other key (the
+    # file is also synced to production Postgres). utf-8-sig tolerates the byte-order
+    # mark a Windows editor may add.
     keys_file = Path(args.output_dir) / "local-keys.json"
-    try:
-        if keys_file.exists():
-            with open(keys_file, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        else:
-            existing = {}
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"Warning: Could not read existing keys file: {e}", file=sys.stderr)
-        existing = {}
-    
+    existing = {}
+    if keys_file.exists():
+        try:
+            existing = json.loads(keys_file.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            print(f"Error: could not read {keys_file} ({e}). Refusing to overwrite it — "
+                  "fix or move the file, then retry.", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(existing, dict):
+            print(f"Error: {keys_file} does not hold a JSON object. Refusing to overwrite it.",
+                  file=sys.stderr)
+            sys.exit(1)
+
     # Add new key (format: {hash: {tenant_id, tier}})
     existing[key_hash] = metadata
-    
-    # Write back
+
+    # Write through a temp file + rename, so a crash mid-write never leaves a truncated store.
+    tmp_file = keys_file.with_name(keys_file.name + ".tmp")
     try:
         keys_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(keys_file, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
-    except IOError as e:
+        tmp_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        os.replace(tmp_file, keys_file)
+    except OSError as e:
+        tmp_file.unlink(missing_ok=True)
         print(f"Error: Could not write keys file: {e}", file=sys.stderr)
         sys.exit(1)
     
@@ -102,13 +110,13 @@ def main():
     print(f"# Generated key for tenant: {args.tenant} (tier: {args.tier})")
     print(f"# Stored hash in: {keys_file}")
     print()
-    print(f"# Linux/Mac:")
+    print("# Linux/Mac:")
     print(f"export {env_var}={key}")
     print()
-    print(f"# Windows PowerShell:")
+    print("# Windows PowerShell:")
     print(f"$env:{env_var} = '{key}'")
     print()
-    print(f"# Windows CMD:")
+    print("# Windows CMD:")
     print(f"set {env_var}={key}")
 
 

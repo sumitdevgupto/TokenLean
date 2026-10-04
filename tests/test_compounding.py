@@ -69,7 +69,7 @@ def _full_config(g19_enabled=True, g21_enabled=True):
                 "min_length_to_compress": 30,
                 "compression_strategies": {
                     "json": {"remove_empty": True, "dedupe_keys": True},
-                    "code": {"strip_comments": True, "strip_whitespace": True, "compress_imports": True},
+                    "code": {"strip_comments": True, "strip_whitespace": True},
                     "logs": {"dedupe_lines": True, "truncate_long_lines": 200},
                 },
             },

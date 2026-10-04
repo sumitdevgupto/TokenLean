@@ -2,7 +2,7 @@
 
 Complete step-by-step guide for deploying, managing, and tearing down the TokenLean — Token Optimisation Framework.
 
-This project supports **two deployment modes** with identical optimisation coverage (G0–G28, G26 reserved — 27 implemented):
+This project supports **two deployment modes** with identical optimisation coverage (G0–G28, G27 reserved — 27 implemented):
 
 - **GCP Deployment** — Managed services, production-grade, pay-per-use. See [`docs/deployment-gcp.md`](docs/deployment-gcp.md) for a focused GCP guide.
 - **Local Deployment** — Docker Compose on your machine, zero GCP cost. See [`docs/deployment-local.md`](docs/deployment-local.md) for a focused local guide.
@@ -97,7 +97,7 @@ Follow these steps in order to deploy the framework. Each step includes the scri
    - Configures Qdrant, Prometheus, Alertmanager
 
 5. **Config upload:**
-   - Patches config.yaml with real sidecar URLs (llmlingua, routellm, tika)
+   - Patches config.yaml with real sidecar URLs (routellm; llmlingua only with `LLMLINGUA_ON_GCP=true` in `.env.gcp` — otherwise G01's LLMLingua step is switched off)
    - Uploads to GCS bucket
 
 6. **Prometheus/Alertmanager patch (`patch_prometheus`):**
@@ -148,12 +148,13 @@ curl -H "Authorization: Bearer YOUR_PROXY_KEY" \
 
 **What it skips:** Terraform infrastructure (faster, ~5 minutes)
 
-### To Pause (Zero Cost)
+### To Pause (Minimum Cost)
 **Script:** `scripts/gcp/stop-gcp.sh`
 ```bash
 ./scripts/gcp/stop-gcp.sh --project YOUR_PROJECT_ID
 ```
-**Result:** ~$2/month billing only (Cloud SQL storage)
+**Result:** ~$2/month for Cloud SQL storage, plus Qdrant's one instance, which keeps running
+(at Cloud Run's idle rate) so its documents survive
 
 ### To Resume
 **Script:** `scripts/gcp/start-gcp.sh` + Terraform
@@ -450,9 +451,9 @@ source .env.gcp && ./scripts/gcp/gcp-deploy.sh
 
 **Cloud Run Services:**
 - `token-proxy` - Main proxy (public endpoint; scale ceiling via `PROXY_MAX_INSTANCES`, default 1 — after raising, re-run a concurrent two-tenant isolation smoke)
-- `llmlingua-svc` - G1 compression sidecar (internal)
-- `routellm-svc` - G6 routing sidecar (internal)
-- `tika-svc` - G3 document extraction sidecar (internal, deployed if `src/tika-sidecar/` exists)
+- `llmlingua-svc` - G1 compression sidecar (private: callers need an identity token and `run.invoker`; runs as its own service account with no roles)
+- `routellm-svc` - G6 routing sidecar (private, like `llmlingua-svc`; G06 sends the proxy's identity token)
+- `tika-svc` - document extraction sidecar for the doc-pipeline job (private, like `llmlingua-svc`; deployed if `src/tika-sidecar/` exists). The job reads each file with Unstructured first and asks Tika for what Unstructured cannot read, such as Excel and PowerPoint
 - `langfuse-svc` - G18 observability & trace UI (public if `LANGFUSE_UI_PUBLIC=1`)
 - `grafana-svc` - Dashboards (public)
 - `token-opt-qdrant` - Vector database for RAG (internal)
@@ -631,6 +632,17 @@ in `token-proxy-api-keys`, and prints the raw key **once**:
   key is auto-issued and printed in the deploy logs. Subsequent deploys skip this.
 - The `--user` value is bookkeeping only — auth is purely by hash, so **any**
   issued key authenticates. Store the raw key securely; it cannot be retrieved again.
+- A revoke reaches every running proxy instance within `KEY_SECRET_CHECK_SECONDS`
+  (default 5): while it serves requests, each instance asks Secret Manager for the secret's
+  latest version name at most that often (a metadata call, not a read of the keys) and
+  reloads its key cache when it changed. That needs `secretmanager.versions.get` on the
+  secret, which Terraform grants the proxy (`roles/secretmanager.viewer` on that secret
+  only): run `terraform apply` before deploying a proxy that checks. Without it the proxy
+  logs a warning once and a revoke waits for the next full reload, up to
+  `KEY_CACHE_TTL_SECONDS` (default 300). A new key is picked up as soon as it is used: an
+  unknown key triggers a reload (at most every `KEY_FORCED_RELOAD_MIN_INTERVAL_SECONDS`,
+  default 5). With a local key file (`LOCAL_PROXY_KEYS_FILE`) the check is a stat of the
+  file, every `KEY_FILE_CHECK_SECONDS` (default 1).
 - `--project` defaults to `GCP_PROJECT_ID` (from `.env`) or your active `gcloud` config.
 
 ---
@@ -868,6 +880,13 @@ gcloud secrets delete token-proxy-api-keys --project=PROJECT_ID
 ```bash
 gcloud iam service-accounts delete token-opt-proxy-sa@PROJECT_ID.iam.gserviceaccount.com
 gcloud iam service-accounts delete routellm-sidecar-sa@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-ingest-push-sa@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-redis-vm@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-qdrant-sa@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-prometheus-sa@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-alertmanager-sa@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-grafana-sa@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts delete token-opt-langfuse-sa@PROJECT_ID.iam.gserviceaccount.com
 ```
 
 ### 4. Disable APIs (Optional)
@@ -969,6 +988,11 @@ gcloud run services describe token-proxy --region=REGION \
 
 # If empty, Redis host was not in Terraform output. Check:
 cd infra && terraform output redis_host
+
+# Redis has only a private address: the proxy reaches it through Direct VPC egress on the
+# project's default network. Check it is there (egress should read private-ranges-only):
+gcloud run services describe token-proxy --region=REGION --format=yaml \
+  | grep -iE "vpc-access-egress|network-interfaces"
 ```
 
 **Prometheus showing no targets / Alertmanager webhook 404**

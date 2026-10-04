@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from middleware import RequestContext, coerce_mode, resolve_group_config
 from guardrails import content_filter_response
-from guardrails.injection import InjectionScanner, InjectionVerdict
+from guardrails.injection import InjectionScanner, InjectionVerdict, tenant_capped_threshold
 
 logger = logging.getLogger(__name__)
 GROUP = "G30"
@@ -51,7 +51,11 @@ class G30Guardrails:
         self._scanner_cache: Optional[tuple] = None
 
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
-        return resolve_group_config(ctx, "G30_guardrails")
+        # A tenant may not raise its own threshold past a shipped rule: past every rule it
+        # is `mode: allow`, which the portal refuses a tenant.
+        return tenant_capped_threshold(resolve_group_config(ctx, "G30_guardrails"),
+                                       getattr(ctx, "tenant_config_overrides", None),
+                                       "G30_guardrails")
 
     def _get_scanner(self, cfg: Dict[str, Any]) -> InjectionScanner:
         threshold = float(cfg.get("threshold", 0.5))

@@ -38,6 +38,7 @@ class TestG12ReasoningSuppression:
                 {"role": "user", "content": "Explain quantum computing."},
             ],
             model="claude-sonnet-4-5",
+            params={"reasoning_effort": "medium"},   # the request asks for reasoning
         )
         ctx.provider_adapter = AnthropicAdapter()
         ctx.config["groups"]["G12_reasoning"]["default_effort"] = "medium"
@@ -60,8 +61,9 @@ class TestG12ReasoningSuppression:
                 {"role": "user", "content": "Prove Fermat's Last Theorem."},
             ],
             model="o1",
+            # Asked for by the request: a platform default is capped at the provider's own.
+            params={"reasoning_effort": "high"},
         )
-        ctx.config["groups"]["G12_reasoning"]["default_effort"] = "high"
 
         from middleware.g12_reasoning_budget import G12ReasoningBudget
         ctx = await G12ReasoningBudget().process_request(ctx)
@@ -90,6 +92,25 @@ class TestG12ReasoningSuppression:
         assert ctx.messages[0]["role"] == "system"
         assert "[BUDGET]" in ctx.messages[0]["content"]
 
+    @pytest.mark.parametrize("tenant_prompt", [True, False], ids=["tenant prompt", "none"])
+    async def test_the_prompt_never_lands_in_the_retrieved_documents(self, make_ctx, tenant_prompt):
+        """G07 now puts retrieved documents after the tenant's prompt, so the last system
+        message is often theirs. The prompt is the proxy's instruction, not part of them: it
+        goes to the tenant's prompt, or to a new system message when there is none."""
+        retrieved = {"role": "system", "content": "[Retrieved context]\ndoc"}
+        head = [{"role": "system", "content": "You are support."}] if tenant_prompt else []
+        ctx = make_ctx([*head, {"role": "user", "content": "q1"}, retrieved,
+                        {"role": "user", "content": "q2"}], model="o1")
+        ctx.config["groups"]["G12_reasoning"]["default_effort"] = "low"
+
+        from middleware.g12_reasoning_budget import G12ReasoningBudget
+        ctx = await G12ReasoningBudget().process_request(ctx)
+
+        assert retrieved in ctx.messages                       # untouched
+        first = ctx.messages[0]
+        assert first["role"] == "system" and first["content"].endswith("[BUDGET] Provide the final answer only.")
+        assert first["content"].startswith("You are support." if tenant_prompt else "[BUDGET]")
+
     async def test_claude_model_low_effort_suppression_and_budget(self, make_ctx):
         """Claude at low effort should get both suppression + thinking budget."""
         ctx = make_ctx(
@@ -98,6 +119,7 @@ class TestG12ReasoningSuppression:
                 {"role": "user", "content": "Summarise the report."},
             ],
             model="claude-haiku-4-5",
+            params={"reasoning_effort": "low"},   # the request asks for reasoning
         )
         ctx.provider_adapter = AnthropicAdapter()
         ctx.config["groups"]["G12_reasoning"]["default_effort"] = "low"

@@ -2,7 +2,7 @@
 Token Optimisation Proxy — main entry point.
 
 Exposes an OpenAI-compatible /v1/chat/completions endpoint.
-Developers swap only their base_url; all optimisations (G0-G28, G26 reserved) are transparent.
+Developers swap only their base_url; all optimisations (G0-G28, G27 reserved) are transparent.
 
 Authentication: Bearer <proxy-key>  (issued per developer/team, stored in Secret Manager)
                 Developers NEVER receive LLM provider keys.
@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -34,13 +34,17 @@ import litellm
 litellm.drop_params = True
 
 from auth.api_key_manager import (
-    get_llm_provider_key, validate_proxy_key, is_admin_key, is_gateway_key, is_suspended,
-    is_contract_inactive, get_ip_allowlist,
+    validate_proxy_key, is_admin_key, is_gateway_key, is_suspended,
+    is_contract_inactive, get_ip_allowlist, key_cached_and_fresh, key_store_backend_installed,
 )
-from net.ip_allowlist import client_ip_from_request, ip_allowed
+# Unused here; kept because the test fixtures patch main.get_llm_provider_key.
+from auth.api_key_manager import get_llm_provider_key  # noqa: F401
+from net.client_ip import ClientIPMiddleware, request_client_ip
+from net.ip_allowlist import ip_allowed
+from tracing.otel import TraceIdHeaderMiddleware
 from config_loader import get_config, get_fallback_request_model, load_config, start_hot_reload
 from tenancy.resolver import resolve_tenant
-from providers import get_adapter, apply_context_management, get_provider_entry
+from providers import get_adapter, get_provider_entry
 from providers.key_resolver import resolve_provider_key, ProviderKeyError, ProviderKeyDecryptError
 from providers.resilience import (
     ResilienceConfig,
@@ -49,6 +53,7 @@ from providers.resilience import (
     BREAKER_STATE_CODE,
     BreakerState,
     call_with_resilience,
+    describe_error,
     get_resilience_store,
 )
 from middleware.g18_observability import (
@@ -60,11 +65,13 @@ from middleware.g18_observability import (
     CIRCUIT_BREAKER_STATE,
     FAILOVER_TOTAL,
     MODEL_LOCKOUT_STATE,
+    price_billed_call,
 )
 from protocols import OPENAI, ANTHROPIC, GEMINI
+from protocols.base import UnsupportedRequestField, header_params
 import events
 from middleware import RequestContext, record_provider_call
-from middleware.g00_rate_limit import RateLimitExceeded
+from middleware.g00_rate_limit import RateLimitExceeded, add_to_spend, counter_prefix
 from middleware.g03_doc_pipeline import trigger_doc_ingestion
 # The SAME predicate G05 uses to refuse STORING an empty answer, reused here to refuse
 # SERVING one that is already stored. One definition, so the two sides cannot drift.
@@ -77,9 +84,18 @@ from middleware import langfuse_tracing
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-# H2: bearer token guarding the /metrics scrape endpoint. When unset the endpoint
-# is open (local dev); set it in production so per-tenant metrics aren't public.
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
+
+
+# H2: bearer token guarding the /metrics scrape endpoint, which lists tenant ids with their
+# token and cost figures. When unset the endpoint refuses every scrape, unless
+# METRICS_ALLOW_UNAUTHENTICATED opens it (local dev, on a machine nobody else can reach).
 _METRICS_SCRAPE_TOKEN = os.getenv("METRICS_SCRAPE_TOKEN", "")
+_METRICS_ALLOW_UNAUTHENTICATED = _env_flag("METRICS_ALLOW_UNAUTHENTICATED")
+# The token Alertmanager presents to /admin/alert-webhook (Terraform generates it). It opens
+# that endpoint only; unset, the webhook takes an admin key as before.
+_ALERT_WEBHOOK_TOKEN = os.getenv("ALERT_WEBHOOK_TOKEN", "")
 
 # Extension point: layers that compose on top of the core app (e.g. commercial_app)
 # register an async startup callable here instead of using @app.on_event — FastAPI
@@ -97,7 +113,9 @@ async def lifespan(app: FastAPI):
     ``_init_openllmetry``, …) — that is fine, they are resolved when the server starts,
     long after the module has finished importing."""
     # ── startup ──
-    load_config()
+    # required=True: refuse to start rather than serve on an empty config (no rate card,
+    # spend cap or provider tiers). Hot reload keeps the last good config afterwards.
+    load_config(required=True)
     start_hot_reload()
     # WS22 env invariant: provider credentials must reach this process ONLY as
     # LLM_KEY_<PROVIDER> (resolved through the BYOK seam). Litellm-native vars are
@@ -121,9 +139,13 @@ async def lifespan(app: FastAPI):
     _pipeline.g20._redis = redis
     cfg = get_config()
     # Start G13 Redis Streams batch consumer background task
-    asyncio.create_task(start_batch_consumer(cfg))
+    _service_task(start_batch_consumer(cfg), "g13-batch-consumer")
     # Start G13 provider-native batch poller (no-op unless provider_native is on)
-    asyncio.create_task(start_batch_poller(cfg))
+    _service_task(start_batch_poller(cfg), "g13-batch-poller")
+    # G08's daily pruning of registry tools the model has stopped calling: report only
+    # until pruning.dry_run_first is false, and nothing at all while pruning.enabled is off
+    from middleware.g08_tool_loading import run_tool_pruning_loop
+    _service_task(run_tool_pruning_loop(get_config), "g08-tool-pruning")
     # Warm the G05 L2 semantic-cache embedding model. On a fresh container the
     # sentence-transformers model (bge-small) is downloaded + loaded on first use
     # (~18s), and because the loader is lock-guarded the whole first request burst
@@ -146,41 +168,32 @@ async def lifespan(app: FastAPI):
             )
         except Exception as exc:
             logger.warning("G05 L2 embedding warmup failed (%s): %s", model_name, exc)
-    asyncio.create_task(_warm_l2_embedding_model())
+    _service_task(_warm_l2_embedding_model(), "g05-embedding-warmup")
+    # OTel pipeline tracing, from the `tracing` block (and OTEL_EXPORTER_OTLP_ENDPOINT)
+    from tracing import otel as _otel
+    _otel.configure(cfg)
     # Initialise OpenLLMetry (OTLP auto-instrumentation for LLM SDKs)
     _init_openllmetry(cfg)
-    # Ensure billing table exists and wire UsageMeter (idempotent DDL)
-    global _usage_meter, _audit_logger
-    try:
-        from cache.pg_pool import get_pg_pool
-        from billing.models import USAGE_EVENTS_DDL
-        from billing.metering import UsageMeter
-        db_url = os.getenv("DATABASE_URL", "")
-        if not db_url:
-            raise RuntimeError("DATABASE_URL not set")
-        pg = await get_pg_pool(db_url)
-        async with pg.acquire() as conn:
-            await conn.execute(USAGE_EVENTS_DDL)
-        _usage_meter = UsageMeter(db_pool=pg)
-        # D1 fix: inject the pool into the pipeline so per-tenant config_overrides
-        # (model prefs + G-group knobs from the portal) are actually applied at runtime.
-        _pipeline.set_db_pool(pg)
-        # Trust & Safety audit (G29/G30): core audit ENGINE writes PII-free security
-        # rows into audit_events (idempotent DDL). The commercial Security tab reads
-        # them; core just records. No commercial import — audit/log.py is a core engine.
-        from audit.log import AuditLogger, ensure_audit_schema
-        await ensure_audit_schema(pg)
-        _audit_logger = AuditLogger(db_pool=pg)
-        logger.info("Billing: usage_events table ready; tenant-config loader wired")
-        # WS25: config-driven retention loop (default OFF — retention.enabled).
-        from retention import run_retention_loop
-        asyncio.create_task(run_retention_loop(lambda: pg, get_config))
-    except Exception as exc:
-        logger.warning("Billing: could not initialise usage_events: %s", exc)
-    if not _METRICS_SCRAPE_TOKEN:
+    # Billing, the security audit log and per-tenant settings. Before the startup hooks:
+    # a managed deploy waits here for the database, so the hooks always get one.
+    await _wire_database_at_startup()
+    if not _METRICS_SCRAPE_TOKEN and _METRICS_ALLOW_UNAUTHENTICATED:
         logger.warning(
-            "METRICS_SCRAPE_TOKEN is not set — /metrics is unauthenticated. Set it in "
-            "production so per-tenant token/cost metrics are not world-readable."
+            "METRICS_ALLOW_UNAUTHENTICATED is on and METRICS_SCRAPE_TOKEN is not set — "
+            "/metrics, with every tenant's token and cost figures, is open to anyone who can "
+            "reach this port."
+        )
+    elif not _METRICS_SCRAPE_TOKEN:
+        logger.warning(
+            "METRICS_SCRAPE_TOKEN is not set — /metrics refuses every scrape. Set it (your "
+            "Prometheus presents it), or METRICS_ALLOW_UNAUTHENTICATED=true on a machine "
+            "nobody else can reach."
+        )
+    if _ingest_oidc_required() and not all(_ingest_oidc_settings()):
+        logger.warning(
+            "/ingest-doc requires a Pub/Sub OIDC token but INGEST_PUSH_SA_EMAIL and "
+            "INGEST_OIDC_AUDIENCE are not both set, so it refuses every notification. Set "
+            "them, or INGEST_REQUIRE_OIDC=false where nobody else can reach the proxy."
         )
     logger.info("Token Optimisation Proxy started")
 
@@ -193,6 +206,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── shutdown ──
+    # Billing rows and counter updates of the last requests first: they need the pools.
+    await _drain_after_response()
     from cache.redis_pool import close_pool
     await close_pool()
     logger.info("Token Optimisation Proxy shut down")
@@ -200,7 +215,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Token Optimisation Proxy",
-    description="LLM proxy implementing G0-G28 token optimisations (G26 reserved).",
+    description="LLM proxy implementing G0-G28 token optimisations (G27 reserved).",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -221,6 +236,12 @@ if cors_origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+# The caller's address, resolved once per request from the right of X-Forwarded-For (or a
+# trusted forwarder's vouch), then the forwarding headers are dropped: see net/client_ip.py.
+# The lambda reads get_config at call time, so a hot reload (or a test patch) applies.
+app.add_middleware(ClientIPMiddleware, get_config=lambda: get_config())
+# X-Trace-ID on every response to a pipeline request (tracing.propagate_trace_id_header).
+app.add_middleware(TraceIdHeaderMiddleware)
 
 _pipeline = OptimisationPipeline()
 
@@ -256,11 +277,127 @@ def _init_openllmetry(cfg: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Database wiring: billing, the security audit log and per-tenant settings
+# ---------------------------------------------------------------------------
+
+# Until these are wired, requests go unbilled (_schedule_billing), G29-G32 audit rows are
+# dropped (_schedule_security_audit) and tenant settings made in the portal are ignored.
+# Startup used to try once, so a database blip at start left an instance like that for
+# its whole life.
+_DB_RETRY_FIRST_S = 1.0
+_DB_RETRY_MAX_S = 30.0
+_db_expected = False    # DATABASE_URL was set at startup
+_db_pool = None         # set once the database has answered
+_db_retry_task = None   # a self-hosted proxy's background retry
+_retention_task = None
+
+
+def _db_not_wired() -> list:
+    """The database-backed parts this instance is running without (reported by /health)."""
+    if not _db_expected:
+        return []
+    return [part for part, wired in (("billing", _usage_meter is not None),
+                                     ("audit", _audit_logger is not None),
+                                     ("tenant_config", _db_pool is not None)) if not wired]
+
+
+async def _wire_database(db_url: str) -> None:
+    """Wire each part not wired yet. The parts are independent, so a failing schema step
+    leaves the others wired. Raises, naming the parts that failed."""
+    global _db_pool, _usage_meter, _audit_logger, _retention_task
+    if _db_pool is None:
+        from cache.pg_pool import get_pg_pool
+        pg = await get_pg_pool(db_url)
+        # D1 fix: inject the pool into the pipeline so per-tenant config_overrides
+        # (model prefs + G-group knobs from the portal) are actually applied at runtime.
+        _pipeline.set_db_pool(pg)
+        _db_pool = pg
+        # WS25: config-driven retention loop (default OFF — retention.enabled).
+        from retention import run_retention_loop
+        _retention_task = asyncio.create_task(run_retention_loop(lambda: pg, get_config))
+    failed = []
+    if _usage_meter is None:
+        try:
+            from billing.models import ensure_usage_events_schema
+            from billing.metering import UsageMeter
+            await ensure_usage_events_schema(_db_pool)
+            _usage_meter = UsageMeter(db_pool=_db_pool)
+        except Exception as exc:
+            failed.append(f"billing: {exc}")
+    if _audit_logger is None:
+        try:
+            # Trust & Safety audit (G29/G30): core audit ENGINE writes PII-free security
+            # rows into audit_events (idempotent DDL). The commercial Security tab reads
+            # them; core just records. No commercial import — audit/log.py is a core engine.
+            from audit.log import AuditLogger, ensure_audit_schema
+            await ensure_audit_schema(_db_pool)
+            _audit_logger = AuditLogger(db_pool=_db_pool)
+        except Exception as exc:
+            failed.append(f"audit: {exc}")
+    if failed:
+        raise RuntimeError("; ".join(failed))
+
+
+async def _try_wire_database(db_url: str) -> bool:
+    try:
+        await _wire_database(db_url)
+    except Exception as exc:
+        logger.warning("Database: %s not wired yet: %s", ", ".join(_db_not_wired()), exc)
+        return False
+    logger.info("Database: usage_events table ready; audit log and tenant settings wired")
+    return True
+
+
+async def _keep_wiring_database(db_url: str) -> None:
+    """Retry until every part is wired: 1 s apart at first, doubling up to 30 s."""
+    delay = _DB_RETRY_FIRST_S
+    while True:
+        await asyncio.sleep(delay)
+        if await _try_wire_database(db_url):
+            return
+        delay = min(delay * 2, _DB_RETRY_MAX_S)
+
+
+async def _wire_database_at_startup() -> None:
+    """Wire the database-backed parts, or arrange for them to be wired.
+
+    One attempt now. If it fails, a self-hosted proxy serves without the missing parts
+    while a background task retries, and /health reports them. With MANAGED_DEPLOY=true
+    the retries happen here instead, so startup, and the startup hooks after it, wait for
+    the database. uvicorn opens its port only once startup has finished: no request reaches
+    a managed instance that would serve it unbilled, unaudited or without tenant settings,
+    and a deploy made during a database outage fails instead of replacing a working one."""
+    global _db_expected, _db_retry_task
+    db_url = os.getenv("DATABASE_URL", "")
+    _db_expected = bool(db_url)
+    if not db_url:
+        logger.warning("DATABASE_URL not set: billing, the security audit log and "
+                       "per-tenant settings are off")
+        return
+    if await _try_wire_database(db_url):
+        return
+    if os.getenv("MANAGED_DEPLOY", "").strip().lower() in ("1", "true", "yes", "on"):
+        logger.warning("MANAGED_DEPLOY: startup waits until the database is wired")
+        await _keep_wiring_database(db_url)
+    else:
+        logger.warning("Serving without %s until the database is wired, retrying in the "
+                       "background (/health reports degraded)", ", ".join(_db_not_wired()))
+        _db_retry_task = asyncio.create_task(_keep_wiring_database(db_url))
+
+
+# ---------------------------------------------------------------------------
 # Health / info endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
+    # "degraded" while DATABASE_URL is set but billing, the audit log or tenant settings are
+    # not wired yet: a self-hosted proxy keeps serving and retrying meanwhile. Part names
+    # only, since this endpoint is public; the error, which can name hosts and users, is
+    # in the log.
+    missing = _db_not_wired()
+    if missing:
+        return {"status": "degraded", "version": "1.0.0", "not_wired": missing}
     return {"status": "ok", "version": "1.0.0"}
 
 
@@ -268,10 +405,10 @@ async def health():
 async def metrics(request: Request):
     """Prometheus scrape endpoint — exposes all token-optimisation metrics.
 
-    Gated by ``METRICS_SCRAPE_TOKEN`` (Bearer) when that env var is set. The
-    metrics carry per-tenant token/cost labels, so on a public Cloud Run service
-    they must not be world-readable. When the token is unset the endpoint stays
-    open for local dev (a one-time startup warning is logged in startup_event).
+    Gated by ``METRICS_SCRAPE_TOKEN`` (Bearer). The metrics carry per-tenant
+    token/cost labels, so they must not be world-readable. When the token is unset
+    the endpoint refuses every scrape, unless ``METRICS_ALLOW_UNAUTHENTICATED`` is on
+    (local dev; the startup log says which applies).
 
     The image runs ``uvicorn --workers 2``, so each worker process holds its own
     in-process registry and a scrape would otherwise answer from whichever worker
@@ -291,6 +428,11 @@ async def metrics(request: Request):
         provided = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
         if not hmac.compare_digest(provided, _METRICS_SCRAPE_TOKEN):
             raise HTTPException(status_code=401, detail="Invalid or missing metrics scrape token")
+    elif not _METRICS_ALLOW_UNAUTHENTICATED:
+        raise HTTPException(status_code=403, detail=(
+            "/metrics is closed: set METRICS_SCRAPE_TOKEN on the proxy and present it as a "
+            "Bearer token, or METRICS_ALLOW_UNAUTHENTICATED=true on a machine nobody else "
+            "can reach"))
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         from prometheus_client import CollectorRegistry, multiprocess
@@ -336,7 +478,7 @@ async def tool_governance(request: Request):
             "stale_count": len(stale),
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Tool governance query failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Tool governance query failed: {exc}") from exc
 
 
 @app.post("/admin/alert-webhook")
@@ -359,9 +501,17 @@ async def alert_webhook(request: Request):
         ],
         ...
     }
+
+    Alertmanager authenticates with ``ALERT_WEBHOOK_TOKEN`` (Bearer), which opens this
+    endpoint only; an admin key is accepted too.
     """
-    user_id, _api_key, tenant_metadata = await _authenticate(request)
-    _require_admin(tenant_metadata, "alert webhook ingestion")
+    auth = request.headers.get("Authorization", "")
+    presented = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    if _ALERT_WEBHOOK_TOKEN and hmac.compare_digest(presented, _ALERT_WEBHOOK_TOKEN):
+        user_id = "alertmanager"
+    else:
+        user_id, _api_key, tenant_metadata = await _authenticate(request)
+        _require_admin(tenant_metadata, "alert webhook ingestion")
     try:
         payload = await request.json()
         from cache.redis_pool import get_redis
@@ -393,76 +543,7 @@ async def alert_webhook(request: Request):
         return {"received": True, "alerts_count": len(alerts), "alert_id": alert_id}
     except Exception as exc:
         logger.error("Alert webhook processing failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Alert processing failed: {exc}")
-
-
-@app.get("/admin/budget-status")
-async def budget_status(request: Request):
-    """Return current budget consumption per team/feature from Prometheus/Redis.
-
-    Returns aggregated token usage and remaining budget for all configured
-    teams and features. Used by operators and chargeback systems.
-    """
-    user_id, _api_key, tenant_metadata = await _authenticate(request)
-    _require_admin(tenant_metadata, "cross-tenant budget status")
-    try:
-        from cache.redis_pool import get_redis
-        redis = get_redis()
-        cfg = get_config().get("groups", {}).get("G18_observability", {})
-
-        # Get budget configuration
-        team_budgets = cfg.get("team_daily_budgets", {})
-        feature_budgets = cfg.get("feature_daily_budgets", {})
-
-        # Query Redis for today's usage (keys: tok_opt:usage:{team}:{feature}:{date})
-        today = time.strftime("%Y-%m-%d")
-        result = {
-            "queried_at": time.time(),
-            "date": today,
-            "teams": {},
-            "features": {},
-        }
-
-        # Aggregate team usage
-        for team, budget in team_budgets.items():
-            # Sum all features for this team
-            pattern = f"tok_opt:usage:{team}:*:{today}"
-            keys = await redis.keys(pattern)
-            total_tokens = 0
-            for key in keys:
-                try:
-                    total_tokens += int(await redis.get(key) or 0)
-                except (ValueError, TypeError):
-                    continue
-            result["teams"][team] = {
-                "budget": budget,
-                "consumed": total_tokens,
-                "remaining": max(0, budget - total_tokens),
-                "percent_used": round((total_tokens / budget * 100), 2) if budget > 0 else 0,
-            }
-
-        # Aggregate feature usage
-        for feature, budget in feature_budgets.items():
-            # Sum all teams for this feature
-            pattern = f"tok_opt:usage:*:{feature}:{today}"
-            keys = await redis.keys(pattern)
-            total_tokens = 0
-            for key in keys:
-                try:
-                    total_tokens += int(await redis.get(key) or 0)
-                except (ValueError, TypeError):
-                    continue
-            result["features"][feature] = {
-                "budget": budget,
-                "consumed": total_tokens,
-                "remaining": max(0, budget - total_tokens),
-                "percent_used": round((total_tokens / budget * 100), 2) if budget > 0 else 0,
-            }
-
-        return result
-    except Exception as exc:
-        logger.error("Budget status query failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Budget status query failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Alert processing failed: {exc}") from exc
 
 
 @app.post("/admin/usage-export")
@@ -493,9 +574,12 @@ async def usage_export(request: Request):
         end_date = body.get("end_date", "")
         tenant_filter = body.get("tenant_id")
         # H1: non-admin keys may only export their OWN tenant — ignore any
-        # client-supplied tenant_id (and never return the all-tenant set).
+        # client-supplied tenant_id (and never return the all-tenant set: without a tenant
+        # the filter below would drop out, so that is refused).
         if not is_admin_key(tenant_metadata):
             tenant_filter = _caller_tenant_id(tenant_metadata)
+            if not tenant_filter:
+                raise HTTPException(status_code=403, detail="This proxy key is not bound to a tenant.")
 
         def _parse_date(d: str) -> datetime.datetime:
             return datetime.datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
@@ -548,7 +632,7 @@ async def usage_export(request: Request):
         raise
     except Exception as exc:
         logger.error("Usage export failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Usage export failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Usage export failed: {exc}") from exc
 
 
 @app.get("/v1/batch/results/{request_id}")
@@ -560,9 +644,11 @@ async def batch_results(request_id: str, request: Request):
         from middleware.g13_batch import get_batch_result_owner
         r = get_redis()
         # H1: only the owning tenant (or an admin key) may poll this result.
-        # Return 404 (not 403) to a non-owner so we don't confirm the id exists.
+        # Return 404 (not 403) to a non-owner so we don't confirm the id exists. With no
+        # owner on record only an admin may read it: G13 records the owner before it queues
+        # a request, so no caller can claim a result that has none.
         owner = await get_batch_result_owner(request_id)
-        if owner and not is_admin_key(tenant_metadata) and owner != _caller_tenant_id(tenant_metadata):
+        if not is_admin_key(tenant_metadata) and owner != _caller_tenant_id(tenant_metadata):
             return JSONResponse(status_code=404, content={"status": "not_found", "request_id": request_id})
         key = f"tok_opt:batch_result:{request_id}"
         raw = await r.get(key)
@@ -577,7 +663,7 @@ async def batch_results(request_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Batch result lookup failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Batch result lookup failed: {exc}") from exc
 
 
 @app.get("/v1/models")
@@ -676,31 +762,51 @@ async def _ingest_tenant_registry() -> tuple[bool, list]:
         return True, []
 
 
-def _verify_ingest_oidc(request: Request) -> None:
-    """Verify the Pub/Sub push OIDC token, gated by INGEST_REQUIRE_OIDC.
+def _ingest_oidc_required() -> bool:
+    """INGEST_REQUIRE_OIDC, else whether DATABASE_URL is set (a multi-tenant deploy, whose
+    tenants' buckets anyone could otherwise make it re-ingest). Only an explicit off opts
+    out, so a mistyped value keeps the check."""
+    flag = os.getenv("INGEST_REQUIRE_OIDC", "").strip().lower()
+    if flag:
+        return flag not in ("0", "false", "no", "off")
+    return bool(os.getenv("DATABASE_URL", ""))
 
-    Local/self-host (INGEST_REQUIRE_OIDC=false, default) skips this so the existing
-    flat-payload curl flow and tests keep working. Managed GCP sets it true so only the
-    push SA can drive ingestion. 401 on any failure.
+
+def _ingest_oidc_settings() -> tuple[str, str]:
+    """(the push SA's email, the audience) a Pub/Sub push token must carry."""
+    return (os.getenv("INGEST_PUSH_SA_EMAIL", "").strip(),
+            os.getenv("INGEST_OIDC_AUDIENCE", "").strip())
+
+
+def _verify_ingest_oidc(request: Request) -> None:
+    """Verify the Pub/Sub push OIDC token: required with INGEST_REQUIRE_OIDC on, or unset
+    while DATABASE_URL is set (see _ingest_oidc_required).
+
+    Single-tenant local runs (no DATABASE_URL) skip this so the flat-payload curl flow and
+    tests keep working; INGEST_REQUIRE_OIDC=false opts any deploy out. When required, both
+    INGEST_PUSH_SA_EMAIL and INGEST_OIDC_AUDIENCE must be set, since without either the
+    check accepted any Google-signed token (503 until they are). Managed GCP sets all three
+    so only the push SA can drive ingestion. 401 on any token failure.
     """
-    if os.getenv("INGEST_REQUIRE_OIDC", "false").lower() != "true":
+    if not _ingest_oidc_required():
         return
+    expected_sa, audience = _ingest_oidc_settings()
+    if not (expected_sa and audience):
+        logger.error("Refused /ingest-doc: OIDC is required but INGEST_PUSH_SA_EMAIL and "
+                     "INGEST_OIDC_AUDIENCE are not both set")
+        raise HTTPException(status_code=503, detail="Document ingestion is not configured")
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing OIDC token")
     token = auth.removeprefix("Bearer ").strip()
-    expected_sa = os.getenv("INGEST_PUSH_SA_EMAIL", "")
-    audience = os.getenv("INGEST_OIDC_AUDIENCE", "")
     try:
         from google.oauth2 import id_token as _id_token
         from google.auth.transport import requests as _ga_requests
-        claims = _id_token.verify_oauth2_token(
-            token, _ga_requests.Request(), audience=audience or None
-        )
+        claims = _id_token.verify_oauth2_token(token, _ga_requests.Request(), audience=audience)
     except Exception as exc:
         logger.warning("Rejected /ingest-doc: OIDC verification failed: %s", exc)
-        raise HTTPException(status_code=401, detail="Invalid OIDC token")
-    if expected_sa and claims.get("email") != expected_sa:
+        raise HTTPException(status_code=401, detail="Invalid OIDC token") from exc
+    if claims.get("email") != expected_sa:
         logger.warning("Rejected /ingest-doc: OIDC email %r != expected push SA", claims.get("email"))
         raise HTTPException(status_code=401, detail="OIDC token not from the ingest push SA")
 
@@ -773,10 +879,67 @@ async def ingest_doc(request: Request):
 # Body params consumed by middleware for routing/retrieval/loop-control — the
 # canonical set + hygiene builder now live in providers (shared with the deferred
 # G06 cascade, review S2); these aliases keep main.py's call sites/tests stable.
-from providers import INTERNAL_PARAM_KEYS as _INTERNAL_PARAM_KEYS
+from providers import outgoing_messages_for
 from providers import outgoing_params_for as _outgoing_params_for
-_usage_meter = None  # initialised in the lifespan startup once pg pool is ready
-_audit_logger = None  # core AuditLogger for G29/G30 security events (lifespan-wired)
+_usage_meter = None  # set by _wire_database once the database answers
+_audit_logger = None  # core AuditLogger for G29/G30 security events (_wire_database)
+
+# Work a request leaves to run after its response: the billing row, the security audit,
+# the quota/trial/spend counters. The loop keeps only a weak reference to a task, so each
+# is held here until it is done; a failure is logged; and shutdown waits for what is still
+# running before the pools close (bounded: Cloud Run allows 10 s after SIGTERM).
+_AFTER_RESPONSE: set = set()
+_DRAIN_TIMEOUT_S = 5.0
+
+
+def _after_response(coro, what: str) -> None:
+    """Run ``coro`` after the response, held in ``_AFTER_RESPONSE``. RuntimeError (no
+    running loop) is raised as before, with ``coro`` closed: it never started."""
+    try:
+        task = asyncio.create_task(coro, name=what)
+    except RuntimeError:
+        coro.close()
+        raise
+    _AFTER_RESPONSE.add(task)
+    task.add_done_callback(_after_response_done)
+
+
+_SERVICE_TASKS: set = set()
+
+
+def _service_task(coro, what: str) -> None:
+    """Start a background service (the G13 consumer and poller, a warm-up), held in
+    ``_SERVICE_TASKS`` so the loop's weak reference is not its only one, with a failure
+    logged by name. Not drained at shutdown: the consumer and poller never finish."""
+    task = asyncio.create_task(coro, name=what)
+    _SERVICE_TASKS.add(task)
+    task.add_done_callback(_service_task_done)
+
+
+def _service_task_done(task) -> None:
+    _SERVICE_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("background service %s stopped: %s", task.get_name(),
+                     _redact_secrets(task.exception()))
+
+
+def _after_response_done(task) -> None:
+    _AFTER_RESPONSE.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("%s failed after the response: %s", task.get_name(),
+                       _redact_secrets(task.exception()))
+
+
+async def _drain_after_response(limit_s: float = _DRAIN_TIMEOUT_S) -> None:
+    """Wait (at most ``limit_s`` seconds) for after-response work still running, webhook
+    event deliveries included."""
+    pending = set(_AFTER_RESPONSE) | events.pending_tasks()
+    if not pending:
+        return
+    _, still = await asyncio.wait(pending, timeout=limit_s)
+    if still:
+        logger.warning("shutdown: %d after-response task(s) still running after %.0f s; their "
+                       "billing rows or counter updates may be lost", len(still), limit_s)
 
 
 def _schedule_security_audit(ctx) -> None:
@@ -796,13 +959,14 @@ def _schedule_security_audit(ctx) -> None:
         return
     if not (getattr(ctx, "guardrail_action", None) or getattr(ctx, "pii_action", None)
             or getattr(ctx, "context_trust_action", None)
+            or getattr(ctx, "context_trust_managed_recorded", None)
             or getattr(ctx, "context_trust_pii_action", None)
             or getattr(ctx, "tool_eligibility_action", None)
             or getattr(ctx, "tool_dispatch_blocked", None)
             or getattr(ctx, "empty_completion", None)):
         return
     try:
-        asyncio.create_task(_audit_logger.log_security_events(ctx))
+        _after_response(_audit_logger.log_security_events(ctx), "security-audit")
     except RuntimeError:  # no running loop (not the request path) — skip
         logger.debug("[%s] security audit skipped: no loop", getattr(ctx, "request_id", "?"))
 
@@ -903,8 +1067,8 @@ async def _apply_tool_eligibility_on_short_circuit(ctx, response: Dict) -> Dict:
         try:
             from middleware.quality_metrics import record_tool_gate_failure
             record_tool_gate_failure(getattr(ctx, "tenant_id", "default"), path="short_circuit")
-        except Exception:  # metrics must never break the served response
-            pass
+        except Exception as err:  # metrics must never break the served response
+            logger.debug("tool-gate failure metric not recorded: %r", err)
         return response
 
 
@@ -988,11 +1152,11 @@ def _schedule_billing(
     if ctx is None or response is None or _usage_meter is None:
         return
     try:
-        asyncio.create_task(_usage_meter.record(
+        _after_response(_usage_meter.record(
             ctx, response,
             status_code=status_code, billable=billable,
             total_duration_ms=total_duration_ms, llm_duration_ms=llm_duration_ms,
-        ))
+        ), "billing-row")
     except RuntimeError:  # no running loop (not the request path) — skip billing
         logger.debug("[%s] billing skipped: no running event loop", getattr(ctx, "request_id", "?"))
 
@@ -1062,6 +1226,15 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
                         _served_model, llm_ms,
                         alpha=float(_g6_cfg.get("least_latency_alpha", 0.3) or 0.3),
                     )
+        # ... and a model whose call failed on the provider's side, served or not, is
+        # passed over by least_latency for a while: only successes are measured, so it
+        # otherwise stayed unmeasured and was picked first on every request.
+        _failed = [a.model for a in (getattr(ctx, "provider_attempts", None) or [])
+                   if a.outcome == "error" and getattr(a, "transient", False)]
+        if _failed:
+            from middleware.g06_routing import record_model_failure
+            for _model in _failed:
+                record_model_failure(_model)
     except Exception as exc:  # never let metrics break the response
         logger.debug("SLA metric record failed: %s", exc)
     # Trust & Safety: record any G29/G30 activity at every exit path (a flagged
@@ -1078,8 +1251,8 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
         status_code = int(status)
     except (TypeError, ValueError):
         status_code = 0
-    billable = status == "200"
-    if billable:
+    served = status == "200"
+    if served and not _impersonated(ctx):
         _schedule_billing(
             ctx, response if response is not None else {},
             status_code=status_code, billable=True,
@@ -1088,23 +1261,47 @@ def _record_outcome(ctx, start_ts: float, status: str, response=None) -> None:
         _bump_quota_counter(ctx)
         _bump_spend_counter(ctx)
         _bump_trial_counter(ctx)
-    elif status_code != 202 and _persist_all_outcomes():
-        # Observability-only error row. ctx may be None for very-early failures — skip then.
+    elif served or (status_code != 202 and _persist_all_outcomes()):
+        # A row never billed: an answer to an admin key acting as this tenant (the row names
+        # the impersonator), or an observability-only error row. ctx may be None for
+        # very-early failures — skip then.
         _schedule_billing(
-            ctx, {},
+            ctx, (response if response is not None else {}) if served else {},
             status_code=status_code, billable=False,
             total_duration_ms=int(elapsed_ms), llm_duration_ms=int(llm_ms),
         )
 
 
+def _impersonated(ctx) -> bool:
+    """Whether an admin key sent this request as another tenant (X-Tenant-ID). That is the
+    operator's traffic, not the tenant's: it is recorded, naming the impersonator, but never
+    billed to the tenant or counted against its quota, spend cap or trial."""
+    return ctx is not None and bool(getattr(ctx, "impersonator_tenant_id", None))
+
+
+def _bill_batch_deferred(ctx) -> None:
+    """C1b: a batched request is billable at defer, since it was accepted and will be served
+    async (the result-serve endpoint has no ctx); request_id UNIQUE keeps it single even if
+    the client polls the result. Being billed, it counts against the quota and trial now
+    too; its cost is known only when its answer arrives, and G13 adds it to the spend
+    counter then. None of this when an admin key sent it as the tenant."""
+    billable = not _impersonated(ctx)
+    _schedule_billing(ctx, getattr(ctx, "cache_response", None) or {}, status_code=202,
+                      billable=billable)
+    if billable:
+        _bump_quota_counter(ctx)
+        _bump_trial_counter(ctx)
+
+
 def _bump_quota_counter(ctx) -> None:
     """WS23: fire-and-forget monthly billable-request counter (G00 quota gate reads it).
 
-    Mirrors the billable unit exactly — bumped for every served 2xx, tenant-prefixed
-    (`t:<id>:quota:<YYYYMM>`), ~40-day TTL so last month's key self-expires."""
+    Mirrors the billable unit exactly — bumped for every served 2xx and every batched
+    request at defer, tenant-prefixed (`t:<id>:quota:<YYYYMM>`), ~40-day TTL so last
+    month's key self-expires."""
     if ctx is None:
         return
-    prefix = getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
+    prefix = counter_prefix(ctx)
 
     async def _bump() -> None:
         try:
@@ -1119,7 +1316,7 @@ def _bump_quota_counter(ctx) -> None:
             logger.debug("quota counter bump failed: %s", exc)
 
     try:
-        asyncio.create_task(_bump())
+        _after_response(_bump(), "quota-counter")
     except RuntimeError:
         pass
 
@@ -1129,16 +1326,15 @@ def _bump_trial_counter(ctx) -> None:
 
     Bumped for every served 2xx while the tenant's trial is ``active`` — the counting
     basis is the billable unit exactly (cache hits + bypasses + content-filter 200s all
-    reach this path). Tenant-prefixed (`t:<id>:trial_used`) with **no TTL** — a trial
-    spans arbitrary calendar time; the counter is reset (DEL) by the admin console's
-    start/convert/cancel actions, never by expiry. No-op unless a trial is active, so
-    OSS/non-trial traffic is untouched. Documented asymmetry (matches the quota
-    counter): the 202 batch-defer path bills at defer but does not bump this counter."""
+    reach this path, and a batched request at defer, where it is billed). Tenant-prefixed
+    (`t:<id>:trial_used`) with **no TTL** — a trial spans arbitrary calendar time; the
+    counter is reset (DEL) by the admin console's start/convert/cancel actions, never by
+    expiry. No-op unless a trial is active, so OSS/non-trial traffic is untouched."""
     if ctx is None:
         return
     if ((getattr(ctx, "config", None) or {}).get("trial") or {}).get("status") != "active":
         return
-    prefix = getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
+    prefix = counter_prefix(ctx)
 
     async def _bump() -> None:
         try:
@@ -1150,7 +1346,7 @@ def _bump_trial_counter(ctx) -> None:
             logger.debug("trial counter bump failed: %s", exc)
 
     try:
-        asyncio.create_task(_bump())
+        _after_response(_bump(), "trial-counter")
     except RuntimeError:
         pass
 
@@ -1159,7 +1355,8 @@ def _bump_spend_counter(ctx) -> None:
     """Fire-and-forget monthly running-USD spend counter (G00 spend-cap gate reads it).
 
     Bumped for every served 2xx by the request's REAL ``cost_actual_usd`` (set by
-    G18 from the provider's actual token usage), tenant-prefixed
+    G18 from the provider's actual token usage), through G00's ``add_to_spend``, which
+    G13 uses for a batched request's cost when its answer arrives: tenant-prefixed
     (`t:<id>:spend:<YYYYMM>`), ~40-day TTL so last month's key self-expires. A
     zero/absent cost (e.g. a bypass that never reached the LLM) is skipped."""
     if ctx is None:
@@ -1170,25 +1367,23 @@ def _bump_spend_counter(ctx) -> None:
         cost = 0.0
     if cost <= 0:
         return
-    prefix = getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
-
-    async def _bump() -> None:
-        try:
-            from cache.redis_pool import get_redis
-            from middleware.g00_rate_limit import G00RateLimit
-            key = G00RateLimit.spend_key(prefix)
-            r = get_redis()
-            total = await r.incrbyfloat(key, cost)
-            # Set the TTL once, on first accrual for the period.
-            if float(total) <= cost + 1e-9:
-                await r.expire(key, 40 * 86400)
-        except Exception as exc:
-            logger.debug("spend counter bump failed: %s", exc)
-
     try:
-        asyncio.create_task(_bump())
+        _after_response(add_to_spend(counter_prefix(ctx), cost), "spend-counter")
     except RuntimeError:
         pass
+
+
+def _stream_options_with_usage(requested) -> tuple:
+    """(stream_options for the provider, withhold): the provider is always asked for its
+    usage chunk, because pricing, billing and the spend cap depend on it and a client's own
+    ``include_usage: false`` must not switch them off. ``withhold`` is True when the client
+    sent stream_options without asking for usage: the usage chunk is then kept from it, as
+    the provider would have. A client that sent no stream_options gets the chunk, as it
+    always has."""
+    opts = dict(requested) if isinstance(requested, dict) else {}
+    withhold = isinstance(requested, dict) and not requested.get("include_usage")
+    opts["include_usage"] = True
+    return opts, withhold
 
 
 def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, request_start,
@@ -1196,9 +1391,10 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
     """Pass-through SSE streaming: relay the provider's chunks unchanged.
 
     Request-side optimisations (G0–G13) are already applied before this is called. The
-    response-side pipeline (G14/G18/G23) is intentionally skipped for streamed calls;
-    usage is captured best-effort from the final chunk (needs provider stream-usage
-    support) and billing fires once on completion (billing is per-request).
+    response-side pipeline (G14/G18/G23) is skipped for streamed calls; the call is priced
+    on completion through G18's own ``price_response`` and ``emit_usage_metrics``
+    (``_price_stream``), from the provider's usage chunk, which is always requested, or
+    from an estimate when none arrived. Billing fires once on completion (per request).
 
     Resilience (#1): the stream is established through call_with_resilience — a transient
     error establishing the primary stream retries then fails over to a configured fallback
@@ -1213,15 +1409,17 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
     import json as _json
 
     params = dict(outgoing_params)
-    # Ask for a usage chunk where the provider supports it; litellm.drop_params removes it
-    # for providers that don't.
-    params.setdefault("stream_options", {"include_usage": True})
+    # Always ask for the usage chunk (the client's own include_usage cannot switch metering
+    # off); litellm.drop_params removes stream_options for providers that don't support it.
+    params["stream_options"], withhold_usage = _stream_options_with_usage(
+        params.get("stream_options"))
 
     _rcfg = ResilienceConfig.resolve(eff_cfg or ctx.config or {}, provider)
 
     async def _establish_primary():
         return await litellm.acompletion(
-            model=call_model, messages=ctx.messages, **call_kwargs, **params
+            model=call_model, messages=outgoing_messages_for(routed_adapter, ctx.messages),
+            **call_kwargs, **params, **_rcfg.call_limits(),
         )
 
     async def _open_stream():
@@ -1258,6 +1456,8 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
     async def event_gen():
         last_usage = {}
         parts = []  # accumulated assistant text for chunk-aware G23 (measurement only)
+        generated = []  # everything the model generated, to estimate usage if none arrives
+        called = set()  # the tools the model called (G08's pruning signal)
         served = False   # True once any chunk reached the client (billing/SLA truth)
         fail_status = "502"
         _llm_start = time.time()
@@ -1268,12 +1468,25 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 served = True
                 if cd.get("usage"):
                     last_usage = cd["usage"]
+                if withhold_usage and "usage" in cd:
+                    if cd.get("usage") and not cd.get("choices"):
+                        continue          # the usage-only chunk this client did not ask for
+                    cd = {k: v for k, v in cd.items() if k != "usage"}
                 try:
                     delta = (cd.get("choices") or [{}])[0].get("delta") or {}
                     if isinstance(delta.get("content"), str):
                         parts.append(delta["content"])
-                except Exception:
-                    pass
+                        generated.append(delta["content"])
+                    if isinstance(delta.get("reasoning_content"), str):
+                        generated.append(delta["reasoning_content"])
+                    for call in delta.get("tool_calls") or []:
+                        fn = (call or {}).get("function") or {}
+                        generated.extend(v for v in (fn.get("name"), fn.get("arguments"))
+                                         if isinstance(v, str))
+                        if isinstance(fn.get("name"), str) and fn["name"]:
+                            called.add(fn["name"])
+                except Exception as err:
+                    logger.debug("stream chunk delta unreadable: %r", err)
                 if _tool_gate is not None:
                     try:
                         cd = _tool_gate.filter(cd)
@@ -1323,16 +1536,20 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
                 record_routing_step(ctx)
             except Exception as exc:  # noqa: BLE001 — accounting never breaks a stream
                 logger.debug("[%s] streaming routing-step record failed: %s", request_id, exc)
-            # The response pipeline (incl. G18) is skipped for streamed calls, so wire the
-            # provider's real usage from the final chunk into savings here — otherwise the
-            # billed row records real input/output tokens (z / response_tokens) as 0.
-            if last_usage:
+            # G08's pruning signal, which the (skipped) response pipeline records for other
+            # calls: which offered registry tools the model called. After the response.
+            if called and getattr(ctx, "g08_offered_tools", None):
                 try:
-                    ctx.savings.provider_prompt_tokens = last_usage.get("prompt_tokens")
-                    ctx.savings.response_tokens = last_usage.get("completion_tokens", 0) or 0
-                    _record_stream_cache_cost(ctx, last_usage)
-                except Exception:
-                    pass
+                    from middleware.g08_tool_loading import record_called_tools
+                    _after_response(record_called_tools(ctx, set(called)), "g08-called-tools")
+                except Exception as exc:  # noqa: BLE001 — accounting never breaks a stream
+                    logger.debug("[%s] recording the streamed tool calls failed: %s",
+                                 request_id, exc)
+            # The response pipeline (incl. G18) is skipped for streamed calls, so price the
+            # served call here, through G18's own pricing and counters. A stream that failed
+            # before any chunk served nothing and is not billed, so it is not priced.
+            if served:
+                _price_stream(ctx, last_usage, "".join(generated), request_id)
             try:
                 # For streamed calls the provider owns the whole stream lifetime,
                 # so LLM time = acompletion start → last chunk consumed. += to
@@ -1352,71 +1569,57 @@ def _stream_response(ctx, call_model, call_kwargs, outgoing_params, request_id, 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
-def _record_stream_cache_cost(ctx, last_usage: Dict) -> None:
-    """Record provider cache tokens + actual cost for a STREAMED response.
+def _price_stream(ctx, usage: Dict, generated_text: str, request_id: str) -> None:
+    """Price a served stream and emit G18's token and cost counters for it.
 
-    The response pipeline (and therefore G18, the single source of truth for cost) is
-    skipped for streamed calls, so before this a streamed request recorded no cached-read
-    tokens, no cache-write tokens and a cost_actual_usd of 0 — while agentic clients, the
-    ones that benefit most from prompt caching, stream almost everything. Reuses G18's own
-    helpers so the streamed and non-streamed paths can never price the same usage
-    differently. Best-effort: never let accounting break a stream.
+    The response pipeline, G18 included, does not run for streamed calls, so this calls
+    G18's own ``price_response`` and ``emit_usage_metrics``: a streamed call is priced like
+    any other (cache, reasoning surcharge, every judge or cascade call booked in
+    ``ctx.provider_calls``), and budget alerts count it. It is priced even when G18 is off,
+    as the spend cap needs the cost; the counters follow G18's own switches.
+
+    With no usage chunk (the client disconnected first, or the provider does not report
+    stream usage) the call is priced from an estimate: the proxy's own prompt count and
+    the generated text's token count. It is recorded the way G18 records any call the
+    provider did not report, with ``provider_prompt_tokens`` left None, and counted.
+
+    Never raises: a failure is logged at warning and counted, and the stream is unaffected.
     """
-    from middleware.g18_observability import apply_cache_usage_to_savings, resolve_cache_usage
-    from savings.calculator import cache_cost_split, estimate_cost, estimate_cost_with_cache
-
-    info = resolve_cache_usage(ctx, {"usage": last_usage})
-    apply_cache_usage_to_savings(ctx, info)
-
-    prompt_tokens = last_usage.get("prompt_tokens") or 0
-    completion_tokens = last_usage.get("completion_tokens", 0) or 0
-    model = ctx.routed_model
-    cache_kwargs = dict(
-        cache_write_tokens=info.get("cache_write_tokens") or 0,
-        cache_write_multiplier=info.get("cache_write_multiplier", 1.0),
-        cache_write_1h_tokens=info.get("cache_write_1h_tokens") or 0,
-        cache_write_1h_multiplier=info.get("cache_write_1h_multiplier", 1.0),
+    from middleware import record_provider_call
+    from middleware.g18_observability import (
+        STREAM_ACCOUNTING_ERRORS, STREAM_USAGE_ESTIMATED, emit_usage_metrics, price_response,
     )
-    read_tokens = info.get("cached_tokens", 0) or 0
-    read_multiplier = info.get("cache_read_multiplier", 1.0)
-    ctx.savings.cost_actual_usd = estimate_cost_with_cache(
-        prompt_tokens, read_tokens, completion_tokens, model, read_multiplier,
-        reasoning_tokens=info.get("reasoning_tokens", 0) or 0,
-        **cache_kwargs,
-    )
-    ctx.savings.cost_baseline_usd = estimate_cost(
-        ctx.savings.baseline_tokens, completion_tokens, ctx.savings.model_requested
-    )
-    if info.get("cache_read_tokens") is not None or info.get("cache_write_tokens") is not None:
-        read_usd, write_usd = cache_cost_split(
-            prompt_tokens, read_tokens, model, read_multiplier, **cache_kwargs
-        )
-        if info.get("cache_read_tokens") is not None:
-            ctx.savings.cost_cache_read_usd = read_usd
-        if info.get("cache_write_tokens") is not None:
-            ctx.savings.cost_cache_write_usd = write_usd
+    tenant_id = getattr(ctx, "tenant_id", "default")
+    try:
+        if usage:
+            record_provider_call(ctx, ctx.routed_model, {"usage": usage})
+        else:
+            from savings.calculator import estimate_tokens
+            completion = estimate_tokens(generated_text, ctx.routed_model or "")
+            usage = {"completion_tokens": completion}  # no prompt_tokens: the provider sent none
+            record_provider_call(ctx, ctx.routed_model, {"usage": {
+                "prompt_tokens": ctx.savings.proxy_optimised_tokens,
+                "completion_tokens": completion}})
+            STREAM_USAGE_ESTIMATED.labels(tenant_id=tenant_id).inc()
+            logger.info("[%s] stream ended without a usage chunk: priced from an estimate "
+                        "(%d completion tokens)", request_id, completion)
+        cfg = ((getattr(ctx, "config", None) or {}).get("groups", {})
+               .get("G18_observability", {})) or {}
+        priced = price_response(ctx, {"usage": usage}, cfg)
+        if cfg.get("enabled", False) and cfg.get("prometheus_enabled", True):
+            emit_usage_metrics(ctx, priced)
+    except Exception as exc:  # noqa: BLE001 — accounting never breaks a stream
+        STREAM_ACCOUNTING_ERRORS.labels(tenant_id=tenant_id).inc()
+        logger.warning("[%s] streamed call could not be priced (its cost is missing): %s",
+                       request_id, exc)
 
 
 def _apply_stream_g23(ctx, content: str) -> None:
-    """Record G23 output-side savings for a streamed response (measurement only)."""
-    if not content:
-        return
-    cfg = ctx.config.get("groups", {}).get("G23_streaming_compression", {})
-    if not cfg.get("enabled", False):
-        return
+    """G23's measurement of a streamed answer, as the (skipped) response pipeline would
+    take it: the client got the whole stream, so it is not a saving."""
     try:
-        from middleware.g23_streaming_compression import _compress_text, _estimate_tokens_from_chars
-        compressed, chars_saved = _compress_text(
-            content, cfg.get("min_repeat", 3), cfg.get("ngram_size", 5)
-        )
-        if chars_saved > 0:
-            orig_t = _estimate_tokens_from_chars(len(content))
-            saved_t = _estimate_tokens_from_chars(chars_saved)
-            ctx.savings.add_step(
-                "G23",
-                f"G23 (stream): output compressed {chars_saved} chars → ~{saved_t} tokens saved",
-                orig_t, orig_t - saved_t,
-            )
+        from middleware.g23_streaming_compression import measure_output
+        measure_output(ctx, content)
     except Exception as exc:
         logger.debug("[%s] stream G23 failed: %s", ctx.request_id, exc)
 
@@ -1672,7 +1875,44 @@ def _served_response(ctx, response_dict: Dict, request_start: float) -> JSONResp
     return JSONResponse(content=response_dict, headers=headers)
 
 
+async def _process_and_serve(ctx, response: Dict, request_start: float) -> JSONResponse:
+    """Run the response stages over a paid answer, then serve it (`_served_response`).
+
+    The pipeline skips a response stage that fails, except the safety stages (G29, G30,
+    G32): their failure ends the request here, and the answer is withheld rather than served
+    unmasked or unchecked. The provider was paid all the same, so the outcome is recorded: a
+    non-billable usage row priced at what the provider billed, the security audit row and
+    the SLA metrics. The tenant is not billed for our failure."""
+    try:
+        ctx, response_dict = await _pipeline.process_response(ctx, response)
+    except Exception as exc:
+        rid = getattr(ctx, "request_id", "?")
+        logger.error("[%s] response stages failed, answer withheld: %s", rid, _redact_secrets(exc))
+        try:
+            price_billed_call(ctx, response)
+        except Exception as price_exc:
+            logger.warning("[%s] the call could not be priced: %s", rid, price_exc)
+        langfuse_tracing.finish_trace(ctx, None)
+        _record_outcome(ctx, request_start, "500")
+        raise HTTPException(status_code=500,
+                            detail="The answer could not be processed, so it was withheld") from exc
+    return _served_response(ctx, response_dict, request_start)
+
+
 _OPENAI_VALID_ROLES = {"system", "user", "assistant", "tool", "function", "developer"}
+
+
+def _ingress_extra_allowed_params(cfg: Any) -> Tuple[str, ...]:
+    """Operator-admitted extra OpenAI body fields: ``ingress.extra_allowed_params``.
+
+    Read from the GLOBAL config only — never tenant config, so a tenant cannot widen
+    what its own callers may send. A malformed value admits nothing extra.
+    """
+    section = cfg.get("ingress") if isinstance(cfg, dict) else None
+    raw = section.get("extra_allowed_params") if isinstance(section, dict) else None
+    if not isinstance(raw, list):
+        return ()
+    return tuple(name for name in raw if isinstance(name, str) and name)
 
 
 def _validate_openai_request(messages: Any) -> None:
@@ -1704,7 +1944,9 @@ async def chat_completions(request: Request):
     # _serve_protocol). _authenticate stays outside — its 401/403 handling is unchanged.
     try:
         body = await request.json()
-        messages, model, params = OPENAI.parse_request(body, dict(request.headers))
+        messages, model, params = OPENAI.parse_request(
+            body, dict(request.headers),
+            extra_allowed=_ingress_extra_allowed_params(get_config()))
         _validate_openai_request(messages)
     except HTTPException as exc:
         eb, st = OPENAI.serialise_error(exc.status_code, _detail_str(exc))
@@ -1713,10 +1955,14 @@ async def chat_completions(request: Request):
         logger.warning("[%s] OpenAI ingress: bad request: %s", request_id, _redact_secrets(exc))
         eb, st = OPENAI.serialise_error(400, "Invalid request body")
         return JSONResponse(status_code=st, content=eb)
-    return await _serve_core(
+    # Read before the core runs: what the client asked for, not what the pipeline made of it.
+    want_stream = bool(params.get("stream"))
+    withhold_usage = _stream_options_with_usage(params.get("stream_options"))[1]
+    resp = await _serve_core(
         request, request_id, _request_start, messages, model, params,
         user_id, api_key, tenant_metadata, OPENAI.name,
     )
+    return _as_requested_stream(resp, withhold_usage=withhold_usage) if want_stream else resp
 
 
 async def _serve_core(
@@ -1737,16 +1983,11 @@ async def _serve_core(
     if not model:
         model = get_fallback_request_model()
 
-    # Map X-* proxy headers into params (X-Template-ID → x_template_id, etc.).
-    # x-api-key / x-goog-api-key carry the native-SDK PROXY CREDENTIAL (#4) — they must
-    # never enter ctx.params (which G13 persists to the Redis batch stream), so exclude
-    # them alongside the routing headers. Auth reads them directly in _authenticate.
-    for header_name, header_value in request.headers.items():
-        lower = header_name.lower()
-        if lower.startswith("x-") and lower not in (
-            "x-user-id", "x-scenario-tag", "x-api-key", "x-goog-api-key",
-        ):
-            params[lower.replace("-", "_")] = header_value
+    # Map TokenLean's X-* headers into params (X-Template-ID → x_template_id). Only those:
+    # ctx.params is persisted by G13, so infrastructure headers and a caller's own routing
+    # hints stay out (the pipeline gives the routing rules every X-* header separately), and
+    # the native-SDK proxy credential (x-api-key / x-goog-api-key) never enters it.
+    params.update(header_params(request.headers))
 
     # G7 RAG: derive rag_query from the last user message when x_rag_collection is set
     if "x_rag_collection" in params and "rag_query" not in params:
@@ -1759,9 +2000,10 @@ async def _serve_core(
     params["_api_key_hash"] = api_key_hash
     # The validated key is the authoritative tenant identity (C1); the pipeline reads
     # these _auth_* params and only honours X-Tenant-ID for admin keys. Stamped for EVERY
-    # key: the OpenAI ingress copies every body field into params, so an `_auth_*` field a
-    # client sent must always be overwritten — until 2026-09-18 a legacy (string-format) key
-    # skipped this block, and `_auth_admin` / `_auth_tenant_id` in its body were believed.
+    # key. The OpenAI ingress now drops `_`-prefixed body fields (protocols/base.py), and
+    # this unconditional overwrite stays as the second line of defence — until 2026-09-18 a
+    # legacy (string-format) key skipped this block, and `_auth_admin` / `_auth_tenant_id`
+    # in its body were believed.
     meta = tenant_metadata if isinstance(tenant_metadata, dict) else {}
     params["_auth_tenant_id"] = meta.get("tenant_id")
     params["_auth_tier"] = meta.get("tier", "free")
@@ -1779,6 +2021,10 @@ async def _serve_core(
         model=model, params=params, config=cfg,
     )
     ctx.ingress_protocol = ingress_protocol
+    # Read when the response starts (TraceIdHeaderMiddleware): its X-Trace-ID, on every path.
+    state = getattr(request, "state", None)
+    if state is not None:
+        state.pipeline_ctx = ctx
 
     # Run the request-side pipeline (authoritative stage order: middleware/pipeline.py)
     try:
@@ -1888,10 +2134,7 @@ async def _serve_core(
     # Batch deferred — response delivered async
     if ctx.batch_deferred:
         langfuse_tracing.finish_trace(ctx, None)
-        # C1b: a batched request is billable at defer — it was accepted and will be
-        # served async. ctx/savings exist here; the result-serve endpoint has no ctx.
-        # request_id UNIQUE keeps it single even if the client polls the result.
-        _schedule_billing(ctx, ctx.cache_response or {}, status_code=202, billable=True)
+        _bill_batch_deferred(ctx)
         _record_outcome(ctx, _request_start, "202")
         return JSONResponse(
             status_code=202,
@@ -1921,7 +2164,8 @@ async def _serve_core(
                 max_tier_idx=ctx.cascade_plan.get("max_tier_idx"),
             )
         except Exception as _c_exc:  # noqa: BLE001 — cascade failure must never 500
-            _c_model, _c_resp = None, {"error": f"{type(_c_exc).__name__}: {_c_exc}"}
+            # Class and status only: the exception's text can carry a key or the base_url.
+            _c_model, _c_resp = None, {"error": describe_error(_c_exc)}
         if _c_model and isinstance(_c_resp, dict) and "error" not in _c_resp:
             ctx.routed_model = _c_model
             ctx.savings.routed_model = _c_model
@@ -1948,7 +2192,7 @@ async def _serve_core(
             logger.warning(
                 "[%s] G06 deferred cascade errored (%s) — falling back to a normal "
                 "call on %s", request_id,
-                (_c_resp or {}).get("error") if isinstance(_c_resp, dict) else _c_resp,
+                _redact_secrets((_c_resp or {}).get("error") if isinstance(_c_resp, dict) else _c_resp),
                 ctx.routed_model,
             )
 
@@ -1960,8 +2204,7 @@ async def _serve_core(
             "[%s] Using G06 cascade result (model=%s); skipping duplicate main LLM call",
             request_id, ctx.routed_model,
         )
-        ctx, response_dict = await _pipeline.process_response(ctx, ctx.cascade_response)
-        return _served_response(ctx, response_dict, _request_start)
+        return await _process_and_serve(ctx, ctx.cascade_response, _request_start)
 
     # F2 Intent Orchestration — the request matched a registered downstream agent and
     # IntentOrchestration already dispatched it there (its provider time is accumulated in
@@ -1973,8 +2216,7 @@ async def _serve_core(
             "[%s] Served by downstream agent '%s'; skipping main LLM call",
             request_id, ctx.agent_id,
         )
-        ctx, response_dict = await _pipeline.process_response(ctx, ctx.agent_response)
-        return _served_response(ctx, response_dict, _request_start)
+        return await _process_and_serve(ctx, ctx.agent_response, _request_start)
 
     # Split-brain fix: resolve provider/adapter/entry from the TENANT-merged ctx.config
     # (the pipeline made it per-tenant), not the global cfg snapshot.
@@ -2061,9 +2303,11 @@ async def _serve_core(
         # resilience layer may run a failover target instead, and each target captures
         # its own, so what is echoed is what the provider that actually served received.
         # Deliberately NOT `**_call_kwargs`: that is where the provider credential lives.
-        capture_sent_prompt(ctx, ctx.messages, outgoing_params, _call_model)
+        _sent_messages = outgoing_messages_for(routed_adapter, ctx.messages)
+        capture_sent_prompt(ctx, _sent_messages, outgoing_params, _call_model)
         resp = await litellm.acompletion(
-            model=_call_model, messages=ctx.messages, **_call_kwargs, **outgoing_params,
+            model=_call_model, messages=_sent_messages, **_call_kwargs, **outgoing_params,
+            **_rcfg.call_limits(),
         )
         return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
 
@@ -2087,13 +2331,13 @@ async def _serve_core(
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "401")
-        raise HTTPException(status_code=401, detail="LLM provider authentication failed")
+        raise HTTPException(status_code=401, detail="LLM provider authentication failed") from exc
     except litellm.exceptions.RateLimitError as exc:
         logger.warning("LLM rate limit: %s", _redact_secrets(exc))
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "429")
-        raise HTTPException(status_code=429, detail="LLM provider rate limit reached")
+        raise HTTPException(status_code=429, detail="LLM provider rate limit reached") from exc
     except AllTargetsFailedError as exc:
         # Every target failed or was skipped. Map to the last real error's status so
         # the client sees a meaningful 429 vs 502, and log the (safe) attempts trail —
@@ -2104,15 +2348,15 @@ async def _serve_core(
         logger.error("[%s] %s", request_id, exc)  # message embeds safe attempt descriptors
         if isinstance(_last, litellm.exceptions.RateLimitError):
             _record_outcome(ctx, _request_start, "429")
-            raise HTTPException(status_code=429, detail="All providers rate limit reached")
+            raise HTTPException(status_code=429, detail="All providers rate limit reached") from exc
         if _last is None:
             # No target was even attemptable (e.g. no viable key on any target) —
             # near-unreachable thanks to fail-open, but never report it as an
             # upstream failure that didn't happen.
             _record_outcome(ctx, _request_start, "503")
-            raise HTTPException(status_code=503, detail="No provider available for this request")
+            raise HTTPException(status_code=503, detail="No provider available for this request") from exc
         _record_outcome(ctx, _request_start, "502")
-        raise HTTPException(status_code=502, detail="All providers failed (upstream error)")
+        raise HTTPException(status_code=502, detail="All providers failed (upstream error)") from exc
     except Exception as exc:
         # Item 12: never echo the raw upstream exception to the client (it can embed the
         # api_key/base_url) and redact secrets from the log line too.
@@ -2120,7 +2364,7 @@ async def _serve_core(
         ctx.llm_elapsed_ms += (time.time() - _llm_start) * 1000
         _emit_resilience_metrics(ctx)
         _record_outcome(ctx, _request_start, "502")
-        raise HTTPException(status_code=502, detail="LLM provider error (upstream call failed)")
+        raise HTTPException(status_code=502, detail="LLM provider error (upstream call failed)") from exc
 
     # Book the served call against ctx.provider_calls, so G18's cost is the sum over
     # every provider call this request paid for rather than the price of one. Recorded
@@ -2137,8 +2381,8 @@ async def _serve_core(
         STAGE_DURATION_MS.labels(
             stage="LLM-call", tenant_id=getattr(ctx, "tenant_id", "default"),
         ).observe(_llm_ms)
-    except Exception:  # never let metrics break the response
-        pass
+    except Exception as err:  # never let metrics break the response
+        logger.debug("LLM-call duration metric not recorded: %r", err)
     (logger.warning if _llm_ms > 10000 else logger.info)(
         "[%s] LLM call %s completed in %.0fms", request_id, ctx.routed_model, _llm_ms
     )
@@ -2147,8 +2391,7 @@ async def _serve_core(
     # Run the response-side pipeline (authoritative stage order: middleware/pipeline.py),
     # then finalise (savings metadata, headers, SLA metrics + billing) via the
     # shared helper.
-    ctx, response_dict = await _pipeline.process_response(ctx, response_dict)
-    return _served_response(ctx, response_dict, _request_start)
+    return await _process_and_serve(ctx, response_dict, _request_start)
 
 
 # ---------------------------------------------------------------------------
@@ -2182,7 +2425,8 @@ async def _translate_stream(translator, source_iter):
                 continue  # translator.finish() owns the terminal framing
             try:
                 obj = json.loads(payload)
-            except Exception:
+            except Exception as exc:
+                logger.debug("stream payload is not JSON, skipped: %r", exc)
                 continue
             if isinstance(obj, dict) and "error" in obj and "choices" not in obj:
                 msg = obj.get("error")
@@ -2233,6 +2477,52 @@ async def _one_shot_stream(translator, chunk: Dict):
         yield out
     for line in translator.finish():
         yield line
+
+
+async def _openai_one_shot_stream(openai_body: Dict, *, withhold_usage: bool):
+    """A whole OpenAI completion sent as the stream the client asked for: one content
+    chunk, then the usage chunk the way a live stream sends it (``choices: []``), then
+    ``[DONE]``. The usage chunk follows the live stream's rule
+    (:func:`_stream_options_with_usage`): kept from a client that sent stream_options
+    without include_usage."""
+    chunk = _completion_to_stream_chunk(openai_body)
+    chunk["object"] = "chat.completion.chunk"
+    chunk.setdefault("created", int(time.time()))
+    usage = chunk.pop("usage", None)
+    frames = [chunk]
+    if usage and not withhold_usage:
+        head = {k: chunk[k] for k in ("id", "object", "created", "model") if k in chunk}
+        frames.append({**head, "choices": [], "usage": usage})
+    translator = OPENAI.stream_translator()
+    for line in translator.start():
+        yield line
+    for frame in frames:
+        for out in translator.chunk(frame):
+            yield out
+    for line in translator.finish():
+        yield line
+
+
+def _as_requested_stream(resp, *, withhold_usage: bool):
+    """Answer a stream=true OpenAI request with a stream, whichever path produced it.
+
+    A cache hit, a G04 bypass, a G29/G30/G31 block, an F2 agent answer and a G06 cascade
+    return a whole JSON completion. An SDK reading that body as a stream finds no events
+    and shows an empty reply, while the request is billed as served. Such a body is sent
+    as a one-chunk stream instead, as the Anthropic and Gemini routes already do
+    (:func:`_translate_response`), with its ``x-*`` headers. A live stream, an error and
+    the batch 202 pass through unchanged."""
+    if not isinstance(resp, JSONResponse) or resp.status_code != 200:
+        return resp
+    try:
+        body = json.loads(bytes(resp.body).decode("utf-8"))
+    except Exception:
+        return resp
+    if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
+        return resp
+    headers = {k: v for k, v in resp.headers.items() if k.lower().startswith("x-")}
+    return StreamingResponse(_openai_one_shot_stream(body, withhold_usage=withhold_usage),
+                             media_type=OPENAI.stream_media_type, headers=headers)
 
 
 async def _translate_response(protocol, resp, *, want_stream: bool = False,
@@ -2299,6 +2589,9 @@ async def _serve_protocol(request: Request, proto, *, path_model: str = "",
     except HTTPException as exc:
         eb, st = proto.serialise_error(exc.status_code, _detail_str(exc))
         return JSONResponse(status_code=st, content=eb)
+    except UnsupportedRequestField as exc:   # names the field, never request content
+        eb, st = proto.serialise_error(400, str(exc))
+        return JSONResponse(status_code=st, content=eb)
     except Exception as exc:
         logger.warning("[%s] %s ingress: bad request: %s", request_id, proto.name, _redact_secrets(exc))
         eb, st = proto.serialise_error(400, "Invalid request body")
@@ -2343,6 +2636,16 @@ async def gemini_stream_generate_content(request: Request, model: str):
 # Helpers
 # ---------------------------------------------------------------------------
 
+async def _validate_key(api_key: str):
+    """validate_proxy_key without making the event loop wait on the key store. A lookup
+    that may reload the cache from a blob store (Secret Manager: a blocking RPC) runs in a
+    worker thread; a cached fresh key, or an installed backend whose load never blocks on
+    the loop, is answered here."""
+    if key_store_backend_installed() or key_cached_and_fresh(api_key):
+        return validate_proxy_key(api_key)
+    return await asyncio.to_thread(validate_proxy_key, api_key)
+
+
 async def _authenticate(
     request: Request, proto=OPENAI,
 ) -> tuple[str, Optional[str], Optional[dict]]:
@@ -2378,12 +2681,19 @@ async def _authenticate(
             detail=("Missing proxy key. Use 'Authorization: Bearer <proxy-key>' "
                     "(or x-api-key / x-goog-api-key / ?key= for native Anthropic/Gemini SDKs)."),
         )
-    is_valid, user_id, tenant_metadata = validate_proxy_key(api_key)
+    is_valid, user_id, tenant_metadata = await _validate_key(api_key)
     if not is_valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid proxy API key. Contact your platform team for a key.",
         )
+    # A key record whose tenant is empty or null is malformed (create_key refuses one): its
+    # tenant cannot scope anything, and a tenant filter that tests truthy would drop out.
+    if isinstance(tenant_metadata, dict) and "tenant_id" in tenant_metadata \
+            and not tenant_metadata["tenant_id"]:
+        logger.warning("Refused a proxy key whose record has an empty tenant_id")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="This proxy key is not bound to a tenant.")
     # The key-bound identity, recorded BEFORE any X-User-ID override below: _serve_core
     # hands it to G00 as the rate-limit principal (an allow-listed override is still the
     # caller's choice). getattr: some callers pass a bare request object with no .state.
@@ -2414,25 +2724,24 @@ async def _authenticate(
             detail="Contract inactive. Contact your account administrator.",
         )
 
-    # Source-IP allowlist: when enabled, the caller's IP must fall in the union of
-    # the global CIDRs (config.yaml) and the tenant's own CIDRs (key metadata).
-    # Empty+empty ⇒ the tenant is unrestricted. Enforced pre-override for the same
-    # reason as the gates above.
+    # Source-IP allowlist: the caller's IP must fall in the union of the global CIDRs
+    # (config.yaml, applied while ip_allowlist.enabled is on) and the tenant's own CIDRs
+    # (key metadata, applied whenever the tenant has any: an operator who set them for a
+    # tenant was told nothing when the global switch was off). Empty+empty ⇒ unrestricted.
+    # Enforced pre-override for the same reason as the gates above.
     ipcfg = cfg.get("ip_allowlist", {}) or {}
-    if ipcfg.get("enabled"):
-        global_cidrs = ipcfg.get("global_cidrs", []) or []
-        tenant_cidrs = get_ip_allowlist(tenant_metadata)
-        if global_cidrs or tenant_cidrs:
-            client_ip = client_ip_from_request(
-                request, bool(ipcfg.get("trust_x_forwarded_for", True)))
-            if not ip_allowed(client_ip, global_cidrs, tenant_cidrs):
-                logger.warning(
-                    "IP allowlist: rejected %s for tenant=%s",
-                    client_ip, _caller_tenant_id(tenant_metadata))
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Source IP not allowed for this tenant.",
-                )
+    global_cidrs = (ipcfg.get("global_cidrs", []) or []) if ipcfg.get("enabled") else []
+    tenant_cidrs = get_ip_allowlist(tenant_metadata)
+    if global_cidrs or tenant_cidrs:
+        client_ip = request_client_ip(request, cfg)
+        if not ip_allowed(client_ip, global_cidrs, tenant_cidrs):
+            logger.warning(
+                "IP allowlist: rejected %s for tenant=%s",
+                client_ip, _caller_tenant_id(tenant_metadata))
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Source IP not allowed for this tenant.",
+            )
 
     # Check for X-User-ID header override (per-user attribution within a tenant)
     header_override_enabled = cfg.get("proxy", {}).get("allow_user_id_header_override", False)
@@ -2502,36 +2811,11 @@ def _resolve_provider(model: str, cfg: Dict[str, Any]) -> str:
 
 
 # Provider-scoped request params injected by G21 for the PRIMARY provider — they must
-# never leak onto a failover target routed to a different provider (review P1).
+# never leak onto a failover target routed to a different provider (review P1). Prompt-
+# cache markers (the caller's, or G21's) follow the target's own rule instead: kept for a
+# provider that caches by marker, removed for any other (providers.outgoing_messages_for
+# and outgoing_params_for), so a fallback to another Anthropic model keeps its caching.
 _PRIMARY_SCOPED_PARAMS = ("prompt_cache_key", "prompt_cache_retention")
-
-
-def _sanitized_failover_messages(messages):
-    """Copy `messages` with provider-specific annotations removed (review P2).
-
-    G21's Anthropic marker opt-in writes ``cache_control`` INTO message dicts; a
-    fallback routed to another provider must not carry them (OpenAI/Gemini 400 on
-    unknown message fields, and a fallback 400 would abort the chain). Shallow-copies
-    each message dict; content is shared (read-only downstream).
-    """
-    out = []
-    for m in messages:
-        if isinstance(m, dict) and "cache_control" in m:
-            m = {k: v for k, v in m.items() if k != "cache_control"}
-        out.append(m)
-    return out
-
-
-def _sanitized_failover_tools(tools):
-    """Same scrub for tool definitions (G21 annotates tools[-1] with cache_control)."""
-    if not isinstance(tools, list):
-        return tools
-    out = []
-    for t in tools:
-        if isinstance(t, dict) and "cache_control" in t:
-            t = {k: v for k, v in t.items() if k != "cache_control"}
-        out.append(t)
-    return out
 
 
 def _lazy_fallback_target(ctx, model: str, eff_cfg: Dict[str, Any], request_id: str,
@@ -2560,25 +2844,27 @@ def _lazy_fallback_target(ctx, model: str, eff_cfg: Dict[str, Any], request_id: 
         for pk in _PRIMARY_SCOPED_PARAMS:
             outgoing.pop(pk, None)
         if stream:
-            outgoing.setdefault("stream_options", {"include_usage": True})
+            # As on the primary: the usage chunk is always requested (whether the client
+            # sees it is decided once, in _stream_response).
+            outgoing["stream_options"] = _stream_options_with_usage(
+                outgoing.get("stream_options"))[0]
         call_model, call_kwargs = adapter.build_call(
             model, get_provider_entry(model, providers_cfg) or {}, key
         )
-        _failover_messages = _sanitized_failover_messages(ctx.messages)
-        _failover_outgoing = {
-            **outgoing,
-            **({"tools": _sanitized_failover_tools(outgoing.get("tools"))}
-               if outgoing.get("tools") is not None else {}),
-        }
-        # E4: a failover target sends DIFFERENT bytes (sanitised messages/tools, a different
+        _failover_messages = outgoing_messages_for(adapter, ctx.messages)
+        # E4: a failover target sends DIFFERENT bytes (its own messages/tools, a different
         # model). Capturing here overwrites the primary's snapshot, so the echo describes
         # the call that actually served rather than the one that failed.
-        capture_sent_prompt(ctx, _failover_messages, _failover_outgoing, call_model)
+        capture_sent_prompt(ctx, _failover_messages, outgoing, call_model)
+        # A failover target exists only while the resilience layer is on, and it retries
+        # this call itself: the client library adds no retries of its own.
         resp = await litellm.acompletion(
             model=call_model,
             messages=_failover_messages,
             **call_kwargs,
-            **_failover_outgoing,
+            **outgoing,
+            timeout=ResilienceConfig.resolve(eff_cfg, provider).request_timeout_seconds,
+            max_retries=0,
         )
         if stream:
             return resp  # the stream iterator; caller relays it
@@ -2664,4 +2950,6 @@ def _emit_resilience_metrics(ctx) -> None:
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "4000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    # proxy_headers=False: uvicorn would otherwise rewrite the socket peer from
+    # X-Forwarded-For whenever FORWARDED_ALLOW_IPS trusts the caller (net/client_ip.py).
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", proxy_headers=False)

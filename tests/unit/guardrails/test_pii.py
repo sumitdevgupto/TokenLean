@@ -249,3 +249,128 @@ class TestPhiIsOptIn:
         d = PiiDetector(entities=[EMAIL, US_SSN, DEA, NPI, MRN, ICD10])
         found = {m.entity_type for m in d.detect("email x@y.com ssn 123-45-6789 DEA AB1234563")}
         assert {EMAIL, US_SSN, DEA} <= found
+
+
+# ── Linear-time scanning ──────────────────────────────────────────────────────
+# G29 runs on the event loop every tenant shares. The email pattern was quadratic: one
+# request of "a." repeated to a few hundred KB, with no '@', stalled a worker for
+# minutes. Each check runs in a child process with a hard limit, so a quadratic
+# pattern fails the test instead of hanging the suite.
+
+_PROXY_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "proxy"))
+_TIMING_CHILD = r"""
+import json, sys, time
+sys.path.insert(0, {src!r})
+from guardrails import pii
+n = 400_000
+inputs = {{
+    "a.": "a." * (n // 2), "a": "a" * n, "a@": "a@" + "a." * (n // 2),
+    "digits": "1" * n, "digit-space": "1 " * (n // 2), "digit-dash": "1-" * (n // 2),
+    "dotted-digits": "1." * (n // 2), "mrn-spaces": "MRN" + " " * n,
+    "medical-spaces": "medical" + " " * n, "npi-spaces": "NPI" + " " * n, "words": "word " * (n // 5),
+}}
+worst = {{}}
+for name in ("_EMAIL_RE", "_SSN_RE", "_CARD_CANDIDATE_RE", "_PHONE_RE", "_IP_RE",
+             "_DEA_CANDIDATE_RE", "_NPI_RE", "_MRN_RE", "_ICD_CODE_RE"):
+    rx = getattr(pii, name)
+    for text in inputs.values():
+        started = time.perf_counter()
+        sum(1 for _ in rx.finditer(text))
+        worst[name] = max(worst.get(name, 0.0), time.perf_counter() - started)
+started = time.perf_counter()
+pii.PiiDetector(entities=list(pii.DEFAULT_ENTITIES) + list(pii.PHI_ENTITIES)).detect("a." * (n // 2))
+worst["detect: the finding's input"] = time.perf_counter() - started
+print(json.dumps(worst))
+"""
+
+
+def test_every_pii_pattern_scans_adversarial_input_in_linear_time():
+    import json
+    import subprocess
+    out = subprocess.run([sys.executable, "-c", _TIMING_CHILD.format(src=_PROXY_SRC)],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    worst = json.loads(out.stdout)
+    slow = {name: round(seconds, 2) for name, seconds in worst.items() if seconds > 1.0}
+    assert not slow, f"quadratic (or worse) on 400 KB: {slow}"
+
+
+@pytest.mark.parametrize("address", [
+    "alice@example.com", "first.last+tag@sub.example.co.uk", "x_y%z-1@a-b.io", "UPPER@EXAMPLE.COM",
+    f"{'l' * 64}@example.com",                       # the longest valid local part
+])
+def test_bounded_email_pattern_still_finds_real_addresses(address):
+    found = PiiDetector(entities=[EMAIL]).detect(f"contact: {address}, thanks")
+    assert [m.text for m in found] == [address]
+
+
+def test_text_without_an_at_sign_skips_the_email_scan(monkeypatch):
+    import guardrails.pii as pii_module
+    scans = []
+
+    class _Recorder:
+        def finditer(self, text):
+            scans.append(len(text))
+            return iter(())
+
+    monkeypatch.setattr(pii_module, "_EMAIL_RE", _Recorder())
+    PiiDetector(entities=[EMAIL]).detect("a." * 100_000)   # no '@': never scanned
+    PiiDetector(entities=[EMAIL]).detect("reach me at a@b.co")
+    assert scans == [len("reach me at a@b.co")]
+
+
+# ── One Presidio engine per process ──────────────────────────────────────────
+# Building an AnalyzerEngine loads the spaCy model (seconds, hundreds of MB), on the event
+# loop. Every PiiDetector built its own, and G29/G31 rebuild their detector whenever the
+# entity set changes, so two tenants with different `phi` settings rebuilt it per request.
+@pytest.fixture
+def _engine_builds(monkeypatch):
+    import guardrails.pii as pii_module
+    builds = []
+
+    def build():
+        builds.append(object())
+        return builds[-1]
+
+    monkeypatch.setattr(pii_module, "_build_presidio_analyzer", build)
+    monkeypatch.setattr(pii_module, "_PRESIDIO_ENGINE", None)
+    return builds
+
+
+def test_detectors_share_one_presidio_engine(_engine_builds):
+    a = PiiDetector(entities=[EMAIL], use_presidio=True)
+    b = PiiDetector(use_presidio=True)
+    assert len(_engine_builds) == 1
+    assert a._presidio is b._presidio is _engine_builds[0]
+
+
+def test_an_unavailable_presidio_is_not_retried(monkeypatch):
+    import guardrails.pii as pii_module
+    attempts = []
+    monkeypatch.setattr(pii_module, "_build_presidio_analyzer", lambda: attempts.append(1))
+    monkeypatch.setattr(pii_module, "_PRESIDIO_ENGINE", None)
+    for _ in range(3):
+        assert PiiDetector(use_presidio=True)._presidio is None
+    assert attempts == [1]
+
+
+@pytest.mark.asyncio
+async def test_tenants_alternating_phi_build_the_engine_once(_engine_builds):
+    from datetime import datetime, timezone
+    from middleware import RequestContext
+    from middleware.g29_pii_redaction import G29PiiRedaction
+    from savings.models import SavingsRecord
+
+    def ctx(phi):
+        g29 = {"enabled": True, "mode": "flag", "use_presidio": True, "phi": phi}
+        return RequestContext(
+            request_id="r", user_id="u", original_messages=[], model="m", routed_model="m",
+            messages=[{"role": "user", "content": "reach me at a@b.co"}], params={},
+            config={"groups": {"G29_pii_redaction": g29}},
+            savings=SavingsRecord(request_id="r", user_id="u", timestamp=datetime.now(timezone.utc),
+                                  model_requested="m", routed_model="m", baseline_tokens=1))
+
+    mw = G29PiiRedaction()
+    for phi in (True, False, True, False):
+        await mw.process_request(ctx(phi))
+    assert len(_engine_builds) == 1

@@ -17,9 +17,9 @@ alerting:
 scrape_configs:
   - job_name: token-opt-proxy
     metrics_path: /metrics
+    # The certificate is verified (the proxy's run.app one is publicly trusted): the token
+    # below must not go to whoever answers in its place.
     scheme: https
-    tls_config:
-      insecure_skip_verify: true
     # H2: /metrics is gated by METRICS_SCRAPE_TOKEN on the proxy — present it here.
     authorization:
       type: Bearer

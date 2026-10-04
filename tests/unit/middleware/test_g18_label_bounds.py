@@ -90,6 +90,35 @@ async def test_feature_allowlist_folds_unknown_to_other():
     assert features == {"other", "billing"}
 
 
+def _labels(metric, tenant, dimension):
+    return {k[list(metric._labelnames).index(dimension)] for k in _series(metric, tenant)}
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_feature_is_folded_by_default():
+    # Shipped config: label_values {}. Any caller sets X-Feature, so a fresh value per
+    # request minted a new series on every counter until an operator listed values.
+    tenant = f"t-{uuid.uuid4().hex[:8]}"
+    await _record([_ctx(tenant, {"x_feature": f"f-{i}"}) for i in range(25)]
+                  + [_ctx(tenant, {"x_feature": "default"})])
+    assert _labels(REQUESTS_TOTAL, tenant, "feature") == {"other", "default"}
+
+
+@pytest.mark.asyncio
+async def test_feature_passthrough_is_an_explicit_choice():
+    tenant = f"t-{uuid.uuid4().hex[:8]}"
+    cfg = {"groups": {"G18_observability": {"enabled": True, "label_values": {"feature": "*"}}}}
+    await _record([_ctx(tenant, {"x_feature": f"f-{i}"}, config=cfg) for i in range(3)])
+    assert _labels(REQUESTS_TOTAL, tenant, "feature") == {"f-0", "f-1", "f-2"}
+
+
+@pytest.mark.asyncio
+async def test_the_trusted_team_passes_through_by_default():
+    tenant = f"t-{uuid.uuid4().hex[:8]}"
+    await _record([_ctx(tenant, {}, team="alpha")])
+    assert _labels(REQUESTS_TOTAL, tenant, "team") == {"alpha"}
+
+
 @pytest.mark.asyncio
 async def test_gateway_teams_are_bounded_by_allowlist():
     tenant = f"t-{uuid.uuid4().hex[:8]}"
@@ -135,3 +164,53 @@ async def test_export_writes_a_safe_workflow_id(tmp_path, monkeypatch):
     ctx = _ctx("acme", {"x_workflow_id": "wf-legit"})
     await G18Observability()._export_jsonl(ctx, {"k": "v"})
     assert list(root.rglob("*.json")), "a safe workflow id should still be written"
+
+
+# The root check alone let '../tenantB/x' land in another tenant's partition inside the root.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_id", ["../beta/x", "..", "a/../../beta", "..\\beta\\x", "/beta", "."])
+async def test_a_workflow_id_stays_inside_the_callers_tenant(tmp_path, monkeypatch, workflow_id):
+    root = tmp_path / "export-root"
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("STORAGE_LOCAL_PATH", str(root))
+    ctx = _ctx("acme", {"x_workflow_id": workflow_id})
+    await G18Observability()._export_jsonl(ctx, {"k": "v"})
+    written = list(root.rglob("*.json"))
+    assert len(written) == 1
+    tenant_dir = (root / "token-usage-logs" / "acme").resolve()
+    assert written[0].resolve().parent.parent == tenant_dir
+
+
+class _RecordingBackend:
+    """Notes, for each write, whether it ran on a thread with a running event loop."""
+
+    def __init__(self):
+        self.on_loop = []
+
+    def write(self, path, data):
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            self.on_loop.append(True)
+        except RuntimeError:
+            self.on_loop.append(False)
+
+
+@pytest.mark.asyncio
+async def test_the_export_is_written_off_the_event_loop():
+    # A GCS upload is blocking HTTPS; on the loop it stalled every request on the worker.
+    backend = _RecordingBackend()
+    with patch("storage.get_storage_backend", return_value=backend):
+        await G18Observability()._export_jsonl(_ctx("acme", {}), {"k": "v"})
+    assert backend.on_loop == [False]
+
+
+@pytest.mark.asyncio
+async def test_one_backend_serves_every_export():
+    # Building a GCS client runs credential discovery: once per process, not per request.
+    backend = _RecordingBackend()
+    g18 = G18Observability()
+    with patch("storage.get_storage_backend", return_value=backend) as factory:
+        for _ in range(3):
+            await g18._export_jsonl(_ctx("acme", {}), {"k": "v"})
+    assert factory.call_count == 1 and len(backend.on_loop) == 3

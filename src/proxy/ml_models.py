@@ -12,6 +12,7 @@ thread-safe, so a single shared instance can serve concurrent requests.
 """
 import os
 import threading
+import time
 from typing import Any, Dict, Tuple
 
 _lock = threading.Lock()
@@ -58,7 +59,13 @@ _qdrant_compat_lock = threading.Lock()
 # param, so `qdrant_client_kwargs` attaches a cached metadata-server token provider
 # automatically when running on GCP. Locally (no metadata server / QDRANT_LOCAL_NOAUTH=1)
 # nothing is attached and behaviour is byte-identical to before.
-_gcp_metadata_available: Any = None  # tri-state: None=unprobed, True/False cached
+# Cloud Run names itself in every service's (K_SERVICE) and job's (CLOUD_RUN_JOB)
+# environment. Elsewhere the metadata server is probed; a "no" is kept _GCP_NO_TTL_S only.
+_CLOUD_RUN_ENV = ("K_SERVICE", "CLOUD_RUN_JOB")
+_GCP_NO_TTL_S = 300.0
+_gcp_metadata_available: Any = None  # None = unprobed, True = GCP (kept), False = not (for now)
+_gcp_checked_at = 0.0                # when the last "no" was probed
+_clock = time.monotonic
 _id_token_cache: Dict[str, Tuple[str, float]] = {}  # audience -> (token, expires_at)
 _id_token_lock = threading.Lock()
 
@@ -88,21 +95,49 @@ def _gcp_identity_token(audience: str) -> str:
 
 
 def _on_gcp() -> bool:
-    """Probe the metadata server once per process; cache the verdict."""
-    global _gcp_metadata_available
-    if _gcp_metadata_available is None:
-        import socket
-        import urllib.request
-        try:
-            req = urllib.request.Request(
-                "http://metadata.google.internal/computeMetadata/v1/instance/id",
-                headers={"Metadata-Flavor": "Google"},
-            )
-            urllib.request.urlopen(req, timeout=2).read()
-            _gcp_metadata_available = True
-        except (socket.gaierror, socket.timeout, OSError, Exception):
-            _gcp_metadata_available = False
+    """Whether this process runs on GCP: Cloud Run's environment says so, else the metadata
+    server answers. A yes is kept for the process, a no for _GCP_NO_TTL_S only: one slow
+    probe on GCP used to turn the identity token off until a restart, and every
+    IAM-protected call (Qdrant, the sidecars) was refused meanwhile."""
+    global _gcp_metadata_available, _gcp_checked_at
+    if _gcp_metadata_available:
+        return True
+    if any(os.environ.get(name) for name in _CLOUD_RUN_ENV):
+        _gcp_metadata_available = True
+        return True
+    now = _clock()
+    if _gcp_metadata_available is False and now - _gcp_checked_at < _GCP_NO_TTL_S:
+        return False
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/id",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        urllib.request.urlopen(req, timeout=2).read()
+        _gcp_metadata_available = True
+    except Exception:
+        _gcp_metadata_available = False
+        _gcp_checked_at = now
     return _gcp_metadata_available
+
+
+def cloud_run_auth_headers(url: str) -> Dict[str, str]:
+    """``Authorization: Bearer <identity token>`` for a call to a Cloud Run service that
+    requires IAM (the G01 LLMLingua and G06 RouteLLM sidecars), or ``{}`` when there is nothing
+    to attach: a URL that is not a Cloud Run one (local compose) or a process off GCP.
+
+    The audience is the URL's origin: Cloud Run checks it against the service URL, which
+    has no path. Only ``https://*.run.app`` hosts get a token, so a mistyped or foreign URL
+    never receives the proxy's identity. Blocks on a token-cache miss (a metadata-server
+    call), so async callers run it in a thread."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host.endswith(".run.app") or not _on_gcp():
+        return {}
+    return {"Authorization": f"Bearer {_gcp_identity_token(f'https://{host}')}"}
 
 
 def qdrant_client_kwargs(**extra: Any) -> Dict[str, Any]:

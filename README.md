@@ -96,7 +96,7 @@ The **54.1%** headline is our internal quality-gated ablation (temperature-0, 12
 - 🧩 **Route by policy** — declarative **per-tenant routing rules** pin any traffic segment (matched on keywords/regex, prompt size, requested model, tools, header tags, or user id) to a tier or specific model, with a portal **dry-run tester**; deterministic, cost-floor-protected, off by default (byte-identical when off)
 - 🔀 **Per-provider routing out of the box** — bring any provider and its requests cascade **within their own family** (a Claude request routes `claude-haiku → sonnet → opus`, a Gemini request `flash → pro`, …); the config ships ladders for all 10 native providers, so a non-OpenAI request is never silently rerouted to `gpt-4o-mini` — delete the providers you don't use and the rest pass through untouched
 - ♻️ **Hot-reload + self-tuning** — tune or A/B any technique without a redeploy; the proxy can also **learn per-tenant** which optimisations stop paying off and switch them off automatically (managed on Enterprise; the applying engine ships OSS)
-- 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger, LangGraph
+- 🧱 **100% OSS stack** — LiteLLM, LLMLingua-2, Qdrant, Langfuse, Grafana, Jaeger
 
 ---
 
@@ -381,7 +381,7 @@ Per-tenant policy, **PII-free audit rows**, Prometheus counters, and a Trust & S
 </p>
 
 ### 🔌 Native multi-protocol ingress
-The one-line base-URL swap works from the **OpenAI**, **Anthropic** (`/v1/messages` — Claude Code included), and **Gemini** (`:generateContent` / `:streamGenerateContent`) SDKs, with each SDK's native auth (`x-api-key` / `x-goog-api-key` / `?key=`). Every request is normalised into the OpenAI-shaped pipeline and the response re-serialised — non-streaming, streaming, error envelopes, **and tool/function calls** — back to your SDK's native shape. Multi-turn agentic tool use round-trips **structurally** (not as text): Anthropic `tool_use`/`tool_result` and Gemini `functionCall`/`functionResponse` map to well-formed OpenAI `tool_calls`/`tool` messages both ways, so an agentic loop through `/v1/messages` (Claude Code) or `generateContent` keeps full tool-call fidelity across turns. Every optimisation applies; billing is one row per served request regardless of protocol.
+The one-line base-URL swap works from the **OpenAI**, **Anthropic** (`/v1/messages` — Claude Code included), and **Gemini** (`:generateContent` / `:streamGenerateContent`) SDKs, with each SDK's native auth (`x-api-key` / `x-goog-api-key` / `?key=`). Every request is normalised into the OpenAI-shaped pipeline and the response re-serialised — non-streaming, streaming, error envelopes, **and tool/function calls** — back to your SDK's native shape. Multi-turn agentic tool use round-trips **structurally** (not as text): Anthropic `tool_use`/`tool_result` and Gemini `functionCall`/`functionResponse` map to well-formed OpenAI `tool_calls`/`tool` messages both ways, so an agentic loop through `/v1/messages` (Claude Code) or `generateContent` keeps full tool-call fidelity across turns. Your own prompt-cache markers (`cache_control`) survive the translation and reach Anthropic where you placed them; they are sent only to providers that cache by marker (Anthropic, Bedrock), never to another provider a request is routed or failed over to. Every optimisation applies; billing is one row per served request regardless of protocol.
 
 | Client | Endpoint |
 |---|---|
@@ -389,9 +389,11 @@ The one-line base-URL swap works from the **OpenAI**, **Anthropic** (`/v1/messag
 | Anthropic SDK / Claude Code | `POST /v1/messages` |
 | Gemini SDK | `POST /v1beta/models/{model}:generateContent` · `:streamGenerateContent` |
 
+Tool-use and output-format controls arrive as the client set them: Anthropic `tool_choice` (including `none`) and `disable_parallel_tool_use`; Gemini `toolConfig`, JSON mode (`responseMimeType` + `responseSchema`), `topK` and `thinkingConfig`. A Gemini `generationConfig` field the proxy cannot carry (audio output, for example) is refused with a 400 that names it, never silently dropped.
+
 ### 🧭 Intent-based agent orchestration (OSS engine)
 Point **one** endpoint at TokenLean and let it route each request to the right downstream agent by intent — with no routing code in your app. The engine (`middleware/intent_orchestration.py`) runs right after routing (G6):
-- **Config-driven registry** — declare agents under `orchestration.agents` (each with an OpenAI-compatible `url`, `match` keywords, optional per-agent `model` / `api_key_env` / `max_tokens` / `timeout`). A request whose intent matches an agent is **dispatched to that agent instead of the LLM** and short-circuits — while billing and the response-side groups still fire.
+- **Config-driven registry** — declare agents under `orchestration.agents` (each with an OpenAI-compatible `url`, `match` keywords, optional per-agent `model` / `api_key_env` / `max_tokens` / `timeout`; `api_key_env` is honoured only for agents defined in the operator's config). A request whose intent matches an agent is **dispatched to that agent instead of the LLM** and short-circuits — while billing and the response-side groups still fire.
 - **Default-off & byte-identical** — `agents: []` (the default) is a pure no-op; the pipeline is unchanged until you register an agent.
 - **Per-tenant isolation** — a tenant's `agents` list *replaces* the global one (never merges), so agents never leak across tenants. Every routing decision is recorded on the OSS `usage_events.agent_id` column.
 
@@ -420,7 +422,8 @@ The defaults reproduce the standard deploy; flip these to shrink the footprint o
 | `enable_self_hosted_observability` | `false` → **Google Cloud Monitoring** instead of self-hosted Prometheus/Grafana/Alertmanager |
 | `redis_backend` | `memorystore` (default) or `docker` → a cheap **GCE COS Redis VM** (~$8/mo) |
 | `db_tier` | Cloud SQL machine size |
-| `least_privilege_secret_iam` · `private_cloud_sql` · `enable_kms_master_key` | BYOK hardening opt-ins — scoped Secret Manager IAM, private-IP Cloud SQL, and **KMS-wrapped** master key |
+| `db_backups` · `db_point_in_time_recovery` | Daily Cloud SQL backups (7 kept, `db_backup_retained_count`) and point-in-time recovery over 7 days of logs (`db_transaction_log_days`) — both on by default |
+| `least_privilege_secret_iam` · `private_cloud_sql` · `enable_kms_master_key` | BYOK hardening — scoped Secret Manager IAM (on by default), and the opt-ins private-IP Cloud SQL and a **KMS-wrapped** master key |
 
 ## Repository Structure
 
@@ -437,7 +440,7 @@ src/
 ├── llmlingua-sidecar/      # G1: LLMLingua-2 HTTP compression sidecar
 ├── doc-pipeline/           # G3: Document ingestion Cloud Run Job
 ├── finetune-pipeline/      # G3: Fine-tuning pipeline (Vertex AI/OpenAI)
-├── tika-sidecar/           # Apache Tika 2.9.1 for document parsing
+├── tika-sidecar/           # Apache Tika 3.3.1 for document parsing
 └── templates/              # G16: Developer starter kits (Python / Java / Go)
 config/                     # Externalised config (hot-reloaded from GCS)
 dashboard/                  # 10 Grafana dashboards (per-call/live/trends/quarterly/billing/sla/tenant-overview/trust-safety/requests/latency-breakup)
@@ -461,22 +464,22 @@ tests/                      # Unit and integration tests (pytest)
 | **G5** | Response Caching | 30-80% | L1 Redis exact-match + L2 pgvector semantic. `cache_scope`: `tenant` (default — reuse across providers), `tenant+model` (isolate per requested model), `tenant+system` (isolate per system-prompt fingerprint, so personas/apps sharing one key never get each other's cached answers), or `tenant+model+system` |
 | **G6** | Model Routing | 40-70% | Three-tier cascade (fast→confidence check→escalation→rollback) + opt-in strategies (canary / weighted / round-robin / least-latency) |
 | **G7** | Retrieval Optimisation | 20-35% | Hybrid RAG (dense + sparse) with reranking |
-| **G8** | Tool Loading | varies — see note | MCP lazy-load manifest protocol with scheduled pruning. **Intent-based pruning only acts on tools you have listed in your own `registry_path`** — a tool with no registry entry is always kept, so on a fresh install this part of G8 is a no-op until you register your tools. **Tool-description compression** (`compress_descriptions`, on by default) trims the prose in tool schemas that ride every agentic request — code/paths/identifiers preserved byte-for-byte, no tool ever dropped — and is what G8 contributes out of the box |
+| **G8** | Tool Loading | varies — see note | MCP lazy-load manifest protocol, and a daily, per-tenant check for registry tools the model has stopped calling (it reports them until you let it drop them: `pruning.dry_run_first`). **Intent-based pruning only acts on tools you have listed in your own `registry_path`** — a tool with no registry entry is always kept, so on a fresh install this part of G8 is a no-op until you register your tools. **Tool-description compression** (`compress_descriptions`, on by default) trims the prose in tool schemas that ride every agentic request — code/paths/identifiers preserved byte-for-byte, no tool ever dropped — and is what G8 contributes out of the box |
 | **G9** | Context Schema | 15-25% | Instructor library with timeout fallback to heuristic |
-| **G10** | Memory Management | 20-40% | Mem0 OSS integration for long-horizon conversation memory |
+| **G10** | Memory Management | 20-40% | Sliding window with a per-session summary in Redis; relevant agent skills retrieved from Qdrant |
 | **G11** | Output Format | not measured | Output-shape control. Optional, **default-off** learned `max_tokens` cap, derived only from past answers to the same `workflow_id`/`template_id` and never from a tenant's other traffic (the loop that shipped on until 2026-09-08 cut answers mid-sentence; see release notes). Opt-in **output JSON-schema validation** (`validate_output`) — flag / one-shot repair / block a structured answer that isn't valid JSON or misses a schema field. Opt-in **terse-output steering** (`verbosity_steering.level`: lite/full/ultra) — a built-in "answer tersely" dial (safety carve-outs; cache-key-scoped) that subsumes the Caveman-style terseness prompt |
 | **G12** | Reasoning Budget | **not measured** | Injects the provider's reasoning parameter for the selected effort tier, including **`off`** — which omits it entirely. `off` genuinely disables reasoning on Claude and Gemini; OpenAI o-series models reason intrinsically, so there it selects the model default and is recorded as `off_unsupported` rather than counted as a saving. The old "10-30%" was never measured: the ablation's reasoning workload is **−2.7%**, and its three reasoning datasets are OpenAI-only, where `off` cannot help |
 | **G13** | Batch/Compact | **36% measured** (TOON only) | TOON (Token-Optimized Object Notation) compaction — the measured figure, from the DS4 ablation. The other mechanism in this group is **not measured**: the opt-in **provider-native async batch lane** (`provider_native`), which claims the provider's **50% batch discount** on OpenAI / Anthropic / Gemini batch APIs. It is not exercised by the ablation, so it does not contribute to this number. (A third mechanism, Kafka batching, was listed here until 2026-09-06; it was never reachable code and has been removed — batching runs on Redis Streams) |
 | **G14** | Tool Output | 15-30% | Dependency-aware parallel tool combining |
 | **G15** | Server Compute | Variable | MCP SDK server dispatch for external handlers |
-| **G16** | Agent Architecture | 5-20% enforced (tool pruning; system-prompt compaction is opt-in); 20-45% with manual role decomposition | LangGraph runtime with cost modeling |
+| **G16** | Agent Architecture | 5-20% enforced (tool pruning; system-prompt compaction is opt-in); 20-45% with manual role decomposition | Tool pruning and opt-in system-prompt compaction for monolithic agents; LangGraph decomposition templates in `templates/` for the manual role split |
 | **G17** | Loop Control | 10-20% | Inter-agent state via HTTP headers + token budgets |
 | **G18** | Observability | N/A | Langfuse tracing + Grafana dashboards + admin webhooks |
 | **G19** | Structured Pruning | up to ~40% | Built-in structured pruning of JSON / logs / prose (duplicate-sentence dedupe, JSON compaction); request + response. Honours the cacheable-prefix floor when G1's guard is on |
 | **G20** | Prompt Optimization | 5-15% | Inline application of offline-optimised prompts (Opik/DSPy) |
 | **G21** | Cache Alignment | measured per call (not modelled) | Reorder messages for provider prefix-caching (zero quality risk); reports when the prefix it is about to mark is below the provider's cacheable minimum. **Cache policy v2**: deterministic tenant-scoped `prompt_cache_key` + per-provider `cache_read_multiplier`. **Cache accounting**: both halves of provider cache billing — reads *and* writes — are captured from the response and reported per call, per tenant and per day (`cache_read_tokens` / `cache_write_tokens` / `cache_share_of_bill_pct`), so a cost line can be reconciled against a provider invoice. Opt-in per-tenant Anthropic `cache_control` marker + native `context_editing` |
 | **G22** | Deduplication | 5-20% | Collapse near-duplicate conversation turns (cosine / n-gram) |
-| **G23** | Streaming Compression | Variable | Collapse repeated n-grams in response output |
+| **G23** | Streaming Compression | N/A (a measurement) | Counts how much of each answer repeats itself; the answer is not changed |
 | **G24** | Adaptive Bypass | Variable | Skip groups with historically negative savings per request pattern |
 | **G25** | Adaptive Reasoning | **not measured** | Picks the reasoning effort before G12 applies it. Reuses the complexity tier **G06 already decided** for routing rather than running a second, differently tuned classifier over the same text; when G06 says `simple`, selects `off`. Falls back to keyword classification otherwise. The old "10-30%" was never measured — see G12 |
 | **G26** | Context Budget Compaction | 20-60%¹ | Compact history when the prompt passes X% of the usable context window: prune duplicates/stale tool output → compress wording → cached summary → opt-in drop-oldest. **Compaction is lossy from rung 3 on** — a summary keeps the gist, so a specific value inside the compacted span can be dropped and the model will answer without it. Raise `keep_recent_turns`, or use **G28** for content that must come back verbatim. Default off |
@@ -527,7 +530,7 @@ On the [Enterprise](#free-self-host-vs-enterprise-managed) managed portal, **eve
 | **G20** Prompt Optimization | `quality_threshold` 0.95; `max_prompt_tokens` 4000 | accept prompts at lower quality score | raise threshold → only accept ≥95% eval-quality prompts |
 | **G21** Cache Alignment | *(zero quality risk by design — request content unchanged)* | `prompt_cache_key`, `cache_read_multiplier`, `providers.anthropic.marker`, `groups.context_editing` (all opt-in) | — |
 | **G22** Deduplication | `dedup_threshold` 0.92; `tenant_thresholds` | lower threshold → collapse more turns | raise threshold → only near-identical turns merged |
-| **G23** Streaming Compression | `min_repeat` 3; `ngram_size` 5 | lower `min_repeat` → compress more | raise `min_repeat` → only heavy repetition collapsed |
+| **G23** Streaming Compression | *(no quality trade-off — a measurement; the answer is not changed)* | — | — |
 | **G24** Adaptive Bypass | `rules_file` (per-rule skip conditions) | add skip rules for negative-savings patterns | scope rules tightly (token/model/tenant conditions) |
 | **G25** Adaptive Reasoning | `use_routing_complexity` true (G06 `simple` → `off`); `effort_floor` 'off' / `effort_ceiling` medium (non-increasing by default since 2026-09-08 - it never raises effort above the provider default); `{high,medium,low}_keywords` | lower ceiling → cap reasoning effort | `use_routing_complexity: false` for keyword-only; raise floor/ceiling for reasoning-heavy workloads |
 | **G26** Context Budget | `enabled` false; `compact_at_pct` 85 → `target_pct` 60; `keep_recent_turns` 6; four `rungs.*` switches | enable for long conversations; lower the trigger/target | raise `keep_recent_turns`/`target_pct`; leave `rungs.drop` off — and note `rungs.summarize` is lossy too, so turn it off as well if details in older turns must survive verbatim |
@@ -566,11 +569,15 @@ Every LLM response includes detailed savings metadata:
 > **Fair-disclosure on cost figures.** `cost_baseline_usd` / `cost_actual_usd` /
 > `cost_saving_usd` are **config-priced estimates** — token counts multiplied by a
 > static `pricing:` table in config. They are **directional, not invoice-grade**:
-> they do not reflect negotiated discounts, provider-side prompt caching, batch or
-> reasoning surcharges, or currency effects, and `baseline_tokens` is a
-> counterfactual (what *would* have been sent without optimisation). Token-count
-> savings are measured directly; dollar figures are an estimate. Provider-reconciled
-> billing is a separate, non-OSS concern.
+> they do not reflect negotiated discounts, batch or reasoning surcharges, or
+> currency effects, and `baseline_tokens` is a counterfactual (what *would* have been
+> sent without optimisation). A provider's prompt-cache discount is priced from the
+> cached tokens it reports, at configured rates. The baseline gets the same discount
+> whenever the provider would have given it without the proxy (it caches repeated
+> prompts on its own, or the caller marked the prompt for caching), so the saving
+> counts only a cache discount the proxy made possible. Token-count savings are
+> measured directly; dollar figures are an estimate. Provider-reconciled billing is a
+> separate, non-OSS concern.
 
 Alongside the `_token_opt` body, the same figures are emitted as machine-readable **`x-tokenlean-*` response headers** (request-id, routed-model, cache state, tokens/%/$ saved, latency) — **including on cache-hit, bypass, and content-filter responses** — so a FinOps pipeline attributes cost per call without parsing the body.
 
@@ -643,8 +650,8 @@ main._record_outcome ───────────────────�
 | **Caching** | Redis 7 + pgvector | L1 exact-match + L2 semantic cache |
 | **RAG** | Qdrant + sentence-transformers | Vector search (G7) |
 | **Routing** | RouteLLM | Model selection (G6) |
-| **Memory** | Mem0 OSS + Qdrant | Long-horizon conversation memory (G10) |
-| **Orchestration** | LangGraph | Agent runtime (G16) |
+| **Memory** | Redis + Qdrant | Session summaries and agent skills (G10) |
+| **Orchestration** | LangGraph | Role-decomposition templates in `templates/` (G16 guidance; the proxy does not run them) |
 | **Observability** | Langfuse + Grafana + Prometheus | Tracing and dashboards (G18) |
 | **Infrastructure** | Terraform + GCP Cloud Run | Serverless deployment |
 | **Config** | GCS + hot-reload | Externalised configuration |
@@ -683,6 +690,7 @@ groups:
     pruning:
       enabled: true
       inactivity_threshold_days: 30
+      dry_run_first: true         # report only; false = drop the tools it finds
 
   # G15 — server-side compute + Headroom MCP tool hosting (wired).
   G15_server_compute:
@@ -693,9 +701,9 @@ groups:
 
 > **Notes.**
 > - `G8_tools.mcp_servers` entries are **objects** (`{url, filter_tools}`), not bare URL strings.
-> - Manifest/registry cache TTLs and the pruning threshold are **environment variables**
->   (`MCP_MANIFEST_CACHE_TTL_SECONDS`, `TOOL_REGISTRY_CACHE_TTL_SECONDS`,
->   `TOOL_INACTIVITY_THRESHOLD_DAYS`), not config keys — see [docs/config-reference.md](docs/config-reference.md).
+> - Manifest/registry cache TTLs and the pruning threshold are read from `G8_tools` first; the
+>   environment variables `MCP_MANIFEST_CACHE_TTL_SECONDS`, `TOOL_REGISTRY_CACHE_TTL_SECONDS`
+>   and `TOOL_INACTIVITY_THRESHOLD_DAYS` only supply defaults — see [docs/config-reference.md](docs/config-reference.md).
 
 ### How It Works
 
@@ -718,8 +726,7 @@ Your MCP servers must expose:
 1. **Manifest endpoint**: `GET /.well-known/mcp-manifest.json` returning tool definitions
 2. **Tool endpoint**: `POST /tools/{tool_name}` accepting JSON input and returning results
 
-The wired tool-loading path is `src/proxy/middleware/g08_tool_loading.py`. For the lower-level SDK
-module (not in the default pipeline) see `g08_mcp_loader.py`.
+The tool-loading path is `src/proxy/middleware/g08_tool_loading.py`.
 
 ## Security
 

@@ -108,20 +108,13 @@ steps:
       - 'src/finetune-pipeline'
     waitFor: [run-tests]
 
-  # Step 8a: Stage the OSS guardrails engine into the doc-pipeline build context so
-  # opt-in INGEST_PII_MODE masking can run in the Job. Copies ONLY the 3 public files —
-  # NEVER ruleset_feed.py (commercial/gitignored). Explicit list = no accidental leak.
+  # Step 8a: Stage the proxy's guardrails engine into the doc-pipeline build context so
+  # opt-in INGEST_PII_MODE masking can run in the Job. The script copies an explicit list
+  # of files, the one every build path uses (gcp-deploy.sh, cloudbuild-images-only.yaml).
   - name: 'gcr.io/cloud-builders/gcloud'
     id: stage-doc-pipeline-guardrails
     entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
-        set -euo pipefail
-        mkdir -p src/doc-pipeline/guardrails
-        cp src/proxy/guardrails/__init__.py  src/doc-pipeline/guardrails/
-        cp src/proxy/guardrails/injection.py src/doc-pipeline/guardrails/
-        cp src/proxy/guardrails/pii.py       src/doc-pipeline/guardrails/
+    args: ['scripts/ci/stage-doc-pipeline-guardrails.sh']
     waitFor: ['-']
 
   # Step 8: Build doc-pipeline image
@@ -158,18 +151,22 @@ steps:
     args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/doc-pipeline']
     waitFor: [build-doc-pipeline]
 
-  # Step 10: Deploy proxy to Cloud Run
+  # Step 10: Deploy proxy to Cloud Run. Refused when token-proxy runs the commercial image
+  # (proxy-commercial): this OSS image would replace it, and the commercial app with it.
+  # Deploy that project with its own commercial deploy. ($$ is a literal $ in Cloud Build.)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     id: deploy-proxy
-    entrypoint: gcloud
+    entrypoint: bash
     args:
-      - run
-      - deploy
-      - token-proxy
-      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/proxy:$COMMIT_SHA'
-      - '--region=${_REGION}'
-      - '--platform=managed'
-      - '--quiet'
+      - '-c'
+      - |
+        live="$$(gcloud run services describe token-proxy --region=${_REGION} --platform=managed --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)"
+        case "$$live" in
+          */proxy-commercial:*|*/proxy-commercial@*)
+            echo "token-proxy runs the commercial image ($$live): not replacing it with the OSS image. Use the commercial deploy for this project." >&2
+            exit 1 ;;
+        esac
+        gcloud run deploy token-proxy --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/proxy:$COMMIT_SHA --region=${_REGION} --platform=managed --quiet
     waitFor: [push-proxy]
 
 substitutions:

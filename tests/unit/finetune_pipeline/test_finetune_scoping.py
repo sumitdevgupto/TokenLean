@@ -189,3 +189,132 @@ def test_nondefault_tenant_strict_byok_no_key_refuses(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         pipe._resolve_training_key()
     assert exc.value.code == 2
+
+
+# ── The tenant's key arrives as the name of a Secret Manager version ──────────────────
+# An execution keeps its env overrides, readable by anyone who can view the Job, so the
+# trigger no longer passes the key itself: the Job reads the version it is given, and
+# destroys it once the run has ended cleanly (a failed run may be retried, which needs it).
+VERSION = "projects/tl-test/secrets/finetune-tenant-key/versions/7"
+
+
+class _FakeVersions:
+    """Stands in for Secret Manager's client in the Job: one version's data (None: it
+    cannot be read), and the versions read and destroyed."""
+
+    def __init__(self, data):
+        self.data, self.read, self.destroyed = data, [], []
+
+    def access_secret_version(self, request):
+        self.read.append(request["name"])
+        if self.data is None:
+            raise PermissionError("secretmanager.versions.access denied")
+        return types.SimpleNamespace(payload=types.SimpleNamespace(data=self.data))
+
+    def destroy_secret_version(self, request):
+        self.destroyed.append(request["name"])
+
+
+def _job_with(monkeypatch, versions, **env):
+    from google.cloud import secretmanager
+    monkeypatch.setattr(secretmanager, "SecretManagerServiceClient", lambda *a, **k: versions)
+    return _load(monkeypatch, {"TENANT_ID": "NOVA-STG-01", "TENANT_PROVIDER_KEY": "",
+                               "TENANT_PROVIDER_KEY_VERSION": VERSION, "BYOK_ENFORCE": "true",
+                               "OPENAI_API_KEY": "sk-platform", **env})
+
+
+def test_the_key_is_read_from_the_version_the_trigger_named(monkeypatch):
+    versions = _FakeVersions(b"sk-tenant")
+    mod = _job_with(monkeypatch, versions)
+    try:
+        key = mod.FineTunePipeline()._resolve_training_key()
+    except SystemExit as exc:
+        pytest.fail(f"the run refused (exit {exc.code}) instead of using the tenant's key")
+    assert key == "sk-tenant"
+    assert versions.read == [VERSION]
+
+
+def test_a_key_version_that_cannot_be_read_refuses_to_run_never_the_platform_key(monkeypatch):
+    mod = _job_with(monkeypatch, _FakeVersions(None), BYOK_ENFORCE="false")
+    with pytest.raises(SystemExit) as exc:
+        mod.FineTunePipeline()._resolve_training_key()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("ending, destroyed", [(None, True), (0, True), (1, False), (2, False)],
+                         ids=["finished", "skipped (exit 0)", "failed (retried)", "refused"])
+def test_the_key_version_is_destroyed_once_the_run_has_ended_cleanly(monkeypatch, ending, destroyed):
+    versions = _FakeVersions(b"sk-tenant")
+    mod = _job_with(monkeypatch, versions)
+
+    def run(self):
+        if ending is not None:
+            sys.exit(ending)
+
+    monkeypatch.setattr(mod.FineTunePipeline, "run", run)
+    if ending is None:
+        mod.main()
+    else:
+        with pytest.raises(SystemExit):
+            mod.main()
+    assert versions.destroyed == ([VERSION] if destroyed else [])
+
+
+# ── Redis requires a password ─────────────────────────────────────────────────────────
+@pytest.mark.parametrize("password, login", [
+    ("s3cret", {"username": "default", "password": "s3cret"}), ("", {}),
+], ids=["password set", "no password"])
+def test_job_tracking_logs_in_to_redis_when_a_password_is_set(monkeypatch, password, login):
+    mod = _load(monkeypatch, {"TENANT_ID": "NOVA-STG-01", "DOMAIN": "support",
+                              "REDIS_PASSWORD": password})
+    seen = {}
+
+    class _FakeRedis:
+        def hset(self, key, mapping):
+            pass
+
+        def zadd(self, key, mapping):
+            pass
+
+    def from_url(url, **kwargs):
+        seen.update(kwargs)
+        return _FakeRedis()
+
+    redis_mod = types.ModuleType("redis")
+    redis_mod.from_url = from_url
+    monkeypatch.setitem(sys.modules, "redis", redis_mod)
+    mod.FineTunePipeline()._track_job("job-1", "RUNNING", {})
+    assert {k: seen[k] for k in ("username", "password") if k in seen} == login
+
+
+_CA_PEM = "-----BEGIN CERTIFICATE-----\nQ0FDRVJU\n-----END CERTIFICATE-----\n"
+
+
+@pytest.mark.parametrize("url, tls", [
+    ("rediss://10.0.0.3:6378/0",
+     {"ssl_ca_data": _CA_PEM, "ssl_cert_reqs": "required", "ssl_check_hostname": False}),
+    ("redis://10.0.0.3:6379/0", {}),
+], ids=["tls", "plaintext url"])
+def test_job_tracking_trusts_only_the_redis_ca_it_is_given(monkeypatch, url, tls):
+    # As the proxy: the CA (REDIS_CA_CERT, a secret) with a rediss:// URL.
+    mod = _load(monkeypatch, {"TENANT_ID": "NOVA-STG-01", "DOMAIN": "support", "REDIS_URL": url,
+                              "REDIS_CA_CERT": _CA_PEM, "REDIS_PASSWORD": ""})
+    seen = {}
+
+    class _FakeRedis:
+        def hset(self, key, mapping):
+            pass
+
+        def zadd(self, key, mapping):
+            pass
+
+    def from_url(url, **kwargs):
+        seen.update(kwargs)
+        return _FakeRedis()
+
+    redis_mod = types.ModuleType("redis")
+    redis_mod.from_url = from_url
+    monkeypatch.setitem(sys.modules, "redis", redis_mod)
+    mod.FineTunePipeline()._track_job("job-1", "RUNNING", {})
+    assert {k: seen[k] for k in ("ssl_ca_data", "ssl_cert_reqs", "ssl_check_hostname")
+            if k in seen} == tls

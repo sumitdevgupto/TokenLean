@@ -139,10 +139,11 @@ class TestG18Observability:
     async def test_record_emits_prometheus_metrics_with_team_feature_labels(self, make_ctx):
         ctx = make_ctx()
         # team label comes from the TRUSTED team (ctx.team — a gateway key's X-Team), never
-        # the raw params["x_team"] (2026-09-18). feature reads params but is unbounded here
-        # only because no label_values allowlist is configured (default behaviour).
+        # the raw params["x_team"] (2026-09-18). feature reads params and keeps its own label
+        # only when listed: unlisted, any caller's value folds to "other".
         ctx.team = "team-a"
         ctx.params["x_feature"] = "feature-x"
+        ctx.config["groups"]["G18_observability"]["label_values"] = {"feature": ["feature-x"]}
         with patch("middleware.langfuse_tracing.finish_trace"):
             from middleware.g18_observability import G18Observability, REQUESTS_TOTAL, COST_USD
             before = REQUESTS_TOTAL.labels(
@@ -251,8 +252,15 @@ _PRICING = {  # per-1k USD; pinned so the tests don't depend on ambient config_l
     "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
     "gpt-4o": {"input": 0.005, "output": 0.015},
     "o1": {"input": 0.015, "output": 0.06},
+    "claude-sonnet-4-5": {"input": 0.003, "output": 0.015},
+    "gemini-2.5-flash": {"input": 0.0003, "output": 0.0025},
     "default": {"input": 0.005, "output": 0.015},
 }
+_PROVIDERS = [  # model -> provider, pinned for the same reason
+    {"name": "openai", "model_prefixes": ["gpt-", "o1"]},
+    {"name": "anthropic", "model_prefixes": ["claude-"]},
+    {"name": "gemini", "model_prefixes": ["gemini-"]},
+]
 
 
 @pytest.mark.asyncio
@@ -343,6 +351,7 @@ class TestG18CostAccounting:
         from providers.openai_adapter import OpenAIAdapter
         from savings.calculator import estimate_cost, estimate_cost_with_cache
         ctx = make_ctx(model="gpt-4o")
+        ctx.config["providers"] = _PROVIDERS
         ctx.provider_adapter = OpenAIAdapter()
         ctx.savings.baseline_tokens = 100
 
@@ -358,7 +367,9 @@ class TestG18CostAccounting:
 
         assert ctx.savings.cost_actual_usd == expected
         assert ctx.savings.cost_actual_usd < full      # discount genuinely applied
-        assert ctx.savings.cost_saving_usd > 0
+        # OpenAI caches a repeated prompt with or without the proxy, so the same discount
+        # is in the baseline and this request saved nothing.
+        assert ctx.savings.cost_saving_usd == 0
 
     async def test_cached_tokens_without_adapter_apply_no_discount(self, make_ctx):
         """No provider_adapter → multiplier defaults to 1.0 (no crash, no phantom discount)."""
@@ -376,95 +387,200 @@ class TestG18CostAccounting:
         assert ctx.savings.cost_actual_usd == estimate_cost(100, 20, "gpt-4o")
 
 
-# ── F3-T: G18 AuditLogger integration regression tests ───────────────────────
+@pytest.mark.asyncio
+class TestCostIsNotObservability:
+    """A tenant may switch G18 off in the portal. That turns off its metrics, export and
+    tracing, not its cost: the spend counter, the spend cap and the billing row all read
+    cost_actual_usd, and with G18 off every non-streamed answer was priced at $0 (a
+    streamed one was still priced)."""
+
+    async def _record(self, ctx, enabled):
+        ctx.config["groups"]["G18_observability"]["enabled"] = enabled
+        with patch("config_loader.get_pricing_table", return_value=_PRICING), \
+                patch("middleware.langfuse_tracing.finish_trace"), \
+                patch("middleware.g18_observability.emit_usage_metrics") as metrics:
+            from middleware.g18_observability import G18Observability
+            await G18Observability().record(ctx, _make_llm_response(100, 50))
+        return metrics
+
+    async def test_an_answer_is_priced_with_g18_off(self, make_ctx):
+        from savings.calculator import estimate_cost
+        ctx = make_ctx(model="gpt-4o-mini")
+        ctx.savings.baseline_tokens = 100
+        with patch("config_loader.get_pricing_table", return_value=_PRICING):
+            expected = estimate_cost(100, 50, "gpt-4o-mini")
+        await self._record(ctx, enabled=False)
+        assert expected > 0 and ctx.savings.cost_actual_usd == expected
+        assert ctx.savings.cost_baseline_usd == expected
+
+    async def test_g18_off_still_emits_no_metrics(self, make_ctx):
+        metrics = await self._record(make_ctx(model="gpt-4o-mini"), enabled=False)
+        metrics.assert_not_called()
+
+    async def test_the_fallback_pricing_prices_with_g18_off(self, make_ctx):
+        from middleware.g18_observability import price_billed_call
+        ctx = make_ctx(model="gpt-4o-mini")
+        ctx.config["groups"]["G18_observability"]["enabled"] = False
+        with patch("config_loader.get_pricing_table", return_value=_PRICING):
+            price_billed_call(ctx, _make_llm_response(100, 50))
+        assert ctx.savings.cost_actual_usd > 0
+
+
+@pytest.fixture
+def _pinned_pricing():
+    with patch("config_loader.get_pricing_table", return_value=_PRICING), \
+         patch("middleware.langfuse_tracing.finish_trace"):
+        yield
+
+
+def _adapter(name):
+    from providers import get_adapter_by_name
+    return get_adapter_by_name(name)
+
 
 @pytest.mark.asyncio
-class TestG18AuditLoggerIntegration:
-    """F3-T: G18 must call AuditLogger.log once per request when audit.enabled,
-    and must not break Prometheus metrics when audit is active."""
+@pytest.mark.usefixtures("_pinned_pricing")
+class TestBaselineCacheDiscount:
+    """The baseline is the caller's own request, sent straight to the model it asked for.
+    It gets the provider's prompt-cache discount (the reads and writes the served call
+    reported, at the requested provider's rates) whenever that request would have been
+    cached without the proxy: its provider caches repeated prompts on its own, or the
+    caller marked the prompt for caching. Otherwise the discount is the proxy's saving."""
 
-    def _response(self):
-        return {
-            "id": "chatcmpl-f3t",
-            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
-        }
+    async def _price(self, make_ctx, *, requested, served, usage, baseline_tokens=1000,
+                     params=None):
+        from middleware.g18_observability import G18Observability
+        ctx = make_ctx(model=requested, params=params or {})
+        ctx.config["providers"] = _PROVIDERS
+        ctx.routed_model = served
+        ctx.provider_adapter = _adapter(next(
+            p["name"] for p in _PROVIDERS if served.startswith(tuple(p["model_prefixes"]))))
+        ctx.savings.baseline_tokens = baseline_tokens
+        resp = _make_llm_response(prompt_tokens=usage.pop("prompt_tokens", 1000),
+                                  completion_tokens=20)
+        resp["usage"].update(usage)
+        await G18Observability().record(ctx, resp)
+        return ctx.savings
 
-    async def test_audit_logger_log_called_once(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["audit"] = {"enabled": True}
+    @pytest.mark.parametrize("model,rate", [("gpt-4o", 0.5), ("gemini-2.5-flash", 0.25)])
+    async def test_a_provider_that_caches_on_its_own_puts_its_discount_in_the_baseline(
+            self, make_ctx, model, rate):
+        from savings.calculator import estimate_cost_with_cache
+        savings = await self._price(make_ctx, requested=model, served=model,
+                                    usage={"prompt_tokens_details": {"cached_tokens": 800}})
+        assert savings.cost_baseline_usd == estimate_cost_with_cache(1000, 800, 20, model, rate)
+        assert savings.cost_baseline_usd == savings.cost_actual_usd
+        assert savings.cost_saving_usd == 0
 
-        mock_audit = AsyncMock()
-        mock_audit.log = AsyncMock()
+    async def test_a_prompt_saving_still_counts_beside_the_discount(self, make_ctx):
+        from savings.calculator import estimate_cost, estimate_cost_with_cache
+        savings = await self._price(
+            make_ctx, requested="gpt-4o", served="gpt-4o", baseline_tokens=1500,
+            usage={"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 800}})
+        assert savings.cost_baseline_usd == estimate_cost_with_cache(1500, 800, 20, "gpt-4o", 0.5)
+        assert savings.cost_saving_usd == pytest.approx(estimate_cost(500, 0, "gpt-4o"))
 
-        with patch("middleware.langfuse_tracing.finish_trace"):
-            from middleware.g18_observability import G18Observability
-            g18 = G18Observability(audit_logger=mock_audit)
-            await g18.record(ctx, self._response())
+    async def test_a_discount_the_proxys_marker_earned_stays_a_saving(self, make_ctx):
+        from savings.calculator import estimate_cost
+        savings = await self._price(make_ctx, requested="claude-sonnet-4-5",
+                                    served="claude-sonnet-4-5",
+                                    usage={"prompt_tokens_details": {"cached_tokens": 800}})
+        assert savings.cost_baseline_usd == estimate_cost(1000, 20, "claude-sonnet-4-5")
+        # Anthropic bills a cache read at 10% of the input rate: 90% of 800 tokens saved.
+        assert savings.cost_saving_usd == pytest.approx(
+            0.9 * estimate_cost(800, 0, "claude-sonnet-4-5"))
 
-        mock_audit.log.assert_awaited_once()
+    async def test_a_discount_the_callers_own_markers_earned_is_not_a_saving(self, make_ctx):
+        from protocols.base import CALLER_CACHE_MARKERS
+        from savings.calculator import estimate_cost_with_cache
+        savings = await self._price(
+            make_ctx, requested="claude-sonnet-4-5", served="claude-sonnet-4-5",
+            params={CALLER_CACHE_MARKERS: True},
+            usage={"prompt_tokens_details": {"cached_tokens": 600},
+                   "cache_creation_input_tokens": 200,
+                   "cache_creation_token_details": {"ephemeral_1h_input_tokens": 50}})
+        assert savings.cost_baseline_usd == estimate_cost_with_cache(
+            1000, 600, 20, "claude-sonnet-4-5", 0.1,
+            cache_write_tokens=200, cache_write_multiplier=1.25,
+            cache_write_1h_tokens=50, cache_write_1h_multiplier=2.0)
+        assert savings.cost_baseline_usd == savings.cost_actual_usd
+        assert savings.cost_saving_usd == 0
 
-    async def test_audit_logger_not_called_when_disabled(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["audit"] = {"enabled": False}
+    async def test_the_callers_own_cache_write_is_not_charged_to_the_proxy(self, make_ctx):
+        # The first call under the caller's marker only writes the cache, at a premium the
+        # caller would have paid without the proxy too.
+        from protocols.base import CALLER_CACHE_MARKERS
+        savings = await self._price(
+            make_ctx, requested="claude-sonnet-4-5", served="claude-sonnet-4-5",
+            params={CALLER_CACHE_MARKERS: True}, usage={"cache_creation_input_tokens": 800})
+        assert savings.cost_baseline_usd == savings.cost_actual_usd
+        assert savings.cost_saving_usd == 0
 
-        mock_audit = AsyncMock()
-        mock_audit.log = AsyncMock()
+    async def test_asked_for_a_provider_that_caches_on_its_own_but_routed_elsewhere(
+            self, make_ctx):
+        # Sent straight to OpenAI, the prompt would have been cached anyway, at OpenAI's
+        # rate, though the proxy's marker earned the discount on the Anthropic call.
+        from savings.calculator import estimate_cost_with_cache
+        savings = await self._price(make_ctx, requested="gpt-4o", served="claude-sonnet-4-5",
+                                    usage={"prompt_tokens_details": {"cached_tokens": 800}})
+        assert savings.cost_baseline_usd == estimate_cost_with_cache(1000, 800, 20, "gpt-4o", 0.5)
 
-        with patch("middleware.langfuse_tracing.finish_trace"):
-            from middleware.g18_observability import G18Observability
-            g18 = G18Observability(audit_logger=mock_audit)
-            await g18.record(ctx, self._response())
+    async def test_asked_for_a_provider_that_caches_only_a_marked_prompt_but_routed_elsewhere(
+            self, make_ctx):
+        # Sent straight to Anthropic unmarked, nothing would have been cached: the discount
+        # the routed OpenAI call got is the proxy's.
+        from savings.calculator import estimate_cost
+        savings = await self._price(make_ctx, requested="claude-sonnet-4-5",
+                                    served="gpt-4o-mini",
+                                    usage={"prompt_tokens_details": {"cached_tokens": 800}})
+        assert savings.cost_baseline_usd == estimate_cost(1000, 20, "claude-sonnet-4-5")
 
-        mock_audit.log.assert_not_awaited()
+    async def test_no_cache_activity_prices_the_baseline_at_list_price(self, make_ctx):
+        from savings.calculator import estimate_cost
+        savings = await self._price(make_ctx, requested="gpt-4o", served="gpt-4o", usage={})
+        assert savings.cost_baseline_usd == estimate_cost(1000, 20, "gpt-4o")
 
-    async def test_audit_logger_not_called_when_no_audit_config(self, make_ctx):
-        ctx = make_ctx()
-        # No audit key in config at all
-        ctx.config.pop("audit", None)
+    async def test_a_failed_provider_lookup_prices_the_baseline_at_list_price(self, make_ctx):
+        from savings.calculator import estimate_cost, estimate_cost_with_cache
+        with patch("middleware.g18_observability.get_adapter", side_effect=RuntimeError("x")):
+            try:
+                savings = await self._price(
+                    make_ctx, requested="gpt-4o", served="gpt-4o",
+                    usage={"prompt_tokens_details": {"cached_tokens": 800}})
+            except RuntimeError as exc:  # pricing must never fail the request
+                pytest.fail(f"raised {exc!r}")
+        assert savings.cost_baseline_usd == estimate_cost(1000, 20, "gpt-4o")
+        assert savings.cost_actual_usd == estimate_cost_with_cache(1000, 800, 20, "gpt-4o", 0.5)
 
-        mock_audit = AsyncMock()
-        mock_audit.log = AsyncMock()
 
-        with patch("middleware.langfuse_tracing.finish_trace"):
-            from middleware.g18_observability import G18Observability
-            g18 = G18Observability(audit_logger=mock_audit)
-            await g18.record(ctx, self._response())
+# ── G18 neither bills nor audits a request ───────────────────────────────────
 
-        mock_audit.log.assert_not_awaited()
+def test_g18_takes_no_usage_meter_or_audit_logger():
+    """G18 had branches that billed through a usage meter and wrote an audit row per request,
+    but the pipeline builds G18Observability() bare, so they never ran: billing is
+    main._record_outcome's, and the audit log records configuration changes and security
+    events. The branches only made G18 look like the billing path."""
+    import inspect
+    from middleware.g18_observability import G18Observability
+    assert list(inspect.signature(G18Observability.__init__).parameters) == ["self"]
 
-    async def test_prometheus_metrics_still_recorded_with_audit_active(self, make_ctx):
-        ctx = make_ctx()
-        ctx.config["audit"] = {"enabled": True}
-        ctx.team = "audit-team"                       # trusted team → label (2026-09-18)
-        ctx.params["x_feature"] = "audit-feature"
 
-        mock_audit = AsyncMock()
-        mock_audit.log = AsyncMock()
-
-        with patch("middleware.langfuse_tracing.finish_trace"):
-            from middleware.g18_observability import G18Observability, REQUESTS_TOTAL
-            before = REQUESTS_TOTAL.labels(
-                model=ctx.routed_model, team="audit-team", feature="audit-feature", tenant_id=ctx.tenant_id
-            )._value.get()
-            g18 = G18Observability(audit_logger=mock_audit)
-            await g18.record(ctx, self._response())
-            after = REQUESTS_TOTAL.labels(
-                model=ctx.routed_model, team="audit-team", feature="audit-feature", tenant_id=ctx.tenant_id
-            )._value.get()
-
-        assert after == before + 1
-        mock_audit.log.assert_awaited_once()
-
-    async def test_audit_logger_failure_does_not_raise(self, make_ctx):
-        """AuditLogger failure must be swallowed — audit must not break serving."""
-        ctx = make_ctx()
-        ctx.config["audit"] = {"enabled": True}
-
-        mock_audit = AsyncMock()
-        mock_audit.log = AsyncMock(side_effect=RuntimeError("db gone"))
-
-        with patch("middleware.langfuse_tracing.finish_trace"):
-            from middleware.g18_observability import G18Observability
-            g18 = G18Observability(audit_logger=mock_audit)
-            await g18.record(ctx, self._response())  # must not raise
+@pytest.mark.asyncio
+async def test_a_request_is_counted_under_its_team_and_feature(make_ctx):
+    ctx = make_ctx()
+    ctx.team = "audit-team"                       # trusted team → label (2026-09-18)
+    ctx.params["x_feature"] = "audit-feature"     # listed, so it keeps its own label
+    ctx.config["groups"]["G18_observability"]["label_values"] = {"feature": ["audit-feature"]}
+    response = {
+        "id": "chatcmpl-f3t",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+    }
+    with patch("middleware.langfuse_tracing.finish_trace"):
+        from middleware.g18_observability import G18Observability, REQUESTS_TOTAL
+        labels = dict(model=ctx.routed_model, team="audit-team", feature="audit-feature",
+                      tenant_id=ctx.tenant_id)
+        before = REQUESTS_TOTAL.labels(**labels)._value.get()
+        await G18Observability().record(ctx, response)
+        after = REQUESTS_TOTAL.labels(**labels)._value.get()
+    assert after == before + 1

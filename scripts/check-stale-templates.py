@@ -59,10 +59,14 @@ class StaleTemplateChecker:
         self._redis = None
     
     def _get_redis(self):
-        """Get Redis connection."""
+        """Get Redis connection. REDIS_PASSWORD (the local Redis requires one) is sent as the
+        `default` user's, as the proxy sends it; credentials in the URL win."""
         if self._redis is None:
             import redis.asyncio as aioredis
-            self._redis = aioredis.from_url(self.redis_url, decode_responses=True)
+            password = os.getenv("REDIS_PASSWORD") or ""
+            self._redis = aioredis.from_url(
+                self.redis_url, decode_responses=True,
+                **({"username": "default", "password": password} if password else {}))
         return self._redis
     
     async def _get_all_templates(self) -> List[str]:
@@ -211,7 +215,7 @@ class StaleTemplateChecker:
             return
         
         message = {
-            "text": f"📋 Template Deprecation Report",
+            "text": "📋 Template Deprecation Report",
             "blocks": [
                 {
                     "type": "header",
@@ -284,7 +288,7 @@ def main():
         active = [r for r in results if r.status == "ACTIVE"]
         
         print(f"\n{'='*60}")
-        print(f"Template Deprecation Check Complete")
+        print("Template Deprecation Check Complete")
         print(f"{'='*60}")
         print(f"Total templates checked: {len(results)}")
         print(f"  🟢 Active: {len(active)}")
@@ -292,12 +296,12 @@ def main():
         print(f"  🔴 Stale (auto-deprecated): {len(stale)}")
         
         if stale:
-            print(f"\nStale templates (action: deprecated + sunset in 30 days):")
+            print("\nStale templates (action: deprecated + sunset in 30 days):")
             for t in stale:
                 print(f"  - {t.template_id}: {t.days_since_access} days idle")
         
         if warning:
-            print(f"\nWarning templates (action: warning issued):")
+            print("\nWarning templates (action: warning issued):")
             for t in warning[:5]:  # Show first 5
                 print(f"  - {t.template_id}: {t.days_since_access} days since last use")
             if len(warning) > 5:

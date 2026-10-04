@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -5,6 +6,8 @@ from typing import Any, Dict, List, Optional, Sequence
 from savings.models import SavingsRecord
 from savings.calculator import count_messages_tokens, count_request_tokens
 from protocols.base import DEFAULT_PROTOCOL_NAME
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -28,6 +31,10 @@ class RequestContext:
     batch_deferred: bool = False                # G13 batched this request
     langfuse_trace: Optional[Any] = None        # active Langfuse trace object
     skip_groups: List[str] = field(default_factory=list)  # G24 adaptive bypass
+    # Every X-* request header as an x_* key (protocols.base.routing_header_params): the
+    # routing hints G06 rules match. ctx.params holds only TokenLean's own headers, because
+    # G13 persists params; this is never persisted.
+    routing_headers: Dict[str, Any] = field(default_factory=dict)
 
     # ── Multi-tenancy (A1) ──────────────────────────────────────────────────
     tenant_id: str = "default"
@@ -49,6 +56,10 @@ class RequestContext:
     # X-Tenant-ID — carries the impersonating (actor) key's own tenant so G18
     # can write an impersonation audit row (I6). None = no impersonation.
     impersonator_tenant_id: Optional[str] = None
+    # The tenant's own stored overrides (tenant_configs, written by the portal) as loaded,
+    # before they were merged into ``config``: what the TENANT chose, as opposed to the
+    # platform. G06 reads its tier picks from here. None = no stored overrides.
+    tenant_config_overrides: Optional[Dict[str, Any]] = None
     # ── Authenticated caller identity (stamped by tenancy.resolver.apply_caller_identity) ──
     # The identity the proxy KEY carries (tenant id for a dict-metadata key, the user for a
     # legacy key) — never an X-User-ID override, which the caller chooses within its
@@ -108,6 +119,10 @@ class RequestContext:
     # (final_tokens_sent) deliberately stays the FINAL call's prompt for comparability
     # with every past measurement, with provider_call_prompt_tokens disclosed beside it.
     provider_calls: List[Dict[str, Any]] = field(default_factory=list)
+    # The response as it entered the response pipeline, i.e. as the provider returned it.
+    # A later stage may hand the caller something else (a G30 or G11 block, which carries
+    # zero usage), but this is what was billed, so G18 prices it. None outside that path.
+    provider_response: Optional[Dict[str, Any]] = None
     # Set when the proxy served a DIFFERENT model than the caller asked for without the
     # caller choosing it (the routing-disabled / no-tiers substitution of an unconfigured
     # model). Disclosure only — the substitution itself is unchanged. "" when the served
@@ -150,6 +165,9 @@ class RequestContext:
     # attack classes. Consumed by the G18 context-trust metric + Security surface.
     context_trust_action: Optional[str] = None
     context_trust_categories: List[str] = field(default_factory=list)
+    # G31 managed rules running record-only (before enforcement is switched on): the ids of
+    # the managed rules that matched retrieved context. Nothing was done about them.
+    context_trust_managed_recorded: List[str] = field(default_factory=list)
     # G31 PII pass over RETRIEVED context (system/tool spans injected by G07/G10),
     # kept SEPARATE from G29's request-side pii_* so retrieved PII is never added to
     # the reversible pii_vault (which would let the model echo a RAG doc's PII back and
@@ -172,6 +190,9 @@ class RequestContext:
     tool_eligibility_action: Optional[str] = None
     tool_eligibility_denied: List[str] = field(default_factory=list)
     tool_eligibility_count: int = 0
+    # G08: the registry tools it kept in this request's `tools` (names only). The response
+    # side records which of them the model called: the scheduled pruning's signal.
+    g08_offered_tools: List[str] = field(default_factory=list)
     # True once G28 has injected the CCR tools (headroom_compress/retrieve/stats) into
     # this request's `tools`. It is the ONLY thing that makes an auto-execution of those
     # names legitimate: G15 matches them by bare name, so without this a tenant declaring
@@ -441,14 +462,59 @@ def coerce_mode(raw: Any, valid: Sequence[str], default: str) -> str:
     return mode if mode in valid else default
 
 
-def record_provider_call(ctx, model: str, response: Any) -> None:
+def append_to_system_prompt(messages: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    """A copy of ``messages`` with ``text`` appended to the last system message, or with a
+    new system message in front when there is none.
+
+    System content may be a string or a list of parts, both valid OpenAI shapes. A string
+    gets ``"\\n" + text``. A list gets a trailing text part, so a ``cache_control`` marker
+    on an earlier part still covers the same prefix. Empty or missing content becomes
+    ``text``. The groups that append (G11 verbosity, G12 suppression) used to concatenate
+    strings, so a list raised TypeError and a valid request got a 500.
+
+    Never onto retrieved documents (G07), which follow the caller's own system prompt: the
+    text is the proxy's instruction, not part of them."""
+    from providers import is_retrieved_context
+    messages = list(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "system" or is_retrieved_context(msg):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = [*content, {"type": "text", "text": text}]
+        elif content:
+            content = f"{content}\n{text}"
+        else:
+            content = text
+        messages[i] = {**msg, "content": content}
+        return messages
+    return [{"role": "system", "content": text}] + messages
+
+
+def insert_before_last_user(
+    messages: List[Dict[str, Any]], inserted: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """A copy of ``messages`` with ``inserted`` just before the last user message, or at the
+    end when there is none."""
+    messages = list(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+            return messages[:i] + list(inserted) + messages[i:]
+    return messages + list(inserted)
+
+
+def record_provider_call(ctx, model: str, response: Any, side: bool = False) -> None:
     """Append one COMPLETED provider call to ``ctx.provider_calls``.
 
     Called from every site that pays a provider: main.py's primary/failover call and
-    G06's cascade tier probes + judge calls. Before this existed, a cascade that
-    escalated made two or three billed calls and G18 priced only the last one — the
-    proxy under-reported what the request actually cost, in the direction that
-    flattered the savings figure.
+    G06's cascade tier probes. Before this existed, a cascade that escalated made two or
+    three billed calls and G18 priced only the last one — the proxy under-reported what
+    the request actually cost, in the direction that flattered the savings figure.
+
+    ``side`` marks a call that cannot be the served answer — the G06 judge, G09's schema
+    extraction, the G10/G26 summariser, G11's repair re-ask. G18 adds side calls wherever
+    they fall in the list; the served call is the last call that is not one.
 
     Never raises and never blocks a response: a call it cannot parse is simply not
     recorded (cost then falls back to the response G18 already has), because a
@@ -465,12 +531,16 @@ def record_provider_call(ctx, model: str, response: Any) -> None:
             ctd = ctd.model_dump() if hasattr(ctd, "model_dump") else {}
         if not isinstance(ptd, dict):
             ptd = ptd.model_dump() if hasattr(ptd, "model_dump") else {}
-        ctx.provider_calls.append({
+        call = {
             "model": model or "",
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "completion_tokens": int(usage.get("completion_tokens") or 0),
             "reasoning_tokens": int(ctd.get("reasoning_tokens") or 0),
             "cached_tokens": int(ptd.get("cached_tokens") or 0),
-        })
-    except Exception:  # noqa: BLE001 — bookkeeping never fails a served request
-        pass
+        }
+        if side:
+            call["side"] = True
+        ctx.provider_calls.append(call)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping never fails a served request
+        logger.warning("[%s] a %s call could not be recorded, so this request's cost is "
+                       "understated: %s", getattr(ctx, "request_id", "?"), model, exc)

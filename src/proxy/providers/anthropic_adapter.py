@@ -2,7 +2,10 @@ import copy
 import logging
 from typing import Any, Dict, List, Optional
 
-from providers import ProviderAdapter, REASONING_OFF, REASONING_TIERS, register_adapter
+from protocols.base import CALLER_CACHE_MARKERS
+from providers import (
+    ProviderAdapter, REASONING_OFF, REASONING_TIERS, is_retrieved_context, register_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +88,17 @@ class AnthropicAdapter(ProviderAdapter):
 
     def align_prefix(self, ctx, system_msgs, variable_msgs, cfg) -> bool:
         """G21: Anthropic prompt caching — mark the last system message (and last tool)
-        with cache_control. Honours ``providers.anthropic.marker`` (default off). Only ever
-        called when this adapter is the routed one, so no isinstance guard is needed.
+        with cache_control. ``system_msgs`` is the stable prefix: G21 keeps retrieved
+        documents in ``variable_msgs``. Honours ``providers.anthropic.marker`` (default off).
+        Only ever called when this adapter is the routed one, so no isinstance guard is
+        needed.
         """
         provider_cfg = cfg.get("providers", {}).get("anthropic", {})
         if not provider_cfg.get("marker", False):
+            return False
+        # The caller placed its own breakpoints: leave them where it put them. Anthropic
+        # rejects a request with more than four, so adding ours could fail it.
+        if (getattr(ctx, "params", None) or {}).get(CALLER_CACHE_MARKERS):
             return False
         cache_type = provider_cfg.get("cache_type", "ephemeral")
         changed = False
@@ -114,7 +123,8 @@ class AnthropicAdapter(ProviderAdapter):
 
         Kept deliberately in step with ``align_prefix`` above, which places that marker on
         the last system message and the last tool: the block whose size decides whether
-        the marker pays out is exactly the block the marker covers. Tool definitions are
+        the marker pays out is exactly the block the marker covers. Retrieved documents
+        follow the marker (G21), so they are not in it. Tool definitions are
         counted by the caller from ``params["tools"]``; they sit first inside the block and
         are the reason a tool-description trim can push it under the minimum.
 
@@ -134,7 +144,7 @@ class AnthropicAdapter(ProviderAdapter):
         )
         if not provider_cfg.get("marker", False):
             return []
-        return [m for m in messages if m.get("role") == "system"]
+        return [m for m in messages if m.get("role") == "system" and not is_retrieved_context(m)]
 
     def map_structured_output(
         self,
@@ -330,6 +340,10 @@ class AnthropicAdapter(ProviderAdapter):
             .get("anthropic", {})
         )
         return float(pcfg.get("cache_write_multiplier_1h", 2.0))
+
+    def prompt_cache_needs_marker(self) -> bool:
+        """Anthropic caches only up to a ``cache_control`` marker in the request."""
+        return True
 
     def cache_read_cost_multiplier(self, config: Dict) -> float:
         """Anthropic bills cache-read tokens at ~10% (config-overridable)."""

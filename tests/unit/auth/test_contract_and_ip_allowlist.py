@@ -101,21 +101,93 @@ def test_get_ip_allowlist_legacy_key_is_empty(temp_store):
     ("2001:db8::1", ["203.0.113.0/24"], [], False),             # no cross-family FP
     ("garbage", ["203.0.113.0/24"], [], False),                 # bad ip, restricted → deny
     ("garbage", [], [], True),                                  # bad ip, unrestricted → allow
+    ("::ffff:10.1.2.3", [], ["10.0.0.0/8"], True),              # IPv4-mapped IPv6 is IPv4
+    ("invalid", [], ["10.0.0.0/8"], False),                     # client_ip.INVALID → deny
 ])
 def test_ip_allowed_matrix(ip, g, t, expect):
     assert ipa.ip_allowed(ip, g, t) is expect
 
 
-def test_client_ip_from_request_xff():
+def test_the_client_address_is_counted_from_the_right():
+    # The left-most X-Forwarded-For entry is whatever the client wrote; with one trusted
+    # proxy (Cloud Run) the caller is the entry that proxy appended. Parser: test_client_ip.py.
+    from net.client_ip import request_client_ip
+
     class _Req:
         def __init__(self, xff=None, host="9.9.9.9"):
             self.headers = {"x-forwarded-for": xff} if xff else {}
             self.client = type("C", (), {"host": host})()
-    assert ipa.client_ip_from_request(_Req("1.1.1.1, 2.2.2.2"), True) == "1.1.1.1"
-    assert ipa.client_ip_from_request(_Req(None, "9.9.9.9"), True) == "9.9.9.9"
-    assert ipa.client_ip_from_request(_Req("1.1.1.1"), False) == "9.9.9.9"  # xff not trusted
+    one_hop = {"network": {"trusted_proxy_hops": 1}}
+    assert request_client_ip(_Req("1.1.1.1, 2.2.2.2"), one_hop) == "2.2.2.2"
+    assert request_client_ip(_Req(None, "9.9.9.9"), one_hop) == "9.9.9.9"
+    assert request_client_ip(_Req("1.1.1.1"), {"network": {"trusted_proxy_hops": 0}}) == "9.9.9.9"
 
 
 def test_invalid_cidr_never_widens_access():
     # A malformed CIDR in the list is ignored, not treated as allow-all.
     assert ipa.ip_allowed("8.8.8.8", ["not-a-cidr"], []) is False
+
+
+# ── the allowlist belongs to the tenant, not to one key ──────────────────────
+# Enforcement reads each key's metadata, so a key issued after the CIDRs were set must carry
+# them too, and what the console shows must be read from the same place.
+
+def test_a_new_key_carries_the_tenants_allowlist(temp_store):
+    akm.create_key("acme")
+    akm.set_ip_allowlist("acme", ["10.0.0.0/8"])
+    _raw, _h, meta = akm.create_key("acme")
+    assert meta.get("ip_allowlist") == ["10.0.0.0/8"]
+
+
+def test_a_tenants_first_key_is_unrestricted(temp_store):
+    akm.create_key("other")
+    akm.set_ip_allowlist("other", ["10.0.0.0/8"])
+    _raw, _h, meta = akm.create_key("acme")
+    assert "ip_allowlist" not in meta
+
+
+def test_the_console_listing_shows_the_enforced_allowlist(temp_store):
+    akm.create_key("acme")
+    akm.set_ip_allowlist("acme", ["10.0.0.0/8"])
+    akm.create_key("acme")
+    akm.create_key("beta")
+    rows = {t["tenant_id"]: t for t in akm.list_tenants()}
+    assert rows["acme"]["ip_allowlist"] == ["10.0.0.0/8"]
+    assert rows["acme"]["ip_allowlist_mixed"] is False
+    assert rows["beta"]["ip_allowlist"] == [] and rows["beta"]["ip_allowlist_mixed"] is False
+    assert akm.get_tenant_ip_allowlist("acme") == ["10.0.0.0/8"]
+    assert akm.get_tenant_ip_allowlist("beta") == []
+
+
+def test_keys_that_disagree_are_reported_as_mixed(temp_store):
+    import json
+    store = {"h1": {"tenant_id": "acme", "ip_allowlist": ["10.0.0.0/8"], "created_at": "2026-01-01"},
+             "h2": {"tenant_id": "acme", "created_at": "2026-02-01"}}
+    temp_store.write_text(json.dumps(store), encoding="utf-8")
+    (row,) = [t for t in akm.list_tenants() if t["tenant_id"] == "acme"]
+    assert row["ip_allowlist_mixed"] is True
+
+
+def test_the_newest_list_is_the_tenants_wherever_it_sits_in_the_store(temp_store):
+    import json
+    store = {"h1": {"tenant_id": "acme", "ip_allowlist": ["10.0.0.0/8"], "created_at": "2026-01-01"},
+             "h2": {"tenant_id": "acme", "ip_allowlist": ["192.0.2.0/24"], "created_at": "2026-03-01"},
+             "h3": {"tenant_id": "acme", "ip_allowlist": ["198.51.100.0/24"], "created_at": "2026-02-01"},
+             "h4": {"tenant_id": "acme", "created_at": "2026-04-01"},
+             "h5": {"tenant_id": "beta", "ip_allowlist": ["203.0.113.0/24"], "created_at": "2026-05-01"}}
+    temp_store.write_text(json.dumps(store), encoding="utf-8")
+    (row,) = [t for t in akm.list_tenants() if t["tenant_id"] == "acme"]
+    assert row["ip_allowlist"] == ["192.0.2.0/24"]
+    assert akm.get_tenant_ip_allowlist("acme") == ["192.0.2.0/24"]
+    _raw, _h, meta = akm.create_key("acme")
+    assert meta["ip_allowlist"] == ["192.0.2.0/24"]
+
+
+def test_rotation_keeps_a_restriction_the_newest_key_lacked(temp_store):
+    # Keys issued before new keys inherited the list: the newest one carries none.
+    import json
+    store = {"h1": {"tenant_id": "acme", "ip_allowlist": ["10.0.0.0/8"], "created_at": "2026-01-01"},
+             "h2": {"tenant_id": "acme", "created_at": "2026-02-01"}}
+    temp_store.write_text(json.dumps(store), encoding="utf-8")
+    _raw, _h, meta = akm.rotate_tenant_keys("acme")[:3]
+    assert meta.get("ip_allowlist") == ["10.0.0.0/8"]

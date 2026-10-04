@@ -12,9 +12,8 @@ import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel
 
-from middleware import RequestContext
+from middleware import RequestContext, record_provider_call
 
 logger = logging.getLogger(__name__)
 GROUP = "G09"
@@ -111,7 +110,7 @@ class G09ContextSchema:
                     try:
                         compacted = await asyncio.wait_for(
                             _compact_with_schema(
-                                content, schema_fields, instructor_model, provider_key
+                                content, schema_fields, instructor_model, provider_key, ctx=ctx
                             ),
                             timeout=instructor_timeout_ms / 1000.0,
                         )
@@ -130,8 +129,8 @@ class G09ContextSchema:
                         # wall-time to LLM (not proxy) time in the SLA split.
                         try:
                             ctx.llm_elapsed_ms += (time.time() - _t0) * 1000.0
-                        except Exception:
-                            pass
+                        except Exception as err:
+                            logger.debug("LLM time not added: %r", err)
 
                     if compacted and len(compacted) < len(content) * 0.7:
                         new_messages.append({**msg, "content": compacted})
@@ -204,13 +203,17 @@ def _try_compact_prose(text: str) -> Optional[str]:
 
 
 async def _compact_with_schema(
-    text: str, schema: Dict[str, str], model: str, provider_key: str
+    text: str, schema: Dict[str, str], model: str, provider_key: str,
+    ctx: Optional[RequestContext] = None,
 ) -> Optional[str]:
     """
     Use Instructor with a schema to extract structured data from prose.
     schema: {field_name: "description of what to extract"}
     Returns pipe-delimited compact string or None on failure.
+    With ``ctx`` every call Instructor made (it may retry) is recorded as a side call, so
+    G18 prices it — paid whether or not the extraction succeeded.
     """
+    calls: List[Any] = []
     try:
         import instructor
         import litellm
@@ -227,7 +230,9 @@ async def _compact_with_schema(
         # litellm.acompletion module function, so concurrent requests can't
         # clobber each other's patched state on the same global object.
         async def _acompletion(*args, **kwargs):
-            return await litellm.acompletion(*args, **kwargs)
+            response = await litellm.acompletion(*args, **kwargs)
+            calls.append(response)
+            return response
 
         client = instructor.from_litellm(_acompletion)
 
@@ -255,3 +260,7 @@ async def _compact_with_schema(
     except Exception as exc:
         logger.warning("G09 schema-based compaction failed: %s", exc)
         return None
+    finally:
+        if ctx is not None:
+            for response in calls:
+                record_provider_call(ctx, model, response, side=True)

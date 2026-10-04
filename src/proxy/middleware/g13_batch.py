@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import re
+import socket
 import time
+import uuid
 from collections import Counter
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +26,30 @@ logger = logging.getLogger(__name__)
 GROUP = "G13"
 
 _BATCH_STREAM_PREFIX = os.getenv("BATCH_STREAM_PREFIX", "tok_opt:batch")
+# Every stream a request was queued on, per topic (a set): the consumer reads it to find the
+# tenants' streams. Written before the entry, so no entry sits on a stream nobody reads.
+_BATCH_STREAMS_KEY = "tok_opt:batch_streams"
+
+
+def _stream_key(prefix: str, topic: str) -> str:
+    """A tenant's stream for a topic: its Redis prefix, then the topic. The default tenant's
+    prefix is empty, so its stream is the key all tenants shared until 2026-10-02, and what
+    was queued there still drains."""
+    return f"{prefix}{_BATCH_STREAM_PREFIX}:{topic}"
+
+# Topics this process's batch consumer reads (start_batch_consumer). A request is deferred
+# only onto one of these: on a topic nobody reads it would get a 202, be billed, and never
+# be answered.
+_CONSUMED_TOPICS: set = set()
+# Queued requests at which a topic stops taking more (G13_batch.max_backlog): further
+# requests are answered now, so a flood cannot grow the stream without bound. The consumer
+# deletes what it has processed, so the stream holds only the backlog.
+_DEFAULT_MAX_BACKLOG = 10000
+
+# A consumer idle this long with nothing pending belongs to a stopped process: a live one
+# reads every flush interval. Each process has its own consumer name, so every restart adds
+# one to the group, and the sweep deletes these.
+_STOPPED_CONSUMER_IDLE_MS = 24 * 3600 * 1000
 
 # Kafka configuration (optional - falls back to Redis)
 _KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
@@ -65,13 +91,51 @@ class G13Batch:
             )
             batch_topic = None
         if batch_topic:
-            await _accumulate(ctx, batch_topic)
-            ctx.batch_deferred = True  # response will be delivered async
-            # H1: record the owning tenant so /v1/batch/results/{id} can refuse a
-            # cross-tenant poll even though the request_id is an unguessable UUID.
-            await _record_batch_owner(ctx.request_id, getattr(ctx, "tenant_id", "default"))
+            # The same reasoning for the response-side trust & safety steps G29 and G30
+            # take: a batched result would reach the caller without them.
+            skipped = _response_safety_needed(ctx)
+            if skipped:
+                logger.info("[%s] G13 not batching (topic=%s): %s, which batch results skip",
+                            ctx.request_id, batch_topic, skipped)
+                batch_topic = None
+        if batch_topic and batch_topic not in _CONSUMED_TOPICS:
+            logger.info("[%s] G13 not batching: no consumer reads topic %r (list it in "
+                        "G13_batch.batch_topics); answering the request now",
+                        ctx.request_id, batch_topic)
+            batch_topic = None
+        max_backlog = cfg.get("max_backlog", _DEFAULT_MAX_BACKLOG)
+        # H1: /v1/batch/results/{id} serves a result only to the tenant recorded as its
+        # owner, so the owner goes on record BEFORE the request is queued (a result can never
+        # be stored without one) and a request whose owner cannot be recorded is answered
+        # now: its result would be served to nobody.
+        if batch_topic and await _record_batch_owner(ctx.request_id,
+                                                     getattr(ctx, "tenant_id", "default")):
+            if await _accumulate(ctx, batch_topic, max_backlog=max_backlog):
+                ctx.batch_deferred = True  # response will be delivered async
+            else:
+                await _forget_batch_owner(ctx.request_id)
 
         return ctx
+
+
+def _response_safety_needed(ctx: RequestContext) -> Optional[str]:
+    """Why this request's RESPONSE needs a trust & safety step that batching would skip,
+    or None. Batch results bypass the response pipeline, as for the G32 case above.
+
+    G29 in ``mask`` mode masks PII the model writes and restores the caller's own masked
+    values; G30 with ``scan_response`` checks (and may withhold) the model's output. Both
+    are served synchronously. G29's default ``flag`` mode only detects and records, and a
+    batched output is not scanned for it: the same caveat as streaming.
+    """
+    from middleware import coerce_mode, resolve_group_config
+    from middleware.g29_pii_redaction import _VALID_MODES as _G29_MODES
+    g29 = resolve_group_config(ctx, "G29_pii_redaction")
+    if g29.get("enabled", True) and coerce_mode(g29.get("mode"), _G29_MODES, "flag") == "mask":
+        return "G29 masks the response"
+    g30 = resolve_group_config(ctx, "G30_guardrails")
+    if g30.get("enabled", True) and g30.get("scan_response", False):
+        return "G30 scans the response"
+    return None
 
 
 def _tool_bearing(ctx: RequestContext) -> bool:
@@ -104,9 +168,11 @@ async def _apply_toon(
     """
     Detect arrays of uniform objects in user messages and compress them to TOON.
 
-    Gating is config-driven and the defaults reproduce the legacy behaviour:
-      • ``toon_auto_detect`` false (default): only runs when a system message already
-        carries a TOON schema marker (``schema`` + ``|``).
+    Gating is config-driven:
+      • ``toon_auto_detect`` false (default): only runs when a system message carries the
+        TOON marker, a line written in the notation itself (``schema:name|age``). Any
+        prompt that mentioned "schema" and held a "|", as a markdown table does, used to
+        switch it on.
       • ``toon_auto_detect`` true: runs on every request, relying on the per-block
         eligibility + net-savings gates so non-tabular / nested / would-inflate data
         is left untouched as JSON (the "JSON fallback").
@@ -114,13 +180,8 @@ async def _apply_toon(
     cfg = _resolve_toon_cfg(ctx)
 
     if not cfg.get("toon_auto_detect", False):
-        toon_detected = any(
-            "schema" in str(msg.get("content", "")).lower()
-            and "|" in str(msg.get("content", ""))
-            for msg in ctx.messages
-            if msg.get("role") == "system"
-        )
-        if not toon_detected:
+        if not any(_has_toon_marker(msg.get("content"))
+                   for msg in ctx.messages if msg.get("role") == "system"):
             return False, ctx
 
     new_messages = []
@@ -158,6 +219,20 @@ async def _apply_toon(
     return changed, ctx
 
 
+_TOON_MARKER_RE = re.compile(r"^[ \t]*schema:[^\n|]*\|", re.MULTILINE)
+
+
+def _has_toon_marker(content: Any) -> bool:
+    """Whether a system message's text (or one of its text parts) carries the TOON marker."""
+    if isinstance(content, str):
+        return bool(_TOON_MARKER_RE.search(content))
+    if isinstance(content, list):
+        return any(isinstance(part, dict) and part.get("type") == "text"
+                   and isinstance(part.get("text"), str) and _TOON_MARKER_RE.search(part["text"])
+                   for part in content)
+    return False
+
+
 _DEFAULT_TOON_MAX_BLOCK_CHARS = 20000
 _array_pattern_cache: Dict[int, "re.Pattern"] = {}
 
@@ -177,12 +252,26 @@ def _array_of_objects_pattern(max_block_chars: int) -> "re.Pattern":
 
 
 def _toon_cell(value: Any) -> str:
-    """Render a scalar JSON value as a TOON cell."""
+    """Render a JSON value as a TOON cell. A key the row lacks is the empty cell, so null is
+    written ``null`` and an empty string ``""``; a string that would read as either (or that
+    starts with a quote) and a nested value are written as JSON."""
     if value is None:
-        return ""
+        return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, str):
+        if value in ("", "null") or value.startswith('"'):
+            return json.dumps(value, ensure_ascii=False)
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return str(value)
+
+
+def _toon_safe(text: str) -> bool:
+    """Whether ``text`` can be a cell or column name: the delimiter or a line break in one
+    would shift the columns or split the row."""
+    return not any(ch in text for ch in ("|", "\n", "\r"))
 
 
 def _encode_block_to_toon(
@@ -226,17 +315,20 @@ def _encode_block_to_toon(
             if any(isinstance(v, (dict, list)) for v in item.values()):
                 return None
 
-    # Header = union of keys (first-seen order) so near-uniform rows stay lossless.
+    # Header = union of keys (first-seen order) so near-uniform rows stay lossless; a key
+    # a row lacks is its empty cell.
     keys: List[str] = []
     for item in data:
         for k in item.keys():
             if k not in keys:
                 keys.append(k)
+    cells = [[_toon_cell(item[k]) if k in item else "" for k in keys] for item in data]
+    if not all(_toon_safe(k) for k in keys) or not all(
+            _toon_safe(cell) for row in cells for cell in row):
+        return None
 
     header = "|".join(keys)
-    rows = "\n".join(
-        "|".join(_toon_cell(item.get(k, "")) for k in keys) for item in data
-    )
+    rows = "\n".join("|".join(row) for row in cells)
     toon = f"schema:{header}\n{rows}"
 
     if require_net_savings and estimate_tokens(toon, model) >= estimate_tokens(json_str, model):
@@ -279,6 +371,13 @@ def _compact_json_to_toon(
     return result
 
 
+def _default_consumer_name() -> str:
+    """This process's own consumer name. Instances sharing one name are a single consumer
+    to Redis, so nothing could tell which of them held an unacknowledged entry. The random
+    part keeps two containers apart even where hostname and pid repeat."""
+    return f"proxy-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
 async def start_batch_consumer(cfg: Dict[str, Any]) -> None:
     """Background coroutine: consume Redis Streams and flush batches."""
     batch_cfg = cfg.get("groups", {}).get("G13_batch", {})
@@ -291,72 +390,89 @@ async def start_batch_consumer(cfg: Dict[str, Any]) -> None:
         return
 
     group = batch_cfg.get("consumer_group", "proxy-batch-consumers")
-    consumer = batch_cfg.get("consumer_name", f"proxy-{os.getpid()}")
+    consumer = batch_cfg.get("consumer_name") or _default_consumer_name()
     max_batch = batch_cfg.get("max_batch_size", 50)
     flush_ms = batch_cfg.get("flush_interval_ms", 500)
+    stale_ms = int(batch_cfg.get("max_pending_ack_ms", 30000))
 
     redis = _get_redis()
+    grouped: set = set()
 
-    # Ensure consumer groups exist
-    for topic in topics:
-        stream = f"{_BATCH_STREAM_PREFIX}:{topic}"
+    async def _ensure_group(stream: str) -> None:
         try:
             await redis.xgroup_create(stream, group, id="0", mkstream=True)
             logger.info("G13 created consumer group for stream '%s'", stream)
-        except Exception:
-            pass  # Group already exists
+        except Exception as exc:
+            logger.debug("G13 consumer group on '%s' not created (it exists?): %s", stream, exc)
+        grouped.add(stream)
 
+    async def _streams() -> List[str]:
+        """Every stream to read: each topic's default-tenant stream, the tenant streams
+        registered for it, and any already read (a failed registry read drops none)."""
+        found = set(grouped) | {_stream_key("", topic) for topic in topics}
+        for topic in topics:
+            try:
+                found.update(await redis.smembers(f"{_BATCH_STREAMS_KEY}:{topic}") or ())
+            except Exception as exc:
+                logger.debug("G13 could not read the streams registered for '%s': %s", topic, exc)
+        for stream in sorted(found - grouped):
+            await _ensure_group(stream)
+        return sorted(found)
+
+    for topic in topics:                 # the default tenant's streams, before any request
+        await _ensure_group(_stream_key("", topic))
+
+    _CONSUMED_TOPICS.update(topics)
     logger.info("G13 batch consumer started for topics: %s", topics)
 
-    pel_check_interval = batch_cfg.get("max_pending_ack_ms", 30000) / 1000
+    pel_check_interval = stale_ms / 1000
     last_pel_check = time.time()
 
     while True:
         try:
-            streams = {f"{_BATCH_STREAM_PREFIX}:{t}": ">" for t in topics}
+            streams = await _streams()
             entries = await redis.xreadgroup(
-                group, consumer, streams,
+                group, consumer, {stream: ">" for stream in streams},
                 count=max_batch, block=flush_ms
             )
 
             if entries:
-                # Group entries by topic
-                topic_batches: Dict[str, List[Tuple[str, Dict]]] = {}
+                # Group entries by stream: each is one tenant's queue for one topic
+                stream_batches: Dict[str, List[Tuple[str, Dict]]] = {}
                 for stream_name, messages in entries:
-                    topic = stream_name.split(":")[-1]
-                    topic_batches.setdefault(topic, [])
                     for msg_id, fields in messages:
                         payload = json.loads(fields.get("payload", "{}"))
-                        topic_batches[topic].append((msg_id, payload))
+                        stream_batches.setdefault(stream_name, []).append((msg_id, payload))
 
-                # Flush each topic batch
-                for topic, items in topic_batches.items():
-                    stream = f"{_BATCH_STREAM_PREFIX}:{topic}"
-                    msg_ids = [item[0] for item in items]
-                    payloads = [item[1] for item in items]
+                for stream, items in stream_batches.items():
+                    topic = stream.rsplit(":", 1)[-1]
                     try:
-                        await _flush_batch(topic, payloads, cfg)
-                        if msg_ids:
-                            await redis.xack(stream, group, *msg_ids)
+                        await _flush_held(redis, stream, group, consumer, topic, items, cfg,
+                                          stale_ms)
                     except Exception as exc:
-                        logger.error("G13 flush failed for topic '%s': %s", topic, exc)
-                        # Items remain in PEL — will be reclaimed below
+                        logger.error("G13 flush failed for stream '%s': %s", stream, exc)
+                        # Left pending: the sweep retries them once nobody holds them
 
-            # Periodically reclaim timed-out PEL entries
+            # Periodically retry what a stopped consumer left pending
             if time.time() - last_pel_check >= pel_check_interval:
                 last_pel_check = time.time()
-                for topic in topics:
-                    await _reclaim_stale_pel(redis, topic, group, consumer, batch_cfg)
+                for stream in streams:
+                    await _reclaim_stale_pel(redis, stream.rsplit(":", 1)[-1], group, consumer,
+                                             batch_cfg, cfg, stream=stream)
 
         except Exception as exc:
             logger.error("G13 consumer loop error: %s", exc)
             await asyncio.sleep(1)
 
 
-async def _accumulate(ctx: RequestContext, topic: str) -> None:
-    """Push request payload to the Redis Stream for this topic."""
+async def _accumulate(ctx: RequestContext, topic: str,
+                      max_backlog: int = _DEFAULT_MAX_BACKLOG) -> bool:
+    """Push request payload to the Redis Stream for this topic. True only when it was
+    queued: on a failed write, or a stream already holding ``max_backlog`` requests, the
+    caller answers the request now instead of promising a result nothing will produce."""
+    from middleware.g00_rate_limit import counter_prefix
     redis = _get_redis()
-    stream = f"{_BATCH_STREAM_PREFIX}:{topic}"
+    stream = _stream_key(getattr(ctx, "redis_prefix", "") or "", topic)
     payload = json.dumps({
         "request_id": ctx.request_id,
         "tenant_id": getattr(ctx, "tenant_id", "default"),  # BYOK: stamp so the background
@@ -367,79 +483,242 @@ async def _accumulate(ctx: RequestContext, topic: str) -> None:
         # So the /v1/batch/results poller can attach x-tokenlean-* savings headers on
         # completion (it has no RequestContext to read ctx.savings from at poll time).
         "baseline_tokens": getattr(ctx.savings, "baseline_tokens", 0),
+        # The tenant's spend counter, which the consumer adds this request's cost to when its
+        # answer arrives (main bills it, and counts it against the quota and trial, now).
+        # Empty when an admin key sent it as the tenant: that spends nothing of the tenant's.
+        "spend_prefix": "" if getattr(ctx, "impersonator_tenant_id", None) else counter_prefix(ctx),
     })
     try:
+        if max_backlog and await redis.xlen(stream) >= max_backlog:
+            logger.warning("[%s] G13 stream '%s' already holds %d queued requests; "
+                           "answering this one now", ctx.request_id, stream, max_backlog)
+            return False
+        await redis.sadd(f"{_BATCH_STREAMS_KEY}:{topic}", stream)
         await redis.xadd(stream, {"payload": payload})
         logger.debug("[%s] G13 pushed to stream '%s'", ctx.request_id, stream)
+        return True
     except Exception as exc:
-        logger.warning("G13 Redis XADD failed: %s", exc)
+        logger.warning("[%s] G13 could not queue the request (%s); answering it now",
+                       ctx.request_id, exc)
+        return False
+
+
+async def _forget(redis, stream: str, msg_ids) -> None:
+    """Delete stream entries once acknowledged, so the stream holds only the backlog (the
+    length the ``max_backlog`` check reads). Best effort: a failure only delays that."""
+    try:
+        await redis.xdel(stream, *msg_ids)
+    except Exception as exc:
+        logger.debug("G13 could not delete processed entries from '%s': %s", stream, exc)
+
+
+async def _flush_held(redis, stream: str, group: str, consumer: str, topic: str,
+                      entries: List[Tuple[str, Dict]], cfg: Dict[str, Any],
+                      stale_ms: int) -> None:
+    """Flush ``entries`` (stream id, payload) while holding them, then acknowledge them.
+
+    A flush makes up to ``max_batch_size`` provider calls in turn, so it can outlast
+    ``max_pending_ack_ms``, the idle time after which any consumer's sweep takes an entry
+    over. So this consumer re-claims its entries every third of that time while it flushes:
+    an entry goes stale only once nobody is working on it. An error leaves the entries
+    pending, for the sweep to retry.
+    """
+    msg_ids = [msg_id for msg_id, _ in entries]
+    holder = asyncio.create_task(
+        _hold(redis, stream, group, consumer, msg_ids, stale_ms / 3000))
+    try:
+        await _flush_batch(topic, [payload for _, payload in entries], cfg)
+    finally:
+        holder.cancel()
+        await asyncio.gather(holder, return_exceptions=True)
+    if msg_ids:
+        await redis.xack(stream, group, *msg_ids)
+        await _forget(redis, stream, msg_ids)
+
+
+async def _hold(redis, stream: str, group: str, consumer: str, msg_ids: List[str],
+                interval_s: float) -> None:
+    """Reset the idle time of ``msg_ids`` every ``interval_s`` until cancelled. JUSTID
+    leaves their delivery count alone: holding an entry is not delivering it again."""
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await redis.xclaim(stream, group, consumer, 0, msg_ids, justid=True)
+        except Exception as exc:
+            logger.debug("G13 could not hold entries on '%s': %s", stream, exc)
 
 
 _RESULT_TTL = int(os.getenv("BATCH_RESULT_TTL_SECONDS", "3600"))
 _RESULT_KEY_PREFIX = "tok_opt:batch_result"
 _OWNER_KEY_PREFIX = "tok_opt:batch_owner"
+# Recorded when the request is deferred, the owner must outlast its whole wait as well as its
+# result: a provider batch has a 24h completion window, and a backlog adds to that. A result
+# stored later still extends it (_keep_owner_for_result).
+_OWNER_TTL = 3 * 86400 + _RESULT_TTL
+
+
+# Write a result unless the key already holds a completed answer: one step on the server,
+# so no completed write can land between the check and the write.
+_UNLESS_COMPLETED = """
+local stored = redis.call('GET', KEYS[1])
+if stored then
+  local ok, doc = pcall(cjson.decode, stored)
+  if ok and type(doc) == 'table' and doc['status'] == 'completed' then return 0 end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
 
 
 async def _store_batch_result(request_id: str, result: Dict) -> None:
+    """Store a batched request's result for its poller. A completed answer always wins: any
+    other status never replaces one, so a late failure (a retry that gave up, a stale
+    sweep) cannot hide an answer that was produced and priced."""
     key = f"{_RESULT_KEY_PREFIX}:{request_id}"
     redis = _get_redis()
     try:
-        await redis.set(key, json.dumps(result), ex=_RESULT_TTL)
+        if result.get("status") == "completed":
+            await redis.set(key, json.dumps(result), ex=_RESULT_TTL)
+        else:
+            await redis.eval(_UNLESS_COMPLETED, 1, key, json.dumps(result), _RESULT_TTL)
     except Exception as exc:
         logger.warning("G13 result store failed for %s: %s", request_id, exc)
+        return
+    await _keep_owner_for_result(redis, request_id)
 
 
-async def _record_batch_owner(request_id: str, tenant_id: str) -> None:
-    """Record which tenant owns a deferred batch request (H1 isolation)."""
+async def _keep_owner_for_result(redis, request_id: str) -> None:
+    """Keep the owner record at least as long as the result just stored: its poller is
+    refused once the owner is gone. Never shortened, and never recreated (the owner is not
+    known here)."""
+    owner_key = f"{_OWNER_KEY_PREFIX}:{request_id}"
+    try:
+        if 0 <= await redis.ttl(owner_key) < _RESULT_TTL:
+            await redis.expire(owner_key, _RESULT_TTL)
+    except Exception as exc:
+        logger.warning("G13 could not extend the owner record of %s: %s", request_id, exc)
+
+
+async def _completed(request_id: str) -> bool:
+    """Whether a completed answer is stored for ``request_id``."""
+    try:
+        stored = await _get_redis().get(f"{_RESULT_KEY_PREFIX}:{request_id}")
+        return bool(stored) and json.loads(stored).get("status") == "completed"
+    except Exception:
+        return False
+
+
+async def _record_batch_owner(request_id: str, tenant_id: str) -> bool:
+    """Record which tenant owns a deferred batch request (H1 isolation), for longer than
+    the request can wait. False when it could not be written."""
     try:
         redis = _get_redis()
-        await redis.set(f"{_OWNER_KEY_PREFIX}:{request_id}", tenant_id, ex=_RESULT_TTL)
+        await redis.set(f"{_OWNER_KEY_PREFIX}:{request_id}", tenant_id, ex=_OWNER_TTL)
+        return True
     except Exception as exc:
-        logger.debug("G13 owner record failed for %s: %s", request_id, exc)
+        logger.warning("[%s] G13 could not record the request's owner (%s); answering it now",
+                       request_id, exc)
+        return False
+
+
+async def _forget_batch_owner(request_id: str) -> None:
+    """Take back the owner record of a request that was not queued after all, so its id
+    polls as not found rather than pending forever. Best effort: the record expires anyway."""
+    try:
+        await _get_redis().delete(f"{_OWNER_KEY_PREFIX}:{request_id}")
+    except Exception as exc:
+        logger.debug("G13 could not remove the owner record of %s: %s", request_id, exc)
 
 
 async def get_batch_result_owner(request_id: str) -> Optional[str]:
-    """Return the tenant that owns a deferred batch request, or None if unknown."""
-    try:
-        redis = _get_redis()
-        return await redis.get(f"{_OWNER_KEY_PREFIX}:{request_id}")
-    except Exception as exc:
-        logger.debug("G13 owner lookup failed for %s: %s", request_id, exc)
-        return None
+    """Return the tenant that owns a deferred batch request, or None when none is on record.
+    A failed read raises: the caller must not mistake it for "no owner"."""
+    return await _get_redis().get(f"{_OWNER_KEY_PREFIX}:{request_id}")
+
+
+async def _deliveries(redis, stream: str, group: str, msg_id: str) -> int:
+    """How many times ``msg_id`` has been delivered, the claim that just took it included;
+    0 when it is no longer pending."""
+    pending = await redis.xpending_range(stream, group, min=msg_id, max=msg_id, count=1)
+    return int(pending[0]["times_delivered"]) if pending else 0
 
 
 async def _reclaim_stale_pel(
-    redis, topic: str, group: str, consumer: str, batch_cfg: Dict
+    redis, topic: str, group: str, consumer: str, batch_cfg: Dict,
+    cfg: Optional[Dict[str, Any]] = None, stream: Optional[str] = None,
 ) -> None:
-    """Claim messages stuck in PEL beyond max_pending_ack_ms and retry once."""
-    stream = f"{_BATCH_STREAM_PREFIX}:{topic}"
-    min_idle_ms = batch_cfg.get("max_pending_ack_ms", 30000)
+    """Retry the entries a stopped consumer left pending.
+
+    A consumer holds what it is flushing (``_flush_held``), so an entry idle for
+    ``max_pending_ack_ms`` is one nobody is working on. It is claimed and flushed again, up
+    to ``max_attempts`` deliveries in all, then marked failed so its poller gets an answer.
+    One that already has a completed answer, or whose content is gone, is only
+    acknowledged: nothing is left to do for it. ``stream`` is the tenant stream to sweep
+    (default: the topic's default-tenant stream).
+    """
+    stream = stream or _stream_key("", topic)
+    stale_ms = int(batch_cfg.get("max_pending_ack_ms", 30000))
+    max_attempts = int(batch_cfg.get("max_attempts", 3))
     try:
         claimed = await redis.xautoclaim(
             stream, group, consumer,
-            min_idle_time=min_idle_ms,
+            min_idle_time=stale_ms,
             start_id="0-0",
             count=10,
         )
         # claimed[1] contains the reclaimed messages
         reclaimed_messages = claimed[1] if isinstance(claimed, (list, tuple)) and len(claimed) > 1 else []
-        if reclaimed_messages:
-            logger.warning(
-                "G13 PEL reclaim: %d stale messages on stream '%s'",
-                len(reclaimed_messages), stream,
-            )
-            for msg_id, fields in reclaimed_messages:
-                payload = json.loads(fields.get("payload", "{}"))
-                request_id = payload.get("request_id", "unknown")
-                # Mark as failed so poller gets a response
+        retry: List[Tuple[str, Dict]] = []
+        settled: List[str] = []
+        for msg_id, fields in reclaimed_messages:
+            if not fields or "payload" not in fields:
+                settled.append(msg_id)
+                continue
+            payload = json.loads(fields["payload"])
+            request_id = payload.get("request_id", "unknown")
+            if await _completed(request_id):
+                settled.append(msg_id)
+                continue
+            delivered = await _deliveries(redis, stream, group, msg_id)
+            if not delivered:
+                continue          # acknowledged by its own consumer since the claim
+            if delivered > max_attempts:
                 await _store_batch_result(request_id, {
                     "status": "failed",
                     "request_id": request_id,
-                    "error": "Batch item timed out in processing queue",
+                    "error": f"Batch item not processed after {max_attempts} attempts",
                 })
-                await redis.xack(stream, group, msg_id)
+                settled.append(msg_id)
+            else:
+                retry.append((msg_id, payload))
+        if reclaimed_messages:
+            logger.warning(
+                "G13 sweep: %d entries on stream '%s' left by a stopped consumer, %d retried",
+                len(reclaimed_messages), stream, len(retry),
+            )
+        if settled:
+            await redis.xack(stream, group, *settled)
+            await _forget(redis, stream, settled)
+        if retry:
+            await _flush_held(redis, stream, group, consumer, topic, retry, cfg or {}, stale_ms)
+        await _drop_stopped_consumers(redis, stream, group, consumer)
     except Exception as exc:
         logger.warning("G13 PEL reclaim failed for topic '%s': %s", topic, exc)
+
+
+async def _drop_stopped_consumers(redis, stream: str, group: str, consumer: str,
+                                  idle_ms: int = _STOPPED_CONSUMER_IDLE_MS) -> None:
+    """Delete the consumers of stopped processes: idle ``idle_ms`` with nothing pending.
+    One with pending entries still has work for the sweep to take over, and deleting it
+    would drop that work from the group, so it stays until then."""
+    try:
+        for info in await redis.xinfo_consumers(stream, group):
+            name = info.get("name")
+            if (name != consumer and int(info.get("pending", 0)) == 0
+                    and int(info.get("idle", 0)) > idle_ms):
+                await redis.xgroup_delconsumer(stream, group, name)
+    except Exception as exc:
+        logger.debug("G13 could not tidy the consumers of '%s': %s", stream, exc)
 
 
 _BATCH_JOBS_KEY = "tok_opt:batch_jobs"
@@ -459,6 +738,9 @@ async def _record_batch_job(job_id: str, provider: str, items: List[Dict]) -> No
     redis = _get_redis()
     request_ids = [it.get("request_id") for it in items]
     baseline_tokens = {it.get("request_id"): it.get("baseline_tokens", 0) for it in items}
+    # Whose spend counter each answer's cost goes to, and the model it is priced at.
+    spend = {it.get("request_id"): {"prefix": it["spend_prefix"], "model": it.get("model")}
+             for it in items if it.get("spend_prefix")}
     try:
         await redis.hset(
             _BATCH_JOBS_KEY,
@@ -467,6 +749,7 @@ async def _record_batch_job(job_id: str, provider: str, items: List[Dict]) -> No
                 "provider": provider,
                 "request_ids": request_ids,
                 "baseline_tokens": baseline_tokens,
+                "spend": spend,
                 "created": time.time(),
             }),
         )
@@ -502,6 +785,7 @@ async def poll_batch_jobs(cfg: Dict[str, Any]) -> int:
         provider = meta.get("provider", "")
         request_ids = meta.get("request_ids", [])
         baseline_map = meta.get("baseline_tokens", {}) or {}
+        spend_map = meta.get("spend", {}) or {}
         try:
             adapter = get_adapter_by_name(provider)
         except Exception:
@@ -540,6 +824,9 @@ async def poll_batch_jobs(cfg: Dict[str, Any]) -> int:
                         "response": resp,
                         "baseline_tokens": baseline_map.get(rid, 0),
                     })
+                    owed = spend_map.get(rid) or {}
+                    await _add_answer_cost(owed.get("prefix"), rid, owed.get("model") or "",
+                                           resp, adapter, cfg, native=True)
                 else:
                     await _store_batch_result(
                         rid, {"status": "failed", "error": r.get("error", "batch item error")}
@@ -652,9 +939,11 @@ async def _flush_batch_loop(
     logger.info("G13 flushing batch (loop) topic='%s' size=%d", topic, len(items))
     try:
         import litellm
-        from auth.api_key_manager import get_llm_provider_key
         from config_loader import get_provider_model_prefixes, get_providers
-        from providers import build_litellm_call, get_adapter, outgoing_params_for
+        from providers import (
+            build_litellm_call, get_adapter, outgoing_messages_for, outgoing_params_for,
+        )
+        from providers.resilience import request_timeout_for
 
         provider_map = get_provider_model_prefixes()
 
@@ -723,9 +1012,10 @@ async def _flush_batch_loop(
                 )
                 response = await litellm.acompletion(
                     model=_call_model,
-                    messages=messages,
+                    messages=outgoing_messages_for(_routed_adapter, messages),
                     **_call_kwargs,
                     **outgoing_params,
+                    timeout=request_timeout_for(cfg, model),
                 )
                 response_dict = (
                     response.model_dump()
@@ -740,12 +1030,53 @@ async def _flush_batch_loop(
                 })
                 logger.info("G13 batch item %s processed successfully", request_id)
                 _note_batch_provider_outcome(provider, None)
+                await _add_answer_cost(item.get("spend_prefix"), request_id, model,
+                                       response_dict, _routed_adapter, cfg)
             except Exception as exc:
                 await _store_batch_result(request_id, {"status": "failed", "error": str(exc)})
                 logger.error("G13 batch item %s failed: %s", request_id, exc)
                 _note_batch_provider_outcome(provider, exc)
     except Exception as exc:
         logger.error("G13 batch flush failed: %s", exc)
+
+
+def _answer_cost(request_id: str, model: str, response: Dict, adapter: Any,
+                 cfg: Dict[str, Any], *, native: bool) -> float:
+    """What a batched request's answer cost, priced as G18 prices a served call
+    (``price_billed_call``): from the usage the provider reported, so nothing when it
+    reported none, at the configured native-batch discount on the native lane, and nothing
+    while G18 prices no calls. The flush has no RequestContext, so a stand-in carries what
+    pricing reads."""
+    from datetime import datetime, timezone
+    from middleware.g18_observability import price_billed_call
+    from savings.models import SavingsRecord
+    call = SimpleNamespace(
+        request_id=request_id, config=cfg, routed_model=model, provider_adapter=adapter,
+        params={"_native_batch": True} if native else {},
+        savings=SavingsRecord(
+            request_id=request_id, user_id="", timestamp=datetime.now(timezone.utc),
+            model_requested=model, routed_model=model, baseline_tokens=0),
+    )
+    price_billed_call(call, response)
+    return call.savings.cost_actual_usd
+
+
+async def _add_answer_cost(spend_prefix: Optional[str], request_id: str, model: str,
+                           response: Dict, adapter: Any, cfg: Dict[str, Any],
+                           *, native: bool = False) -> None:
+    """Add a batched request's answer cost to its tenant's spend counter, which the spend
+    cap reads. The request was billed, and counted against the quota and trial, when it was
+    queued; its cost is known only now. No ``spend_prefix``: an admin key sent it as the
+    tenant, or it was queued without one. Never raises: the answer is stored either way."""
+    if not spend_prefix:
+        return
+    try:
+        from middleware.g00_rate_limit import add_to_spend
+        await add_to_spend(spend_prefix, _answer_cost(request_id, model, response, adapter,
+                                                      cfg, native=native))
+    except Exception as exc:
+        logger.warning("G13 batch item %s: its cost was not added to the spend counter: %s",
+                       request_id, exc)
 
 
 def _note_batch_provider_outcome(provider: str, exc) -> None:
@@ -756,5 +1087,5 @@ def _note_batch_provider_outcome(provider: str, exc) -> None:
         from config_loader import get_config
         from providers.resilience import note_provider_outcome
         note_provider_outcome(provider, exc, get_config() or {})
-    except Exception:  # never let observability break the flush
-        pass
+    except Exception as err:  # never let observability break the flush
+        logger.debug("batch provider outcome not recorded: %r", err)

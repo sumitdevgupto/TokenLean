@@ -15,6 +15,40 @@ variable "db_tier" {
   default     = "db-g1-small"
 }
 
+variable "db_backups" {
+  description = "Daily automated backups of the Cloud SQL instance (it holds usage_events, the billing source of record)"
+  type        = bool
+  default     = true
+}
+
+variable "db_point_in_time_recovery" {
+  description = "Keep write-ahead logs so the database can be restored to any minute in the window (needs db_backups)"
+  type        = bool
+  default     = true
+}
+
+variable "db_backup_retained_count" {
+  description = "How many daily backups Cloud SQL keeps"
+  type        = number
+  default     = 7
+}
+
+variable "db_transaction_log_days" {
+  description = "Days of write-ahead logs kept for point-in-time recovery (1-7)"
+  type        = number
+  default     = 7
+  validation {
+    condition     = var.db_transaction_log_days >= 1 && var.db_transaction_log_days <= 7
+    error_message = "db_transaction_log_days must be between 1 and 7."
+  }
+}
+
+variable "db_backup_start_time" {
+  description = "UTC start of the daily backup window (HH:MM)"
+  type        = string
+  default     = "03:00"
+}
+
 variable "artifact_registry_repo" {
   description = "Artifact Registry repository name"
   type        = string
@@ -75,7 +109,7 @@ variable "qdrant_image" {
   # refuses a client/server minor gap greater than 1, so a bump here needs the
   # client pins bumped in the same change. Guarded by
   # tests/unit/test_qdrant_version_alignment.py.
-  default     = "qdrant/qdrant:v1.12.6"
+  default = "qdrant/qdrant:v1.12.6"
 }
 
 # ─── Cost-optimization toggles (defaults preserve current OSS behaviour) ──────
@@ -93,14 +127,15 @@ variable "enable_self_hosted_observability" {
   default     = true
 }
 
-# ─── BYOK provider-key security hardening (opt-in; default = current behaviour) ──
-# All three default to the pre-hardening posture so `terraform apply` is a no-op on an
-# existing project. Flip them on a STAGING project first (item 8 changes DB connectivity
-# and can break the `gcloud sql connect` migrations), validate, then promote to prod.
+# ─── BYOK provider-key security hardening ────────────────────────────────────────
+# least_privilege_secret_iam is on by default. The other two default to the pre-hardening
+# posture so `terraform apply` leaves them unchanged on an existing project. Flip those on a
+# STAGING project first (item 8 changes DB connectivity and can break the `gcloud sql
+# connect` migrations), validate, then promote to prod.
 variable "least_privilege_secret_iam" {
-  description = "Item 7: replace the proxy SA's project-wide secretmanager.secretAccessor with per-secret bindings (least privilege). Default false keeps the broad grant."
+  description = "Item 7: bind the proxy SA to only the secrets it reads, and its storage access to the config bucket (least privilege). Default true. false restores project-wide secretmanager.secretAccessor and storage.objectAdmin, which reach every secret and bucket in the project."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "private_cloud_sql" {
@@ -125,6 +160,18 @@ variable "redis_backend" {
   }
 }
 
+variable "redis_auth_enforced" {
+  description = "Make Redis require its password (secret redis-auth). On by default; set from REDIS_AUTH_ENFORCE by gcp-deploy.sh, which restarts the Redis VM when it does not run the setting yet. Memorystore's AUTH string exists only once this is on."
+  type        = bool
+  default     = true
+}
+
+variable "redis_tls" {
+  description = "Encrypt Redis traffic with TLS. On by default; set from REDIS_TLS by gcp-deploy.sh. Memorystore: transit encryption on port 6378 with its own CA; switching it recreates the instance, which then starts empty. The VM: a certificate from a CA made here, and gcp-deploy.sh restarts the VM onto it. The clients get a rediss:// URL (output redis_url) and the CA (secret redis-ca)."
+  type        = bool
+  default     = true
+}
+
 variable "redis_vm_machine_type" {
   description = "Machine type for the docker-Redis GCE VM (redis_backend = docker)."
   type        = string
@@ -132,7 +179,7 @@ variable "redis_vm_machine_type" {
 }
 
 variable "alert_webhook_url" {
-  description = "Alertmanager webhook URL override. When set, used instead of the auto-derived proxy service URL."
+  description = "Alertmanager webhook URL override. When set, used instead of the auto-derived proxy service URL, and the proxy's webhook token is not sent to it."
   type        = string
   default     = ""
 }
@@ -168,7 +215,7 @@ variable "alertmanager_repeat_interval" {
 }
 
 variable "metrics_scrape_token" {
-  description = "Bearer token the proxy requires on /metrics (H2). Prometheus presents it on scrape. Empty = /metrics stays open (not recommended in production)."
+  description = "Bearer token the proxy requires on /metrics (H2). Prometheus presents it on scrape. Empty = Terraform generates one."
   type        = string
   default     = ""
   sensitive   = true

@@ -6,7 +6,7 @@ Complete guide for running the TokenLean — Token Optimisation Framework locall
 
 ## Overview
 
-The local deployment runs the entire optimisation stack (G0–G28, G26 reserved — 27 implemented) in Docker containers on your machine. All services communicate via a Docker bridge network.
+The local deployment runs the entire optimisation stack (G0–G28, G27 reserved — 27 implemented) in Docker containers on your machine. All services communicate via a Docker bridge network.
 
 | Component | Docker Image | Port | Purpose |
 |-----------|-------------|------|---------|
@@ -14,10 +14,10 @@ The local deployment runs the entire optimisation stack (G0–G28, G26 reserved 
 | **G1 Compression** | Built from `src/llmlingua-sidecar/Dockerfile` | 8080 | LLMLingua-2 sidecar |
 | **G3 Doc Pipeline** | Built from `src/tika-sidecar/Dockerfile` | 9998 | Apache Tika extraction |
 | **G4 Bypass** | `pgvector/pgvector:pg15` | 5432 | PostgreSQL cache |
-| **G5 Cache** | `redis:7-alpine` | 6379 | Redis exact-match cache |
+| **G5 Cache** | `redis:7.2-alpine` | 6379 | Redis exact-match cache |
 | **G6 Routing** | Built from `src/routellm-sidecar/Dockerfile` | 8081 | RouteLLM cascade |
 | **G7 Retrieval** | `qdrant/qdrant:v1.9.0` | 6333 | Vector search |
-| **G10 Memory** | Redis + Qdrant | - | Mem0 long-horizon memory |
+| **G10 Memory** | Redis + Qdrant | - | Session summaries + agent skills |
 | **G18 Observability** | `langfuse/langfuse:2` | 3100 | Tracing UI |
 | **G18 Dashboards** | `grafana/grafana-oss:10.4.0` | 3000 | Grafana dashboards (optional profile) |
 | **Config** | Local volume mount | - | `config/config.yaml` |
@@ -43,6 +43,13 @@ bash ./scripts/local/deploy-local.sh --seed
 wsl bash ./scripts/local/deploy-local.sh --seed
 ```
 
+### Linux Users
+
+The proxy and its sidecars run as an unprivileged user, uid 1000, not root. The proxy reads
+`./config` through a bind mount, so on a Linux host whose own user is not uid 1000, make
+`config/` and its files readable by others (the default `644` is). Docker Desktop on Windows
+and macOS needs nothing.
+
 ---
 
 ## Environment Setup
@@ -55,11 +62,21 @@ cp .env.template .env
 # .env
 COMPOSE_PROJECT_NAME=token-opt
 DB_PASSWORD=devpassword
-GRAFANA_PASSWORD=admin
 OPENAI_API_KEY=sk-...  # Required for RouteLLM
 ```
 
 All local scripts automatically source `.env` at the repo root if present.
+
+Redis, Qdrant and the Langfuse and Grafana admins each require a credential of their own:
+`REDIS_PASSWORD`, `QDRANT_API_KEY`, `LANGFUSE_INIT_USER_PASSWORD` and `GRAFANA_PASSWORD`.
+`deploy-local.sh` and `start-local.sh` generate any that `.env` leaves empty, as random values
+written into `.env` (never printed), and `docker compose` refuses to start without them. Tools
+on this machine read them from `.env`: `redis-cli` inside the Redis container logs in by itself,
+and Qdrant's API wants the `api-key` header. Langfuse and Grafana read their admin passwords only
+when they first create the admin; an existing stack keeps the password it already has.
+
+The proxy takes no cross-origin browser calls unless `.env` lists the origin in `CORS_ORIGINS`
+(or sets `CORS_ALLOW_ALL=true`); the portal does not need it.
 
 ---
 
@@ -106,7 +123,7 @@ docker-compose ps
 docker-compose logs -f proxy
 
 # Health check endpoints
-curl http://localhost:4000/health
+curl http://localhost:4000/health   # "degraded" + "not_wired" until the proxy's database is wired
 curl http://localhost:8080/health
 curl http://localhost:8081/health
 curl http://localhost:6333/healthz
@@ -149,7 +166,8 @@ See **Build-Time Quality Gates & Optional Evals** in [DEPLOYMENT.md](../DEPLOYME
 ```bash
 ./scripts/local/stop-local.sh
 
-# Stop with GCS backup (optional)
+# Stop with GCS backup (optional): needs CONFIG_GCS_BUCKET in .env (or
+# scripts/local/docker-backup.sh --bucket NAME), a bucket in your own GCP project
 ./scripts/local/stop-local.sh --backup
 ```
 

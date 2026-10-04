@@ -187,6 +187,30 @@ async def test_anthropic_marks_tools():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_places_no_marker_when_the_caller_placed_its_own():
+    """The caller chose its own breakpoints, and Anthropic rejects a request with more
+    than four: adding G21's on top of the caller's can push a request past the limit and
+    fail it. So G21 leaves the caller's markers as they are."""
+    from protocols.base import CALLER_CACHE_MARKERS
+    from providers.anthropic_adapter import AnthropicAdapter
+    msgs = [
+        {"role": "system", "content": [
+            {"type": "text", "text": "Rules.", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "system", "content": "More rules."},
+        {"role": "user", "content": "Hello"},
+    ]
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
+    ctx = _make_ctx(msgs, model="claude-sonnet-4-5",
+                    params={"tools": tools, CALLER_CACHE_MARKERS: True},
+                    provider_adapter=AnthropicAdapter())
+    result = await G21CacheAlignment().process_request(ctx)
+
+    assert result.messages == msgs
+    assert result.params["tools"] == tools
+    assert result.savings.step_savings == []
+
+
+@pytest.mark.asyncio
 async def test_anthropic_custom_cache_type():
     """Configurable cache_type is injected (requires adapter)."""
     from providers.anthropic_adapter import AnthropicAdapter
@@ -389,6 +413,64 @@ async def test_multiple_system_messages_order_preserved():
     assert result.messages[0]["content"] == "First policy."
     assert result.messages[1]["content"] == "Second policy."
     assert all(m["role"] != "system" for m in result.messages[2:])
+
+
+# ─── Retrieved documents (G07) stay out of the cacheable prefix ──────────────
+# They change with every query. In the prefix they stopped the provider caching the tenant's
+# own system prompt, and they were hashed into OpenAI's prompt_cache_key, scattering
+# requests across cache shards. They belong just before the latest user turn.
+
+def _retrieved(text):
+    return {"role": "system", "content": f"[Retrieved context]\n{text}"}
+
+
+@pytest.mark.asyncio
+async def test_retrieved_documents_move_to_the_changing_tail():
+    from providers.openai_adapter import OpenAIAdapter
+    msgs = [  # as a system-first rebuild (G10, G26) leaves them
+        {"role": "system", "content": "You are support."}, _retrieved("doc A"),
+        {"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+    ]
+    result = await G21CacheAlignment().process_request(
+        _make_ctx(msgs, model="gpt-4o", provider_adapter=OpenAIAdapter()))
+    assert [m["content"] for m in result.messages] == [
+        "You are support.", "q1", "a1", "[Retrieved context]\ndoc A", "q2"]
+
+
+@pytest.mark.asyncio
+async def test_the_cache_key_is_the_tenant_s_prompt_s_alone():
+    from providers.openai_adapter import OpenAIAdapter
+
+    async def key(*retrieved):
+        msgs = [{"role": "system", "content": "You are support."},
+                {"role": "user", "content": "q1"}, *retrieved,
+                {"role": "user", "content": "q2"}]
+        result = await G21CacheAlignment().process_request(
+            _make_ctx(msgs, model="gpt-4o", provider_adapter=OpenAIAdapter()))
+        return result.params["prompt_cache_key"]
+
+    assert await key(_retrieved("doc A")) == await key(_retrieved("doc B")) == await key()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_marks_the_tenant_s_prompt_not_the_documents():
+    from providers.anthropic_adapter import AnthropicAdapter
+    msgs = [{"role": "system", "content": "You are support."}, _retrieved("doc"),
+            {"role": "user", "content": "q"}]
+    result = await G21CacheAlignment().process_request(
+        _make_ctx(msgs, model="claude-sonnet-4-5", provider_adapter=AnthropicAdapter()))
+    assert result.messages[0].get("cache_control") == {"type": "ephemeral"}
+    assert result.messages[1] == _retrieved("doc")          # unmarked, before the user turn
+    assert result.messages[2]["content"] == "q"
+
+
+def test_anthropic_s_cacheable_span_leaves_the_documents_out():
+    from providers.anthropic_adapter import AnthropicAdapter
+    msgs = [{"role": "system", "content": "You are support."}, _retrieved("doc"),
+            {"role": "user", "content": "q"}]
+    span = AnthropicAdapter().cacheable_span_messages(msgs, {}, _make_config())
+    assert [m["content"] for m in span] == ["You are support."]
 
 
 # ─── P1: Provider cache policy (prompt_cache_key) ────────────────────────────

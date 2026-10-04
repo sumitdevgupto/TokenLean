@@ -11,9 +11,11 @@ collection (rag_<tenant>, filtered by the tenant_id payload the doc-pipeline sta
 under finetune-training/<tenant>/<domain>/, and tenant-prefixes its Redis job keys. The
 TENANT_ID / QDRANT_COLLECTION values are derived by the trigger (g03_doc_pipeline) and passed
 as env — this Job is a standalone Cloud Run image without src/proxy on its path, so it does NOT
-import tenancy.context (mirrors the doc-pipeline Job). Under strict BYOK the tenant's own
-provider key is passed as TENANT_PROVIDER_KEY; the Job refuses (exit 2) rather than fall back to
-the platform key.
+import tenancy.context (mirrors the doc-pipeline Job). A tenant's own provider key arrives as
+TENANT_PROVIDER_KEY_VERSION, the name of the Secret Manager version the trigger stored it in, never
+as the key itself (an execution keeps its env overrides); the Job destroys that version once the
+run has ended cleanly. Under strict BYOK with no key the Job refuses (exit 2) rather than fall back
+to the platform key.
 
 Environment Variables:
     TENANT_ID: Owning tenant (default "default" = single-tenant / self-host).
@@ -27,7 +29,8 @@ Environment Variables:
     REDIS_URL: Redis URL (for tracking training jobs)
     GCP_PROJECT_ID: GCP project for Vertex AI
     GCP_REGION: GCP region for Vertex AI (default: us-central1)
-    TENANT_PROVIDER_KEY / BYOK_ENFORCE: Tenant's BYOK training key + strict-BYOK flag.
+    TENANT_PROVIDER_KEY_VERSION: Secret Manager version holding the tenant's BYOK training key.
+    TENANT_PROVIDER_KEY / BYOK_ENFORCE: The key itself (a manual run) + strict-BYOK flag.
     OPENAI_API_KEY: Platform OpenAI key — used ONLY for the default/single-tenant case.
 
 Usage:
@@ -39,9 +42,10 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,6 +67,103 @@ def _sanitise_tenant_id(tenant_id: str) -> str:
 def _redis_prefix(tenant_id: str) -> str:
     safe = _sanitise_tenant_id(tenant_id)
     return f"t:{safe}:" if safe != "default" else ""
+
+
+# ─── Qdrant connection: the proxy's settings (ml_models.qdrant_client_kwargs) ────
+# This image does not ship the proxy's ml_models, so this is a copy, and a test holds it to
+# the proxy's. On GCP, Qdrant runs on Cloud Run behind IAM plus its own API key: without the
+# key, an identity token and port 443, every call from this job failed.
+_id_token_cache: Dict[str, Tuple[str, float]] = {}
+_id_token_lock = threading.Lock()
+# Cloud Run names itself in every service's (K_SERVICE) and job's (CLOUD_RUN_JOB)
+# environment. Elsewhere the metadata server is probed; a "no" is kept _GCP_NO_TTL_S only.
+_CLOUD_RUN_ENV = ("K_SERVICE", "CLOUD_RUN_JOB")
+_GCP_NO_TTL_S = 300.0
+_gcp_metadata_available: Optional[bool] = None
+_gcp_checked_at = 0.0
+_clock = time.monotonic
+
+
+def _gcp_identity_token(audience: str) -> str:
+    """A GCP identity token for ``audience`` from the metadata server, cached ~50 min."""
+    import urllib.request
+
+    now = time.time()
+    tok, exp = _id_token_cache.get(audience, ("", 0.0))
+    if tok and now < exp:
+        return tok
+    with _id_token_lock:
+        tok, exp = _id_token_cache.get(audience, ("", 0.0))
+        if tok and now < exp:
+            return tok
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/"
+            f"service-accounts/default/identity?audience={audience}",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        # The fixed metadata-server URL, never caller input (bandit B310).
+        token = urllib.request.urlopen(req, timeout=5).read().decode().strip()  # nosec B310
+        _id_token_cache[audience] = (token, now + 3000)  # refresh 10 min before 1 h expiry
+        return token
+
+
+def _on_gcp() -> bool:
+    """Whether this process runs on GCP: Cloud Run's environment says so, else the metadata
+    server answers. A yes is kept for the process, a no for _GCP_NO_TTL_S only (one slow
+    probe used to turn the identity token off for the whole run)."""
+    global _gcp_metadata_available, _gcp_checked_at
+    if _gcp_metadata_available:
+        return True
+    if any(os.environ.get(name) for name in _CLOUD_RUN_ENV):
+        _gcp_metadata_available = True
+        return True
+    now = _clock()
+    if _gcp_metadata_available is False and now - _gcp_checked_at < _GCP_NO_TTL_S:
+        return False
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/id",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        urllib.request.urlopen(req, timeout=2).read()  # nosec B310 (fixed URL)
+        _gcp_metadata_available = True
+    except Exception:
+        _gcp_metadata_available = False
+        _gcp_checked_at = now
+    return _gcp_metadata_available
+
+
+def _qdrant_client_kwargs(url: str) -> Dict[str, Any]:
+    """QdrantClient kwargs for ``url``: the Qdrant API key (``QDRANT_API_KEY``), port 443 for
+    an https URL without a port (the client defaults to 6333, which Cloud Run does not
+    serve), and on GCP a Cloud Run identity token for the IAM layer."""
+    kwargs: Dict[str, Any] = {"url": url, "api_key": os.getenv("QDRANT_API_KEY") or None}
+    try:
+        import inspect
+        from qdrant_client import QdrantClient
+        if "check_compatibility" in inspect.signature(QdrantClient.__init__).parameters:
+            kwargs["check_compatibility"] = False
+    except Exception as exc:
+        logger.debug("qdrant-client compatibility probe failed: %r", exc)
+    if url.startswith("https://") and ":" not in url.split("//", 1)[1].split("/", 1)[0]:
+        kwargs["port"] = 443
+    if url.startswith("https://") and os.getenv("QDRANT_LOCAL_NOAUTH") != "1" and _on_gcp():
+        kwargs["auth_token_provider"] = lambda: _gcp_identity_token(url)
+    return kwargs
+
+
+def _read_key_version(name: str) -> str:
+    """The tenant's provider key from the Secret Manager version ``name``, or "" when it
+    cannot be read (the run then refuses rather than train on the platform key)."""
+    try:
+        from google.cloud import secretmanager
+        response = secretmanager.SecretManagerServiceClient().access_secret_version(
+            request={"name": name})
+        return response.payload.data.decode("utf-8")
+    except Exception as exc:
+        logger.error("BYOK: could not read the tenant's key from %s: %s", name, exc)
+        return ""
 
 
 @dataclass
@@ -94,7 +195,7 @@ class TrainingDataBuilder:
             self.tenant_id, self.collection,
         )
 
-        client = QdrantClient(url=self.qdrant_url)
+        client = QdrantClient(**_qdrant_client_kwargs(self.qdrant_url))
 
         # Defense-in-depth: even though the collection is already tenant-scoped, filter by the
         # tenant_id payload the doc-pipeline stamps, so a mis-pointed collection can never leak
@@ -338,6 +439,25 @@ class FineTunePipeline:
         self.tenant_provider_key = os.getenv("TENANT_PROVIDER_KEY", "")
         self.byok_enforce = os.getenv("BYOK_ENFORCE", "false").lower() == "true"
         self.openai_key = os.getenv("OPENAI_API_KEY", "")
+        # What the trigger passes: the name of the Secret Manager version holding the key.
+        # A version means the run is meant to use the tenant's key, so it never falls back
+        # to the platform key, even if the version cannot be read.
+        self.key_version = os.getenv("TENANT_PROVIDER_KEY_VERSION", "")
+        if self.key_version:
+            self.byok_enforce = True
+            self.tenant_provider_key = self.tenant_provider_key or _read_key_version(self.key_version)
+
+    def release_training_key(self) -> None:
+        """Destroy the version holding this run's key. For a run that ended cleanly only: a
+        failed run may be retried and needs it (the trigger destroys versions a day old)."""
+        if not self.key_version:
+            return
+        try:
+            from google.cloud import secretmanager
+            secretmanager.SecretManagerServiceClient().destroy_secret_version(
+                request={"name": self.key_version})
+        except Exception as exc:
+            logger.warning("Could not destroy the key version %s: %s", self.key_version, exc)
 
     def _resolve_training_key(self) -> str:
         """Return the provider key to train with, fail-closed under strict BYOK.
@@ -366,7 +486,17 @@ class FineTunePipeline:
         import redis
 
         try:
-            r = redis.from_url(self.redis_url, decode_responses=True)
+            # REDIS_PASSWORD (a secret, never inside REDIS_URL) as the `default` user's,
+            # which a Redis with no password yet accepts too, as the proxy sends it. With
+            # REDIS_CA_CERT and a rediss:// URL, Redis's certificate must be signed by that CA
+            # (the deployment's own: proxy cache/redis_pool.tls_options).
+            password = os.getenv("REDIS_PASSWORD") or ""
+            ca = os.getenv("REDIS_CA_CERT") or ""
+            tls = ({"ssl_ca_data": ca, "ssl_cert_reqs": "required", "ssl_check_hostname": False}
+                   if ca and self.redis_url.startswith("rediss://") else {})
+            r = redis.from_url(self.redis_url, decode_responses=True,
+                               **({"username": "default", "password": password} if password else {}),
+                               **tls)
 
             job_data = {
                 "job_id": job_id,
@@ -498,7 +628,13 @@ class FineTunePipeline:
 
 def main():
     pipeline = FineTunePipeline()
-    pipeline.run()
+    try:
+        pipeline.run()
+    except SystemExit as exc:
+        if exc.code in (0, None):   # finished or skipped: the task will not be retried
+            pipeline.release_training_key()
+        raise
+    pipeline.release_training_key()
 
 
 if __name__ == "__main__":

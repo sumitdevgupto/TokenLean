@@ -7,10 +7,10 @@
 # lockfile is refreshed via the script instead (see that entry's comment:
 # Dependabot's regenerator cannot honor its CUDA exclusions).
 #
-# Everywhere else the manifests are open ">=" floors: pip already resolves to
-# latest on every install, so a floor-bump PR changes nothing about built
-# artifacts. Version updates are therefore DISABLED (open-pull-requests-limit: 0)
-# for the sidecar/pipeline manifests, Docker base images, and the Java sample —
+# The sidecar/pipeline images compile the same way (their requirements.in), and
+# the script refreshes them for the proxy's reason (torch). Docker base images and
+# the Java sample have reasons of their own (see each entry). Version updates are
+# therefore DISABLED (open-pull-requests-limit: 0) for all of these —
 # SECURITY updates are exempt from that limit and still open PRs.
 #
 # With auto-merge disabled and CODEOWNERS review required, every bump still
@@ -34,7 +34,7 @@ updates:
   # Proxy runtime lockfile (src/proxy/requirements.txt, compiled from
   # requirements.in) — what ships in the image. Version-update PRs are DISABLED
   # here: Dependabot regenerates pip-compile lockfiles with a plain re-resolve
-  # that does NOT honor the --unsafe-package exclusions or the nvidia-* sweep
+  # that does NOT honor the --unsafe-package exclusions or the CUDA sweep
   # (proven by PR #33, which re-pinned torch + the ~17-package CUDA runtime and
   # went red on tests/unit/test_requirements_pinned.py), so every PR it opened
   # would fail CI by design. Refresh the pins deliberately instead:
@@ -77,10 +77,11 @@ updates:
           - minor
           - patch
 
-  # Sidecar / pipeline manifests — open floors in separate containers, not the
-  # proxy runtime. Installs already resolve to latest, so version-update PRs
-  # here are documentation churn: DISABLED. Security updates still flow (the
-  # limit does not apply to them).
+  # Sidecar / pipeline images — each requirements.txt is compiled from its
+  # requirements.in by scripts/compile-requirements.sh. Version-update PRs stay
+  # DISABLED for the proxy's reason: Dependabot's regenerator cannot keep torch
+  # out of the pins. Security updates still flow (the limit does not apply to
+  # them): treat one as the alert and apply it via the script.
   - package-ecosystem: pip
     directories:
       - /src/doc-pipeline
@@ -102,9 +103,10 @@ updates:
           - version-update:semver-major
           - version-update:semver-minor
 
-  # Docker base images — major bumps (postgres 15→18, tika 2→3) need human
-  # verification nothing in CI performs (no job builds these images), so
-  # version-update PRs are noise: DISABLED. Security updates still flow.
+  # Docker base images — every FROM is pinned by digest, so a rebuild takes the same OS and
+  # Python patch level. Dependabot proposes each tag's new digest (its OS and security
+  # patches), monthly, for review. New tags stay out: a major or minor bump (postgres 15→18,
+  # python 3.11→3.13) needs verification nothing in CI performs (no job builds these images).
   # Deliberate upgrades are tracked in internal-docs/demand-driven-features.md.
   - package-ecosystem: docker
     directories:
@@ -117,9 +119,18 @@ updates:
       - /src/tika-sidecar
     schedule:
       interval: monthly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
     commit-message:
       prefix: docker
+    groups:
+      base-images:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
 
   # Java client sample — openai-java 4.x moved its model packages, so a version
   # bump alone ships a non-compiling sample (no CI job builds Java). DISABLED

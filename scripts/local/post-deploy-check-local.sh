@@ -32,6 +32,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
+# The local Qdrant's API key (docker-compose.yml requires one): the environment's, else .env's.
+if [[ -z "${QDRANT_API_KEY:-}" && -f "${REPO_ROOT}/.env" ]]; then
+  QDRANT_API_KEY="$(sed -n 's/^QDRANT_API_KEY=//p' "${REPO_ROOT}/.env" | tail -n 1 | tr -d '\r')"
+fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -158,7 +162,8 @@ else
   for tenant in "${TENANTS[@]}"; do
     # Collection name = rag_<tenant_id> with hyphens preserved (see seed_qdrant_tenants.py).
     COLLECTION="rag_${tenant}"
-    RESPONSE=$(curl -s "http://localhost:6333/collections/${COLLECTION}" 2>/dev/null || echo "")
+    RESPONSE=$(curl -s -H "api-key: ${QDRANT_API_KEY:-}" "http://localhost:6333/collections/${COLLECTION}" \
+      2>/dev/null || echo "")
     if [[ "$RESPONSE" == *'"status":"ok"'* ]]; then
       success "Collection '${COLLECTION}' exists"
     else

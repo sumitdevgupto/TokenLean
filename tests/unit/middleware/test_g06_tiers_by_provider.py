@@ -75,6 +75,105 @@ def test_resolve_tiers_pass_through_when_provider_unresolved(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# A tenant's tier picks (portal model preferences, or the operator's tenants.<id> block)
+# win over the provider ladder. They were stored and shown as in effect, and ignored.
+# --------------------------------------------------------------------------- #
+_BY_PROVIDER = {"tiers": _OPENAI_LADDER,
+                "tiers_by_provider": {"openai": _OPENAI_LADDER, "anthropic": _ANTHRO_LADDER}}
+
+
+def _family(model):
+    return ("anthropic" if model.startswith("claude")
+            else "openai" if model.startswith("gpt") else "mistral")
+
+
+def _g6_tiers(tiers):
+    return {"groups": {"G6_routing": {"tiers": tiers}}}
+
+
+class _Ctx:
+    def __init__(self, config=None, overrides=None, tenant_id="acme"):
+        self.config = config or {}
+        self.tenant_config_overrides = overrides
+        self.tenant_id = tenant_id
+
+
+def test_a_tenant_pick_wins_within_the_requested_family(monkeypatch):
+    monkeypatch.setattr(g06_routing, "_tier_provider", _family)
+    got = g06_routing._resolve_tiers(_BY_PROVIDER, "gpt-4o", {"simple": ["gpt-4.1-nano"]})
+    assert got == {**_OPENAI_LADDER, "simple": ["gpt-4.1-nano"]}
+
+
+def test_a_tenant_pick_wins_for_another_providers_request(monkeypatch):
+    """The tenant chose that model; untouched tiers keep the request's own ladder."""
+    monkeypatch.setattr(g06_routing, "_tier_provider", _family)
+    got = g06_routing._resolve_tiers(_BY_PROVIDER, "claude-sonnet-4-5", {"simple": ["gpt-4.1-nano"]})
+    assert got == {**_ANTHRO_LADDER, "simple": ["gpt-4.1-nano"]}
+
+
+def test_picks_route_a_family_that_has_no_ladder(monkeypatch):
+    monkeypatch.setattr(g06_routing, "_tier_provider", _family)
+    got = g06_routing._resolve_tiers(_BY_PROVIDER, "mistral-small-latest", {"medium": ["gpt-4o"]})
+    assert got == {"medium": ["gpt-4o"]}
+
+
+def test_without_picks_nothing_changes(monkeypatch):
+    monkeypatch.setattr(g06_routing, "_tier_provider", _family)
+    assert g06_routing._resolve_tiers(_BY_PROVIDER, "claude-haiku-4-5", {}) is _ANTHRO_LADDER
+    assert g06_routing._resolve_tiers(_BY_PROVIDER, "mistral-small-latest", {}) is None
+    # The flat path already carries the picks, merged into `tiers` by the loader.
+    flat = {"tiers": _OPENAI_LADDER}
+    assert g06_routing._resolve_tiers(flat, "gpt-4o", {"simple": ["gpt-4.1-nano"]}) is _OPENAI_LADDER
+
+
+def test_tenant_picks_come_from_the_portal_settings():
+    ctx = _Ctx(config=_g6_tiers(_OPENAI_LADDER), overrides=_g6_tiers({"simple": ["gpt-4.1-nano"]}))
+    assert g06_routing._tenant_tier_picks(ctx) == {"simple": ["gpt-4.1-nano"]}
+
+
+def test_the_platform_ladder_is_not_a_pick():
+    assert g06_routing._tenant_tier_picks(_Ctx(config=_g6_tiers(_OPENAI_LADDER))) == {}
+
+
+def test_the_operator_block_is_applied_last_and_wins():
+    config = {"tenants": {"acme": _g6_tiers({"simple": ["gpt-4o"], "complex": " claude-opus-4 "})}}
+    ctx = _Ctx(config=config,
+               overrides=_g6_tiers({"simple": ["gpt-4.1-nano"], "medium": ["gpt-4o"]}))
+    assert g06_routing._tenant_tier_picks(ctx) == {
+        "simple": ["gpt-4o"], "medium": ["gpt-4o"], "complex": ["claude-opus-4"]}
+
+
+def test_another_tenants_block_does_not_count():
+    config = {"tenants": {"other": _g6_tiers({"simple": ["gpt-4o"]})}}
+    assert g06_routing._tenant_tier_picks(_Ctx(config=config)) == {}
+
+
+@pytest.mark.parametrize("overrides", [
+    {"groups": "oops"}, {"groups": {"G6_routing": ["x"]}}, _g6_tiers("simple"),
+    _g6_tiers({"simple": 5, "medium": [1, " ", None], "fast": ["gpt-4o"]}),
+], ids=["groups-not-a-dict", "g6-not-a-dict", "tiers-not-a-dict", "bad-values"])
+def test_malformed_settings_are_ignored(overrides):
+    assert g06_routing._tenant_tier_picks(_Ctx(config={"tenants": ["x"]}, overrides=overrides)) == {}
+
+
+@pytest.mark.parametrize("pick, routed", [
+    ({"simple": ["gpt-4.1-nano"]}, "gpt-4.1-nano"),
+    (None, "claude-haiku-4-5"),
+], ids=["tenant-pick", "platform-ladder"])
+async def test_a_request_is_routed_to_the_tenants_pick(make_ctx, minimal_config, monkeypatch,
+                                                      pick, routed):
+    monkeypatch.setattr(g06_routing, "_tier_provider", _family)
+    monkeypatch.setattr(g06_routing, "_tier_reachable", lambda m: True)
+    minimal_config["groups"]["G6_routing"] = {"enabled": True, "classifier": "heuristic",
+                                              **_BY_PROVIDER}
+    ctx = make_ctx(model="claude-sonnet-4-5", params={"x_complexity": "simple"},
+                   config=minimal_config)
+    ctx.tenant_config_overrides = _g6_tiers(pick) if pick else None
+    out = await g06_routing.G06Routing().process_request(ctx)
+    assert out.routed_model == routed
+
+
+# --------------------------------------------------------------------------- #
 # Shipped template — ladders are well-formed + calibration-safe
 # --------------------------------------------------------------------------- #
 def _template_g06():

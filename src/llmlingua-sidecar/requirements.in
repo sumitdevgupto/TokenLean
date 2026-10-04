@@ -1,0 +1,8 @@
+# What this image needs. scripts/compile-requirements.sh resolves it into requirements.txt with
+# every version pinned. torch stays out of those pins (a PyPI pin pulls the CUDA build): the
+# Dockerfile installs the CPU build of the version named here, so the pins are resolved against it.
+torch==2.14.0
+llmlingua>=0.2.2
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0

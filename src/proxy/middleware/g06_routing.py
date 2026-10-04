@@ -16,16 +16,28 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import litellm
+from prometheus_client import Counter
 
 from middleware import RequestContext, record_provider_call
 from middleware import langfuse_tracing
 from middleware.g06_rules import effective_cfg, match_for_ctx
-from savings.calculator import count_messages_tokens, estimate_cost
+from savings.calculator import estimate_cost
 from config_loader import get_default_model, get_known_models, get_providers
-from providers import build_litellm_call, get_adapter, outgoing_params_for
+from providers import (
+    build_litellm_call, get_adapter, outgoing_messages_for, outgoing_params_for,
+)
+from providers.resilience import describe_error, request_timeout_for
 
 logger = logging.getLogger(__name__)
 GROUP = "G06"
+
+# A tenant routing-rule pattern that ran out of the request's regex time budget
+# (g06_rules.MATCH_BUDGET_SECONDS) and so counted as no match: a runaway pattern.
+RULE_PATTERN_TIMEOUTS = Counter(
+    "token_opt_g06_rule_pattern_timeouts_total",
+    "G06 routing-rule regex searches stopped at the time budget (counted as no match)",
+    ["tenant_id"],
+)
 
 
 async def _timed_llm(ctx: RequestContext, coro, model: str = ""):
@@ -61,14 +73,14 @@ async def _timed_llm(ctx: RequestContext, coro, model: str = ""):
     finally:
         try:
             ctx.llm_elapsed_ms += (time.time() - t0) * 1000.0
-        except Exception:
-            pass
+        except Exception as err:
+            logger.debug("LLM time not added: %r", err)
         if model:
             try:
                 from providers.resilience import note_provider_outcome
                 note_provider_outcome(_tier_provider(model) or "", _exc, ctx.config)
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("provider outcome not recorded: %r", err)
 
 
 def record_routing_step(ctx: RequestContext) -> None:
@@ -332,9 +344,10 @@ def _log_cascade_tier_reachability(ctx: RequestContext, cfg: Dict[str, Any]) -> 
     on_unreach = str(cfg.get("on_unreachable_tier", "fallback")).lower()
     if unreachable:
         logger.warning(
-            "[%s] G06 cascade tier check: %d/%d tier model(s) UNREACHABLE (no API key / ambient "
-            "creds for their provider): %s. on_unreachable_tier=%s → requests routed to these will "
-            "%s. Fix: point the tier at a keyed provider's model, or configure the missing key.",
+            "[%s] G06 cascade tier check: %d/%d tier model(s) have no PLATFORM API key / ambient "
+            "creds for their provider: %s. A tenant's own (BYOK) key for that provider still "
+            "reaches them; for other tenants, on_unreachable_tier=%s → requests routed to these "
+            "will %s. Fix: point the tier at a keyed provider's model, or configure the key.",
             ctx.request_id, len(unreachable), len(models), ", ".join(unreachable), on_unreach,
             "return a clean 503" if on_unreach == "error" else "fall back to the requested model",
         )
@@ -345,7 +358,40 @@ def _log_cascade_tier_reachability(ctx: RequestContext, cfg: Dict[str, Any]) -> 
         )
 
 
-def _resolve_tiers(cfg: Dict[str, Any], model: str) -> Optional[Dict[str, List[str]]]:
+_TIER_NAMES = ("simple", "medium", "complex")
+
+
+def _tenant_tier_picks(ctx) -> Dict[str, List[str]]:
+    """The tiers this tenant set, as ``{tier: [models]}``: the model preferences it stored in
+    the portal, then the operator's ``tenants.<id>`` block, which the pipeline applies after
+    them and so wins. Read from those sources because, once merged into ``ctx.config``, a
+    tenant's setting cannot be told apart from the platform's. Malformed nodes are ignored."""
+    def _tiers(node: Any) -> Dict[str, Any]:
+        for key in ("groups", "G6_routing", "tiers"):
+            node = node.get(key) if isinstance(node, dict) else None
+        return node if isinstance(node, dict) else {}
+
+    config = getattr(ctx, "config", None)
+    tenants = config.get("tenants") if isinstance(config, dict) else None
+    operator = (tenants.get(getattr(ctx, "tenant_id", "default"))
+                if isinstance(tenants, dict) else None)
+    picks: Dict[str, List[str]] = {}
+    for source in (getattr(ctx, "tenant_config_overrides", None), operator):
+        for tier, models in _tiers(source).items():
+            if tier not in _TIER_NAMES:
+                continue
+            if isinstance(models, str):
+                models = [models]
+            if isinstance(models, list):
+                models = [m.strip() for m in models if isinstance(m, str) and m.strip()]
+                if models:
+                    picks[tier] = models
+    return picks
+
+
+def _resolve_tiers(cfg: Dict[str, Any], model: str,
+                   tenant_picks: Optional[Dict[str, List[str]]] = None,
+                   ) -> Optional[Dict[str, List[str]]]:
     """Pick the active tier ladder for a request, given its model.
 
     - ``tiers_by_provider`` configured → route WITHIN the requested model's provider
@@ -357,6 +403,11 @@ def _resolve_tiers(cfg: Dict[str, Any], model: str) -> Optional[Dict[str, List[s
       byte-identical to the pre-existing behaviour and is the one every
       calibration/benchmark config takes (they carry no ``tiers_by_provider``), so the
       published savings baseline is unaffected by construction.
+    - A tier the TENANT set (``tenant_picks``, from ``_tenant_tier_picks``) wins over the
+      provider's ladder for every request of that tenant, as the portal shows it — even a
+      request for another provider's model: the tenant chose that model, which is not the
+      misroute the guarantee above prevents. Tiers the tenant did not set keep the ladder.
+      On the flat path the picks are already merged into ``tiers``.
 
     Returns a tiers dict (possibly empty → the existing no-op rule fires), or ``None``
     to signal 'pass the request through, keep the requested model'.
@@ -365,11 +416,11 @@ def _resolve_tiers(cfg: Dict[str, Any], model: str) -> Optional[Dict[str, List[s
     if isinstance(tbp, dict) and tbp:
         fam = _tier_provider(model)
         fam_tiers = tbp.get(fam) if fam else None
-        if isinstance(fam_tiers, dict) and any(
-            fam_tiers.get(t) for t in ("simple", "medium", "complex")
-        ):
-            return fam_tiers
-        return None
+        if not (isinstance(fam_tiers, dict) and any(fam_tiers.get(t) for t in _TIER_NAMES)):
+            fam_tiers = None
+        if tenant_picks:
+            return {**(fam_tiers or {}), **tenant_picks}
+        return fam_tiers
     return cfg.get("tiers", {})
 
 
@@ -398,6 +449,9 @@ _TIER_ORDER = {"simple": 0, "medium": 1, "complex": 2}
 _VALID_STRATEGIES = ("priority", "cascade", "weighted", "round_robin", "least_latency", "canary")
 _RR_COUNTERS: Dict[str, int] = {}                 # tier-key → rotating index (per worker)
 _MODEL_LATENCY_EWMA: Dict[str, float] = {}        # model → EWMA of served LLM latency (ms)
+_MODEL_FAILED_AT: Dict[str, float] = {}           # model → when a call to it last failed
+_FAILED_MODEL_HOLD_S = 300.0                      # least_latency passes it over this long
+_clock = time.monotonic
 
 
 def record_model_latency(model: str, ms: float, alpha: float = 0.3) -> None:
@@ -408,8 +462,18 @@ def record_model_latency(model: str, ms: float, alpha: float = 0.3) -> None:
             return
         prev = _MODEL_LATENCY_EWMA.get(model)
         _MODEL_LATENCY_EWMA[model] = ms if prev is None else (alpha * ms + (1 - alpha) * prev)
-    except Exception:  # pragma: no cover - observability must never break a call
-        pass
+        _MODEL_FAILED_AT.pop(model, None)
+    except Exception as exc:  # pragma: no cover - observability must never break a call
+        logger.debug("model latency not recorded: %r", exc)
+
+
+def record_model_failure(model: str) -> None:
+    """A call to `model` failed on the provider's side: `least_latency` passes it over for
+    _FAILED_MODEL_HOLD_S, then tries it again. Only successes are measured, so a model whose
+    every call failed stayed unmeasured, sorted as the fastest and was picked on every
+    request, each paying a failed call and the failover. Called from main.py. Never raises."""
+    if model:
+        _MODEL_FAILED_AT[model] = _clock()
 
 
 def stable_bucket(key: Any, mod: int) -> int:
@@ -474,7 +538,7 @@ def _select_from_tier(models: List[str], cfg: Dict[str, Any], ctx, tier_label: s
             return models[0]
         point = stable_bucket(rid, 10_000) / 10_000.0 * total
         acc = 0.0
-        for m, wi in zip(models, w):
+        for m, wi in zip(models, w, strict=True):
             acc += wi
             if point < acc:
                 return m
@@ -483,9 +547,17 @@ def _select_from_tier(models: List[str], cfg: Dict[str, Any], ctx, tier_label: s
     if strategy == "least_latency":
         # Pick the candidate with the lowest observed EWMA latency. An unmeasured model
         # sorts first (EWMA 0) so it gets bootstrapped, then the split converges to the
-        # fastest. Falls back to models[0] when nothing is measured yet.
-        best = min(models, key=lambda m: _MODEL_LATENCY_EWMA.get(m, 0.0))
-        return best
+        # fastest. Falls back to models[0] when nothing is measured yet. A model whose call
+        # failed in the last _FAILED_MODEL_HOLD_S sorts after every other (by latency among
+        # themselves, should all have failed).
+        now = _clock()
+
+        def _rank(m: str):
+            failed_at = _MODEL_FAILED_AT.get(m)
+            held = failed_at is not None and now - failed_at < _FAILED_MODEL_HOLD_S
+            return (held, _MODEL_LATENCY_EWMA.get(m, 0.0))
+
+        return min(models, key=_rank)
 
     return models[0]
 
@@ -544,11 +616,14 @@ _JUDGE_SYSTEM_PROMPT = (
 
 
 async def _classify_llm_judge(
-    messages: List[Dict], params: Dict, cfg: Dict[str, Any]
+    messages: List[Dict], params: Dict, cfg: Dict[str, Any],
+    ctx: Optional[RequestContext] = None,
 ) -> str:
     """
     Call a cheap judge model to classify complexity.
     Returns tier string; falls back to heuristic on any error/timeout.
+    With ``ctx`` the call is recorded as a side call (G18 prices it), and the judge's
+    provider key is the served tenant's, as for the request's own call.
     """
     judge_model = cfg.get("judge_model", "")
     if not judge_model:
@@ -569,7 +644,8 @@ async def _classify_llm_judge(
     ]
 
     try:
-        _judge_key = await _resolve_provider_key(judge_model, params.get("_auth_tenant_id") or "default")
+        _tenant = getattr(ctx, "tenant_id", None) or params.get("_auth_tenant_id") or "default"
+        _judge_key = await _resolve_provider_key(judge_model, _tenant)
         _judge_model, _judge_kwargs = build_litellm_call(judge_model, get_providers(), _judge_key)
         response = await asyncio.wait_for(
             litellm.acompletion(
@@ -581,6 +657,8 @@ async def _classify_llm_judge(
             ),
             timeout=timeout_ms / 1000,
         )
+        if ctx is not None:
+            record_provider_call(ctx, judge_model, response, side=True)
         content = (
             response.get("choices", [{}])[0]
             .get("message", {})
@@ -612,7 +690,8 @@ async def _classify_llm_judge(
 
 
 async def _classify_cascade(
-    messages: List[Dict], params: Dict, cfg: Dict[str, Any]
+    messages: List[Dict], params: Dict, cfg: Dict[str, Any],
+    ctx: Optional[RequestContext] = None,
 ) -> str:
     """
     Fast heuristic first; escalate to llm_judge only when confidence is low
@@ -623,7 +702,7 @@ async def _classify_cascade(
     judge_model = cfg.get("judge_model", "")
     if confidence >= threshold or not judge_model:
         return tier
-    return await _classify_llm_judge(messages, params, cfg)
+    return await _classify_llm_judge(messages, params, cfg, ctx=ctx)
 
 
 async def _execute_three_tier_cascade(
@@ -699,6 +778,12 @@ async def _execute_three_tier_cascade(
         out.pop("stream", None)
         return out
 
+    def _tier_messages(model: str) -> List[Dict[str, Any]]:
+        """The conversation as a tier's provider should receive it: prompt-cache markers
+        (the caller's, or G21's for the routed model) only for a provider that caches by
+        marker — the rule every provider call follows (providers.outgoing_messages_for)."""
+        return outgoing_messages_for(get_adapter(model, get_providers()), ctx.messages)
+
     # Cost is judged as input + expected output (0-output undercounts reasoning tiers,
     # whose output tokens dominate cost), as a delta vs the previous tier and against
     # the caller's own model.
@@ -762,9 +847,10 @@ async def _execute_three_tier_cascade(
         _t1_model, _t1_kwargs = build_litellm_call(tier1_model, get_providers(), provider_key)
         tier1_response = await _timed_llm(ctx, litellm.acompletion(
             model=_t1_model,
-            messages=ctx.messages,
+            messages=_tier_messages(tier1_model),
             **_t1_kwargs,
             **_t1_passthrough,
+            timeout=request_timeout_for(ctx.config, tier1_model),
         ), model=tier1_model)
 
         def _dump(resp: Any) -> Dict[str, Any]:
@@ -804,9 +890,10 @@ async def _execute_three_tier_cascade(
                         _retry_pt.pop(_budget_key, None)
                         retry_response = await _timed_llm(ctx, litellm.acompletion(
                             model=_t1_model,
-                            messages=ctx.messages,
+                            messages=_tier_messages(tier1_model),
                             **_t1_kwargs,
                             **_retry_pt,
+                            timeout=request_timeout_for(ctx.config, tier1_model),
                         ), model=tier1_model)
                         logger.info(
                             "G06 cascade: tier1 response truncated by injected %st cap — retried uncapped",
@@ -815,7 +902,8 @@ async def _execute_three_tier_cascade(
                         return final_model, _dump(retry_response)
                     except Exception as exc:
                         logger.warning(
-                            "G06 cascade: uncapped tier1 retry failed (%s) — serving capped response", exc
+                            "G06 cascade: uncapped tier1 retry failed (%s) — serving capped response",
+                            describe_error(exc),
                         )
             return final_model, _dump(final_response)
 
@@ -825,7 +913,7 @@ async def _execute_three_tier_cascade(
         # escalated every "medium" query all the way to the complex tier.)
         if judge_model:
             confidence = await _timed_llm(ctx, _evaluate_response_confidence(
-                ctx.messages, tier1_response, judge_model, ctx.tenant_id
+                ctx.messages, tier1_response, judge_model, ctx.tenant_id, ctx=ctx
             ))
         else:
             confidence = _heuristic_response_confidence(tier1_response, cfg)
@@ -870,9 +958,10 @@ async def _execute_three_tier_cascade(
                     _t2_model, _t2_kwargs = build_litellm_call(tier2_model, get_providers(), tier2_provider_key)
                     tier2_response = await _timed_llm(ctx, litellm.acompletion(
                         model=_t2_model,
-                        messages=ctx.messages,
+                        messages=_tier_messages(tier2_model),
                         **_t2_kwargs,
                         **_tier_params(tier2_model),
+                        timeout=request_timeout_for(ctx.config, tier2_model),
                     ), model=tier2_model)
                     logger.info("G06 cascade: escalated to tier2 model %s", tier2_model)
                     # Tier2 succeeded — promote it as the best fallback before confidence check
@@ -881,14 +970,15 @@ async def _execute_three_tier_cascade(
                     best_cost = tier2_cost
                     # Re-evaluate confidence after tier2; if still low, try tier3
                     if judge_model:
-                        confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model, ctx.tenant_id))
+                        confidence2 = await _timed_llm(ctx, _evaluate_response_confidence(ctx.messages, tier2_response, judge_model, ctx.tenant_id, ctx=ctx))
                     else:
                         confidence2 = _heuristic_response_confidence(tier2_response, cfg)
                     if confidence2 >= confidence_threshold:
                         logger.info("G06 cascade: using tier2 model %s (confidence %.2f)", tier2_model, confidence2)
                         return await _serve(tier2_model, tier2_response)
                 except Exception as exc:
-                    logger.warning("G06 cascade tier2 failed: %s, rolling back to %s", exc, best_model)
+                    logger.warning("G06 cascade tier2 failed: %s, rolling back to %s",
+                                   describe_error(exc), best_model)
                     return await _serve(best_model, best_response)
 
         # Tier 3: Escalate to complex model (only if the request classifies complex)
@@ -910,14 +1000,16 @@ async def _execute_three_tier_cascade(
                 _t3_model, _t3_kwargs = build_litellm_call(tier3_model, get_providers(), tier3_provider_key)
                 tier3_response = await _timed_llm(ctx, litellm.acompletion(
                     model=_t3_model,
-                    messages=ctx.messages,
+                    messages=_tier_messages(tier3_model),
                     **_t3_kwargs,
                     **_tier_params(tier3_model),
+                    timeout=request_timeout_for(ctx.config, tier3_model),
                 ), model=tier3_model)
                 logger.info("G06 cascade: escalated to tier3 model %s", tier3_model)
                 return await _serve(tier3_model, tier3_response)
             except Exception as exc:
-                logger.warning("G06 cascade tier3 failed: %s, rolling back to best tier (%s)", exc, best_model)
+                logger.warning("G06 cascade tier3 failed: %s, rolling back to best tier (%s)",
+                               describe_error(exc), best_model)
                 return await _serve(best_model, best_response)
 
         # No further escalation available (tiers exhausted or capped) — return the best
@@ -925,8 +1017,10 @@ async def _execute_three_tier_cascade(
         return await _serve(best_model, best_response)
 
     except Exception as exc:
-        logger.error("G06 cascade tier1 failed: %s", exc)
-        return None, {"error": str(exc)}
+        # Class and status only: a provider error's text can carry key material and the
+        # base_url, and main.py logs this error again.
+        logger.error("G06 cascade tier1 failed: %s", describe_error(exc))
+        return None, {"error": describe_error(exc)}
 
 
 def _escalation_block_reason(
@@ -1004,11 +1098,13 @@ def _heuristic_response_confidence(response: Any, cfg: Dict[str, Any]) -> float:
 
 
 async def _evaluate_response_confidence(
-    messages: List[Dict], response: Any, judge_model: str, tenant_id: str = "default"
+    messages: List[Dict], response: Any, judge_model: str, tenant_id: str = "default",
+    ctx: Optional[RequestContext] = None,
 ) -> float:
     """
     Use a judge model to evaluate confidence in the tier1 response.
-    Returns confidence score 0.0-1.0.
+    Returns confidence score 0.0-1.0. With ``ctx`` the judge call is recorded as a side
+    call, so G18 prices it.
     """
     try:
         response_text = (
@@ -1036,6 +1132,8 @@ async def _evaluate_response_confidence(
             ),
             timeout=2.0,
         )
+        if ctx is not None:
+            record_provider_call(ctx, judge_model, judge_response, side=True)
 
         content = (
             judge_response.get("choices", [{}])[0]
@@ -1060,6 +1158,15 @@ async def _evaluate_response_confidence(
         return 0.5
 
 
+# RouteLLM's threshold per router for ~50% strong-model calls: `routellm.calibrate_threshold
+# --strong-model-pct 0.5` on its published Chatbot Arena scores. A threshold only means
+# something for the router it was calibrated on. bert is the default router: its checkpoint
+# is Apache-2.0 (MIT base model), while mf's has no licence and causal_llm's is a Meta Llama 3
+# derivative (see THIRD_PARTY_LICENSES.md).
+_ROUTELLM_THRESHOLDS = {"bert": 0.4066, "mf": 0.11593, "sw_ranking": 0.21647, "causal_llm": 0.0962}
+_ROUTELLM_DEFAULT_ROUTER = "bert"
+
+
 async def _classify_routellm(
     messages: List[Dict], params: Dict, cfg: Dict[str, Any]
 ) -> str:
@@ -1070,8 +1177,9 @@ async def _classify_routellm(
     routellm_cfg = cfg.get("routellm", {})
     sidecar_url = routellm_cfg.get("url", "")
     timeout_ms = routellm_cfg.get("timeout_ms", 500)
-    router = routellm_cfg.get("router", "mf")
-    threshold = routellm_cfg.get("threshold", 0.11593)
+    router = routellm_cfg.get("router", _ROUTELLM_DEFAULT_ROUTER)
+    threshold = routellm_cfg.get(
+        "threshold", _ROUTELLM_THRESHOLDS.get(router, _ROUTELLM_THRESHOLDS[_ROUTELLM_DEFAULT_ROUTER]))
     model_map = routellm_cfg.get("model_map", {"weak": "simple", "strong": "complex"})
     weak_model = routellm_cfg.get("weak_model", "")
     strong_model = routellm_cfg.get("strong_model", "")
@@ -1085,14 +1193,16 @@ async def _classify_routellm(
         return tier
 
     # P8: the mf/sw_ranking routers compute OpenAI embeddings in the sidecar. If no OpenAI
-    # key is configured (e.g. an Anthropic/Gemini-only deployment), degrade to the causal_llm
-    # router (a local classifier, no embeddings) so routing still works. See docs/config-reference.md.
+    # key is configured (e.g. an Anthropic/Gemini-only deployment), use the bert router (a
+    # local classifier, no embeddings) at bert's own threshold: the configured one was
+    # calibrated for the other router. If bert cannot run either, the sidecar call fails and
+    # the heuristic below decides. See docs/config-reference.md.
     if router in ("mf", "sw_ranking") and not _openai_key_available():
         logger.warning(
             "G06 RouteLLM: router=%r needs OpenAI embeddings but no OpenAI key is set — "
-            "falling back to the causal_llm router", router,
+            "using the bert router at its threshold %s instead", router, _ROUTELLM_THRESHOLDS["bert"],
         )
-        router = "causal_llm"
+        router, threshold = "bert", _ROUTELLM_THRESHOLDS["bert"]
 
     payload = {
         "messages": messages,
@@ -1103,8 +1213,12 @@ async def _classify_routellm(
     }
 
     try:
+        # On GCP routellm-svc requires Cloud Run IAM: without an identity token every call
+        # was refused. Nothing is attached locally (compose) or for a URL not on run.app.
+        from ml_models import cloud_run_auth_headers
+        headers = await asyncio.to_thread(cloud_run_auth_headers, sidecar_url)
         async with httpx.AsyncClient(timeout=timeout_ms / 1000) as client:
-            response = await client.post(f"{sidecar_url}/route", json=payload)
+            response = await client.post(f"{sidecar_url}/route", json=payload, headers=headers)
             response.raise_for_status()
             result = response.json()
             routed_model = result.get("routed_model")
@@ -1146,9 +1260,9 @@ async def _dispatch_classifier(
         tier, _ = _classify_heuristic(ctx.messages, ctx.params)
         return tier
     if classifier == "llm_judge":
-        return await _classify_llm_judge(ctx.messages, ctx.params, cfg)
+        return await _classify_llm_judge(ctx.messages, ctx.params, cfg, ctx=ctx)
     if classifier == "cascade":
-        return await _classify_cascade(ctx.messages, ctx.params, cfg)
+        return await _classify_cascade(ctx.messages, ctx.params, cfg, ctx=ctx)
     if classifier == "routellm":
         return await _classify_routellm(ctx.messages, ctx.params, cfg)
     # Unknown classifier → default to cascade
@@ -1178,7 +1292,7 @@ class G06Routing:
                     )
             return ctx
 
-        tiers = _resolve_tiers(cfg, ctx.model)
+        tiers = _resolve_tiers(cfg, ctx.model, _tenant_tier_picks(ctx))
         if tiers is None:
             # tiers_by_provider is configured but the requested model's provider has no
             # ladder → pass the request through untouched. Never cross-provider misroute:
@@ -1249,7 +1363,8 @@ class G06Routing:
         # reachability + cost-floor guards below) means a rule-pinned model inherits both
         # guards automatically.
         if not user_override_attempted and cfg.get("rules"):
-            rule = match_for_ctx(ctx, cfg)
+            rule = match_for_ctx(ctx, cfg, on_timeout=lambda _pattern: RULE_PATTERN_TIMEOUTS.labels(
+                tenant_id=getattr(ctx, "tenant_id", "default")).inc())
             if rule:
                 eff_cfg = effective_cfg(cfg, rule)
                 matched_rule_id = str(rule.get("id", "?"))
@@ -1348,8 +1463,13 @@ class G06Routing:
         # provider has no usable credential — that becomes a downstream 503. Per
         # G6_routing.on_unreachable_tier: 'fallback' (default) serves the caller's OWN model
         # (they chose it, so its key is present); 'error' keeps the unreachable model so main.py's
-        # provider-key guard returns a clean 503 with the reason logged here.
-        if selected_model and selected_model != model_requested and not _tier_reachable(selected_model):
+        # provider-key guard returns a clean 503 with the reason logged here. Reachable means
+        # a platform credential, or (strict BYOK, where the managed service seeds no platform
+        # key) this tenant's own key for the provider: the platform check alone sent every
+        # routed request back to the requested model there.
+        if (selected_model and selected_model != model_requested
+                and not _tier_reachable(selected_model)
+                and await _resolve_provider_key(selected_model, ctx.tenant_id) is None):
             _provider = _tier_provider(selected_model) or "?"
             _mode = str(cfg.get("on_unreachable_tier", "fallback")).lower()
             if _mode == "error":

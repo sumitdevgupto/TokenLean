@@ -27,8 +27,17 @@ Policy modes (per-tenant via ``groups.G31_context_trust.mode``):
 
 The engine lives in ``guardrails/injection.py`` (OSS core). This middleware only
 applies policy + records observability; it carries attack *categories* + rule ids —
-never raw content — into metrics/audit. The managed red-team ruleset feed (extra_rules)
-is the commercial enrichment; the static default ruleset ships OSS.
+never raw content — into metrics/audit. Operators add rules through ``extra_rules``; the
+static default ruleset ships OSS.
+
+Managed rules: the commercial managed ruleset feed writes its rules to
+``managed_extra_rules``. They run record-only by default: a match is counted
+(``token_opt_context_trust_managed_recorded_total``) and audited
+(``context_trust.managed_recorded``) and the request is left alone, so their false positives
+can be measured first. ``managed_rules: enforce`` (the operator's switch, deployment-wide
+or per tenant) or ``managed_rules_enforce: true`` (a tenant's own opt-in) makes them act
+like any other rule under ``mode``. A tenant can only opt in: it cannot switch off
+enforcement the operator set.
 
 PII pass (opt-in, ``pii_mode``): G30 scans the user prompt for PII via G29, but the same
 indirect path applies — a retrieved RAG document or stored memory can carry PII (an SSN
@@ -48,7 +57,7 @@ from typing import Any, Dict, List, Optional
 
 from middleware import RequestContext, coerce_mode, resolve_group_config
 from guardrails import content_filter_response
-from guardrails.injection import InjectionScanner, InjectionVerdict
+from guardrails.injection import InjectionScanner, InjectionVerdict, tenant_capped_threshold
 from guardrails.pii import PiiDetector, mask_matches, PHI_ENTITIES, DEFAULT_ENTITIES
 
 logger = logging.getLogger(__name__)
@@ -67,6 +76,18 @@ _DEFAULT_SCAN_ROLES = ["system", "tool"]
 _PROXY_SUMMARY_MARKER = "[Conversation summary — earlier turns]"
 
 
+def _rules(raw) -> tuple:
+    """The well-formed ``[id, category, severity, regex]`` rules of a config list."""
+    return tuple(tuple(r) for r in (raw or []) if isinstance(r, (list, tuple)) and len(r) == 4)
+
+
+def _managed_enforced(cfg: Dict[str, Any]) -> bool:
+    """Whether the managed rules act: the operator enforces them, or the tenant opted in.
+    The portal offers tenants only the opt-in, so a tenant cannot undo the operator's."""
+    return (str(cfg.get("managed_rules", "record")).strip().lower() == "enforce"
+            or cfg.get("managed_rules_enforce") is True)
+
+
 def _is_proxy_summary(msg: Dict[str, Any]) -> bool:
     content = msg.get("content")
     return (msg.get("role") == "system"
@@ -81,16 +102,22 @@ class G31ContextTrust:
         # (sig, InjectionScanner) in ONE attribute so a concurrent config rebuild swaps
         # it atomically (GIL) — mirrors G30. Recompiling the ruleset per request is waste.
         self._scanner_cache: Optional[tuple] = None
+        # The managed rules on their own, for the record-only pass (same discipline).
+        self._record_cache: Optional[tuple] = None
         # Same single-attribute atomic-swap discipline for the PII detector (mirrors G29).
         self._detector_cache: Optional[tuple] = None
 
     def _config(self, ctx: RequestContext) -> Dict[str, Any]:
-        return resolve_group_config(ctx, "G31_context_trust")
+        # As G30: a tenant may not raise its own threshold past a shipped rule.
+        return tenant_capped_threshold(resolve_group_config(ctx, "G31_context_trust"),
+                                       getattr(ctx, "tenant_config_overrides", None),
+                                       "G31_context_trust")
 
     def _get_scanner(self, cfg: Dict[str, Any]) -> InjectionScanner:
         threshold = float(cfg.get("threshold", 0.5))
-        extra = cfg.get("extra_rules") or []
-        extra_tuples = tuple(tuple(r) for r in extra if isinstance(r, (list, tuple)) and len(r) == 4)
+        extra_tuples = _rules(cfg.get("extra_rules"))
+        if _managed_enforced(cfg):
+            extra_tuples += _rules(cfg.get("managed_extra_rules"))
         sig = (threshold, extra_tuples)
         cache = self._scanner_cache             # single atomic read (no torn pair)
         if cache is not None and cache[0] == sig:
@@ -122,6 +149,8 @@ class G31ContextTrust:
             return  # passthrough — scanner does not run
 
         scan_roles = set(cfg.get("scan_roles", _DEFAULT_SCAN_ROLES))
+        # Before the main pass, which may strip what the managed rules would have matched.
+        self._record_managed(ctx, cfg, scan_roles)
         scanner = self._get_scanner(cfg)
 
         if mode == "strip":
@@ -143,6 +172,50 @@ class G31ContextTrust:
         if mode == "block":
             ctx.security_blocked = True
             ctx.security_block_response = self._refusal(ctx, cfg)
+
+    # ── Managed rules, record-only ──────────────────────────────────────────────
+    def _record_managed(self, ctx: RequestContext, cfg: Dict[str, Any], scan_roles) -> None:
+        """Run the managed rules on their own and record which matched, changing nothing.
+        Not run once they are enforced: they are part of the main scan then."""
+        managed = _rules(cfg.get("managed_extra_rules"))
+        if not managed or _managed_enforced(cfg):
+            return
+        scanner = self._get_record_scanner(managed, float(cfg.get("threshold", 0.5)))
+        matched: List[str] = []
+        for msg in ctx.messages or []:
+            if msg.get("role") not in scan_roles:
+                continue
+            for text in _iter_text(msg.get("content")):
+                verdict = scanner.scan(text)
+                if verdict.matched and verdict.rule_id not in matched:
+                    matched.append(verdict.rule_id)
+        if not matched:
+            return
+        _merge(ctx.context_trust_managed_recorded, matched)
+        self._emit_record_metric(ctx, matched, cfg)
+        logger.info("[%s] G31 managed rules (record-only) matched: %s",
+                    ctx.request_id, ",".join(matched))
+
+    def _get_record_scanner(self, managed: tuple, threshold: float) -> InjectionScanner:
+        sig = (threshold, managed)
+        cache = self._record_cache              # single atomic read (no torn pair)
+        if cache is not None and cache[0] == sig:
+            return cache[1]
+        scanner = InjectionScanner(rules=list(managed), threshold=threshold)
+        self._record_cache = (sig, scanner)     # single atomic swap
+        return scanner
+
+    def _emit_record_metric(self, ctx, rule_ids: List[str], cfg) -> None:
+        if not cfg.get("metrics_enabled", True):
+            return
+        try:
+            from middleware.g18_observability import CONTEXT_TRUST_MANAGED_RECORDED_TOTAL
+            for rule_id in rule_ids:
+                CONTEXT_TRUST_MANAGED_RECORDED_TOTAL.labels(
+                    tenant_id=getattr(ctx, "tenant_id", "default"), rule_id=rule_id,
+                ).inc()
+        except Exception as exc:  # never let metrics break the request
+            logger.debug("[%s] G31 managed-rule metric emit failed: %s", ctx.request_id, exc)
 
     # ── PII pass (retrieved context) ────────────────────────────────────────────
     def _run_pii(self, ctx: RequestContext, cfg: Dict[str, Any]) -> None:

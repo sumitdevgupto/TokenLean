@@ -1,14 +1,21 @@
 # Configuration Reference — `config/config.yaml.template`
 
 All parameters are externalised in `config.yaml`, hot-reloaded every 60 seconds with no restart.
+A reload that cannot be read, or that has no top-level section the running config has (as a
+partly written file would), is not applied: the running config stays, the proxy logs an error
+and counts it in `token_opt_config_reload_failures_total`. Removing a whole section takes a
+restart.
 
 - **Local Docker:** edit `config/config.yaml` directly (mounted into the proxy container).
 - **GCP:** the proxy reads `config.yaml` from GCS — modify and re-upload:
   `gsutil cp config/config.yaml gs://<bucket>/config/config.yaml`
 
 Per-group parameter files under `config/params/` are merged into this config alphabetically at
-startup (`params_dir`), so a group's tuning can live in its own file. This reference covers the
-optimisation groups **G0–G28** (28 implemented); the tables below show the most
+startup (`params_dir`), so a group's tuning can live in its own file. Put group settings under
+`groups:`, naming only the keys you change (for example `groups: {g22_deduplication: {enabled:
+false}}`); the group's other keys keep this file's values. A group key set at the top level of a
+params file is read by nothing, and the proxy logs a warning. This reference covers the
+optimisation groups **G0–G28** (27 implemented; G27 is reserved); the tables below show the most
 commonly tuned keys per group, not every field.
 
 ## Top-level sections
@@ -73,15 +80,17 @@ guardrails never reached a provider — those echo `"sent": null` with a
 
 At request time the effective config for a tenant resolves in this order (most specific wins):
 
-1. **`tenant_configs` (Postgres)** — per-tenant overrides written by the customer portal
+1. **`tenants.<id>` YAML block** — operator-only escape hatch in the main config. Merged
+   after the portal's overrides, so the operator's value wins where both set a key.
+2. **`tenant_configs` (Postgres)** — per-tenant overrides written by the customer portal
    (G-group knobs, default model, cascade tiers). Deep-merged into the base config;
    propagates within ~60 s (in-process TTL cache).
-2. **`tenants.<id>` YAML block** — operator-only escape hatch in the main config.
 3. **Base config** — this file (+ `params_dir` files), the platform defaults.
 
 A tenant's default-model override sets both `proxy.default_model` and
 `proxy.fallback_request_model`; cascade-tier overrides set the head model of
-`groups.G6_routing.tiers.<simple|medium|complex>`. Provider **keys** are never part of
+`groups.G6_routing.tiers.<simple|medium|complex>` and win over `tiers_by_provider` for
+that tenant's requests. Provider **keys** are never part of
 config — per-tenant keys (BYOK, commercial layer) live encrypted in `tenant_provider_keys`
 and resolve per (provider, tenant) through `providers/key_resolver.py`. The OSS default
 resolver uses the global `LLM_KEY_<PROVIDER>` env / Secret Manager keys, so self-host
@@ -92,11 +101,11 @@ behaviour is unchanged.
 | Parameter | Default | Description |
 |---|---|---|
 | `tiers.<tier>` | `{}` | Per-pricing-tier rps/rph defaults (`requests_per_minute`, `requests_per_hour`) |
-| `per_tenant.<id>` | `{}` | Per-tenant overrides (most specific after `per_user`/`per_team`) |
+| `per_tenant.<id>` | `{}` | Per-tenant overrides (most specific after `per_user`/`per_team`). Every override (`per_user`, `per_team`, `per_tenant`, `tiers`) is merged over `default`, so one that sets only `requests_per_minute` keeps the default `requests_per_hour` |
 | `quota.enabled` | `false` | Monthly request-quota gate from `billing.rate_card.<tier>.included_requests` — 429 `quota_exceeded` past the cap. OSS default OFF |
 | `quota.grace_pct` | `10` | Allowance past `included_requests` before rejecting |
 | `quota.exempt_tenants` | `[admin, default]` | Never quota-gated |
-| `trial.enabled` | `false` | Per-tenant free-trial gate (N days AND M served-2xx requests, whichever first). Expiry → **402 `trial_expired`**. OSS default OFF; per-tenant state (`status`/`started_at`/`days`/`max_requests`/`generation`) lives in `tenant_configs.config_overrides.trial`, set at runtime by the admin console. Trial requests are flagged on `usage_events` and excluded from invoices |
+| `trial.enabled` | `false` | Per-tenant free-trial gate (N days AND M served-2xx requests, whichever first; a batched request counts when it is queued). Expiry → **402 `trial_expired`**. OSS default OFF; per-tenant state (`status`/`started_at`/`days`/`max_requests`/`generation`) lives in `tenant_configs.config_overrides.trial`, set at runtime by the admin console. Trial requests are flagged on `usage_events` and excluded from invoices |
 | `trial.exempt_tenants` | `[admin, default]` | Never trial-gated |
 | `trial.warn_pcts` | `[80, 90]` | %% of the driving dimension at which a one-shot `trial.threshold` webhook fires (per trial generation); exhaustion fires one `trial.expired` |
 
@@ -106,21 +115,60 @@ behaviour is unchanged.
 |---|---|---|
 | `enabled` | `false` | Master switch for the background purge loop |
 | `interval_hours` | `24` | How often the purge pass runs |
-| `audit_days` | `0` | Purge `audit_events` older than N days (0 = keep forever) |
+| `audit_days` | `0` | Purge `audit_events` older than N days (0 = keep forever; under the restricted database role below, never fewer than 90) |
 | `usage_days` | `0` | Purge `usage_events` older than N days (0 = keep forever; clamped to a 400-day billing floor) |
 | `cache_l2_expired_cleanup` | `true` | Delete `cache_l2` rows past `expires_at` |
 
+**What the audit log records.** `audit_events` holds configuration changes (admin console,
+portal, tenant keys, webhooks) and the G29-G32 security events (entity types and counts,
+never content). It does not hold a row per request: the per-request record is
+`usage_events`, one row per served request for billing and usage reporting, kept for
+`usage_days`. The `audit.enabled` switch (`config/params/audit.yaml.template`) is not read:
+it gated a per-request audit row that was never written, and that branch was removed
+(2026-10-01).
+
+**Audit-log protection (optional).** By default the proxy's database role owns
+`audit_events` and could rewrite it. To have the database stop that, run
+`python -m audit.enforcement` from `src/proxy` as the tables' owner (`DATABASE_URL`), with
+`RUNTIME_DB_PASSWORD` set: it creates a restricted role (`--role`, default
+`tokenlean_runtime`) that can read and insert audit rows but change them only through two
+database functions, right-to-erasure pseudonymisation and retention (never a row younger than
+90 days). Then point the proxy's `DATABASE_URL` at that role. That role cannot change the
+owner's tables, so its startup schema steps skip them: after an upgrade, start the proxy
+once with the owner's `DATABASE_URL` (its schema steps then run), re-run the command so
+the grants cover any new table, and switch back.
+
 ### ip_allowlist
 
-App-level source-IP allowlist (CIDR) for the proxy request path. **Off by default** — OSS/self-host is open; the managed enterprise deploy turns it on. Enforced in core `_authenticate` for the `/v1/*` routes (`net/ip_allowlist.py`).
+App-level source-IP allowlist (CIDR) for the proxy request path, enforced in core `_authenticate` for the `/v1/*` routes (`net/ip_allowlist.py`). The global list is **off by default** — OSS/self-host is open — and no deploy script turns it on. A tenant's own list is enforced either way.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Master switch. When off, no IP filtering happens |
-| `trust_x_forwarded_for` | `true` | Use the first `X-Forwarded-For` hop as the client IP (Cloud Run / the portal front the proxy). When false, the direct socket peer is used |
-| `global_cidrs` | `[]` | CIDRs applied to **all** tenants (e.g. an office / VPN egress). Unioned with each tenant's own list |
+| `enabled` | `false` | Switches on `global_cidrs`. A tenant's own list is enforced whether this is on or off |
+| `global_cidrs` | `[]` | CIDRs applied to **all** tenants (e.g. an office / VPN egress) while `enabled` is on. Unioned with each tenant's own list |
 
-A request is allowed iff its source IP is in `global_cidrs ∪ tenant_cidrs`. **Empty global + empty per-tenant ⇒ the tenant is unrestricted.** Per-tenant CIDRs are set from the adminconsole (`PUT /api/v1/admin/tenants/{id}/ip-allowlist`) and stored in the tenant's key metadata; `global_cidrs` is edited here in `config.yaml` (hot-reloaded; the adminconsole exposes it read-only at `GET /api/v1/admin/ip-allowlist`).
+A request is allowed iff its source IP is in `global_cidrs ∪ tenant_cidrs`. **Empty global + empty per-tenant ⇒ the tenant is unrestricted.** Per-tenant CIDRs are set from the admin console (`PUT /api/v1/admin/tenants/{id}/ip-allowlist`) and stored in the metadata of every key of that tenant; a key issued to the tenant later, or by rotation, carries the same list. `global_cidrs` is edited here in `config.yaml` (hot-reloaded; the admin console exposes it read-only at `GET /api/v1/admin/ip-allowlist`). The source IP is resolved as [`network`](#network) describes. The old `trust_x_forwarded_for` key is deprecated: while `network.trusted_proxy_hops` is unset it still counts (`true` = 1, `false` = 0) and a warning is logged.
+
+### network
+
+How the caller's address is found, for the IP allowlist and the portal login limits (`net/client_ip.py`). `X-Forwarded-For` is written left to right: a client may put anything in it, and each proxy in front of TokenLean appends the address its connection came from. So the caller is the entry `trusted_proxy_hops` places from the **right**; the left-most entry is never trusted.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `trusted_proxy_hops` | `auto` | Proxies in front of TokenLean that append to `X-Forwarded-For`. `auto` = 1 on Cloud Run (its front end appends one entry), else 0 (no proxy in front: the socket peer is used). Set 1 behind nginx or a load balancer that appends the peer, and 2 behind Google's external Application Load Balancer, which appends two entries |
+| `client_ip_mode` | `enforce` | `observe` keeps the old first-entry address and logs where the new one differs (a rollout step). The `CLIENT_IP_MODE` environment variable overrides it |
+
+The header is ignored (the socket peer is used) when it has fewer entries than `trusted_proxy_hops`, or arrives on more than one line. An entry at that position that is not an IP address is treated as invalid (denied by the allowlist) rather than skipped. The forwarding headers (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) are removed once the address is resolved, so no handler reads them again and they never reach the request parameters. A trusted forwarder may vouch for the address it saw: when `TRUSTED_FORWARDER_AUDIENCE` and `TRUSTED_FORWARDER_SA_EMAIL` are both set, a request carrying `TokenLean-Client-IP` and a Google-signed ID token for that service account in `TokenLean-Forwarder-Token` uses the vouched address. The managed portal does this; without both variables nothing is vouched.
+
+### ingress
+
+Which request-body fields the OpenAI-compatible endpoint (`/v1/chat/completions`) accepts. It admits the documented Chat Completions parameters, TokenLean's own client parameters (every `x_*` field, plus `workflow_id`, `template_id`, `rag_query`, `session_id`, `user_id` and the rest), and any names listed here. Every other field is dropped, and its **name** is logged (never its value), so you can see if a client relies on one. The Anthropic and Gemini endpoints build their parameters from fixed fields and are unaffected.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `extra_allowed_params` | `[]` | Extra body-field names to admit, e.g. `["metadata"]`. Global config only — a tenant override cannot extend it |
+
+Two limits hold whatever you list: a field starting with `_` (the proxy's internal flags) is never admitted, and litellm call arguments — `api_base`, `base_url`, `api_key`, `extra_headers`, `extra_body`, `fallbacks`, `timeout`, `mock_*` and similar — are stripped again before the upstream call, on every provider path.
 
 ### proxy
 | Parameter | Default | Description |
@@ -191,6 +239,7 @@ all provider traffic.
 | `failure_threshold` | `5` | Consecutive 5xx/timeout failures that trip a provider's circuit breaker (skipped in favour of fallbacks until cooldown elapses, then one half-open probe). |
 | `cooldown_seconds` | `30` | Breaker-open duration **and** per-tenant 429-cooldown TTL. |
 | `retry_base_delay` | `0.2` | Exponential-backoff base (seconds) between same-model retries. |
+| `request_timeout_seconds` | `300` | How long every provider call waits for the provider to send anything: the whole answer, or for a stream each next chunk. A call that runs out is a timeout: retried, then failed over, and counted by the breaker. Applies to the main call and its failover, and to the G06 tier cascade, G11 repair, G13 batch and summariser calls. A provider's own `resilience:` block can override it. While this layer is on, the main call and its failover turn the client library's own retries off, so only `num_retries` applies. Not a positive number → the default. |
 | `model_lockout` | `false` | **Per-model lockout** — finer than the provider breaker: quarantine ONE degraded/deprecated model while the provider's other models keep serving. When on, a model that racks up `model_failure_threshold` model-scoped 5xx/timeout failures is skipped on subsequent requests for `model_lockout_seconds` (then one probe re-tests). Off → provider-breaker-only behaviour is unchanged. Gauge: `token_opt_model_lockout_state{provider,model}` (1=locked). |
 | `model_failure_threshold` | `3` | Model-scoped failures that lock one model. Deliberately **lower** than `failure_threshold` so a bad model is isolated before it can open the whole-provider breaker; a fallback model's success then resets the provider breaker, keeping the provider live. |
 | `model_lockout_seconds` | `cooldown_seconds` | Lock duration before a single probe re-tests the model (defaults to `cooldown_seconds` when unset). |
@@ -266,11 +315,14 @@ Request throttling at the gate (token bucket). Lives at the top level, not under
 | `enabled` | `true` | Enable LLMLingua-2 prompt compression |
 | `min_tokens_to_compress` | `200` | Skip compression below this token count |
 | `compression_ratio_target` | `0.5` | Target ratio (0.5 = 50% compression) |
-| `sidecar_url` | `http://llmlingua-svc` | LLMLingua-2 Cloud Run internal URL |
+| `sidecar_url` | `http://llmlingua-svc:8080/compress` | LLMLingua-2 sidecar URL. On GCP a Cloud Run URL: the service requires IAM, and the proxy sends its identity token to `https://*.run.app` hosts only. Empty turns LLMLingua off. The GCP deploy sets it to the sidecar's `/compress` route only with `LLMLINGUA_ON_GCP=true` (it changes tenants' compressed prompts) and empties it otherwise |
 | `compress_user_messages` | `false` | ⚠ Opt-in: also apply compression to `role="user"` messages (default only compresses `system`/`assistant`) |
 | `compress_system_prompt` | `false` | ⚠ Opt-in: compress the system prompt (keep off — losing system policy/facts degrades answers) |
+| `layered_composition_enabled` | `false` | Compose a system prompt from `layers` (`base`, `role`, `task`, `dynamic`), for system messages that ask for it. A message asks by carrying a `layer_context` object, whose keys fill the layers' `{placeholders}`, and its content is **replaced** by the composed prompt. No other message is changed, and G01 removes the `layer_context` field before the provider call. |
 
 Also in the template: `min_chars_to_compress` (100), `reduction_threshold` (0.95), `selective_context_enabled` (false) / `selective_context_max_tokens` (4000), `force_reserve_digit` (true, protects IDs/dates), the Kompress-v2 fallback `kompress_enabled` (true) / `kompress_model` / `kompress_max_new_tokens` (256), and `deterministic_fallback` (false — a zero-LLM regex prose compressor that engages only when neither LLMLingua nor Kompress reduced a message, e.g. sidecar down; protects code/paths/identifiers byte-for-byte).
+
+**What compression never changes.** A message containing a fenced code block (a line opening with ```` ``` ```` or `~~~`) is not sent to LLMLingua, Kompress or Selective Context; the deterministic fallback, which keeps code byte-for-byte, may still shorten the prose around it. Any compression is refused, and the original message sent, if it drops a negation or a scope word (`not`, `never`, `only`, `up to`, `except`, …) or if it changes or moves inline code, a URL, a file path, an identifier (`snake_case`, `camelCase`, `name(args)`, `a.b.c`) or a version number. Each refusal is logged as a warning naming the reason.
 
 #### Prefix-cache floor (operator-only, default off)
 
@@ -283,7 +335,7 @@ as well**, since tool-description trimming and structured pruning shrink the sam
 
 | Parameter | Default | Description |
 |---|---|---|
-| `preserve_cacheable_prefix` | `false` | Stop shrinking the span your provider measures against its minimum cacheable size once doing so would cross that minimum. **Not** a blanket "stop compressing": the decision is arithmetic over the provider's own cache rates and the reuse actually observed, and G01 aims the span just *above* the minimum rather than abandoning the compression. Content outside the span is never cached, so it stays fully compressed either way. **Aiming at the minimum requires the LLMLingua compression sidecar** (`sidecar_url`) — it is the only engine here with a rate dial. Without it (not deployed, unreachable, or unable to land above the minimum) the span is instead **preserved whole**: still cheaper on a repeating prefix, but it gives back the whole prefix's compression rather than only the part that was at stake. |
+| `preserve_cacheable_prefix` | `false` | Stop shrinking the span your provider measures against its minimum cacheable size once doing so would cross that minimum. **Not** a blanket "stop compressing": the decision is arithmetic over the provider's own cache rates and the reuse actually observed, and G01 aims the span just *above* the minimum rather than abandoning the compression. Content outside the span is never cached, so it stays fully compressed either way. **Aiming at the minimum requires the LLMLingua compression sidecar** (`sidecar_url`) — it is the only engine here with a rate dial. Without it (not deployed, unreachable, or unable to land above the minimum) the choice is between compressing the span anyway and **preserving it whole**, and the same arithmetic picks the cheaper: with a small cache discount, keeping the whole span can cost more than compressing it. G08 and G19 can only trim or not, so they always make that comparison. |
 | `cacheable_prefix_margin` | `0.05` | Headroom above the minimum when aiming at it. Token counts are estimates and undershooting forfeits the entire discount. |
 | `assumed_prefix_reuse` | `1` | Reuse to assume before any has been observed. `1` means "assume none", which keeps the feature standing down until repeats are actually seen. Raising it on traffic whose prefixes do not repeat **costs money**. |
 | `prefix_reuse_window_seconds` | `300` | How long a prefix sighting counts toward the reuse total, as a **fixed** window: the first sighting starts the clock, and the count restarts once it expires (it is not renewed by later sightings, which would turn the reuse total into a lifetime count). Track your provider's prompt-cache TTL; too long over-counts reuse that has already expired. |
@@ -328,14 +380,19 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `enabled` | `true` | Enable doc pipeline |
 | `chunk_size_tokens` | `400` | ⚠ Chunk size for retrieval (smaller = fewer tokens, less context per chunk) |
 | `chunk_overlap_tokens` | `50` | Overlap between chunks |
+| `rag_fallback.enabled` | `true` | When G07's primary search finds nothing, try the fallback chain below (`false`: one strict search) |
 | `rag_fallback.top_k` | `5` | ⚠ Chunks retrieved in fallback (fewer = cheaper, lower recall) |
-| `rag_fallback.similarity_threshold` | `0.85` | ⚠ Min score to include a chunk (higher = stricter, may drop relevant context) |
-| `rag_fallback.strategies` | `[strict_hybrid, relaxed_hybrid, dense_only, sparse_only]` | Fallback retrieval order |
+| `rag_fallback.similarity_threshold` | `0.85` | ⚠ Min score for the strict strategy; `relaxed_hybrid` takes 0.15 less (and twice the chunks), `dense_only` 0.10 less (higher = stricter, may drop relevant context) |
+| `rag_fallback.strategies` | `[strict_hybrid, relaxed_hybrid, dense_only, sparse_only]` | Fallback retrieval order; the first that finds anything wins. `sparse_only` searches nothing yet (it needs a sparse query vector this path does not build) |
 | `fine_tuning.{enabled, min_docs, stability_days, auto_trigger}` | `true / 100 / 30 / false` | Fine-tuning break-even trigger |
-| `tika_sidecar.{enabled, url}` | `false / http://tika-svc:9998` | Apache Tika document extraction |
 | `sparse_model` / `dense_model` | `Qdrant/bm25` / `all-MiniLM-L6-v2` | Retrieval models |
 
-*(OOD detection `OOD_SIMILARITY_THRESHOLD` (0.65) / `OOD_MAX_RETRIES` (3) are env-only — see [appendix](#appendix--knob-coverage-caveats).)*
+**Tika.** The doc-pipeline job reads each file with Unstructured first. When Unstructured
+cannot read it or finds no text, the job asks the Tika sidecar at `TIKA_SIDECAR_URL` (the GCP
+deploy sets it to the `tika-svc` it deploys), which covers Excel, PowerPoint and many more
+formats. A file neither can read is refused, unless it is a plain-text file that really is
+UTF-8: the job stores nothing rather than its bytes. A `tika_sidecar.{enabled, url}` row was
+listed here until 2026-10-01; nothing read it.
 
 ### G4_bypass
 | Parameter | Default | Description |
@@ -343,7 +400,7 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `enabled` | `true` | Enable rules-based bypass |
 | `default_confidence_threshold` | `0.7` | ⚠ Min confidence to bypass (lower = bypass more, higher = only high-confidence) |
 | `keyword_weight` / `pattern_weight` | `0.4` / `0.6` | ⚠ Weights blended into the confidence score |
-| `db_cache_ttl_seconds` | `60` | How long DB-resolved rules are cached before re-fetch |
+| `db_cache_ttl_seconds` | `60` | How long the database's answer is kept before asking again: its rules, or that it has none (an empty or missing `bypass_rules` table), in which case the `rules` from config apply |
 | `rules` | `[]` | List of bypass rules — see `config/bypass-rules.yaml` |
 
 ### G5_cache
@@ -352,8 +409,32 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `enabled` | `true` | Enable L1+L2 caching |
 | `cache_scope` | `tenant` | `tenant` = key cache by tenant + request content (an answer is reused across providers within a tenant — max savings). `tenant+model` = also key on the **requested** model, so a tenant using several providers never gets one model's cached answer served to another. `tenant+system` = also key on a fingerprint of the **system prompt** — the semantic (L2) key embeds user turns only, so without this the same user question under a *restrictive* system prompt can be served an answer cached under a *laxer* one, bypassing the scope/persona/format constraint it encodes; enable when one tenant runs several personas, apps, or agents through one key (costs some hit-rate). `tenant+model+system` = both. Unrecognised values fail closed to `tenant` with a logged warning. Per-tenant override: `tenants.<id>.groups.G5_cache.cache_scope`. Default keeps keys byte-identical to prior behaviour (no cache invalidation). |
 | `l1_ttl_seconds` | `3600` | Redis exact-match TTL |
-| `l2_similarity_threshold` | `0.90` | Semantic similarity threshold (0.88–0.92 range) |
-| `l2_ttl_seconds` | `86400` | pgvector semantic cache TTL |
+| `l2_similarity_threshold` | `0.90` | Semantic similarity threshold (0.88–0.92 range). The lookup takes the tenant's nearest stored question through an HNSW index on `cache_l2.embedding`, which the proxy builds in the background (`CONCURRENTLY`) on first use, and serves it only within this threshold. pgvector 0.8 or later keeps the index scan going past other tenants' rows; on an older pgvector a tenant with few rows among many can miss (`ALTER EXTENSION vector UPDATE`) |
+| `l2_ttl_seconds` | `86400` | pgvector semantic cache TTL. Enforced on every read: a row past its expiry is never served. The store also deletes expired rows (one bounded batch per tenant every 5 minutes, more while a backlog remains), whether or not `retention` is enabled |
+| `auto_ttl_enabled` | `true` | Adapt both TTLs to the tenant's recent hit rate per tier, counted in hourly windows (the current and previous one): above 80% a new entry is stored for 25% longer, below 20% for 25% shorter, and with fewer than 10 lookups as configured. `false` = the configured TTLs, and no hit/miss counting |
+| `auto_ttl_min_multiplier` | `0.25` | Floor on an adapted TTL, as a multiple of the configured one. The adaptation is 25% either way, so only a value above `0.75` changes anything |
+| `auto_ttl_max_multiplier` | `2.0` | Ceiling on an adapted TTL, as a multiple of the configured one; only a value below `1.25` changes anything (`1.0` = never extend) |
+
+**What a cache entry is keyed on.** Besides the tenant, the messages and `cache_scope`, both
+tiers key on the request parameters that change the answer:
+- `tools`, `tool_choice`, `parallel_tool_calls`, `functions` and `function_call`;
+- `response_format`, `n`, `max_tokens` and `max_completion_tokens`;
+- the sampling parameters: `temperature`, `top_p`, `top_k`, `seed`, `stop`, the penalties,
+  `logit_bias`, `logprobs` and `top_logprobs`;
+- `reasoning_effort`, `thinking`, `modalities`, `audio`, `verbosity` and `web_search_options`;
+- TokenLean's own fields that change the prompt later in the pipeline: `json_schema` and
+  `x_json_output` (G11), `rag_query`, `x_rag_collection`, `x_rag_top_k` and
+  `x_jit_retrieval` (G07), and `session_id` and `x_session_id` (G10 session context).
+
+The exact-match tier (L1) also keys on each turn's tool calls (arguments verbatim), the call
+a tool result answers, and a message's `name`. Delivery and label fields (`stream`, `user`,
+`workflow_id`, …) do not split the cache.
+
+The semantic tier (L2) is skipped for a request whose user turns carry an image, audio or a
+file, and for one with no user text. L1 still applies to those requests.
+
+After upgrading, requests that set any of these parameters get new keys, so their cache
+entries are rebuilt once.
 
 ### G6_routing
 | Parameter | Default | Description |
@@ -361,7 +442,7 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `enabled` | `true` | Enable model routing |
 | `classifier` | `cascade` | Complexity classifier: `cascade` (default), `heuristic`, `llm_judge`, or `routellm` |
 | `cascade_execution` | `false` | When `classifier: cascade`, run the true tier1→tier2→tier3 execution cascade (call cheap model, escalate only if its answer is inadequate) instead of classify-then-route |
-| `strategy` | `priority` | Which model of a chosen tier's list to use (the classifier picks the tier; this picks *within* it). `priority` = the tier's first model (**default — byte-identical to historical behaviour; the savings baseline is unchanged**). `round_robin` = rotate across the tier's models (per worker). `weighted` = deterministic split by `strategy_weights`. `least_latency` = the tier model with the lowest observed served-latency EWMA (fed from real calls; falls back to the first model until measured). `canary` = `canary_pct`% to the tier's **second** model, the rest to the first. All strategies are deterministic (request-id hash / counter / EWMA), never random |
+| `strategy` | `priority` | Which model of a chosen tier's list to use (the classifier picks the tier; this picks *within* it). `priority` = the tier's first model (**default — byte-identical to historical behaviour; the savings baseline is unchanged**). `round_robin` = rotate across the tier's models (per worker). `weighted` = deterministic split by `strategy_weights`. `least_latency` = the tier model with the lowest observed served-latency EWMA (fed from real calls; falls back to the first model until measured; a model whose call failed on the provider's side — 5xx, timeout, connection — is passed over for 5 minutes, then tried again). `canary` = `canary_pct`% to the tier's **second** model, the rest to the first. All strategies are deterministic (request-id hash / counter / EWMA), never random |
 | `strategy_weights` | `{}` | For `strategy: weighted` — `{model: weight}` map; models absent from the map default to weight 1 |
 | `canary_pct` | `0` | For `strategy: canary` — percentage of traffic routed to the tier's second (candidate) model |
 | `least_latency_alpha` | `0.3` | For `strategy: least_latency` — EWMA smoothing factor (0–1) for the per-model latency estimate; higher reacts faster to recent calls, lower is smoother/slower to react. Hot-reloadable — no redeploy needed to tune it |
@@ -376,11 +457,10 @@ Knowledge ingestion — hybrid RAG chunking + fine-tuning trigger.
 | `cascade_tier1_max_tokens` | `512` | Output cap injected on the tier-1 probe call **only when the caller set no output budget under either `max_tokens` or `max_completion_tokens`** (a caller-supplied value always wins). Injected under whichever key the call already speaks, never both — sending both is a provider 400. Bounds the probe's cost. `0` = never inject; the provider default applies |
 | `cascade_retry_uncapped_on_truncation` | `true` | If the cascade settles on the tier-1 probe as the final answer but that answer was truncated by the injected cap (`finish_reason: length`), retry tier-1 once without the cap before serving — a self-inflicted truncation is never the customer's answer. No-op when the caller set `max_tokens` |
 | `expected_output_tokens_estimate` | `512` | Expected output tokens used **only for cost estimates** (escalation guards + cost-floor) when the request carries no output budget under `max_tokens` or `max_completion_tokens` |
-| `routellm.enabled` | `true` | Enable RouteLLM sidecar (when classifier=routellm) |
-| `routellm.sidecar_url` | `http://routellm-svc` | RouteLLM Cloud Run internal URL |
-| `routellm.router` | `mf` | RouteLLM router: `mf` (recommended), `sw_ranking`, or `random` |
-| `routellm.threshold` | `0.11593` | Cost threshold (calibrate per workload) |
-| `routellm.strong_model` | `gpt-4-1106-preview` | Strong/expensive model for RouteLLM |
+| `routellm.url` | `http://routellm-svc:8081` | RouteLLM sidecar URL (the GCP deploy rewrites the default to the service's own URL) |
+| `routellm.router` | `bert` | RouteLLM router: `bert` (local classifier, Apache-2.0 checkpoint), `mf` or `sw_ranking` (need an OpenAI key; `mf`'s checkpoint has no licence), `causal_llm` (16 GB Meta Llama 3 derivative), or `random` |
+| `routellm.threshold` | `0.4066` | Cost threshold. Each router has its own scale; unset, G06 uses the router's RouteLLM calibration for ~50% strong-model calls: `bert` 0.4066, `mf` 0.11593, `sw_ranking` 0.21647, `causal_llm` 0.0962 |
+| `routellm.strong_model` | `gpt-4o` | Strong/expensive model for RouteLLM |
 | `routellm.weak_model` | `gpt-4o-mini` | Weak/cheap model for RouteLLM |
 | `routellm.timeout_ms` | `500` | Max wait for routing decision before fallback |
 | `tiers.simple` | `[gemini-flash-lite, ...]` | Simple task models (heuristic mode). The flat, single-provider ladder — used when `tiers_by_provider` is absent |
@@ -401,6 +481,10 @@ provider family** — a model is matched to its provider by that provider's `mod
 - **Precedence:** when `tiers_by_provider` is present it is used instead of the flat `tiers`.
   The template's `openai` ladder mirrors the flat tiers, so OpenAI routing (and the published
   savings baseline) is **byte-identical** whether or not this block is present.
+- **A tenant's own tier picks win:** a tier a tenant set, in its portal model preferences or
+  in the operator's `tenants.<id>.groups.G6_routing.tiers`, replaces that tier of the ladder
+  for every request from that tenant, including a request for another provider's model (the
+  tenant chose that model). Tiers the tenant did not set keep the ladder.
 - **No ladder → pass-through:** a request whose provider family has no ladder here (you deleted
   it, or never added it) is served on its **requested** model, untouched — G06 never
   cross-provider misroutes.
@@ -456,7 +540,7 @@ Each rule: `{id, description?, enabled?, priority?, match, action}`.
 | `match.min_prompt_tokens` / `max_prompt_tokens` | Prompt-token bounds; `0`/absent = no bound |
 | `match.models` | Exact any-of vs the **requested** model |
 | `match.has_tools` | `true`/`false` vs whether the request carries tools |
-| `match.params` | `{param: [values]}` — AND across keys, any-of within. `X-*` headers arrive as `x_*` params (e.g. `X-Team` → `x_team`). These are raw, caller-supplied routing hints — a G06 rule may match them, but rate limiting (G00) and metric labels (G18) do **not** trust `x_team`; they use the gateway-verified team instead |
+| `match.params` | `{param: [values]}` — AND across keys, any-of within. `X-*` headers arrive as `x_*` params (e.g. `X-Team` → `x_team`); a rule sees every `X-*` header, though only TokenLean's own are kept with the request (the batch lane stores them). These are raw, caller-supplied routing hints — a G06 rule may match them, but rate limiting (G00) and metric labels (G18) do **not** trust `x_team`; they use the gateway-verified team instead |
 | `match.user_ids` | Any-of vs `ctx.user_id` (the `X-User-ID` header — **not** a `params` entry; only allow-listed user ids populate it) |
 | `action.tier` | Pin `simple`/`medium`/`complex` — the tier list + `strategy` layer then pick the model |
 | `action.model` | Pin an exact configured model (wins over `tier` if both are set) |
@@ -473,10 +557,11 @@ routing rules are skipped with it.)
 
 **RouteLLM Configuration Notes:**
 - The `mf` and `sw_ranking` routers require an OpenAI API key for embeddings (stored in Secret Manager as `routellm-openai-key`)
-- **No OpenAI key?** The proxy auto-degrades: if `router` is `mf`/`sw_ranking` and no OpenAI key is configured, it falls back to the `causal_llm` router (a local classifier, no embeddings) so routing still works for Anthropic/Gemini-only deployments
+- **No OpenAI key?** If `router` is `mf`/`sw_ranking` and no OpenAI key is configured, G06 logs a warning and uses the `bert` router (a local classifier, no embeddings) at bert's own threshold, so routing still works for Anthropic/Gemini-only deployments. If `bert` cannot run either, the heuristic decides
 - **Tier models must be reachable.** The default tiers/`weak_model`/`strong_model` are OpenAI models — an OpenAI-free deployment should point them at its own provider's models (e.g. `weak_model: claude-haiku-4-5`, `strong_model: claude-sonnet-4-5`). If a routed tier's provider has no credential, G6 logs the unreachable tier(s) once at first use and, per `on_unreachable_tier`, either falls back to the requested model (default) or returns a clean 503
-- The `mf` router is recommended for best performance with low latency
-- Calibrate the threshold using: `python -m routellm.calibrate_threshold --routers mf --strong-model-pct 0.5`
+- `bert` is the default because its checkpoint is Apache-2.0 (on MIT `xlm-roberta-base`); `mf`'s checkpoint carries no licence and `causal_llm`'s is a Meta Llama 3 derivative, so read [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) before choosing either
+- The sidecar only *decides*: RouteLLM's `route()` scores the last turn and the answer is `weak_model` or `strong_model` as configured here. No model is called, so nothing is billed (`mf` and `sw_ranking` still embed that turn with OpenAI). Each router loads on first use; `causal_llm` is a large local model (an 8B-parameter checkpoint in RouteLLM's release), so give the sidecar the memory it needs before choosing it (`bert`'s 1.1 GB fits the default 2 GB)
+- Calibrate the threshold using: `python -m routellm.calibrate_threshold --routers bert --strong-model-pct 0.5`
 - If the RouteLLM sidecar is unavailable, the proxy automatically falls back to heuristic routing
 - Switch between classifiers by changing `classifier` in config and re-uploading to GCS (no code deploy needed)
 
@@ -498,11 +583,17 @@ python scripts/validate-cascade.py \
 It runs each case tier-1 → LLM judge → optional tier-3 escalation, sweeps thresholds `[0.5 … 0.95]`, and reports accuracy, cost-saving %, and escalation rate per threshold — plus an optimal threshold (best accuracy keeping >50% cost saving) and per-`workload_tag` recommendations. Set the recommended value back into `cascade_confidence_threshold`. Run it before enabling the cascade, after changing tier models, when onboarding a new workload, or on suspected drift. It makes real (paid) LLM calls — keep validation sets small.
 
 ### G7_retrieval
+Retrieved documents go into a `[Retrieved context]` system message just before the latest
+user turn. Not first: they change with every query, and ahead of the caller's own system
+prompt they stopped the provider caching it. As a system message, G31 still scans them as
+untrusted context.
+
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable RAG retrieval optimisation |
 | `chunk_size_tokens` | `256` | Chunk size for RAG documents |
 | `top_k` | `3` | ⚠ Retrieve top-K before reranking (fewer = cheaper, lower recall) |
+| `max_top_k` | `50` | The most a caller's `X-Rag-Top-K` header (`x_rag_top_k`) may ask for; it replaces `top_k` for that request. A value that is not a whole number of at least 1 is ignored and `top_k` used |
 | `top_k_after_rerank` | `1` | ⚠ Inject only top-N after reranking |
 | `similarity_threshold` | `0.85` | ⚠ Minimum score to include a chunk (higher = stricter) |
 | `max_total_context_tokens` | `4000` | ⚠ Hard cap on total injected context |
@@ -514,18 +605,37 @@ It runs each case tier-1 → LLM judge → optional tier-3 escalation, sweeps th
 Also present: `dense_model`, `sparse_model`, `reranker_model`, `rrf_k` (60), `jit_retrieval_enabled` (true), `use_pgvector_fallback` (false).
 
 ### G8_tools
-Lazy tool-definition loading + MCP manifest fetch + scheduled pruning.
+Lazy tool-definition loading + MCP manifest fetch, and a daily check for registry tools the model has stopped calling (see `pruning` below).
 
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable tool loading |
 | `max_tools_per_agent` | `20` | ⚠ Prune tools beyond this count (too low → the model loses a tool it needs) |
 | `registry_path` | `gs://<bucket>/config/tool-registry.yaml` | Tool registry location. **Intent pruning only acts on tools listed here.** A requested tool with no registry entry is treated as intent `default` and is always KEPT — so until you add your own tools to this file, G08's pruning is a no-op and only `compress_descriptions` has any effect. The file ships seeded with example entries, not yours |
-| `compress_descriptions` | `true` | Compress tool/function `description` prose (deterministic regex, zero-LLM; manifests ride every agentic request). Code/paths/identifiers preserved byte-for-byte. |
+| `compress_descriptions` | `true` | Compress tool/function `description` prose (deterministic regex, zero-LLM; manifests ride every agentic request). Code/paths/identifiers preserved byte-for-byte. Only filler goes: "make sure", modal hedges such as "might", a degree word after a negation ("not just") and hyphenated compounds are kept, and no word changes case. A description whose compression would drop a negation or a bound is sent as written (G01's faithfulness check). |
 | `compress_description_fields` | `[description]` | Which string fields to compress when `compress_descriptions` is on |
 | `mcp_servers` | `null` | MCP servers — **list of `{url, filter_tools}` dicts** (not URL strings) |
-| `pruning.{enabled, inactivity_threshold_days, dry_run_first, schedule}` | `true / 30 / true / 0 2 * * *` | Scheduled removal of unused tools |
+| `pruning.{enabled, inactivity_threshold_days, dry_run_first, schedule}` | `true / 30 / true / 0 2 * * *` | A daily pass, per tenant, over the registry tools the model has stopped calling. See **Tool pruning** below. `schedule` is the daily time in UTC, as `M H * * *`; any other form runs every 24 h (`TOOL_PRUNING_INTERVAL_HOURS`). `dry_run_first: true` = report only. |
 | `registry_cache_ttl_seconds`, `mcp_manifest_cache_ttl_seconds`, `mcp_http_timeout_seconds`, `tool_usage_ttl_days` | `300 / 300 / 10 / 90` | **Config-first, `TOOL_*` env fallback** (`TOOL_REGISTRY_CACHE_TTL_SECONDS` etc.) — see [appendix](#appendix--knob-coverage-caveats) |
+
+**Usage records.** For each tool in the request that the registry or an MCP manifest
+names, G08 keeps when it was first and last offered and a count, and the response side adds
+when the model last called it (streamed or not). They are written in one pipelined Redis
+call per request, and each expires after `tool_usage_ttl_days`. A tool the registry does
+not name is never recorded, so a caller's own tool names never become Redis keys. The
+pruned status is looked up in one call per request too.
+
+**Tool pruning.** Once a day (`pruning.schedule`, UTC), for every tenant with usage
+records and against that tenant's own registry (an operator `tenants.<id>` override
+applies), G08 finds the registry tools that were offered for the whole
+`inactivity_threshold_days` window, are still being offered, and that the model did not
+call in it. A tool with no record is never one, since it may not have been sent yet. While
+`dry_run_first` is true (the default) the pass only reports them: an INFO log line per
+tenant and the `token_opt_tool_pruning_candidates{tenant_id}` gauge. Set it to `false` and
+it marks them pruned, and G08 drops them from that tenant's requests. A mark lapses after
+the same window, and the tool's record starts again, so it is offered and judged afresh. A
+request that names the tool (`tool_choice`, or a call earlier in the conversation) lifts
+the mark at once. One pass a day runs across all replicas.
 
 ### G9_context_schema
 Prose→schema compaction (Instructor library) with heuristic fallback. **Off by default.**
@@ -545,10 +655,30 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 |---|---|---|
 | `enabled` | `true` | Enable conversation memory management |
 | `sliding_window_turns` | `6` | ⚠ Keep last N turns verbatim (fewer = cheaper, less recent context) |
+| `memory_query_max_chars` | `400` | How much of the last user message a Mem0 or skills lookup sends. Unset = `MEMORY_QUERY_MAX_CHARS` (default `400`) |
 | `skills_top_k` | `2` | ⚠ Skills retrieved per task |
-| `skills_similarity_threshold` | `0.7` | ⚠ Min score to inject a skill |
-| `skills_qdrant_enabled` | `true` | `false` → non-Qdrant heuristic skill-injection fallback |
-| `summary_model` | `gemini-flash-lite` | Cheap model for history summarisation |
+| `skills_similarity_threshold` | `0.7` | ⚠ Min score to inject a skill. Unset = `SKILLS_SIMILARITY_THRESHOLD` (default `0.70`) |
+| `skills_qdrant_enabled` | `true` | How skills are looked up in the tenant's skills collection: `true` = a vector search; `false` = G7's hybrid search and reranker |
+| `summary_model` | `gpt-4o-mini` | Cheap model for history summarisation |
+| `mem0_enabled` | `false` | Mem0 long-term memory, through the Mem0 platform API. Needs `MEM0_API_URL` (`https://api.mem0.ai` for Mem0's hosted service) and `MEM0_API_KEY`; the first request logs a warning if either is missing or the mem0ai library did not import. See **Mem0 long-term memory** below |
+
+**Sessions:** a request carrying `session_id` or `x_session_id` (or the `X-Session-ID`
+header) keeps a session summary in Redis. A request that resends the conversation (more
+turns than the session's last request) gets nothing from it and costs no summary call; the
+sliding window still shortens a long history. A request with no more turns than last time (a
+client relying on the proxy to remember) gets the stored summary as a `[Session context]`
+system message, and the update summarises it with the new turns, so the memory builds up.
+Each session's first request is summarised once.
+
+**Mem0 long-term memory** (`mem0_enabled`) is kept per user of a tenant, and the user is the
+authenticated one: a legacy key's user, or an `X-User-ID` the tenant's allowlist accepted
+(`proxy.allow_user_id_header_override` on). A user id named in the request body is never
+used. A tenant key authenticates the tenant, not a user, so a request on one without an
+accepted `X-User-ID` gets no long-term memory (the first such request logs a warning): one
+memory for the whole tenant would mix what its users said. A request waits at most 2 s for
+its memories and goes on without them after that. The last assistant turn and the last user
+turn (500 characters each, plain text only) are then sent to Mem0 in the background. The
+mem0ai library's own usage analytics stay off unless you set `MEM0_TELEMETRY=true`.
 
 ### G11_output
 | Parameter | Default | Description |
@@ -556,6 +686,8 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | `enabled` | `true` | Enable output format control |
 | `enforce_max_tokens` | `true` | Auto-set max_tokens if not provided — from completion-size evidence only |
 | `fallback_max_tokens` | `null` | Optional static cap used ONLY while no completion-size evidence exists; `null` = leave uncapped until evidence (output length is not derivable from input length) |
+| `model_max_tokens` | per-model table | The ceiling on any cap G11 sets, looked up for the model the request will call (after G06 routing): exact name first, then the first entry the model name starts with |
+| `default_model_max_tokens` | `4096` | The ceiling for a model not in `model_max_tokens` |
 | `max_tokens_auto_tighten` | `false` | **Ships OFF (2026-09-08).** On, G11 derives a `max_tokens` cap from the observed sizes of past **completed** answers in this request's `(tenant, workflow_id, template_id)` bucket. A request that sets **neither** `workflow_id` nor `template_id` is **never** capped: with no way to tell workloads apart, the only evidence available is other workloads' answers, and capping a long-form answer from short-form ones cut 4 of 54 answers on the DS1 ablation and 6 of 27 probes on a live readiness sweep, on billed 200s. Enable it only for traffic that identifies its workload. |
 | `truncation_backoff_multiplier` | `2.0` | An answer cut off by a G11-set cap re-enters the evidence at cap×this **and raises a sticky per-bucket floor** (Redis, tenant-prefixed, same TTL as the history) that no later percentile may undercut. The floor is what makes the loop converge: the escalated history entry alone is one sample among many and ages out, so the cap fell back and re-cut the same request. |
 | `tighten_quantile` / `tighten_multiplier` | `0.95` / `2.0` | ⚠ Auto-tightening from the p95 of observed **completed** answer sizes (tenant + workload-scoped history; truncated/tool-call answers are never evidence). `tighten_multiplier` was `1.2` until 2026-09-08 — below the model's own same-prompt spread (measured up to 2.03× at temperature 0), so it truncated answers the model had already been observed to produce. |
@@ -566,14 +698,14 @@ Prose→schema compaction (Instructor library) with heuristic fallback. **Off by
 | `output_holdout.enabled` | `false` | A3 holdout: route a % of traffic to a control cohort that **skips** G11 shaping, so the real output-token reduction can be measured (treatment vs holdout) via the `g11_output_holdout_completion_tokens` metric. Opt-in — control traffic is intentionally un-optimised. |
 | `output_holdout.fraction` | `0.05` | Share of requests in the control cohort (0.0–1.0) |
 | `output_holdout.sticky_key` | `workflow_id` | Stable cohort key (sticky per conversation); falls back to `user_id` then `request_id` |
-| `validate_output` | `off` | Validate a **structured-output** answer (only when the request set `response_format` `json_object`/`json_schema`, or a `json_schema` param). `off` (no-op) / `flag` (record + annotate `_token_opt.output_validation`, non-mutating) / `repair` (one bounded corrective re-ask) / `block` (withhold with a content-filter 200, not cached). Emits `token_opt_output_schema_failures_total`. |
+| `validate_output` | `off` | Validate a **structured-output** answer (only when the request set `response_format` `json_object`/`json_schema`, or a `json_schema` param). `off` (no-op) / `flag` (record + annotate `_token_opt.output_validation`, non-mutating) / `repair` (one bounded corrective re-ask) / `block` (withhold with a content-filter 200, not cached; the call is still recorded at the provider's billed usage). Emits `token_opt_output_schema_failures_total`. |
 | `repair_fallback` | `flag` | When `repair`'s single re-ask is still invalid: `flag` (annotate + return) or `block` (withhold). Exactly one re-ask — never loops. |
 | `repair_max_tokens` | `null` | Cap on the corrective re-ask (`null` → reuse the request's `max_tokens`). |
 | `validate_block_message` | *(default text)* | Message returned when a malformed answer is withheld in `block` mode. |
 
 ### G12_reasoning
-Injects the provider's reasoning parameter for the effort tier G25 selected (or
-`default_effort` when G25 did not run).
+Injects the provider's reasoning parameter for the effort tier the request or G25 set, or
+else `default_effort` (see its row).
 
 **The `off` tier** means *"do not opt this request into optional reasoning"* — deliberately
 not *"guarantee zero reasoning tokens"*, because that promise cannot be kept on every
@@ -593,7 +725,7 @@ request itself, and exports it as `token_opt_reasoning_mode_total{mode}`: `off_h
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable reasoning budget injection |
-| `default_effort` | `medium` | `off` \| `low` \| `medium` \| `high` — validate per workload. Only consulted when G25 did not set an effort. |
+| `default_effort` | `medium` | `off` \| `low` \| `medium` \| `high` — validate per workload. Only consulted when neither the request nor G25 set an effort. The platform's value is capped at the provider's own default, as G25 caps its choice: Anthropic requests get no thinking (it is opt-in there), and the o-series never goes above `medium`. Raise a provider's default with `providers[].default_reasoning_effort`. A value the tenant set in the portal, or in the operator's `tenants.<id>` block, is used as it is. |
 | `effort_map.<tier>` | see template | Per-provider budgets. The `off` row is intentionally empty — `off` is the *absence* of a budget. **Quote the key** (`'off'`): bare `off` is the boolean `false` in YAML. |
 | `reasoning_suppression_prompts.<tier>` | low/medium set | Prompt text appended for that tier. No `off` entry: with reasoning already off there is nothing to suppress, so paying input tokens for it would be waste. **These bound verbosity, never completeness** — the pre-2026-09-08 medium text ("One brief step max, then final answer") dropped the named subject of the question on 4 of 30 graded DS18 requests while saving 49% of reasoning tokens. If you re-word them, keep "do not skip a step the correct answer requires". |
 
@@ -645,15 +777,40 @@ refused both when it would be stored and when an entry stored earlier would be s
 > Same shape as the documented G29/G30 response-scan and G32 tool-policy limitations.
 
 ### G13_batch
-Batch accumulation (Redis Streams) plus TOON compact notation — converts JSON arrays of uniform objects into pipe-delimited rows. The `toon_*` knobs gate when TOON fires so it never inflates tokens. All `toon_*` knobs honour per-tenant overrides (`tenants.<id>.groups.G13_batch`).
+Batch accumulation (Redis Streams) plus TOON compact notation — converts JSON arrays of uniform objects into pipe-delimited rows. The `toon_*` knobs gate when TOON fires so it never inflates tokens. All `toon_*` knobs honour per-tenant overrides (`tenants.<id>.groups.G13_batch`). Unless `toon_auto_detect` is on, TOON runs only when a system message carries a line written in the notation itself (`schema:name|age`); mentioning "schema" next to a markdown table does not turn it on. A block with a `|` or a line break in any value or key stays JSON, and `null`, an empty string and a key a row lacks are written `null`, `""` and an empty cell.
 
 **Provider-native batch lane (optional, default off):** when `provider_native: true`, a flushed batch is grouped by provider and submitted to a native Batch API (**50% discount** on latency-tolerant traffic) instead of looping `litellm.acompletion` per item at sync price. **OpenAI** uses the OpenAI SDK directly; **Anthropic/Gemini** route through litellm's unified batch API (`custom_llm_provider`), which normalises results to OpenAI shape. A background poller (`poll_batch_jobs` / `start_batch_poller`) maps completed results back to each `request_id`, served by the existing `/v1/batch/results/{id}` endpoint. A missing key, an unsupported provider, or a submit error → graceful fallback to the per-item loop (a failed provider is memoised for the process so it isn't re-attempted every flush). Applies only to requests tagged with `batch_topic`; quality-neutral (same model/inputs). *Anthropic/Gemini batch depends on the installed litellm's batch support for that provider and needs live verification.*
 
 **Flex / `service_tier`:** a request may set `service_tier` (e.g. `"flex"` — ~50% off, latency-tolerant) in its params. It is forwarded only to providers that accept it (OpenAI) and stripped for others (Anthropic/Gemini reject it), via `adapter.supports_service_tier()` in the outgoing-params build.
 
+**Which requests are batched:** one with a `batch_topic` listed in `batch_topics`, queued
+successfully, and none of these: tools in the request (G32 must see the tool calls), G29 in
+`mask` mode, or G30 `scan_response` on. A batched result skips the response pipeline, so those
+requests are answered normally. In G29's default `flag` mode a batched output is not scanned
+for PII, as with streaming.
+
+**Who can read a batched result:** the sending tenant is recorded as the request's owner
+before it is queued (a request whose owner cannot be recorded is answered normally), and the
+record lasts longer than any batch can wait. `GET /v1/batch/results/{id}` answers only that
+tenant or an admin key; any other caller, and every caller for an id with no owner on record,
+gets 404.
+
+**Limits:** a batched request is billed, and counts against the tenant's monthly quota and
+free trial, when it is queued. Its cost is known only when its answer arrives. The consumer
+then prices it from the usage the provider reported, as G18 prices a served call (at
+`batch_discount_multiplier` on the native lane), and adds it to the tenant's spend counter,
+which the spend cap reads. A request an admin key sends as the tenant counts against none
+of them.
+
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable batch processing + TOON |
+| `batch_topics` | `[]` | The topics a consumer reads. A request's `batch_topic` is batched only if it is listed here; any other topic is answered at once |
+| `max_backlog` | `10000` | Requests one tenant may have queued on a topic; beyond it that tenant's new requests are answered at once. Each tenant has its own stream per topic (`<tenant prefix>tok_opt:batch:<topic>`), so one tenant's backlog never fills a topic for the others (processed entries are deleted, so a stream holds only the backlog) |
+| `consumer_group` | `proxy-batch-consumers` | The Redis consumer group every instance's consumer joins |
+| `consumer_name` | *(unset)* | Unset (recommended) gives each process its own name. Instances sharing one name are a single consumer to Redis, which then cannot tell whose work an entry is |
+| `max_pending_ack_ms` | `30000` | A consumer keeps re-claiming the entries it is flushing, so an entry goes this long unclaimed only once its process has stopped; another consumer then retries it |
+| `max_attempts` | `3` | Deliveries of one queued request, the first included, before it is marked failed. A failure never replaces an answer already stored |
 | `provider_native` | `false` | Submit grouped items to the provider Batch API (OpenAI) for the 50% discount; off = per-item sync loop |
 | `completion_window` | `"24h"` | OpenAI Batch completion window |
 | `poll_interval_seconds` | `30` | How often the background poller checks outstanding native-batch jobs |
@@ -700,19 +857,21 @@ Agent-architecture enforcement — bounds system-prompt size and tool count.
 |---|---|---|
 | `enabled` | `true` | Enable loop control |
 | `max_iterations` | `10` | ⚠ Hard iteration limit per workflow (too low → workflow stops before completing) |
-| `starting_budget_tokens` | `10000` | ⚠ Initial token budget per workflow |
-| `compact_output_below_tokens` | `500` | ⚠ Inject compact-mode when budget < this |
+| `starting_budget_tokens` | `10000` | Token budget for a request that carries a `workflow_id`, measured against that conversation's own prompt: remaining = budget − prompt tokens, reported in the `x-token-opt-state` header. (It used to be a running total per workflow id that re-charged the whole history every turn and was shared by every conversation sending that id.) |
+| `compact_output_enabled` | `false` | Opt-in. When remaining < `compact_output_below_tokens`, append "Keep your answer brief: the token budget for this workflow is nearly used up." to the end of the system prompt. The start of the prompt, which the provider caches, is left unchanged. |
+| `compact_output_below_tokens` | `500` | Threshold for `compact_output_enabled` |
 | `confidence_stop_threshold` | `0.95` | ⚠ Stop early when confidence ≥ this (needs `x_confidence_score`) |
 | `wall_clock_timeout_seconds` | `300` | Hard wall-clock stop for a workflow |
 
 ### G18_observability
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Enable G18 observability (Prometheus counters + savings metrics) |
+| `enabled` | `true` | Enable G18 observability (Prometheus counters + savings metrics, export, tracing). Off, every answer is still priced: the spend counter, the spend cap and billing read that cost |
 | `langfuse_enabled` | `false` | Emit Langfuse traces. Requires `enabled` **and** Langfuse keys. Gates only trace emission (Prometheus/savings metrics run regardless). OSS default off; the commercial deploy sets it true. |
 | `langfuse_host` | `http://langfuse-svc` | **Not read by the proxy.** The Langfuse endpoint comes from the `LANGFUSE_HOST` environment variable (the local compose stack sets `http://langfuse:3000`); keys from `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`. Setting this key changes nothing |
 | `prometheus_enabled` | `true` | Expose `/metrics` Prometheus counters |
-| `label_values.team` / `label_values.feature` | *(unset)* | Allowlist for the `team` / `feature` metric label values. Unset = keep the value as-is (default). A list bounds cardinality: only `default` and the listed values keep their own label; anything else is folded to `other`. `team` is already the gateway-verified team; this mainly bounds a gateway's team space and the free-form `feature`. |
+| `capture_trace_content` | `false` | Store the raw prompt and response in Langfuse traces (all tenants share one Langfuse project). A tenant's override wins. Even when on, a request whose PII G29 or G31 found and left in place (`flag`, or a `block`) is traced without its text, and with it off spans keep only their counts |
+| `label_values.team` / `label_values.feature` | *(unset)* | Allowlist for the `team` / `feature` metric label values. A list bounds cardinality: only `default` and the listed values keep their own label; anything else is folded to `other`. `"*"` keeps every value as-is. Unset, `feature` (any caller's `X-Feature`) keeps only `default`, and `team`, already the gateway-verified team, keeps its value. |
 | `openllmetry_enabled` | `false` | Enable OTLP auto-instrumentation (set OTLP endpoint first). Needs the `traceloop-sdk` package, which the default image does not include — install it in your image, or the proxy logs a warning and leaves the feature off. Separate from Langfuse tracing (`langfuse_enabled`) |
 | `et_weights.input` | `1.0` | ET metric input weight |
 | `et_weights.cache_read` | `0.1` | ET metric cache-read weight |
@@ -721,7 +880,7 @@ Agent-architecture enforcement — bounds system-prompt size and tool count.
 | `batch_discount_multiplier` | `0.5` | Reporting-only: multiplier applied to `cost_actual` **only** for requests served via the native async batch lane (`_native_batch`); `1.0` elsewhere. |
 
 ### G19_headroom
-Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and response paths. Additive to G1's natural-language compression.
+Structured pruning of code/JSON/logs/text (line- and structure-based, not a syntax-tree parse). Runs on both request and response paths. Additive to G1's natural-language compression.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -731,16 +890,16 @@ Structured (AST-aware) pruning of code/JSON/logs/text. Runs on both request and 
 | `response_side_compress_answers` | `false` | Also rewrite the model's user-visible **answer** content (prose, code, logs, JSON alike — e.g. stripping code comments or deduping sentences). Off by default: the answer is what the caller reads, and rewriting it saves nothing on that call (the provider already generated and billed those output tokens). Response-side **tool results** are compressed regardless; request-side compression is unaffected. |
 | `detect_dominance_ratio` | `0.5` | Fraction of non-blank lines that must be code-shaped (or log-shaped) before a payload is pruned as code/logs rather than prose — guards against a single code fence or quoted log line reclassifying a whole prose message |
 | `min_length_to_compress` | `50` | Skip content shorter than this (chars) |
-| `compression_strategies.json` | `{remove_empty, dedupe_keys}` | Drop null/empty fields, dedupe repeated array structures |
-| `compression_strategies.code` | `{strip_comments, strip_whitespace, compress_imports}` | Remove comments/blank lines, collapse import blocks |
+| `compression_strategies.json` | `{remove_empty, dedupe_keys}` | Drop fields holding an empty list or object, dedupe repeated array structures. `null` and `""` are kept: a field that is null or empty is not the same as one that is absent. |
+| `compression_strategies.code` | `{strip_comments, strip_whitespace}` | Remove blank lines, and remove comments from a fenced block that names its language (every other line, imports included, is kept as written; a `compress_imports` key is no longer read): `#` for Python, shell, Ruby, YAML, TOML and similar; `//` for C, C++, C#, Java, JS/TS, Go, Rust, Swift, Kotlin and similar. Unlabelled code and other languages keep their comments, since `#` also starts `#include`, `#[derive]`, a shebang or a CSS colour. |
 | `compression_strategies.logs` | `{dedupe_lines, truncate_long_lines: 200, always_keep_severities: [ERROR, FATAL, CRITICAL, PANIC]}` | Dedupe repeated log lines, truncate long lines. Lines matching an `always_keep_severities` entry (whole-word, case-insensitive) are never folded into the dedup count — every occurrence survives verbatim (a recurring error is diagnostic signal, not noise); empty list reverts to timestamp-blind dedup of every line |
 | `compression_strategies.text` | `{dedupe_sentences, max_sentence_len: 0}` | Collapse duplicate sentences (`0` = no truncation) |
 
 G19 rewrites **every** role, including `system`, so it can shrink the span a provider
 measures against its minimum cacheable size. When
 `groups.G1_compression.preserve_cacheable_prefix` is on, G19 leaves the in-span messages
-whole rather than pruning them under that minimum; everything outside the span is pruned
-as usual. No new knob — see the prefix-cache floor under `G1_compression`.
+whole rather than pruning them under that minimum, when keeping them whole is the cheaper
+bill; everything outside the span is pruned as usual. No new knob — see the prefix-cache floor under `G1_compression`.
 
 ### g20_prompt_optimizer
 Inline application of prompts tuned by the offline optimiser (`scripts/run_prompt_optimization.py`). The heavy optimisation runs out-of-band; the middleware applies the learned templates.
@@ -758,6 +917,22 @@ Inline application of prompts tuned by the offline optimiser (`scripts/run_promp
 
 ### G21_cache_alignment
 Reorders messages so shared prefixes are contiguous for provider auto-caching, **and applies a provider cache policy v2**: it emits a deterministic, tenant-scoped OpenAI `prompt_cache_key` (so identical prefixes from a tenant route to the same cache shard, raising the hit rate) and supplies a per-provider `cache_read_multiplier` that lets G18 credit the **real** `cached_tokens` discount from the response into `cost_actual_usd` — replacing the old static `discount_pct` estimate. Final pre-send stage; zero latency / zero quality risk (request content unchanged); cost saving only. Skipped on `bypassed`/`cache_hit`. (See `config/params/` for the full per-provider block.)
+
+Retrieved documents (G07) stay out of the cached prefix and the `prompt_cache_key`: G21 keeps
+them just before the latest user turn, wherever an earlier group left them, and an Anthropic
+`cache_control` marker goes on the caller's own system prompt, never on them.
+
+The same multipliers price the savings baseline, which is the caller's own request sent
+straight to the model it asked for. When that request would have been cached without the
+proxy (its provider caches repeated prompts on its own, as OpenAI and Gemini do, or the caller
+marked the prompt with its own `cache_control`), the baseline gets the same discount, so
+`cost_saving_usd` does not count it. An Anthropic or Bedrock discount the caller did not ask
+for, earned by G21's marker or by routing to a provider that caches, stays in the saving.
+
+Markers, the caller's or G21's, are sent only to a provider that caches by marker (Anthropic,
+Bedrock). A request routed, cascaded or failed over to any other provider goes without them:
+litellm would turn them into a separately billed Gemini cache, or pass them to an
+OpenAI-compatible endpoint that may reject them.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -781,7 +956,7 @@ is off and this is exactly the observation an operator needs before turning it o
 | `providers.openai.cache_read_multiplier` | `0.5` | Cost weight for provider-reported cached input tokens (OpenAI bills cache reads at ~50%) |
 | `providers.openai.discount_pct` | `50` | **Legacy, inert.** A modelled discount that was never checked against the provider response; G21 no longer publishes it. Cost now uses the measured `cache_read_multiplier` / `cache_write_multiplier` |
 | `providers.openai.cache_write_multiplier` | `1.0` | Cost weight for provider-reported cache-WRITE (creation) tokens. OpenAI does not surcharge writes |
-| `providers.anthropic.marker` | `false` | Inject `cache_control` markers (requires Anthropic adapter). Tenant-overridable — set `true` per Claude-heavy tenant to capture the 90% discount. |
+| `providers.anthropic.marker` | `false` | Inject `cache_control` markers (requires Anthropic adapter). Placed only on a request that carries none of the caller's own: Anthropic accepts at most four, and the caller chose where its go. Tenant-overridable — set `true` per Claude-heavy tenant to capture the 90% discount. |
 | `providers.anthropic.cache_read_multiplier` | `0.1` | Anthropic bills cache reads at ~10% |
 | `providers.anthropic.discount_pct` | `90` | **Legacy, inert** (see above). Notably it claimed a 90% discount even with `marker: false`, i.e. when nothing was cached |
 | `providers.anthropic.cache_write_multiplier` | `1.25` | Anthropic bills 5-minute cache creation at ~1.25x the input rate |
@@ -799,7 +974,7 @@ Anthropic-native context editing — clears stale tool results / thinking blocks
 | `clear_tool_inputs` | `false` | Also clear `tool_use` params, not just results (`clear_tool_uses` only) |
 
 ### g22_deduplication
-Collapses near-duplicate conversation turns by similarity. Falls back to character n-gram similarity when sentence-transformers is unavailable. *(Config key is lowercase `g22_deduplication`.)*
+Drops near-duplicate consecutive turns of the same role (user or assistant), keeping the last of each run word for word, so the model always sees the latest phrasing of a repeated question. Falls back to character n-gram similarity when sentence-transformers is unavailable. *(Config key is lowercase `g22_deduplication`.)*
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -810,12 +985,12 @@ Collapses near-duplicate conversation turns by similarity. Falls back to charact
 | `tenant_thresholds` | `{}` | Per-tenant threshold overrides |
 
 ### G23_streaming_compression
-Collapses repeated n-gram patterns in response text (response path); stores the compressed version under `response["x_compressed_content"]` for G10 memory / downstream agents.
+A measurement, not a saving: counts the output tokens that collapsing repeated n-gram patterns in each answer (served or streamed) would remove, as `token_opt_g23_compressible_output_tokens_total{tenant_id}`. The answer reaches the client unchanged and nothing reuses a shorter copy, so G23 records no savings step. (It used to add the compressed copy to the response as `x_compressed_content`, cached with it, and book it as savings.)
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Enable streaming output compression |
-| `min_repeat` | `3` | Minimum repetitions before compressing |
+| `enabled` | `true` | Enable the measurement |
+| `min_repeat` | `3` | Repetitions before a phrase counts as repeated |
 | `ngram_size` | `5` | Words per n-gram |
 
 ### G24_adaptive_bypass
@@ -829,7 +1004,7 @@ Runs first in the pipeline. Loads learned rules and populates `ctx.skip_groups` 
 **Tuning the rules (offline).** The `rules_file` is produced by a two-step, human-in-the-loop workflow — nothing is auto-applied:
 
 1. **Analyse** — `scripts/analyse_savings_patterns.py` scans live Prometheus metrics (`--prometheus http://localhost:9090`) — or a directory of ROI run outputs (`--run-dir`) — and writes `analysis/pattern_report.json`, flagging G-groups that consistently *add* tokens for a given request pattern, with a confidence score per candidate.
-2. **Review & approve** — `scripts/review_bypass_candidates.py --input analysis/pattern_report.json` presents each candidate for approve / reject / modify and writes the approved skip rules to `config/adaptive_bypass_rules.yaml`, stamping confidence, approver, and timestamp on each. Use `--auto-approve 0.8 --non-interactive` to promote only candidates above a confidence threshold.
+2. **Review & approve** — `scripts/review_bypass_candidates.py --input analysis/pattern_report.json --tenants <ids>` (or `--global`, said explicitly; one of the two is required) presents each candidate for approve / reject / modify and writes the approved skip rules to `config/adaptive_bypass_rules.yaml`, stamping confidence, approver, timestamp and the tenant scope on each. A rule that names `datasets` applies only to requests tagged with one of them (`X-Dataset` / `dataset_id`); untagged traffic never matches it. Use `--auto-approve 0.8 --non-interactive` to promote only candidates above a confidence threshold.
 
 G24 picks up the rules file on the normal config-reload cycle (local) or after the deploy uploads it to the config bucket (GCP). With an empty or missing `rules_file`, G24 is a no-op.
 
@@ -937,13 +1112,13 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 |---|---|---|
 | `enabled` | `true` | Run the guardrail scanner |
 | `mode` | `flag` | `allow` (passthrough, no scan) · `flag` (detect + record, pass) · `block` (refuse on match) |
-| `threshold` | `0.5` | Minimum rule severity to fire; raise to require higher confidence |
+| `threshold` | `0.5` | Minimum rule severity to fire; raise to require higher confidence. Never above the strongest active rule (that would be `mode: allow`), and a tenant's own (portal) value never above the weakest built-in rule (0.8) |
 | `scan_roles` | `[user]` | Message roles scanned (untrusted content only by default) |
 | `metrics_enabled` | `true` | Emit the Prometheus counter |
 | `extra_rules` | `[]` | `[[id, category, severity, regex], …]` operator/managed additions (Enterprise ships a managed red-team ruleset feed) |
 | `block_message` | *(built-in)* | Optional custom refusal text |
 | `scan_response` | `false` | Opt-in: also scan the **model's output** for injection/jailbreak content (a model echoing an attack payload or emitting unsafe instructions). Default off = shipped behaviour unchanged. Non-streaming responses only. |
-| `response_mode` | `flag` | When `scan_response`: `flag` (detect + record) · `block` (withhold the unsafe answer with a content-filter 200; the LLM already ran, but the caller never sees the flagged output, and it is not cached). |
+| `response_mode` | `flag` | When `scan_response`: `flag` (detect + record) · `block` (withhold the unsafe answer with a content-filter 200; the LLM already ran, but the caller never sees the flagged output, and it is not cached; the call is still recorded at the provider's billed usage, for cost, tokens and the spend cap). |
 | `response_block_message` | *(built-in)* | Optional custom text for a withheld response. |
 
 ### G31_context_trust
@@ -953,10 +1128,12 @@ Contextual Content Reuse. Replaces a large content block (≥ `min_tokens`) with
 |---|---|---|
 | `enabled` | `true` | Run the context-trust scanner |
 | `mode` | `flag` | Injection: `allow` (passthrough) · `flag` (detect + record, pass) · `block` (refuse on match) · `strip` (drop the poisoned injected content, continue) |
-| `threshold` | `0.5` | Minimum rule severity to fire |
+| `threshold` | `0.5` | Minimum rule severity to fire; capped as for G30 |
 | `scan_roles` | `[system, tool]` | Roles that retrieval/memory inject into (`user` is G30's job) — shared by the injection and PII passes |
 | `metrics_enabled` | `true` | Emit the Prometheus counter |
-| `extra_rules` | `[]` | `[[id, category, severity, regex], …]` additions (Enterprise ships a managed red-team ruleset feed) |
+| `extra_rules` | `[]` | `[[id, category, severity, regex], …]` your own additions |
+| `managed_rules` | `record` | What the managed rules (in `managed_extra_rules`, written by the Enterprise ruleset feed) do. `record`: a match is counted (`token_opt_context_trust_managed_recorded_total{rule_id}`, on the Trust & Safety dashboard) and audited (`context_trust.managed_recorded`), and the request is left alone. `enforce`: they act under `mode` like any other rule. Operator-only; per tenant via `tenants.<id>.groups.G31_context_trust` |
+| `managed_rules_enforce` | `false` | A tenant's own opt-in to enforcement (portal knob). It can only add enforcement: `false` does not undo an operator's `managed_rules: enforce` |
 | `block_message` | *(built-in)* | Optional custom injection-refusal text |
 | `pii_mode` | `off` | PII pass over retrieved content: `off` · `flag` (detect + record) · `mask` (irreversible `[EMAIL]` placeholders) · `block` (refuse). Uses the G29 engine. |
 | `pii_entities` | `[]` (unset) | Subset of `EMAIL/US_SSN/CREDIT_CARD/PHONE/IP_ADDRESS` (+ `phi`); unset = the PII default set. A `phi` token expands to the PHI set. |
@@ -1052,7 +1229,7 @@ response-side groups + billing). Per-tenant override `tenants.<id>.orchestration
 |---|---|---|
 | `orchestration.enabled` | `false` | Master switch; `false` → no-op |
 | `orchestration.confidence_threshold` | `1` | Min matched `match` keywords to dispatch (else fall back to the LLM) |
-| `orchestration.agents` | `[]` | List of `{id, url, match:[keywords], description?, model?, api_key_env?, max_tokens?, timeout_seconds?}`. `url` = the agent's OpenAI-compatible endpoint; `match` = heuristic intent keywords; `max_tokens` = optional per-agent output budget |
+| `orchestration.agents` | `[]` | List of `{id, url, match:[keywords], description?, model?, api_key_env?, max_tokens?, timeout_seconds?}`. `url` = the agent's OpenAI-compatible endpoint; `match` = heuristic intent keywords; `max_tokens` = optional per-agent output budget. `api_key_env` names the server environment variable holding the agent's API key and is **operator-only**: it is honoured only when an agent with the same `id`, `url` and `api_key_env` is defined in this config (globally or under a static `tenants.<id>.orchestration`). Agents saved from the portal are called without a key, and the portal does not store `api_key_env`. **`url` reach:** an agent defined in this config (same `id` and `url`) may name a host on your own network, e.g. a compose service; any other agent must name a public host: no single-label name, no `.internal` / `.local` / `.svc` name, no address that is not public (in any spelling, such as `2852039166`), and its name is resolved before each call and refused if it points inside. The metadata service and loopback are refused for every agent |
 
 The managed registry console (declare/govern agents in the portal), routing-decision audit, and a
 managed ML intent classifier are the **[Enterprise]** layer — <https://tokenlean.cbeyond.cloud/>.
@@ -1113,14 +1290,24 @@ per-tenant quality knobs.
 | Group | Env var | Default | Purpose |
 |---|---|---|---|
 | `G7_retrieval` | `QDRANT_LOCAL_NOAUTH` | `0` | Skip GCP token fetch on local/non-GCP |
-| `G3_doc_pipeline` | `OOD_SIMILARITY_THRESHOLD`, `OOD_MAX_RETRIES` | `0.65`, `3` | ⚠ Out-of-distribution detection for RAG fallback |
 
 ### D. Pending wiring (source-audit finding — verify before relying)
 The following knobs are read by classes that the audit reports are **not registered in
-`pipeline.py`**, so they are inert until the class is wired: `G4` `fuzzy_similarity_threshold`
-(`G04DBResolution`), `G5` `temporal_activity_cache` / `idempotent_activities` /
-`activity_cache_ttl_seconds` (`G05TemporalActivity`), `G8` `mcp_enabled` (`G08MCPLoader`),
-`G16` `langgraph_enabled` (`G16LangGraphRuntime`).
+`pipeline.py`**, so they are inert until the class is wired: `G5` `temporal_activity_cache` /
+`idempotent_activities` / `activity_cache_ttl_seconds` (`G05TemporalActivity`).
+
+> **Removed 2026-10-01.** `G4` `fuzzy_similarity_threshold` (`G04DBResolution`, a database
+> answer cache with no tenant column, so one tenant's stored answer would have served
+> another's question), `G8` `mcp_enabled` (`G08MCPLoader`) and `G16` `langgraph_enabled`
+> (`G16LangGraphRuntime`, which priced runs from a hardcoded table and counted cost at a
+> flat rate per token) were on the list above. The G03 middleware class `G03DocPipeline` and
+> its out-of-distribution fallback (the `OOD_SIMILARITY_THRESHOLD` / `OOD_MAX_RETRIES` env
+> knobs, and a shared `broad-domain-index` collection) were never called either, and the
+> same was true of the Mem0 adapter middleware (`G10Mem0Adapter`, which looked memories up
+> by bare `user_id` in one collection shared by every tenant), the TOON legend module
+> (`g13_toon.py`), G10's skill writers, and G18's usage-meter and per-request audit
+> branches (billing is the `usage_events` row `main.py` writes). None was wired; the
+> modules, their tests and these rows were deleted together.
 
 > **Removed 2026-09-06.** `G14` `combine_tool_calls` (`G14ToolCombining`) was on the list above,
 > and a `G13_batch` row here documented a **Kafka batch backend** (`G13_USE_KAFKA`,

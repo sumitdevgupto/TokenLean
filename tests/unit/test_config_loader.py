@@ -208,72 +208,66 @@ class TestParamsDirMerge:
             assert merged["ok"] is True
 
 
-class TestGroupDConfigKeys:
-    """D8-T: Assert G23, G05 warm_patterns, and G12 o-model keys load correctly."""
+class TestGroupParamsFiles:
+    """A params file tunes a group under `groups:`, by the keys it names. The shipped group
+    templates set top-level keys (G05_cache, g22_deduplication, ...) that nothing reads, so
+    an operator who copied one to switch G22 off left it on."""
 
-    def _merge_from_yaml_str(self, yaml_content: str) -> dict:
+    def _merge(self, base: dict, *files: str) -> dict:
         import config_loader
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "params.yaml")
-            with open(path, "w") as f:
-                f.write(yaml_content)
-            return config_loader.merge_params_dir({}, tmpdir)
-
-    def test_g23_streaming_compression_key_present(self):
-        merged = self._merge_from_yaml_str(
-            "G23_streaming_compression:\n  enabled: false\n  min_repeat: 3\n  ngram_size: 5\n"
-        )
-        assert "G23_streaming_compression" in merged
-        assert merged["G23_streaming_compression"]["enabled"] is False
-
-    def test_g23_min_repeat_loaded(self):
-        merged = self._merge_from_yaml_str(
-            "G23_streaming_compression:\n  enabled: true\n  min_repeat: 4\n  ngram_size: 6\n"
-        )
-        assert merged["G23_streaming_compression"]["min_repeat"] == 4
-
-    def test_g05_warm_patterns_key_present(self):
-        merged = self._merge_from_yaml_str(
-            "G05_cache:\n  enabled: true\n  warm_patterns:\n    - 'hello world'\n    - 'checkout error'\n"
-        )
-        assert "G05_cache" in merged
-        assert "warm_patterns" in merged["G05_cache"]
-        assert "hello world" in merged["G05_cache"]["warm_patterns"]
-
-    def test_g05_empty_warm_patterns_is_list(self):
-        merged = self._merge_from_yaml_str(
-            "G05_cache:\n  enabled: true\n  warm_patterns: []\n"
-        )
-        assert merged["G05_cache"]["warm_patterns"] == []
-
-    def test_g12_o_model_effort_key_present(self):
-        merged = self._merge_from_yaml_str(
-            "G12_reasoning:\n  enabled: false\n  o_model_effort: medium\n  thinking_budget_tokens: 8000\n"
-        )
-        assert "G12_reasoning" in merged
-        assert merged["G12_reasoning"]["o_model_effort"] == "medium"
-
-    def test_g12_thinking_budget_tokens_key_present(self):
-        merged = self._merge_from_yaml_str(
-            "G12_reasoning:\n  enabled: false\n  o_model_effort: low\n  thinking_budget_tokens: 12000\n"
-        )
-        assert merged["G12_reasoning"]["thinking_budget_tokens"] == 12000
-
-    def test_all_three_groups_accessible_after_merge(self):
-        import config_loader
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for filename, content in [
-                ("g05.yaml", "G05_cache:\n  warm_patterns: []\n"),
-                ("g12.yaml", "G12_reasoning:\n  o_model_effort: medium\n  thinking_budget_tokens: 8000\n"),
-                ("g23.yaml", "G23_streaming_compression:\n  enabled: false\n  min_repeat: 3\n"),
-            ]:
-                with open(os.path.join(tmpdir, filename), "w") as f:
+            for i, content in enumerate(files):
+                with open(os.path.join(tmpdir, f"p{i}.yaml"), "w") as f:
                     f.write(content)
-            merged = config_loader.merge_params_dir({}, tmpdir)
+            return config_loader.merge_params_dir(base, tmpdir)
 
-        assert "G05_cache" in merged
-        assert "G12_reasoning" in merged
-        assert "G23_streaming_compression" in merged
+    def test_a_group_file_overrides_only_the_keys_it_names(self):
+        base = {"groups": {"g22_deduplication": {"enabled": True, "dedup_threshold": 0.92},
+                           "G5_cache": {"enabled": True}}}
+        merged = self._merge(base, "groups:\n  g22_deduplication:\n    enabled: false\n")
+        assert merged["groups"]["g22_deduplication"] == {"enabled": False, "dedup_threshold": 0.92}
+        assert merged["groups"]["G5_cache"] == {"enabled": True}
+        assert base["groups"]["g22_deduplication"]["enabled"] is True   # the base is not changed
+
+    def test_a_group_the_base_lacks_is_added(self):
+        merged = self._merge({"groups": {}}, "groups:\n  G23_streaming_compression:\n    min_repeat: 4\n")
+        assert merged["groups"] == {"G23_streaming_compression": {"min_repeat": 4}}
+
+    def test_a_base_without_groups_gets_them(self):
+        merged = self._merge({}, "groups:\n  G12_reasoning:\n    default_effort: low\n")
+        assert merged["groups"] == {"G12_reasoning": {"default_effort": "low"}}
+
+    def test_an_empty_group_entry_changes_nothing(self):
+        merged = self._merge({"groups": {"G5_cache": {"enabled": True}}}, "groups:\n  G5_cache:\n")
+        assert merged["groups"]["G5_cache"] == {"enabled": True}
+
+    def test_later_files_win(self):
+        merged = self._merge({"groups": {}}, "groups:\n  G5_cache:\n    l1_ttl_seconds: 10\n",
+                             "groups:\n  G5_cache:\n    l1_ttl_seconds: 20\n")
+        assert merged["groups"]["G5_cache"] == {"l1_ttl_seconds": 20}
+
+    @pytest.mark.parametrize("key", ["G05_cache", "g22_deduplication", "G23_streaming_compression",
+                                     "tool_registry"])
+    def test_a_group_at_the_top_level_is_reported(self, key, caplog):
+        base = {"groups": {"tool_registry": {}}}
+        self._merge(base, f"{key}:\n  enabled: false\n")
+        assert f"{key!r} at the top level" in caplog.text and "groups:" in caplog.text
+
+    def test_other_sections_merge_at_the_top_without_a_warning(self, caplog):
+        merged = self._merge({"billing": {"enabled": False, "x": 1}}, "billing:\n  enabled: true\n")
+        assert merged["billing"] == {"enabled": True, "x": 1}
+        assert "top level" not in caplog.text
+
+    def test_no_shipped_template_sets_a_group_at_the_top_level(self):
+        import re
+        params = os.path.join(os.path.dirname(__file__), "..", "..", "config", "params")
+        offenders = []
+        for name in sorted(os.listdir(params)):
+            if name.endswith(".template"):
+                with open(os.path.join(params, name), encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                offenders += [f"{name}: {k}" for k in data if re.match(r"^[Gg]\d+_", k)]
+        assert offenders == []
 
 
 class TestTenancyConfigKeys:

@@ -100,7 +100,7 @@ class AcmeAdapter(GenericLiteLLMAdapter):
 
 Capability hooks you can override on any adapter: `build_call` (routing/auth),
 `map_structured_output`, `map_reasoning_effort`, `supports_reasoning`, `unsupported_params`,
-`extract_usage`, `cache_read_cost_multiplier`, `supports_native_batch`, `requires_api_key`,
+`extract_usage`, `cache_read_cost_multiplier`, `prompt_cache_needs_marker` (True when the provider caches only a prompt the request marks, as Anthropic does), `supports_native_batch`, `requires_api_key`,
 `align_prefix`, `requires_json_keyword`. Add a `providers:` entry, `pricing:` rows, and a unit test.
 
 ---

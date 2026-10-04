@@ -23,7 +23,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from middleware import RequestContext
+from middleware import RequestContext, append_to_system_prompt
 from middleware import langfuse_tracing
 
 logger = logging.getLogger(__name__)
@@ -76,17 +76,18 @@ def _get_model_max_tokens(model: Optional[str], cfg: Optional[Dict[str, Any]] = 
     Falls back to cfg['default_model_max_tokens'] (default 4096) for unknown models.
     Model limits live entirely in config/config.yaml under G11_output.model_max_tokens.
     """
+    default = (cfg or {}).get("default_model_max_tokens", _DEFAULT_MODEL_MAX_TOKENS)
     if not model:
-        return _DEFAULT_MODEL_MAX_TOKENS
+        return default
 
-    config_limits = (cfg or {}).get("model_max_tokens", {})
+    config_limits = (cfg or {}).get("model_max_tokens") or {}
     if model in config_limits:
         return config_limits[model]
     for prefix, max_tokens in config_limits.items():
         if model.startswith(prefix):
             return max_tokens
 
-    return (cfg or {}).get("default_model_max_tokens", _DEFAULT_MODEL_MAX_TOKENS)
+    return default
 
 
 def _get_adapter(ctx: RequestContext):
@@ -291,7 +292,8 @@ async def _get_historical_p95(
                     completion_values.append(int(ct * max(1.0, truncation_backoff)))
                 else:
                     completion_values.append(ct)
-            except Exception:
+            except Exception as err:
+                logger.debug("output history entry unreadable, skipped: %r", err)
                 continue
         if len(completion_values) < min_entries:
             return None
@@ -421,16 +423,9 @@ def verbosity_cache_tag(ctx: RequestContext) -> str:
 
 
 def _append_verbosity_suffix(messages: List[Dict], suffix: str) -> List[Dict]:
-    """Append the terse suffix to the last system message, or add a new one."""
-    messages = list(messages)
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "system":
-            messages[i] = {
-                **messages[i],
-                "content": messages[i].get("content", "") + "\n" + suffix,
-            }
-            return messages
-    return [{"role": "system", "content": suffix}] + messages
+    """Append the terse suffix to the last system message, or add a new one.
+    A system message given as a list of parts gets a text part (append_to_system_prompt)."""
+    return append_to_system_prompt(messages, suffix)
 
 
 # ─── A3: output-savings holdout ───────────────────────────────────────────────
@@ -510,8 +505,8 @@ def _replace_answer(response: Dict[str, Any], new_content: str) -> Dict[str, Any
     """Return response with the first choice's assistant content replaced (in place)."""
     try:
         response["choices"][0]["message"]["content"] = new_content
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("answer not replaced in a non-standard response: %r", exc)
     return response
 
 
@@ -580,7 +575,11 @@ async def _reask(ctx: RequestContext, answer: str, schema: Optional[Dict[str, An
         provider_key = None
 
     schema_hint = json.dumps(schema) if schema else "a single valid JSON object"
-    repair_messages = list(ctx.messages) + [
+    # Prompt-cache markers go along only to a provider that caches by marker (the served
+    # one's adapter; none known means none sent), as on every provider call.
+    from providers import outgoing_messages_for
+    conversation = outgoing_messages_for(getattr(ctx, "provider_adapter", None), ctx.messages)
+    repair_messages = list(conversation) + [
         {"role": "assistant", "content": answer},
         {"role": "user", "content": (
             "Your previous reply was not valid JSON for the required format. Reply again "
@@ -596,7 +595,12 @@ async def _reask(ctx: RequestContext, answer: str, schema: Optional[Dict[str, An
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
     try:
-        resp = await litellm.acompletion(model=model, messages=repair_messages, **kwargs)
+        from providers.resilience import request_timeout_for
+        resp = await litellm.acompletion(model=model, messages=repair_messages, **kwargs,
+                                         timeout=request_timeout_for(ctx.config, model))
+        # Paid on top of the served call, whose usage the repaired answer keeps: a side call.
+        from middleware import record_provider_call
+        record_provider_call(ctx, model, resp, side=True)
         rd = resp.model_dump() if hasattr(resp, "model_dump") else resp
         return _extract_answer(rd if isinstance(rd, dict) else {})
     except Exception as exc:
@@ -693,7 +697,9 @@ class G11OutputFormat:
                         ctx.request_id,
                     )
 
-                model_limit = _get_model_max_tokens(ctx.params.get("model"), cfg)
+                # The model this request will call (G06 has routed it by now); params
+                # carry no "model", so reading it there clamped every cap to the fallback.
+                model_limit = _get_model_max_tokens(ctx.routed_model or ctx.model, cfg)
                 if floor_unreadable:
                     # We have a percentile but cannot see whether this bucket has already
                     # been cut at it. Fail CLOSED: no cap.

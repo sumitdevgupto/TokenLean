@@ -52,6 +52,9 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT '';
 -- Free trial: served 2xx made during an active trial; excluded from invoices.
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS trial BOOLEAN NOT NULL DEFAULT false;
+-- The tenant of an admin key that sent the request as this tenant (X-Tenant-ID); such a row
+-- is never billable. Empty for the tenant's own traffic.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS impersonated_by TEXT NOT NULL DEFAULT '';
 -- #34: provider prompt-cache accounting — the half of cache billing (writes) that was
 -- previously reported nowhere, plus its cost split. NULLABLE with no DEFAULT on purpose:
 -- "the provider reported nothing" must stay distinguishable from "it reported zero".

@@ -145,3 +145,25 @@ class TestLiteLLMBatchLane:
         from providers.anthropic_adapter import AnthropicAdapter
         with patch("litellm.aretrieve_batch", new=AsyncMock(return_value=MagicMock(output_file_id=None))):
             assert await AnthropicAdapter().fetch_batch_results("b", "key") == []
+
+    @pytest.mark.parametrize("adapter_path", ["providers.anthropic_adapter.AnthropicAdapter",
+                                              "providers.gemini_adapter.GeminiAdapter"])
+    async def test_every_call_uses_the_key_it_was_given(self, adapter_path):
+        # Without it litellm reads the provider's own env var (ANTHROPIC_API_KEY …): a
+        # deployment that keeps those out of the proxy never ran the lane, and one that has
+        # them ran it on a credential nobody resolved.
+        import importlib
+        module, cls = adapter_path.rsplit(".", 1)
+        adapter = getattr(importlib.import_module(module), cls)()
+        out = json.dumps({"custom_id": "r1", "response": {"status_code": 200, "body": {"id": "c1"}}})
+        with patch("litellm.acreate_file", new=AsyncMock(return_value=MagicMock(id="f"))) as cf, \
+                patch("litellm.acreate_batch", new=AsyncMock(return_value=MagicMock(id="b"))) as cb, \
+                patch("litellm.aretrieve_batch", new=AsyncMock(
+                    return_value=MagicMock(status="completed", output_file_id="o"))) as rb, \
+                patch("litellm.afile_content", new=AsyncMock(return_value=MagicMock(text=out))) as fc:
+            await adapter.submit_batch(_items(), "sk-resolved", {})
+            await adapter.poll_batch("b", "sk-resolved")
+            await adapter.fetch_batch_results("b", "sk-resolved")
+        for mock in (cf, cb, rb, fc):
+            assert mock.await_args_list, f"{mock} never called"
+            assert all(c.kwargs.get("api_key") == "sk-resolved" for c in mock.await_args_list)

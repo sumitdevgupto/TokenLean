@@ -1,0 +1,8 @@
+# What this image needs. scripts/compile-requirements.sh resolves it into requirements.txt with
+# every version pinned.
+google-cloud-aiplatform>=1.38.0
+openai>=1.0.0
+google-cloud-storage>=3.13.0
+google-cloud-secret-manager>=2.30.0
+redis>=5.0.0
+qdrant-client>=1.12,<1.13

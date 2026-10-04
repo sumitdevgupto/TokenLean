@@ -175,8 +175,8 @@ def _record_miss(prefix: str) -> None:
     try:
         from middleware.g18_observability import CCR_MISSES
         CCR_MISSES.labels(tenant_id=(prefix or "default").strip(":") or "default").inc()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("CCR miss metric not recorded: %r", exc)
 
 
 def _stats_for(prefix: str = "") -> Dict[str, int]:
@@ -564,10 +564,13 @@ async def dispatch_mcp_tool(
 
     if tool_name == "headroom_stats":
         # Tenant-scoped: a single process-global counter leaked co-tenants' request volume,
-        # block-size distribution and activity timing to anyone polling this tool.
+        # block-size distribution and activity timing to anyone polling this tool. A block is
+        # this tenant's only when its key is exactly `{prefix}ccr:...`: the default tenant's
+        # prefix is "", and startswith("") alone counted every tenant's blocks.
         tenant_stats = _stats_for(prefix)
+        own = f"{prefix}ccr:"
         return {
-            "local_store_size": sum(1 for k in _local_store if k.startswith(prefix)),
+            "local_store_size": sum(1 for k in _local_store if k.startswith(own)),
             "hits": tenant_stats["hits"],
             "misses": tenant_stats["misses"],
         }

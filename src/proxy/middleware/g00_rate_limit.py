@@ -104,11 +104,15 @@ class G00RateLimit:
         rl_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, int]:
         """Applicable limits, most specific wins (WS23):
-        per_user > per_team > per_tenant > tiers[tier] > default."""
-        if user_id in self._per_user_limits:
-            return self._per_user_limits[user_id]
-        if team in self._per_team_limits:
-            return self._per_team_limits[team]
+        per_user > per_team > per_tenant > tiers[tier] > default. Every override is merged
+        over the defaults, so one that sets a single window keeps the other (an unmerged
+        partial override raised a KeyError the caller turned into "admit")."""
+        per_user = self._per_user_limits.get(user_id)
+        if isinstance(per_user, dict):
+            return {**self._default_limits, **per_user}
+        per_team = self._per_team_limits.get(team)
+        if isinstance(per_team, dict):
+            return {**self._default_limits, **per_team}
         rl_cfg = rl_cfg or {}
         per_tenant = rl_cfg.get("per_tenant") or {}
         if tenant_id in per_tenant and isinstance(per_tenant[tenant_id], dict):
@@ -121,16 +125,18 @@ class G00RateLimit:
     @staticmethod
     def quota_key(redis_prefix: str, now: Optional[float] = None) -> str:
         """Monthly billable-request counter key (tenant-prefixed; bumped by main
-        on every served 2xx, checked here before any work happens)."""
+        on every served 2xx and every batched request when it is queued, checked here
+        before any work happens)."""
         month = time.strftime("%Y%m", time.gmtime(now if now is not None else time.time()))
         return f"{redis_prefix}quota:{month}"
 
     @staticmethod
     def spend_key(redis_prefix: str, now: Optional[float] = None) -> str:
-        """Monthly running-USD spend counter key (tenant-prefixed; bumped by main
-        on every served 2xx by the request's real ``cost_actual_usd``, checked here
-        before any work happens). Separate from ``quota_key`` — this is the
-        denial-of-wallet ceiling, not the request-count billing gate."""
+        """Monthly running-USD spend counter key (tenant-prefixed; ``add_to_spend``
+        adds each served request's real ``cost_actual_usd``, and each batched request's
+        cost when its answer arrives; checked here before any work happens). Separate from
+        ``quota_key`` — this is the denial-of-wallet ceiling, not the request-count
+        billing gate."""
         month = time.strftime("%Y%m", time.gmtime(now if now is not None else time.time()))
         return f"{redis_prefix}spend:{month}"
 
@@ -140,7 +146,8 @@ class G00RateLimit:
         monthly ``quota_key``/``spend_key`` this carries **no month suffix and no
         TTL** — a trial spans arbitrary calendar time. It is reset (DEL) by the admin
         console's trial ``start``/``convert``/``cancel`` actions, never by time; main
-        bumps it by 1 on every served 2xx while the trial is active."""
+        bumps it by 1 on every served 2xx, and every batched request when it is queued,
+        while the trial is active."""
         return f"{redis_prefix}trial_used"
 
     async def _check_trial(self, ctx, redis, rl_cfg: Dict[str, Any]) -> None:
@@ -236,7 +243,9 @@ class G00RateLimit:
                                         "1", nx=True, ex=8640000)
                 if not first:
                     continue  # already warned at this threshold for this generation
-            except Exception:
+            except Exception as exc:
+                logger.debug("trial %d%% warning skipped: its dedup key could not be set (%s)",
+                             threshold, exc)
                 continue  # dedup unavailable → skip rather than spam
             events.schedule_event(tenant_id, events.TRIAL_THRESHOLD, {
                 "pct": threshold,
@@ -309,8 +318,9 @@ class G00RateLimit:
         Enforced only when ``rate_limit.spend_cap.enabled`` — OSS/self-host default
         OFF. Cap = effective ``monthly_spend_cap_usd`` × (1 + grace_pct/100); absent
         cap means unlimited. Reads the running ``t:<id>:spend:<YYYYMM>`` counter that
-        main bumps by each served request's real ``cost_actual_usd``. Fail-open on
-        Redis errors so the ceiling never takes the proxy down."""
+        ``add_to_spend`` adds each served request's real ``cost_actual_usd`` to (a batched
+        request's when its answer arrives). Fail-open on Redis errors so the ceiling never
+        takes the proxy down."""
         scfg = rl_cfg.get("spend_cap") or {}
         if not scfg.get("enabled", False):
             return
@@ -515,3 +525,26 @@ class G00RateLimit:
         logger.debug("[%s] G00 rate limit check passed for user=%s team=%s",
                      ctx.request_id, principal, team_tag(team))
         return ctx
+
+
+def counter_prefix(ctx) -> str:
+    """The namespace of a tenant's quota, spend and trial counters: its Redis prefix, or
+    ``t:<id>:`` for a tenant without one (the default tenant)."""
+    return getattr(ctx, "redis_prefix", None) or f"t:{getattr(ctx, 'tenant_id', 'default')}:"
+
+
+async def add_to_spend(redis_prefix: str, cost_usd: float) -> None:
+    """Add one call's cost to the tenant's monthly spend counter, which ``_check_spend``
+    reads: main's for a served request, G13's for a batched one when its answer arrives, so
+    both use one key and one expiry. Nothing for a zero or unknown cost; never raises."""
+    if not cost_usd > 0:
+        return
+    try:
+        key = G00RateLimit.spend_key(redis_prefix)
+        redis = _get_redis()
+        total = await redis.incrbyfloat(key, cost_usd)
+        # Set the TTL once, on the month's first accrual (~40 days: last month's key expires).
+        if float(total) <= cost_usd + 1e-9:
+            await redis.expire(key, 40 * 86400)
+    except Exception as exc:
+        logger.debug("spend counter bump failed: %s", exc)

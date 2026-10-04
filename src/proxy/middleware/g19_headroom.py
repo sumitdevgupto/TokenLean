@@ -7,8 +7,8 @@ Technique:
   parses a syntax tree — the compressors work line-wise, sentence-wise and over decoded
   JSON structure. ("AST-aware" was claimed here until 2026-09-07; `ast` is not imported.)
   Auto-detects content type and applies optimal compressor:
-    - Code:    strips imports, comments, whitespace; preserves logic
-    - JSON:    removes empty fields, deduplicates repeated structures
+    - Code:    strips imports, whitespace, and comments where a fence names the language
+    - JSON:    removes empty lists/objects, deduplicates repeated structures
     - Logs:    groups, truncates, deduplicates
     - Config:  replaces with concise summaries
 
@@ -18,12 +18,12 @@ Technique:
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from middleware import RequestContext
 from middleware import cache_floor
 from middleware import langfuse_tracing
-from savings.calculator import count_messages_tokens, estimate_tokens
+from savings.calculator import estimate_tokens
 
 logger = logging.getLogger(__name__)
 GROUP = "G19"
@@ -106,7 +106,7 @@ class G19Headroom:
                     (ctx.messages[i] if (_stale or floor_state.covers(ctx.messages[i])) else m)
                     for i, m in enumerate(compressed_messages)
                 ]
-                changed = any(a != b for a, b in zip(ctx.messages, compressed_messages))
+                changed = any(a != b for a, b in zip(ctx.messages, compressed_messages, strict=True))
                 cache_floor.record_action(ctx, cache_floor.ACTION_PRESERVED)
                 logger.info(
                     "[%s] G19: holding the cacheable span whole — pruning it would fall "
@@ -252,6 +252,21 @@ class G19Headroom:
 # Patterns for content type heuristics
 _JSON_PATTERN = re.compile(r"^\s*[\[{]", re.DOTALL)
 _FENCE_PATTERN = re.compile(r"^\s*```")
+# One quantifier per run of whitespace: `\s*\{?\s*` could split a long run of spaces two
+# ways at every position, which is quadratic when no language follows.
+_FENCE_LANGUAGE = re.compile(r"^\s*```+\s*(?:\{\s*)?([\w#+.\-]+)")
+# Fence languages whose comments G19 may strip, by comment marker. A language missing here
+# keeps its comments, which costs only savings.
+_HASH_COMMENT_LANGUAGES = frozenset({
+    "python", "py", "python3", "ruby", "rb", "perl", "pl", "r", "sh", "bash", "zsh",
+    "shell", "yaml", "yml", "toml", "powershell", "ps1", "pwsh", "elixir", "ex", "exs",
+    "julia", "jl", "nim", "cmake", "makefile", "make", "coffeescript", "coffee", "tcl",
+})
+_SLASH_COMMENT_LANGUAGES = frozenset({
+    "c", "h", "cpp", "c++", "cc", "cxx", "hpp", "csharp", "cs", "c#", "java", "javascript",
+    "js", "jsx", "typescript", "ts", "tsx", "go", "golang", "rust", "rs", "swift", "kotlin",
+    "kt", "kts", "scala", "dart", "php", "groovy", "zig", "proto", "protobuf", "solidity",
+})
 _CODE_LINE_PATTERN = re.compile(
     r"^\s*(import |from |def |class |function |const |let |var |public |private )")
 _LOG_LINE_PATTERNS = [
@@ -527,15 +542,19 @@ def _compress_json(text: str, strategy: Dict[str, Any]) -> Optional[str]:
 
 
 def _remove_empty_fields(obj: Any) -> Any:
-    """Recursively remove empty/null/empty-string fields."""
+    """Recursively remove fields holding an empty list or object.
+
+    ``null`` and ``""`` are kept: "the field is null" or "the field is empty" is not the same
+    fact as "the field is absent", and a question may be about exactly that. A null in a list
+    is kept too, since dropping it would shift every later position."""
     if isinstance(obj, dict):
         return {
             k: _remove_empty_fields(v)
             for k, v in obj.items()
-            if v is not None and v != "" and v != [] and v != {}
+            if v != [] and v != {}
         }
     elif isinstance(obj, list):
-        return [_remove_empty_fields(item) for item in obj if item is not None]
+        return [_remove_empty_fields(item) for item in obj]
     return obj
 
 
@@ -567,6 +586,25 @@ def _dedupe_repeated_structures(obj: Any) -> Any:
     return obj
 
 
+def _fence_language(marker_line: str) -> str:
+    """The language an opening ``` fence names, lower-cased ("python" for ```python), or ""."""
+    match = _FENCE_LANGUAGE.match(marker_line)
+    return match.group(1).lower() if match else ""
+
+
+def _comment_markers(language: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """(line prefixes, inline markers) that start a comment in ``language``.
+
+    Empty for every language not listed, including an unlabelled block: ``#`` also starts a
+    C preprocessor line, a Rust attribute, a shebang and a CSS colour, and ``//`` is Python's
+    floor division, so a marker is removed only where the language says it is a comment."""
+    if language in _HASH_COMMENT_LANGUAGES:
+        return ("#",), (" #",)
+    if language in _SLASH_COMMENT_LANGUAGES:
+        return ("//",), (" //",)
+    return (), ()
+
+
 def _compress_code(text: str, strategy: Dict[str, Any]) -> Optional[str]:
     """Strip comments, blank lines, and optionally compress imports.
 
@@ -574,49 +612,55 @@ def _compress_code(text: str, strategy: Dict[str, Any]) -> Optional[str]:
     everything outside them is prose (Markdown headings, bullets, explanation) and is
     emitted verbatim. Without this, a '# Heading' outside a fence is indistinguishable
     from a Python comment and gets deleted, silently rewriting the answer.
+
+    Comments are stripped only from a fenced block that names its language, with that
+    language's markers (:func:`_comment_markers`). Unlabelled code keeps its comments: it
+    used to lose every ``#`` line, #include and #[derive] included, and every line was cut
+    at " #" or " //" (a CSS colour, Python's ``a // b``).
     """
     lines = text.split("\n")
     has_fence = any(_FENCE_PATTERN.match(ln) for ln in lines)
 
-    def _crush(code_lines):
+    def _crush(code_lines, language=""):
         """Apply the code compressors to a run of lines known to BE code."""
         out = []
+        prefixes, inline = (_comment_markers(language) if strategy.get("strip_comments", True)
+                            else ((), ()))
         for line in code_lines:
             stripped = line.strip()
 
-            # Strip single-line comments
-            if strategy.get("strip_comments", True):
-                if stripped.startswith("#") or stripped.startswith("//"):
-                    continue
-                # Strip inline comments (simple heuristic — not AST-level)
-                for comment_marker in (" #", " //"):
-                    idx = line.find(comment_marker)
-                    if idx > 0 and not _in_string(line, idx):
-                        line = line[:idx].rstrip()
+            # Strip whole-line comments, keeping a shebang
+            if prefixes and stripped.startswith(prefixes) and not stripped.startswith("#!"):
+                continue
+            # Strip inline comments (simple heuristic — not AST-level)
+            for comment_marker in inline:
+                idx = line.find(comment_marker)
+                if idx > 0 and not _in_string(line, idx):
+                    line = line[:idx].rstrip()
 
             # Strip blank lines
             if strategy.get("strip_whitespace", True) and stripped == "":
                 continue
 
             out.append(line)
-        # Collapse consecutive imports. Safe here because every line in this run is
-        # code — applied to a whole fenced document it could not tell a prose line
-        # opening "from ..." from a real import statement.
-        if strategy.get("compress_imports", True):
-            out = _compress_import_lines(out)
+        # Import lines are kept as written. The import "compression" that ran here merged
+        # nothing: it only stripped each import line's indentation, which moved a nested
+        # import to top level, and the `compress_imports` key it read is gone with it.
         return out
 
     if not has_fence:
-        return "\n".join(_crush(lines))
+        return "\n".join(_crush(lines))   # no fence, so no language: comments stay
 
     # Fenced payload: compress each fenced region, pass everything else through
     # verbatim. A '# Heading' outside a fence is indistinguishable from a Python
     # comment, so deleting it would silently rewrite the surrounding prose.
-    result, segment = [], []
+    result, segment, language = [], [], ""
     for line, is_marker, in_fence in _iter_fenced(lines):
         if is_marker:
-            if not in_fence:          # closing marker — flush the region we just left
-                result.extend(_crush(segment))
+            if in_fence:              # opening marker — it names the region's language
+                language = _fence_language(line)
+            else:                     # closing marker — flush the region we just left
+                result.extend(_crush(segment, language))
                 segment = []
             result.append(line)
         elif in_fence:
@@ -624,7 +668,7 @@ def _compress_code(text: str, strategy: Dict[str, Any]) -> Optional[str]:
         else:
             result.append(line)       # prose outside a fence — never touched
     if segment:                       # unterminated fence
-        result.extend(_crush(segment))
+        result.extend(_crush(segment, language))
 
     return "\n".join(result)
 
@@ -640,27 +684,6 @@ def _in_string(line: str, pos: int) -> bool:
         elif c == '"' and not in_single:
             in_double = not in_double
     return in_single or in_double
-
-
-def _compress_import_lines(lines: List[str]) -> List[str]:
-    """Group consecutive import/from lines into fewer lines."""
-    result = []
-    import_block: List[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("import ") or stripped.startswith("from "):
-            import_block.append(stripped)
-        else:
-            if import_block:
-                result.extend(import_block)
-                import_block = []
-            result.append(line)
-
-    if import_block:
-        result.extend(import_block)
-
-    return result
 
 
 def _compress_text(text: str, strategy: Dict[str, Any]) -> Optional[str]:

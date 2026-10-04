@@ -59,6 +59,57 @@ class TestRedactIngestPii:
         text = "the quarterly report covers three regions"
         assert mod.redact_ingest_pii(text) == text
 
+    def test_mode_is_trimmed_and_case_folded(self, monkeypatch):
+        mod = _load_pipeline(monkeypatch, INGEST_PII_MODE=" Mask ")
+        assert EMAIL not in mod.redact_ingest_pii(f"contact {EMAIL}")
+
+    def test_an_empty_mode_is_off(self, monkeypatch):
+        mod = _load_pipeline(monkeypatch, INGEST_PII_MODE="")
+        assert mod.redact_ingest_pii(f"contact {EMAIL}") == f"contact {EMAIL}"
+
+
+# With mask asked for and the engine missing, the text was stored unmasked after a warning;
+# an unrecognised mode (a typo of mask) silently meant off.
+class TestIngestPiiFailsClosed:
+    def test_mask_without_the_engine_refuses(self, monkeypatch):
+        mod = _load_pipeline(monkeypatch, INGEST_PII_MODE="mask")
+        monkeypatch.setitem(sys.modules, "guardrails.pii", None)
+        with pytest.raises(mod.IngestPiiError, match="mask"):
+            mod.redact_ingest_pii(f"contact {EMAIL}")
+
+    def test_flag_without_the_engine_warns_and_continues(self, monkeypatch, caplog):
+        mod = _load_pipeline(monkeypatch, INGEST_PII_MODE="flag")
+        monkeypatch.setitem(sys.modules, "guardrails.pii", None)
+        assert mod.redact_ingest_pii(f"contact {EMAIL}") == f"contact {EMAIL}"
+        assert "not importable" in caplog.text
+
+    @pytest.mark.parametrize("mode", ["masked", "true", "none", "on"])
+    def test_an_unknown_mode_is_refused(self, monkeypatch, mode):
+        mod = _load_pipeline(monkeypatch, INGEST_PII_MODE=mode)
+        with pytest.raises(mod.IngestPiiError, match="off, flag or mask"):
+            mod.redact_ingest_pii(f"contact {EMAIL}")
+
+    def test_run_stores_nothing_and_exits_1(self, monkeypatch):
+        mod = _load_pipeline(
+            monkeypatch, GCS_BUCKET="b", GCS_OBJECT="doc.txt",
+            TENANT_ID="NOVA-STG-01", QDRANT_COLLECTION="rag_nova-stg-01", INGEST_PII_MODE="mask")
+        monkeypatch.setitem(sys.modules, "guardrails.pii", None)
+        monkeypatch.setattr(mod, "download_from_gcs", lambda b, o: b"bytes")
+        monkeypatch.setattr(mod, "extract_text", lambda content, name: (
+            f"Patient contact {EMAIL}, SSN {SSN}. This section is long enough to clear the "
+            "minimum-length guard in the ingestion pipeline."))
+        embedded = []
+        monkeypatch.setattr(mod, "embed_chunks_dense",
+                            lambda chunks: embedded.extend(chunks) or [[0.1, 0.2] for _ in chunks])
+        monkeypatch.setattr(mod, "embed_chunks_sparse", lambda chunks: [object() for _ in chunks])
+        monkeypatch.setattr(mod, "_to_sparse_vector", lambda x: x, raising=False)
+        fake = _FakeQdrant()
+        _install_fake_qdrant(monkeypatch, fake)
+        with pytest.raises(SystemExit) as exc:
+            mod.run()
+        assert exc.value.code == 1
+        assert embedded == [] and fake.upserted is None
+
 
 # ── end-to-end run(): redaction happens BEFORE embed/store ───────────────────
 

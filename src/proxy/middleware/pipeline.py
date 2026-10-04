@@ -6,7 +6,8 @@ from typing import Any, Awaitable, Dict, Optional, Tuple
 from config_loader import get_config
 from middleware import RequestContext, apply_operator_overlay
 from middleware import cache_floor
-from middleware.g00_rate_limit import G00RateLimit, RateLimitExceeded
+from middleware.g00_rate_limit import G00RateLimit
+from protocols.base import routing_header_params
 from providers import get_adapter
 from tenancy.resolver import apply_caller_identity, resolve_tenant
 from tenancy.config import TenantConfigLoader, deep_merge
@@ -17,7 +18,7 @@ from middleware.g04_bypass import G04Bypass
 from middleware.g05_cache import G05Cache
 from middleware.g06_routing import G06Routing
 from middleware.g07_retrieval import G07Retrieval
-from middleware.g08_tool_loading import G08ToolLoading
+from middleware.g08_tool_loading import G08ToolLoading, called_tool_names, record_called_tools
 from middleware.g09_context_schema import G09ContextSchema
 from middleware.g10_memory import G10Memory
 from middleware.g11_output_format import G11OutputFormat
@@ -28,7 +29,9 @@ from middleware.g15_server_compute import G15ServerCompute
 from middleware.g16_agent_arch import G16AgentArch
 from middleware.intent_orchestration import IntentOrchestration
 from middleware.g17_loop_control import G17LoopControl
-from middleware.g18_observability import G18Observability, STAGE_DURATION_MS
+from middleware.g18_observability import (
+    G18Observability, RESPONSE_STAGE_ERRORS, STAGE_DURATION_MS, price_billed_call,
+)
 from middleware.g19_headroom import G19Headroom
 from middleware.g20_prompt_optimizer import G20PromptOptimizer
 from middleware.g21_cache_alignment import G21CacheAlignment
@@ -51,13 +54,27 @@ logger = logging.getLogger(__name__)
 # hanging/slow stage is obvious in `docker logs`. Tunable via env without rebuild.
 _SLOW_STAGE_MS = float(os.getenv("PIPELINE_SLOW_STAGE_MS", "1000"))
 
+# The response stages that make an answer safe to serve. If one fails, the answer must not go
+# out unmasked or unchecked, so the error ends the request (main records the paid call and
+# returns a 500). Every other response stage improves or measures an answer that is already
+# safe: if one fails, it is skipped, and the answer goes on with the edits that stage had
+# completed (each one whole, and already in the savings record).
+_SAFETY_RESPONSE_STAGES = frozenset({
+    "G29-pii-redaction-resp", "G30-guardrails-resp", "G32-tool-eligibility",
+})
+
 
 class OptimisationPipeline:
     """
-    Orchestrates the full G0–G28 token optimisation pipeline.
+    Orchestrates the full G0–G28 token optimisation pipeline, with the trust & safety
+    groups (G29–G32) and F2 intent orchestration.
 
-    Request path:  G0 → G24 → G30 → G29 → G4 → G5 → G6 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G26 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21
-    Response path: G14 → G23 → G19 → G15 → G11(feedback) → G18
+    Request path:  G0 → G24 → G30 → G29 → G4 → G5 → G6 → G24(post-routing) → F2 → G1 → G27 → G2 → G20 → G7 → G8 → G28 → G19 → G9 → G10 → G22 → G26 → G31 → G16 → G11 → G25 → G12 → G13 → G17 → G21
+    Response path: G29 → G30 → G32 → G14 → G28 → G23 → G19 → G15 → G11(feedback) → grounding → G18 → G5(store)
+
+    G32 stays ahead of G14, G28 and G15, which run or rewrite tool calls: that order is the
+    security guarantee (tests/unit/test_pipeline_order.py). Both paths are held to the code
+    by tests/unit/test_docs_pipeline_sync.py.
     """
 
     def __init__(self, db_pool=None) -> None:
@@ -127,8 +144,8 @@ class OptimisationPipeline:
                 STAGE_DURATION_MS.labels(
                     stage=name, tenant_id=getattr(ctx, "tenant_id", "default")
                 ).observe(_dt)
-            except Exception:  # never let metrics break the pipeline
-                pass
+            except Exception as exc:  # never let metrics break the pipeline
+                logger.debug("stage %s duration metric not recorded: %r", name, exc)
             otel.end_span(_s)
 
     async def effective_group_enablement(self, tenant_id: str = "default") -> Dict[str, Optional[bool]]:
@@ -152,11 +169,12 @@ class OptimisationPipeline:
         import copy as _copy
 
         class _ConfigShim:
-            __slots__ = ("config", "tenant_id")
+            __slots__ = ("config", "tenant_id", "tenant_config_overrides")
 
             def __init__(self, config, tid):
                 self.config = config
                 self.tenant_id = tid
+                self.tenant_config_overrides = None
 
         shim = _ConfigShim(_copy.deepcopy(get_config()), tenant_id)
         # Mechanism D1 (Postgres per-tenant overrides) — the live portal-written path.
@@ -192,6 +210,7 @@ class OptimisationPipeline:
         # tenant/tier/admin scope into ctx.params as _auth_*. The X-Tenant-ID
         # header is honoured only for admin keys (resolve_tenant enforces this).
         headers = {k.lower(): v for k, v in (request_headers or {}).items()}
+        ctx.routing_headers = routing_header_params(headers)
         key_tenant_id = ctx.params.get("_auth_tenant_id")
         key_tier = ctx.params.get("_auth_tier", "free")
         key_is_admin = bool(ctx.params.get("_auth_admin", False))
@@ -408,6 +427,16 @@ class OptimisationPipeline:
         response: Dict[str, Any],
     ) -> Tuple[RequestContext, Dict[str, Any]]:
         """Run response through the post-LLM optimisation pipeline."""
+        # What the provider billed, kept before any stage can replace it (a G30/G11 block
+        # returns a new, zero-usage response); G18 prices this one.
+        ctx.provider_response = response
+        # G08's pruning signal: which offered tools the model called, read from the
+        # provider's own answer before G32 can strip a call or G14/G15 rewrite one.
+        try:
+            await record_called_tools(ctx, called_tool_names(response))
+        except Exception as exc:
+            logger.debug("[%s] recording the called tools failed: %s",
+                          getattr(ctx, "request_id", "?"), exc)
         # Stage 5 — After the Response
         # G29 runs first so response-side PII masking / placeholder restore happens
         # before observability (G18 trace/audit), format shaping, and the G05 cache
@@ -426,11 +455,15 @@ class OptimisationPipeline:
             ("G19-headroom-resp", lambda r: self.g19.process_response(ctx, r)),
             ("G15-server-compute", lambda r: self.g15.process_response(ctx, r)),
         ]:
-            response = await self._run_timed(_name, ctx, _fn(response))
+            if _name in _SAFETY_RESPONSE_STAGES:
+                response = await self._run_safety_stage(_name, ctx, _fn(response))
+            else:
+                response = await self._run_skippable(_name, ctx, _fn(response), response)
 
         # Stage 5b — G11 max_tokens feedback loop (must run after response received)
-        ctx, response = await self._run_timed(
-            "G11-output-format-resp", ctx, self.g11.process_response(ctx, response)
+        ctx, response = await self._run_skippable(
+            "G11-output-format-resp", ctx, self.g11.process_response(ctx, response),
+            (ctx, response),
         )
 
         # Stage 5c — application-quality: grounding coverage (Task 11). Needs both the
@@ -439,13 +472,46 @@ class OptimisationPipeline:
         try:
             from middleware.quality_metrics import emit_grounding
             emit_grounding(ctx, response)
-        except Exception:
-            pass
+        except Exception as err:
+            logger.debug("grounding metric not recorded: %r", err)
 
         # Stage 6 — Across the Loop (observability)
-        await self._run_timed("G18-observability", ctx, self.g18.record(ctx, response))
+        try:
+            await self._run_timed("G18-observability", ctx, self.g18.record(ctx, response))
+        except Exception as exc:
+            self._stage_failed("G18-observability", ctx, exc)
+            try:
+                price_billed_call(ctx, response)   # the paid call is priced all the same
+            except Exception as price_exc:
+                logger.warning("[%s] the call could not be priced: %s",
+                               getattr(ctx, "request_id", "?"), price_exc)
 
         # Store result in G5 cache
-        await self._run_timed("G05-store-response", ctx, self.g05.store_response(ctx, response))
+        await self._run_skippable(
+            "G05-store-response", ctx, self.g05.store_response(ctx, response), None)
 
         return ctx, response
+
+    def _stage_failed(self, name: str, ctx: RequestContext, exc: Exception,
+                      withheld: bool = False) -> None:
+        RESPONSE_STAGE_ERRORS.labels(stage=name).inc()
+        (logger.error if withheld else logger.warning)(
+            "[%s] response stage %s failed, %s: %s", getattr(ctx, "request_id", "?"), name,
+            "the answer is withheld" if withheld else "skipped", exc, exc_info=True)
+
+    async def _run_safety_stage(self, name: str, ctx: RequestContext, coro: Awaitable[Any]) -> Any:
+        """A stage that makes the answer safe to serve: its error ends the request."""
+        try:
+            return await self._run_timed(name, ctx, coro)
+        except Exception as exc:
+            self._stage_failed(name, ctx, exc, withheld=True)
+            raise
+
+    async def _run_skippable(self, name: str, ctx: RequestContext, coro: Awaitable[Any],
+                             fallback: Any) -> Any:
+        """Any other response stage: if it fails, it is skipped and ``fallback`` returned."""
+        try:
+            return await self._run_timed(name, ctx, coro)
+        except Exception as exc:
+            self._stage_failed(name, ctx, exc)
+            return fallback
