@@ -5,51 +5,35 @@
 #    pip-compile --constraint=../src/proxy/requirements.txt --no-index --no-strip-extras --output-file=requirements-test.txt requirements-test.in
 #
 anyio==4.14.2
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   httpx
+    # via httpx
 certifi==2026.7.22
     # via
-    #   -c ../src/proxy/requirements.txt
     #   httpcore
     #   httpx
 coverage[toml]==7.15.4
     # via pytest-cov
 h11==0.16.0
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   httpcore
+    # via httpcore
 httpcore==1.0.9
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   httpx
+    # via httpx
 httpx==0.28.1
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   -r requirements-test.in
+    # via -r requirements-test.in
 idna==3.18
     # via
-    #   -c ../src/proxy/requirements.txt
     #   anyio
     #   httpx
 iniconfig==2.3.0
     # via pytest
 packaging==24.2
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   pytest
+    # via pytest
 pluggy==1.6.0
     # via
     #   pytest
     #   pytest-cov
 prometheus-client==0.26.0
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   -r requirements-test.in
+    # via -r requirements-test.in
 pygments==2.20.0
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   pytest
+    # via pytest
 pytest==9.1.1
     # via
     #   -r requirements-test.in
@@ -60,14 +44,11 @@ pytest-asyncio==1.4.0
     # via -r requirements-test.in
 pytest-cov==7.1.0
     # via -r requirements-test.in
-pytest-mock==3.15.1
+pytest-mock==3.16.0
     # via -r requirements-test.in
 pyyaml==6.0.3
-    # via
-    #   -c ../src/proxy/requirements.txt
-    #   -r requirements-test.in
+    # via -r requirements-test.in
 typing-extensions==4.16.0
     # via
-    #   -c ../src/proxy/requirements.txt
     #   anyio
     #   pytest-asyncio
