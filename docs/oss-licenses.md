@@ -14,12 +14,10 @@ All **Python package dependencies** used by the Token Optimisation proxy. Every 
 | uvicorn[standard] | >=0.30.0 | BSD-3-Clause | ASGI server |
 | httpx | >=0.27.0 | BSD-3-Clause | Async HTTP client |
 | pyyaml | >=6.0.3 | MIT | Config parsing |
-| redis[asyncio] | >=5.0.0 | MIT | Cache + session store |
+| redis | >=5.0.0 | MIT | Cache + session store (the async client, `redis.asyncio`, is part of the package) |
 | asyncpg | >=0.31.0 | Apache-2.0 | PostgreSQL async driver |
-| pgvector | >=0.2.5 | MIT | pgvector Python client. Not imported by the proxy (its SQL uses the Postgres extension directly); dropped at the next recompile |
 | google-cloud-storage | >=2.16.0 | Apache-2.0 | GCS config/key storage |
 | google-cloud-secret-manager | >=2.20.0 | Apache-2.0 | GCP secret access |
-| google-cloud-tasks | >=2.16.0 | Apache-2.0 | GCP task queues. Not imported by the proxy; dropped at the next recompile |
 | google-cloud-run | >=0.16.1 | Apache-2.0 | GCP Cloud Run admin |
 | langfuse | >=2.7.0,<3.0.0 | MIT | LLM observability |
 | opentelemetry-sdk | >=1.25.0 | Apache-2.0 | Telemetry SDK |
@@ -35,13 +33,11 @@ All **Python package dependencies** used by the Token Optimisation proxy. Every 
 
 ## Optional Dependencies
 
-Imported via `try/except`, so the proxy starts without them, and used only when the corresponding feature is enabled (`langgraph` and `zep-python` are no longer imported at all). `requirements.txt` pins them with the core set, so the Docker image includes them.
+Imported via `try/except`, so the proxy starts without them, and used only when the corresponding feature is enabled. `requirements.txt` pins them with the core set, so the Docker image includes them.
 
 | Package | Version | SPDX License | Used By | Feature |
 |---|---|---|---|---|
 | mem0ai | >=2.0.7 | Apache-2.0 | G10 | Long-term conversation memory |
-| zep-python | >=2.0.2 | Apache-2.0 | — | None: G10's Zep backend was removed; dropped at the next recompile (license: see License Verification Sources) |
-| langgraph | >=0.2.28 | MIT | — | None: no longer imported by the proxy; dropped at the next recompile |
 | presidio-analyzer | >=2.2 | MIT | G29 | Higher-recall PII backend (`use_presidio: true`); the default regex tier needs no dependency |
 
 ## License Verification Sources
@@ -51,7 +47,6 @@ Checked 2026-10-03 against the version `requirements.txt` pins for each package 
 | Package | Verified Via |
 |---|---|
 | mem0ai | PyPI `license_expression` field: `Apache-2.0` |
-| zep-python | GitHub repo (`getzep/zep-python`) `license.spdx_id`: `Apache-2.0`. Caveat: PyPI publishes no license metadata for 2.0.2, the latest release, and the `v2.0.2` tag has no LICENSE file. The repo's main branch dropped its LICENSE on 2024-05-08 and restored it on 2024-10-10; 2.0.0–2.0.2 were all released in between |
 | fastembed | GitHub repo (`qdrant/fastembed`) `license.spdx_id` at tag `v0.8.0`: `Apache-2.0`. PyPI's metadata is inconclusive: `license` reads "Apache License" (not an SPDX identifier) and the classifier reads "Other/Proprietary License" |
 | torch | `License-Expression` in the METADATA of the 2.14.0 CPU wheel the Dockerfile installs (`download.pytorch.org/whl/cpu`), identical to PyPI's `license_expression` for 2.14.0. PyTorch's own code is BSD-3-Clause; the other terms cover third-party code bundled in the wheel |
 | All others | PyPI `license_expression` or `license` field, or OSI classifier |
@@ -67,8 +62,8 @@ Checked 2026-10-03 against the version `requirements.txt` pins for each package 
 ## Compliance Notes
 
 - **The license rule:** every dependency must be free to use and to host — permissively licensed (MIT, Apache-2.0, BSD, ISC, PSF, PostgreSQL, BSL-1.0, CNRI-Python, Zlib, CC0), or MPL-2.0 for an unmodified transitive dependency. `scripts/audit_licenses.py` checks every pin of every image and CI lockfile against it in CI, and `tests/unit/test_oss_licenses_doc.py` keeps the tables above in step with `requirements.in`. Grafana is the one exception (below).
-- All **imported** Python dependencies are permissive (MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0; torch's wheel adds BSL-1.0 and Apache-2.0 WITH LLVM-exception for its bundled third-party code). No GPL, LGPL, AGPL, or SSPL code is imported. (Three transitive deps — `certifi`, `tqdm`, and `orjson`, which only `langgraph` pulls in — carry MPL-2.0, a file-level weak copyleft that does not affect Apache-2.0 redistribution; see `THIRD_PARTY_LICENSES.md`.)
+- All **imported** Python dependencies are permissive (MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0; torch's wheel adds BSL-1.0 and Apache-2.0 WITH LLVM-exception for its bundled third-party code). No GPL, LGPL, AGPL, or SSPL code is imported. (Two transitive deps — `certifi` and `tqdm` — carry MPL-2.0, a file-level weak copyleft that does not affect Apache-2.0 redistribution; see `THIRD_PARTY_LICENSES.md`.)
 - Grafana (AGPL-3.0), the one exception to the rule, is deployed as an unmodified upstream container accessed over the network — not linked into this Work. It must stay unmodified: changing Grafana's own code would oblige publishing those changes. See `THIRD_PARTY_LICENSES.md`.
 - Google Cloud packages are optional at runtime when `STORAGE_BACKEND=local` (T40). They remain in `requirements.txt` for GCP deployments.
-- Of the optional dependencies, `mem0ai` (Apache-2.0), `langgraph` and `presidio-analyzer` (MIT) are permissive. `zep-python`, no longer imported and dropped at the next recompile, is Apache-2.0 by its repository, but its 2.0.2 release carries no license file or license metadata (see License Verification Sources); the license audit reports it as a pending removal.
+- Both optional dependencies are permissive: `mem0ai` (Apache-2.0) and `presidio-analyzer` (MIT).
 - No dependency requires attribution in the binary or restricts sublicensing.

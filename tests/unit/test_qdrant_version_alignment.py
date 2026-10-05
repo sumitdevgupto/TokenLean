@@ -38,7 +38,6 @@ COMPILED_LOCKFILES = [
 
 # Gitignored (commercial repo) — present in a full working tree, absent in the OSS tree.
 OPTIONAL_CLIENT_PIN_FILES = [
-    "pitch-test-plan/requirements-proxy.txt",
     "pitch-test-plan/requirements.txt",
 ]
 

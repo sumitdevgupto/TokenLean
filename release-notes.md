@@ -21,6 +21,25 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-10-05
+
+### The proxy image no longer installs four unused packages — Enhancement (OSS)
+
+`langgraph`, `zep-python`, `pgvector` (the Python client; the Postgres extension stays) and
+`google-cloud-tasks` were declared in `src/proxy/requirements.in` but imported nowhere, and
+`zep-python` 2.0.2 ships with no license. They are gone, and the recompiled lockfile drops 14
+more packages only they pulled in (the langgraph/langchain family, langsmith, orjson, ormsgpack,
+zstandard and others): 171 pins become 153, with no version changes. The other lockfiles keep
+their pins. The license audit now passes with no pending removals.
+- **OSS:** a smaller proxy image; nothing it runs is affected.
+
+### The proxy no longer asks for a Redis extra that does not exist — Bug fix
+
+`src/proxy/requirements.in` asked for `redis[asyncio]`, but redis-py has no `asyncio` extra: its
+async client, `redis.asyncio`, is part of the package. Every lockfile compile and image build
+warned about it. The line is now plain `redis>=5.0.0`; the pin (8.1.0) and what the image
+installs are unchanged.
+
 ## 2026-10-04
 
 ### Every dependency checked against one license rule, in CI — Enhancement (OSS)

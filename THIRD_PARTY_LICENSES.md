@@ -98,18 +98,18 @@ that does **not** impose copyleft on the larger Apache-2.0 Work:
 |---|---|---|
 | certifi | MPL-2.0 | Mozilla CA-certificate bundle (data); pulled in by httpx/requests |
 | tqdm | MPL-2.0 AND MIT | Progress bars; pulled in by sentence-transformers/fastembed |
-| orjson | MPL-2.0 AND (Apache-2.0 OR MIT) | Fast JSON; pulled in through langsmith — by langgraph in the proxy (until langgraph is dropped) and by langchain-text-splitters in the doc pipeline |
+| orjson | MPL-2.0 AND (Apache-2.0 OR MIT) | Fast JSON; pulled in through langsmith by langchain-text-splitters, in the doc pipeline only |
 
 ---
 
 ## Compliance summary
 
 - **No GPL, LGPL, AGPL, or SSPL code is imported into or redistributed as part of this Work.**
-  Checked 2026-10-04 against the published license metadata of every release pinned in
-  the six lockfiles (the proxy, the tests, both sidecars and both pipelines). The five
+  Checked 2026-10-05 against the published license metadata of every release pinned in
+  the six lockfiles (the proxy, the tests, both sidecars and both pipelines). The four
   that publish none were checked against their repositories instead: fsspec
-  (BSD-3-Clause), google-crc32c (Apache-2.0), py-rust-stemmers (MIT), routellm
-  (Apache-2.0), and zep-python (below). `scripts/audit_licenses.py` repeats this check in
+  (BSD-3-Clause), google-crc32c (Apache-2.0), py-rust-stemmers (MIT) and routellm
+  (Apache-2.0). `scripts/audit_licenses.py` repeats this check in
   CI on every change, against the license rule above, with those repository-checked
   licenses recorded as overrides. The direct dependencies' inventory is in
   [docs/oss-licenses.md](docs/oss-licenses.md).
@@ -118,9 +118,6 @@ that does **not** impose copyleft on the larger Apache-2.0 Work:
   7.2 (BSD-3-Clause).
 - Weak-copyleft transitive deps (certifi, tqdm, orjson — MPL-2.0) are file-level and
   compatible with Apache-2.0 redistribution.
-- `zep-python` 2.0.2 ships without a license file or license metadata. The proxy no
-  longer imports it, but the image installs it until the next recompile drops it, and the
-  license audit reports it as a pending removal; see [docs/oss-licenses.md](docs/oss-licenses.md).
 - G06's RouteLLM router defaults to `bert` (Apache-2.0). The `mf` (no license),
   `causal_llm` (Meta Llama 3 derivative) and `sw_ranking` (partly unlicensed data) routers
   fall outside the rule and run only if an operator configures them. See [Models](#models).

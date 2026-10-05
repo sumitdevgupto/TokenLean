@@ -15,7 +15,6 @@ annotated-types==0.8.0
 anyio==4.15.1
     # via
     #   httpx
-    #   httpx2
     #   starlette
     #   watchfiles
 certifi==2026.7.22
@@ -47,7 +46,6 @@ fsspec==2026.9.0
 h11==0.16.0
     # via
     #   httpcore
-    #   httpcore2
     #   uvicorn
 hf-xet==1.6.0
     # via huggingface-hub
@@ -66,7 +64,6 @@ idna==3.20
     # via
     #   anyio
     #   httpx
-    #   httpx2
     #   requests
 jinja2==3.1.6
     # via torch
@@ -154,7 +151,6 @@ typing-extensions==4.16.0
     # via
     #   anyio
     #   fastapi
-    #   httpx2
     #   huggingface-hub
     #   opentelemetry-api
     #   pydantic

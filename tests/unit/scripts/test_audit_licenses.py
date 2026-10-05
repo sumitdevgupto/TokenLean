@@ -95,9 +95,12 @@ def test_permissive_and_mpl_pins_pass(al):
                      al.Row("six", "1", "permissive", "metadata", "MIT")]) == 0
 
 
-def test_a_pending_removal_is_reported_but_does_not_fail(al, capsys):
-    assert al.audit([al.Row("zep-python", "2.0.2", "unknown", "metadata", "")]) == 0
-    assert "zep-python" in capsys.readouterr().out
+def test_a_pending_removal_is_reported_but_does_not_fail(al, capsys, monkeypatch):
+    monkeypatch.setattr(al, "PENDING_REMOVAL", {"old-dep": "no licence; dropped at the next recompile"})
+    assert al.audit([al.Row("old-dep", "1.0", "unknown", "metadata", "")]) == 0
+    assert "old-dep" in capsys.readouterr().out
+    # ...and only for the package it names.
+    assert al.audit([al.Row("new-dep", "1.0", "unknown", "metadata", "")]) == 1
 
 
 def test_every_pending_removal_is_still_marked_for_the_next_recompile(al):

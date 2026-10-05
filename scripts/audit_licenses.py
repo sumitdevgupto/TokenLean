@@ -89,9 +89,7 @@ MANUAL_OVERRIDES = {
 
 # Pins outside the rule that are already on their way out: reported, not failed, while
 # src/proxy/requirements.in still marks them "drop at the next recompile" (a unit test holds that).
-PENDING_REMOVAL = {
-    "zep-python": "2.0.2 ships no licence file or licence metadata; the proxy no longer imports it",
-}
+PENDING_REMOVAL: dict[str, str] = {}   # name -> why it is going; empty since zep-python left (2026-10-05)
 
 Row = namedtuple("Row", "name version verdict source licence")
 
