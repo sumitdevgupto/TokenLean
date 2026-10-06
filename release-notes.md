@@ -23,14 +23,15 @@ date changes.
 
 ## 2026-10-06
 
-### The proxy and the Java client template take three dependency security fixes — Bug fix
+### The proxy and the Java client template take four dependency security fixes — Bug fix
 
 The proxy now pins LiteLLM 1.95.1, the fix for an advisory about request-body routing
 parameters (GHSA-3cv6-jpf6-8222), and `src/proxy/requirements.in` makes 1.95.1 the floor.
 urllib3 moves to 2.8.0 for three advisories (an infinite loop in chunked deflate streaming, an
-unbounded chunk-size line, HTTPS-proxy TLS settings that could be ignored), and the Java client
-template's jackson-databind to 2.18.11 for five. Nothing else in the lockfile moves. A new test
-fails when a lockfile pins a version its `requirements.in` rules out.
+unbounded chunk-size line, HTTPS-proxy TLS settings that could be ignored), multidict to 6.9.1
+for a reference leak in its items views (GHSA-54p9-h82j-f925), and the Java client template's
+jackson-databind to 2.18.11 for five. Nothing else in the lockfile moves. A new test fails when
+a lockfile pins a version its `requirements.in` rules out.
 
 ### A key pasted into an agent's `api_key_env` no longer reaches the log — Bug fix
 
