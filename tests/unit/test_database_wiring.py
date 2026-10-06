@@ -98,11 +98,49 @@ def sleeps(monkeypatch):
     return delays
 
 
+class HeldRetries(list):
+    """The background retry's delays, in order. Each retry also waits for release(), so what a
+    test sees after startup does not depend on how far the retry got before the test looked."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = asyncio.Event()
+
+    def release(self):
+        self.gate.set()
+
+
+@pytest.fixture
+def held(monkeypatch):
+    """`sleeps` for a self-hosted proxy's background retry, which is held until the test
+    releases it."""
+    retries = HeldRetries()
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay, *args, **kwargs):
+        retries.append(delay)
+        await retries.gate.wait()
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return retries
+
+
+# The fixtures patch asyncio.sleep; the loop turns in _start need the real one.
+_real_sleep = asyncio.sleep
+
+
 async def _start():
     await asyncio.wait_for(main._wire_database_at_startup(), 5)
+    # Python 3.11's wait_for gives a task that startup created a few event-loop turns before it
+    # returns, and 3.12's none (CI runs 3.11, like the images). Turn the loop here, so a test
+    # holds on both.
+    for _ in range(5):
+        await _real_sleep(0)
 
 
-async def _retried():
+async def _retried(held):
+    held.release()
     await asyncio.wait_for(main._db_retry_task, 5)
 
 
@@ -135,7 +173,7 @@ class TestAReachableDatabase:
 
 class TestSelfHostedOutageAtStart:
 
-    async def test_it_serves_at_once_and_reports_what_is_missing(self, db, sleeps):
+    async def test_it_serves_at_once_and_reports_what_is_missing(self, db, held):
         db.fail_connects = 3
         await _start()
         assert db.connects == 1
@@ -144,24 +182,24 @@ class TestSelfHostedOutageAtStart:
         assert await main.health() == {"status": "degraded", "version": "1.0.0",
                                        "not_wired": ALL_PARTS}
 
-    async def test_the_background_retry_wires_it_when_the_database_is_back(self, db, sleeps):
+    async def test_the_background_retry_wires_it_when_the_database_is_back(self, db, held):
         db.fail_connects = 3
         await _start()
-        await _retried()
+        await _retried(held)
         assert db.connects == 4
-        assert sleeps == [1.0, 2.0, 4.0]
+        assert held == [1.0, 2.0, 4.0]
         assert _all_wired(db)
         assert await main.health() == OK
         await main._retention_task
         assert db.retention_pools == [db.pool]
 
     @pytest.mark.parametrize("part", ["billing", "audit"])
-    async def test_a_failing_schema_step_leaves_the_other_parts_wired(self, db, sleeps, part):
+    async def test_a_failing_schema_step_leaves_the_other_parts_wired(self, db, held, part):
         setattr(db, f"fail_{part}", 1)
         await _start()
         assert main._db_not_wired() == [part]
         assert (await main.health())["not_wired"] == [part]
-        await _retried()
+        await _retried(held)
         assert _all_wired(db)
         # Only the failed step runs again: one connection, one retention loop.
         assert (db.billing_runs, db.audit_runs) == ((2, 1) if part == "billing" else (1, 2))
@@ -169,7 +207,7 @@ class TestSelfHostedOutageAtStart:
         await main._retention_task
         assert db.retention_pools == [db.pool]
 
-    async def test_the_error_goes_to_the_log_and_not_to_health(self, db, sleeps, caplog):
+    async def test_the_error_goes_to_the_log_and_not_to_health(self, db, held, caplog):
         db.fail_connects = 3
         with caplog.at_level(logging.WARNING, logger=main.logger.name):
             await _start()
@@ -180,7 +218,7 @@ class TestSelfHostedOutageAtStart:
         assert "db.internal" not in body and "tl_admin" not in body
 
     @pytest.mark.parametrize("value", ["false", "0", ""])
-    async def test_other_managed_deploy_values_do_not_wait(self, db, sleeps, monkeypatch, value):
+    async def test_other_managed_deploy_values_do_not_wait(self, db, held, monkeypatch, value):
         monkeypatch.setenv("MANAGED_DEPLOY", value)
         db.fail_connects = 3
         await _start()

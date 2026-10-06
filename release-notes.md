@@ -21,6 +21,26 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-10-06
+
+### The proxy and the Java client template take three dependency security fixes — Bug fix
+
+The proxy now pins LiteLLM 1.95.1, the fix for an advisory about request-body routing
+parameters (GHSA-3cv6-jpf6-8222), and `src/proxy/requirements.in` makes 1.95.1 the floor.
+urllib3 moves to 2.8.0 for three advisories (an infinite loop in chunked deflate streaming, an
+unbounded chunk-size line, HTTPS-proxy TLS settings that could be ignored), and the Java client
+template's jackson-databind to 2.18.11 for five. Nothing else in the lockfile moves. A new test
+fails when a lockfile pins a version its `requirements.in` rules out.
+
+### A key pasted into an agent's `api_key_env` no longer reaches the log — Bug fix
+
+`api_key_env` names a server environment variable. When a tenant's agent names one the
+operator's config does not define, the proxy dispatches without a key and logs a warning that
+names the variable. If the tenant had pasted the key itself into that field, the warning logged
+its first 128 characters. It now names the value only when it looks like a variable name
+(capitals and digits joined by underscores, such as `LLM_KEY_OPENAI`); anything else, a whole
+`.env` line included, shows as withheld.
+
 ## 2026-10-05
 
 ### The proxy image no longer installs four unused packages — Enhancement (OSS)

@@ -56,6 +56,9 @@ _NUMERIC_HOST_RE = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+
 # Each refused (tenant, agent, api_key_env) warns once; the cap bounds the set.
 _WARNED_KEY_ENV: set = set()
 _MAX_WARNED_KEY_ENV = 1024
+# A variable name as operators write one (LLM_KEY_OPENAI). The refusal names only such a value:
+# a tenant may have pasted the key itself, and some keys are all capitals too.
+_ENV_VAR_NAME = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
 
 try:  # Prometheus is always present in the proxy image; degrade gracefully in bare tests.
     from prometheus_client import Counter as _Counter
@@ -128,10 +131,12 @@ def _agent_key_env(agent: Dict[str, Any], tenant_id: str, request_id: str = "") 
     marker = (str(tenant_id), str(agent.get("id")), str(name)[:128])
     if marker not in _WARNED_KEY_ENV and len(_WARNED_KEY_ENV) < _MAX_WARNED_KEY_ENV:
         _WARNED_KEY_ENV.add(marker)
+        shown = (marker[2] if _ENV_VAR_NAME.fullmatch(marker[2])
+                 else "(withheld: not a variable name)")
         logger.warning(
             "[%s] F2: agent %r of tenant %r names api_key_env %r, but only agents defined "
             "in the operator config may read a server environment variable — dispatching "
-            "without a key", request_id, marker[1], marker[0], marker[2])
+            "without a key", request_id, marker[1], marker[0], shown)
     return ""
 
 

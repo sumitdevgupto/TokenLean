@@ -228,7 +228,7 @@ jsonschema-specifications==2025.9.1
     # via jsonschema
 langfuse==2.60.10
     # via -r requirements.in
-litellm==1.95.0
+litellm==1.95.1
     # via -r requirements.in
 loguru==0.7.3
     # via fastembed
@@ -536,7 +536,7 @@ typing-inspection==0.4.2
     # via
     #   fastapi
     #   pydantic
-urllib3==2.7.0
+urllib3==2.8.0
     # via
     #   botocore
     #   qdrant-client

@@ -182,6 +182,27 @@ async def test_refused_key_env_is_logged_by_name_never_by_value(monkeypatch, cap
     assert "LLM_KEY_OPENAI" in text and _PLATFORM_SECRET not in text
 
 
+# Built at runtime so this file never holds a string the push's content scan would flag. The
+# second is all capitals like a variable name, but has no underscore; the third has one; the
+# last is a whole .env line, which starts like a variable name.
+_PASTED_KEYS = ["sk-proj-" + "a1B2c3D4" * 6, "AKIA" + "Q" * 16, "ghp_" + "a1b2c3d4" * 4,
+                "LLM_KEY_OPENAI=sk-proj-" + "a1B2c3D4" * 6]
+
+
+@pytest.mark.parametrize("pasted", _PASTED_KEYS,
+                         ids=["provider-key", "capitals-only", "lowercase-underscore", "env-line"])
+async def test_a_key_pasted_into_api_key_env_is_not_logged(caplog, pasted):
+    """api_key_env holds a variable's NAME, and the refusal names it for the operator. A key
+    pasted there instead must not reach the operator's log."""
+    agent = _agent(id=f"billing-pasted-{len(pasted)}", api_key_env=pasted)
+    ctx = _ctx(config=_cfg(agents=[agent]), tenant_id="ACME")
+    with caplog.at_level(logging.WARNING, logger="middleware.intent_orchestration"):
+        await _dispatched_api_key(ctx, operator_config=_cfg(agents=[]))
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "api_key_env" in text
+    assert pasted[:8] not in text and pasted[-8:] not in text
+
+
 # ── dispatch behaviour ────────────────────────────────────────────────────────────────
 async def test_dispatch_on_intent_match():
     ctx = _ctx(config=_cfg())

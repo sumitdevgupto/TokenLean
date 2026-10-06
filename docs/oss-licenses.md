@@ -8,7 +8,7 @@ All **Python package dependencies** used by the Token Optimisation proxy. Every 
 
 | Package | Version | SPDX License | Notes |
 |---|---|---|---|
-| litellm | >=1.95.0,<2.0.0 | MIT | LLM provider abstraction |
+| litellm | >=1.95.1,<2.0.0 | MIT | LLM provider abstraction |
 | boto3 | >=1.34.0 | Apache-2.0 | AWS Bedrock provider lane (litellm `bedrock/`) |
 | fastapi | >=0.111.0 | MIT | HTTP framework |
 | uvicorn[standard] | >=0.30.0 | BSD-3-Clause | ASGI server |

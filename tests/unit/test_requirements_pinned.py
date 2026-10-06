@@ -22,6 +22,8 @@ import re
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 
@@ -103,6 +105,23 @@ def test_every_direct_dependency_is_pinned():
         assert not missing, (
             f"direct dependencies {missing} from {infile} are missing from {txt} — "
             "run scripts/compile-requirements.sh to regenerate the pins"
+        )
+
+
+def test_every_pin_meets_its_floor():
+    """pip installs the pin, never the floor: a floor raised past a vulnerable release protects
+    nothing while the lockfile still pins that release."""
+    for infile, txt in PAIRS:
+        pins = _pins(txt)
+        outside = {}
+        for line in _requirement_lines(infile):
+            req = Requirement(line)
+            pinned = pins.get(_canonical(req.name))
+            if pinned and not req.specifier.contains(Version(pinned), prereleases=True):
+                outside[req.name] = f"pinned {pinned}, {infile} says {req.specifier}"
+        assert not outside, (
+            f"{txt} pins versions its {infile} rules out: {outside} — "
+            "regenerate with scripts/compile-requirements.sh"
         )
 
 
