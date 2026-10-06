@@ -23,6 +23,14 @@ date changes.
 
 ## 2026-10-06
 
+### Any command run in the proxy image now finds its metrics directory — Bug fix
+
+The proxy images put every process into multiprocess metrics (`PROMETHEUS_MULTIPROC_DIR`), but
+only the server's start command created that directory. Anything started with its own command,
+such as a `docker exec` or the commercial deploy's schema job, failed at its first metric, so
+the next commercial deploy on the runtime database role would have stopped at that job. The
+image now creates the directory, as the user it runs as; the server still clears it at start.
+
 ### The proxy and the Java client template take four dependency security fixes — Bug fix
 
 The proxy now pins LiteLLM 1.95.1, the fix for an advisory about request-body routing

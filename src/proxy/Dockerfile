@@ -57,6 +57,10 @@ ENV LOG_LEVEL=INFO
 # uvicorn workers keeps a private registry and /metrics answers from whichever one
 # the OS routed to (observed live: 69/69/23/69/23/69 on six consecutive scrapes).
 ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-multiproc
+# Every process in the image is in multiprocess mode, not only the server, whose CMD below
+# recreates the directory: a job started with its own command (or a `docker exec`) needs it
+# too, or it fails at its first metric. Created as the runtime user, so the CMD can purge it.
+RUN mkdir -p "$PROMETHEUS_MULTIPROC_DIR"
 
 EXPOSE 8080
 

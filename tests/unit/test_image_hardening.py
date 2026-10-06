@@ -57,6 +57,46 @@ def test_every_image_ends_as_an_unprivileged_user(dockerfile):
     assert users[-1].split(":")[0] not in ("root", "0"), users[-1]
 
 
+def _instructions(lines):
+    """The stage's instructions, each with its backslash continuations joined."""
+    out, current = [], ""
+    for line in lines:
+        current += line.rstrip()
+        if current.endswith("\\"):
+            current = current[:-1] + " "
+            continue
+        if current.strip() and not current.lstrip().startswith("#"):
+            out.append(current.strip())
+        current = ""
+    return out
+
+
+METRICS_DOCKERFILES = [p for p in DOCKERFILES if "PROMETHEUS_MULTIPROC_DIR" in p.read_text(encoding="utf-8")]
+
+
+def test_the_metrics_check_is_not_vacuous():
+    assert ROOT / "src/proxy/Dockerfile" in METRICS_DOCKERFILES
+
+
+@pytest.mark.parametrize("dockerfile", METRICS_DOCKERFILES,
+                         ids=[p.relative_to(ROOT).as_posix() for p in METRICS_DOCKERFILES])
+def test_the_metrics_directory_exists_for_every_command(dockerfile):
+    """PROMETHEUS_MULTIPROC_DIR puts every process in the image into multiprocess metrics, but only
+    the server's CMD created the directory: a job started with its own command, or a `docker exec`,
+    failed at its first metric. The image creates it, as the user it runs as."""
+    _, lines = _stages(dockerfile.read_text(encoding="utf-8"))[-1]
+    user, env_set, made = None, False, False
+    for ins in _instructions(lines):
+        if re.match(r"USER\s", ins, re.I):
+            user = ins.split(None, 1)[1].split(":")[0]
+        elif re.match(r"ENV\s+PROMETHEUS_MULTIPROC_DIR[=\s]", ins, re.I):
+            env_set = True
+        elif (env_set and re.match(r"RUN\s", ins, re.I)
+              and re.search(r"mkdir\s+-p\s+\"?\$\{?PROMETHEUS_MULTIPROC_DIR\b", ins)):
+            made = user not in (None, "root", "0")
+    assert made, "no RUN after the ENV creates $PROMETHEUS_MULTIPROC_DIR as the unprivileged user"
+
+
 def test_ci_tests_the_python_the_images_run():
     images = set()
     for p in DOCKERFILES:
