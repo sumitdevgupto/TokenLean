@@ -16,7 +16,7 @@ The local deployment runs the entire optimisation stack (G0–G28, G27 reserved 
 | **G4 Bypass** | `pgvector/pgvector:pg15` | 5432 | PostgreSQL cache |
 | **G5 Cache** | `redis:7.2-alpine` | 6379 | Redis exact-match cache |
 | **G6 Routing** | Built from `src/routellm-sidecar/Dockerfile` | 8081 | RouteLLM cascade |
-| **G7 Retrieval** | `qdrant/qdrant:v1.9.0` | 6333 | Vector search |
+| **G7 Retrieval** | `qdrant/qdrant:v1.12.6` | 6333 | Vector search |
 | **G10 Memory** | Redis + Qdrant | - | Session summaries + agent skills |
 | **G18 Observability** | `langfuse/langfuse:2` | 3100 | Tracing UI |
 | **G18 Dashboards** | `grafana/grafana-oss:10.4.0` | 3000 | Grafana dashboards (optional profile) |

@@ -41,10 +41,15 @@ OPTIONAL_CLIENT_PIN_FILES = [
     "pitch-test-plan/requirements.txt",
 ]
 
-# Every place the Qdrant SERVER image version is declared.
+# Every place the Qdrant SERVER image version is declared — plus the doc that quotes it.
+# docs/deployment-local.md kept saying v1.9.0 for two months after Compose and Terraform
+# moved to v1.12.6 (5838e16, 2026-08-06): a reader who ran that image would get a server
+# without the Query API (Qdrant 1.10+) that G07 and G03 call, and retrieval would silently
+# return nothing.
 SERVER_IMAGE_FILES = [
     "docker-compose.yml",
     "infra/variables.tf",
+    "docs/deployment-local.md",
 ]
 
 _CLIENT_RE = re.compile(r"^qdrant-client(?P<spec>[^#\s]+)", re.MULTILINE)
@@ -104,10 +109,10 @@ def test_client_pin_is_capped_not_open_ended():
 
 
 def test_server_image_versions_agree():
-    """Local dev and GCP must not run different Qdrant servers."""
+    """Local dev and GCP must not run different Qdrant servers, and the docs must name that one."""
     versions = _server_versions()
     assert len(set(versions.values())) == 1, (
-        f"Qdrant server version differs between deploy targets: {versions}"
+        f"Qdrant server version differs between the deploy targets and the docs: {versions}"
     )
 
 
