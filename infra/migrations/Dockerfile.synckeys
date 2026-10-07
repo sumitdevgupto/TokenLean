@@ -19,7 +19,9 @@ WORKDIR /app
 COPY sync_proxy_keys.py /app/sync_proxy_keys.py
 # local-keys.json is copied into infra/migrations/ by sync-proxy-keys-job.sh right
 # before `docker build` and removed immediately after (it holds key hashes — never lingers).
-COPY local-keys.json /app/local-keys.json
+# It keeps the operator's file mode, often owner-only (600), so it is handed to the user that
+# reads it (uid 1000, below); as root's it could not be opened.
+COPY --chown=1000:1000 local-keys.json /app/local-keys.json
 
 # Runs as an unprivileged user (uid 1000), not root: it only reads the two files above.
 RUN useradd --create-home --uid 1000 --user-group app

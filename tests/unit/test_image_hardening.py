@@ -97,6 +97,19 @@ def test_the_metrics_directory_exists_for_every_command(dockerfile):
     assert made, "no RUN after the ENV creates $PROMETHEUS_MULTIPROC_DIR as the unprivileged user"
 
 
+def test_the_key_sync_image_hands_its_keys_file_to_the_user_that_reads_it():
+    """The key-sync job stages the operator's keys file into the build context with whatever mode it
+    has, and COPY makes it root's, while the image runs as an unprivileged user: a keys file only
+    its owner may read (mode 600, usual on a Linux host) left the job unable to open it."""
+    _, lines = _stages((ROOT / "infra/migrations/Dockerfile.synckeys").read_text(encoding="utf-8"))[-1]
+    ins = _instructions(lines)
+    user = [i.split(None, 1)[1].split(":")[0] for i in ins if re.match(r"USER\s", i, re.I)][-1]
+    copies = [i for i in ins if re.match(r"COPY\s", i, re.I) and "local-keys.json" in i]
+    assert copies, "the image no longer copies local-keys.json"
+    owner = re.search(r"--chown=(\S+)", copies[0])
+    assert owner and owner.group(1).split(":")[0] == user, copies[0]
+
+
 def test_ci_tests_the_python_the_images_run():
     images = set()
     for p in DOCKERFILES:

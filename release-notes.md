@@ -21,6 +21,15 @@ Add a new `###` item under today's date header; only start a new `## YYYY-MM-DD`
 date changes.
 -->
 
+## 2026-10-07
+
+### The key-sync job can read its keys file on any host — Bug fix
+
+The key-sync image copies in the operator's keys file, keeping its file mode, and runs as an
+unprivileged user. Because the copy belonged to root, a keys file only its owner may read
+(mode 600, common on a Linux host or in Cloud Shell) would have left the job unable to open
+it. The copy now belongs to the user that reads it.
+
 ## 2026-10-06
 
 ### Any command run in the proxy image now finds its metrics directory — Bug fix
